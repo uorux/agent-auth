@@ -121,10 +121,10 @@ def main() -> None:
 
     banner("6. homelab-agent requests kubernetes edit on the app namespace (surfaces)")
     req = homelab.request_access(
-        "kubernetes", "namespace", os.environ.get("E2E_K8S_NAMESPACE", "personal-site"),
+        "kubernetes", "edit", os.environ.get("E2E_K8S_NAMESPACE", "personal-site"),
         justification="Final deploy step for 'cactus': apply manifests and restart "
                       "the deployment in this namespace.",
-        duration="2h", scope={"role": "edit"},
+        duration="2h",
     )
     req = wait_decided(homelab, req, "k8s")
     if req["status"] == "granted":

@@ -20,7 +20,7 @@ agent ──HTTP/MCP/CLI──▶ broker ──policy──▶ deny | approve | 
 |-----------|---------------|---------------------|-----------------------------------------------------------------------------|
 | `github`  | `repo`        | `owner/repo`        | broker mints GitHub App installation tokens (≤1h, re-minted on demand) scoped to the repo + `scope.permissions` |
 | `homelab` | `group`       | LLDAP group name    | agent's LLDAP service account is added to the group (Authelia rules are per-group); removed at expiry |
-| `kubernetes` | `namespace` | namespace name     | per-grant ServiceAccount + RoleBinding to an allowlisted ClusterRole (`scope.role`); tokens minted on demand via TokenRequest; SA deleted at expiry → all tokens die instantly |
+| `kubernetes` | role name (`view`, `edit`, `traefik-patcher`, …) | namespace name | per-grant ServiceAccount + RoleBinding to the named (Cluster)Role; tokens minted on demand via TokenRequest; SA deleted at expiry → all tokens die instantly. The capability *is* the role, so policy rules auto-approve narrow roles and surface broad ones |
 | `a2a`     | `talk`        | target agent name   | check-based: `GET /v1/a2a/check`, plus optional relay `POST /v1/a2a/send` → webhook or inbox |
 | `google`  | `calendar.*`… | calendar id / label | stub: decisions recorded, no credential minted (501)                        |
 
@@ -73,13 +73,18 @@ interfaces, all wrapping the same HTTP API:
       "command": "agent-auth-mcp",
       "env": {"AGENT_AUTH_URL": "https://auth.rooty.dev", "AGENT_AUTH_API_KEY": "aa_..."}}}}
   ```
-  Tools: `request_access`, `wait_for_decision`, `retry_request`, `escalate_request`,
-  `get_credential`, `list_grants`, `check_a2a`, `a2a_send`, `a2a_inbox`, `a2a_ack`.
+  Tools: `list_capabilities`, `request_access`, `wait_for_decision`,
+  `retry_request`, `escalate_request`, `get_credential`, `list_grants`,
+  `check_a2a`, `a2a_send`, `a2a_inbox`, `a2a_ack`.
 - **CLI**: `agent-auth ...` (same env vars), plus `agent-auth admin ...` with
   `AGENT_AUTH_ADMIN_TOKEN`.
 
 ### Agent protocol
 
+0. `list_capabilities()` (`GET /v1/catalog`) — discover what's requestable:
+   enabled platforms and their roles/groups/repos/permissions, each with a
+   description and its typical routing (auto-approve / human review). Pick the
+   narrowest capability that does the job.
 1. `request_access(...)` with a **specific** justification and a duration.
 2. `wait_for_decision(id)` — blocks through LLM review / human review.
 3. On `llm_denied`: read `decision_reason`, `retry_request` with a revised
@@ -139,9 +144,31 @@ Set `KUBERNETES_API_URL=in-cluster` (or an API server URL plus
 out-of-cluster). The broker needs RBAC to create/delete ServiceAccounts and
 RoleBindings, create `serviceaccounts/token`, and `bind` the allowlisted
 ClusterRoles — see the `agent-auth-provisioner` ClusterRole in `deploy/k8s.yaml`
-(bind it per brokered namespace). Configure ceilings in
-`platforms.kubernetes.namespace_allowlist` / `role_allowlist`; never allowlist
-`kube-system` or roles you wouldn't hand an agent.
+(bind it per brokered namespace, or cluster-wide if your allowlist is broad).
+
+Ceilings: `namespace_allowlist: ["*"]` is fine — containment comes from narrow
+roles and human review, not from walling namespaces off (an agent with gitops
+access reaches them anyway). Keep `role_allowlist` enumerated and prefer
+purpose-built roles over `edit`/`admin`: it must match the ClusterRoles/Roles
+the broker holds `bind` on, so a tight role means a tight grant *and* a tight
+broker credential.
+
+**Narrow capability library.** The capability an agent requests *is* the role
+name, so a single approval grants exactly one capability rather than a tier.
+`deploy/k8s.yaml` ships two examples — `traefik-patcher` (`get`+`patch` on the
+one named `traefik` deployment) and `logs-reader` (read pods + logs) — and the
+policy auto-approves them while surfacing `edit`/`admin`. To add your own:
+
+1. Define a `ClusterRole` with the minimal rules in `deploy/k8s.yaml`.
+2. Append its name to the provisioner's `bind` `resourceNames` (so the broker
+   can hand it out) **and** to policy `role_allowlist`.
+3. Optionally add a policy rule to auto-approve it; agents request it as the
+   capability (`agent-auth request kubernetes <role> <namespace> ...`).
+
+Caveat: RBAC `resourceNames` scopes `get`/`patch`/`delete` on named objects but
+is ignored by `create` and disables `list`/`watch` — so a name-scoped role acts
+on an object directly but can't enumerate the collection. `get`+`patch` (what
+`kubectl edit` does) works; `kubectl get <type>` without a name won't.
 
 Agents use the credential as a bearer token:
 `kubectl --server=... --token=$(agent-auth cred <grant-id> | jq -r .value) -n <ns> ...`

@@ -70,6 +70,8 @@ class GithubProvisioner:
         repo = spec.resource.strip().strip("/").lower()
         if repo.count("/") != 1:
             raise SpecValidationError("github resource must be 'owner/repo'")
+        if _fnmatch_any(repo, self.config.repo_denylist):
+            raise SpecValidationError(f"repo {repo!r} is never brokered (denylist)")
         if self.config.repo_allowlist and not _fnmatch_any(repo, self.config.repo_allowlist):
             raise SpecValidationError(f"repo {repo!r} is not in the allowlist")
 

@@ -71,37 +71,34 @@ class KubernetesProvisioner:
     # ------------------------------------------------------------ interface
 
     async def validate_request(self, session: AsyncSession, spec: RequestSpec) -> RequestSpec:
-        if spec.capability != "namespace":
-            raise SpecValidationError("kubernetes capability must be 'namespace'")
+        # The capability IS the role (view / edit / traefik-patcher / ...), so
+        # policy rules can auto-approve narrow roles and surface broad ones.
+        role = spec.capability.strip()
+        if role not in self.config.role_allowlist:
+            raise SpecValidationError(
+                f"role {role!r} is not grantable; allowed: {self.config.role_allowlist}"
+            )
         namespace = spec.resource.strip().lower()
         if not re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?", namespace):
             raise SpecValidationError(f"invalid namespace name {namespace!r}")
         if not any(fnmatch(namespace, p) for p in self.config.namespace_allowlist):
             raise SpecValidationError(f"namespace {namespace!r} is not brokered (allowlist)")
 
-        role = spec.scope.get("role")
-        if not role or not isinstance(role, str):
-            raise SpecValidationError('scope.role is required, e.g. {"role": "edit"}')
-        role = role.strip()
-        if role not in self.config.role_allowlist:
-            raise SpecValidationError(
-                f"role {role!r} is not grantable; allowed: {self.config.role_allowlist}"
-            )
-
+        spec.capability = role
         spec.resource = namespace
-        spec.scope = {"role": role}
-        spec.notes.append(
-            f"creates a ServiceAccount bound to ClusterRole {role!r} in namespace {namespace!r}"
-        )
-        if role not in ("view",):
-            spec.notes.append(f"{role} allows mutating workloads in {namespace}")
+        spec.scope = {}
+        spec.notes.append(f"binds role {role!r} in namespace {namespace!r} (namespace-scoped)")
+        if role in ("edit", "admin"):
+            spec.notes.append(
+                f"{role} can run pods as any ServiceAccount in {namespace} — broad"
+            )
         return spec
 
     async def provision(self, session: AsyncSession, grant: Grant) -> dict:
         agent = await session.get(Agent, grant.agent_id)
         assert agent is not None
         namespace = grant.resource
-        role = grant.scope["role"]
+        role = grant.capability
         name = _sa_name(agent.name, grant.id)
         meta = {
             "name": name,

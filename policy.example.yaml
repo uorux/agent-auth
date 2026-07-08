@@ -22,6 +22,10 @@ platforms:
     repo_allowlist:
       - "otisdog8/*"
       - "uorux/*"
+    # Checked first — repos no agent may ever touch, regardless of rules or
+    # human approval. Anything that configures the broker's host belongs here.
+    repo_denylist:
+      - "otisdog8/nixos-dots"
     # Hard ceiling — requests above this are denied before any policy rule runs.
     # Must be a subset of what the GitHub App itself was granted (keep this list
     # and the App's permissions in sync; keys are the API permission names).
@@ -46,15 +50,32 @@ platforms:
       - svc-gitea
       - svc-sonarr
       - svc-radarr
+    group_descriptions:
+      svc-gitea: "Gitea access via Authelia — mint your own Gitea token once in"
+      svc-sonarr: "Sonarr web UI + API"
+      svc-radarr: "Radarr web UI + API"
   kubernetes:
-    # Namespaces agents may be granted access to (globs). Never list kube-system.
+    # Any namespace is brokerable — containment comes from narrow roles and
+    # human review, not from walling namespaces off (an agent with gitops
+    # access can reach them regardless).
     namespace_allowlist:
-      - "apps-*"
-      - personal-site
-    # ClusterRoles agents may request in scope.role
+      - "*"
+    # Roles agents may request, narrowest first. The broker's own RBAC must
+    # hold `bind` on exactly these (deploy/k8s.yaml resourceNames) — widening
+    # this list widens the broker's standing credential too. Prefer purpose-
+    # built roles (see traefik-patcher in deploy/k8s.yaml) so a single "allow"
+    # grants one verb on one resource, not blanket namespace edit.
     role_allowlist:
       - view
+      - logs-reader       # get+list pods and pod logs
+      - traefik-patcher   # get+patch on deployments/traefik only
       - edit
+    # Shown to agents via GET /v1/catalog so they pick the right narrow role.
+    role_descriptions:
+      view: "read-only access to all resources in the namespace"
+      logs-reader: "read pod logs (get + list on pods and pods/log)"
+      traefik-patcher: "get + patch the traefik Deployment only — nothing else"
+      edit: "full read-write in the namespace (broad: can run pods as any SA)"
 
 rules:
   # Low-risk homelab groups: auto-approve, short leash
@@ -68,7 +89,18 @@ rules:
     action: llm
     constraints: {max_duration: 8h}
 
-  # Kubernetes: read-only can be LLM-reviewed; anything mutating asks a human
+  # Kubernetes — the capability IS the role, so friction scales with blast
+  # radius. Read-only and single-purpose roles auto-approve; broad tiers surface.
+  - match: {platform: kubernetes, capability: view}
+    action: approve
+    constraints: {max_duration: 8h}
+  - match: {platform: kubernetes, capability: logs-reader}
+    action: approve
+    constraints: {max_duration: 8h}
+  - match: {platform: kubernetes, capability: traefik-patcher}
+    action: approve
+    constraints: {max_duration: 1h}   # narrow verb on one named resource
+  # edit / admin / anything else → a human decides (Discord shows the namespace)
   - match: {platform: kubernetes}
     action: surface
 

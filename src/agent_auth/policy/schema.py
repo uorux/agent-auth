@@ -71,19 +71,32 @@ class LLMConfig(BaseModel):
 
 class GithubPlatformConfig(BaseModel):
     repo_allowlist: list[str] = Field(default_factory=list)
+    # Checked before the allowlist — carve sensitive repos (e.g. the repo that
+    # configures this broker's host) out of a broad allowlist. Globs on
+    # normalized "owner/repo".
+    repo_denylist: list[str] = Field(default_factory=list)
     # capability ceiling, e.g. {contents: write, secrets: write}
     permission_ceiling: dict[str, str] = Field(default_factory=dict)
 
 
 class HomelabPlatformConfig(BaseModel):
     allowed_groups: list[str] = Field(default_factory=list)
+    # Optional human descriptions surfaced to agents via GET /v1/catalog.
+    group_descriptions: dict[str, str] = Field(default_factory=dict)
 
 
 class KubernetesPlatformConfig(BaseModel):
     # Globs of namespaces that may be brokered; empty = nothing grantable.
+    # ["*"] is reasonable — containment comes from tight roles + human review,
+    # not from walling off namespaces (an agent with gitops access can reach
+    # them anyway).
     namespace_allowlist: list[str] = Field(default_factory=list)
-    # ClusterRole names agents may request (e.g. view, edit, admin, custom roles).
+    # ClusterRole/Role names agents may request. The broker's own RBAC must
+    # hold `bind` on exactly these. Prefer narrow custom roles over edit/admin.
     role_allowlist: list[str] = Field(default_factory=lambda: ["view"])
+    # Optional human descriptions (what each role actually grants) surfaced to
+    # agents via GET /v1/catalog — the broker can't infer this from a role name.
+    role_descriptions: dict[str, str] = Field(default_factory=dict)
 
 
 class PlatformsConfig(BaseModel):

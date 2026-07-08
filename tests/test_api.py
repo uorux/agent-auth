@@ -255,6 +255,42 @@ async def test_admin_decide_endpoint(api, db):
     assert again.status_code == 409
 
 
+async def test_catalog(api, db):
+    a = (await api.post("/admin/agents", headers=ADMIN, json={"name": "cat-agent"})).json()
+    await make_agent(db, "cat-peer")
+    resp = await api.get("/v1/catalog", headers=auth(a["api_key"]))
+    assert resp.status_code == 200
+    by_platform = {p["platform"]: p for p in resp.json()["platforms"]}
+
+    # kubernetes: roles carry descriptions + a typical disposition
+    k = by_platform["kubernetes"]
+    assert k["namespace_allowlist"] == ["apps-*", "personal-site"]
+    roles = {r["name"]: r for r in k["roles"]}
+    assert set(roles) == {"view", "logs-reader", "edit"}
+    assert roles["view"]["description"] == "read-only in the namespace"
+    # conftest rule auto-approves view, surfaces edit
+    assert roles["view"]["typical_disposition"] == "auto-approve"
+    assert roles["edit"]["typical_disposition"] == "human review"
+
+    # github: allowlist + permission ceiling
+    gh = by_platform["github"]
+    assert gh["repo_allowlist"] == ["jrt/*"]
+    assert gh["permission_ceiling"]["contents"] == "write"
+
+    # a2a: peers list other registered agents, not self
+    a2a = by_platform["a2a"]
+    assert "cat-peer" in a2a["peers"]
+    assert "cat-agent" not in a2a["peers"]
+
+    # unused fields are omitted (response_model_exclude_none)
+    assert "roles" not in gh
+    assert "repo_allowlist" not in k
+
+
+async def test_catalog_requires_auth(api):
+    assert (await api.get("/v1/catalog")).status_code == 401
+
+
 async def test_invalid_duration_rejected(api):
     a = (await api.post("/admin/agents", headers=ADMIN, json={"name": "dur-agent"})).json()
     resp = await api.post(

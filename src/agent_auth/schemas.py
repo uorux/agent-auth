@@ -129,6 +129,32 @@ class AgentOut(BaseModel):
     api_key: str | None = None  # only set on create/rotate
 
 
+class CatalogEntry(BaseModel):
+    name: str
+    description: str | None = None
+    # Resource-agnostic policy routing, best-effort: "auto-approve" | "human
+    # review" | "llm review" | "denied". Actual routing may differ by the
+    # specific resource/justification.
+    typical_disposition: str | None = None
+
+
+class PlatformCatalog(BaseModel):
+    platform: Platform
+    capability_hint: str
+    resource_hint: str
+    roles: list[CatalogEntry] | None = None
+    namespace_allowlist: list[str] | None = None
+    repo_allowlist: list[str] | None = None
+    permission_ceiling: dict[str, str] | None = None
+    groups: list[CatalogEntry] | None = None
+    capabilities: list[str] | None = None
+    peers: list[str] | None = None
+
+
+class CatalogOut(BaseModel):
+    platforms: list[PlatformCatalog]
+
+
 class RuleOut(BaseModel):
     id: str
     action: str

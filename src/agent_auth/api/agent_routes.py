@@ -14,12 +14,14 @@ from ..provisioners.base import ProvisionerError, SpecValidationError
 from ..schemas import (
     A2ACheckOut,
     A2ASendBody,
+    CatalogOut,
     CredentialOut,
     GrantOut,
     RequestCreate,
     RequestOut,
     RetryBody,
 )
+from .catalog import build_catalog
 from .deps import get_agent
 from .serialize import grant_out, request_out
 
@@ -36,6 +38,15 @@ async def me(agent: Agent = Depends(get_agent)):
         "webhook_url": agent.webhook_url,
         "lldap_username": agent.lldap_username,
     }
+
+
+@router.get("/catalog", response_model=CatalogOut, response_model_exclude_none=True)
+async def catalog(request: Request, agent: Agent = Depends(get_agent)):
+    """What this agent may request: enabled platforms and the roles/groups/repos
+    (with descriptions and typical routing) available to it."""
+    state = request.app.state
+    async with state.db.session() as session:
+        return await build_catalog(session, agent, state.registry, state.service.engine)
 
 
 @router.post("/requests", response_model=RequestOut)

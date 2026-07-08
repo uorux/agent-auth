@@ -44,7 +44,39 @@ rules:
   - apiGroups: [rbac.authorization.k8s.io]
     resources: [clusterroles]
     verbs: [bind]
-    resourceNames: [view, edit]   # keep in sync with policy role_allowlist
+    # MUST list exactly the roles in policy role_allowlist. The broker can only
+    # hand out roles it can `bind`; adding one here widens its standing power,
+    # so prefer the narrow custom roles below over edit/admin.
+    resourceNames: [view, edit, traefik-patcher, logs-reader]
+---
+# ─── Narrow capability library ──────────────────────────────────────────────
+# Purpose-built ClusterRoles so a single "allow" grants one capability, not a
+# blanket tier. Bound namespace-scoped via RoleBinding by the provisioner, so
+# "traefik-patcher in kube-system" touches only kube-system. To add one: define
+# the ClusterRole here, append its name to the `bind` resourceNames above and to
+# policy `role_allowlist`, and reference it as the request capability.
+#
+# resourceNames caveat: it restricts get/patch/update/delete on *named* objects
+# but is ignored by create and silently disables list/watch — so a resourceName-
+# scoped role can act on the object by name but cannot list the collection.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: traefik-patcher
+rules:
+  - apiGroups: ["apps"]
+    resources: [deployments]
+    resourceNames: [traefik]
+    verbs: [get, patch]          # covers `kubectl edit/patch deploy traefik`
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: logs-reader
+rules:
+  - apiGroups: [""]
+    resources: [pods, pods/log]
+    verbs: [get, list]           # read-only debugging; no exec, no secrets
 ---
 # Scope the provisioner to brokered namespaces: repeat this RoleBinding per
 # namespace in namespace_allowlist (or use a ClusterRoleBinding if you accept

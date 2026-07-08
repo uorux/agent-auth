@@ -16,9 +16,8 @@ from .conftest import make_agent
 def k8s_request(namespace="apps-cactus", role="edit", duration="2h"):
     return RequestCreate(
         platform=Platform.KUBERNETES,
-        capability="namespace",
+        capability=role,  # capability IS the role
         resource=namespace,
-        scope={"role": role},
         justification="deploy the cactus app: apply manifests and restart the deployment",
         requested_duration=duration,
     )
@@ -38,34 +37,25 @@ async def test_validator_ceilings(db, registry, agent):
         with pytest.raises(SpecValidationError, match="not brokered"):
             await provisioner.validate_request(
                 session,
-                RequestSpec(agent=a, capability="namespace", resource="kube-system",
-                            scope={"role": "view"}),
+                RequestSpec(agent=a, capability="view", resource="unlisted-ns"),
             )
         with pytest.raises(SpecValidationError, match="not grantable"):
             await provisioner.validate_request(
                 session,
-                RequestSpec(agent=a, capability="namespace", resource="apps-x",
-                            scope={"role": "cluster-admin"}),
-            )
-        with pytest.raises(SpecValidationError, match="scope.role is required"):
-            await provisioner.validate_request(
-                session,
-                RequestSpec(agent=a, capability="namespace", resource="apps-x", scope={}),
+                RequestSpec(agent=a, capability="cluster-admin", resource="apps-x"),
             )
         with pytest.raises(SpecValidationError, match="invalid namespace"):
             await provisioner.validate_request(
                 session,
-                RequestSpec(agent=a, capability="namespace", resource="Bad_NS!",
-                            scope={"role": "view"}),
+                RequestSpec(agent=a, capability="view", resource="Bad_NS!"),
             )
         spec = await provisioner.validate_request(
             session,
-            RequestSpec(agent=a, capability="namespace", resource=" APPS-cactus ",
-                        scope={"role": "edit"}),
+            RequestSpec(agent=a, capability="edit", resource=" APPS-cactus "),
         )
         assert spec.resource == "apps-cactus"
-        assert any("ServiceAccount" in n for n in spec.notes)
-        assert any("mutating" in n for n in spec.notes)  # edit-role warning
+        assert any("binds role 'edit'" in n for n in spec.notes)
+        assert any("broad" in n for n in spec.notes)  # edit-role warning
 
 
 async def test_grant_credential_revoke_cycle(db, service, k8s_mock):
@@ -76,7 +66,7 @@ async def test_grant_credential_revoke_cycle(db, service, k8s_mock):
                 action=RuleAction.AUTO_APPROVE,
                 agent_pattern="deploy-agent",
                 platform=Platform.KUBERNETES,
-                capability_pattern="namespace",
+                capability_pattern="*",
                 resource_pattern="apps-*",
             )
         )
@@ -131,7 +121,7 @@ async def test_provision_idempotent_on_conflict(db, service, k8s_mock):
                 action=RuleAction.AUTO_APPROVE,
                 agent_pattern="deploy-agent-2",
                 platform=Platform.KUBERNETES,
-                capability_pattern="namespace",
+                capability_pattern="*",
                 resource_pattern="apps-*",
             )
         )
@@ -142,7 +132,45 @@ async def test_provision_idempotent_on_conflict(db, service, k8s_mock):
     assert ("create", "RoleBinding") in k8s_mock.calls
 
 
-async def test_default_policy_surfaces_k8s(db, service):
-    a, _ = await make_agent(db, "some-agent")
-    req = await service.create_request(a.id, k8s_request(role="view"))
-    assert req.status == RequestStatus.AWAITING_HUMAN
+async def test_wildcard_allowlist(db, agent):
+    """allowlist ['*'] brokers any namespace; containment is the role + review."""
+    from agent_auth.policy.schema import KubernetesPlatformConfig
+    from agent_auth.provisioners.kubernetes import KubernetesProvisioner
+
+    a, _ = agent
+    provisioner = KubernetesProvisioner(
+        api_url="https://k8s.test",
+        config=KubernetesPlatformConfig(
+            namespace_allowlist=["*"],
+            role_allowlist=["view", "edit", "admin"],
+        ),
+        token="t",
+    )
+    async with db.session() as session:
+        for ns in ("brand-new-app", "kube-system", "monitoring"):
+            spec = await provisioner.validate_request(
+                session,
+                RequestSpec(agent=a, capability="admin", resource=ns),
+            )
+            assert spec.resource == ns
+        # role ceiling still applies
+        with pytest.raises(SpecValidationError, match="not grantable"):
+            await provisioner.validate_request(
+                session,
+                RequestSpec(agent=a, capability="cluster-admin", resource="anything"),
+            )
+
+
+async def test_role_matched_routing(db, service, k8s_mock):
+    """The capability-is-role change lets policy split friction by blast radius:
+    a read-only role auto-approves; edit on the same namespace surfaces."""
+    a, _ = await make_agent(db, "ops-agent", lldap_username=None)
+
+    # view → auto-approved by the conftest rule, provisions a grant
+    view_req = await service.create_request(a.id, k8s_request("personal-site", role="view"))
+    assert view_req.status == RequestStatus.GRANTED
+    assert view_req.decision_source.value == "policy"
+
+    # edit on the very same namespace → surfaced to a human
+    edit_req = await service.create_request(a.id, k8s_request("personal-site", role="edit"))
+    assert edit_req.status == RequestStatus.AWAITING_HUMAN

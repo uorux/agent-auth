@@ -34,12 +34,14 @@ TEST_POLICY = {
     "platforms": {
         "github": {
             "repo_allowlist": ["jrt/*"],
+            "repo_denylist": ["jrt/nixos-dots"],
             "permission_ceiling": {"contents": "write", "secrets": "write", "issues": "read"},
         },
         "homelab": {"allowed_groups": ["svc-gitea", "svc-sonarr", "svc-k8s-gitops"]},
         "kubernetes": {
             "namespace_allowlist": ["apps-*", "personal-site"],
-            "role_allowlist": ["view", "edit"],
+            "role_allowlist": ["view", "logs-reader", "edit"],
+            "role_descriptions": {"view": "read-only in the namespace"},
         },
     },
     "rules": [
@@ -62,6 +64,16 @@ TEST_POLICY = {
             "match": {"platform": "a2a", "agent": "auto-*"},
             "action": "approve",
             "constraints": {"max_duration": "2h"},
+        },
+        # k8s: role-matched routing — read-only auto-approves, edit surfaces
+        {
+            "match": {"platform": "kubernetes", "capability": "view"},
+            "action": "approve",
+            "constraints": {"max_duration": "8h"},
+        },
+        {
+            "match": {"platform": "kubernetes", "capability": "edit"},
+            "action": "surface",
         },
     ],
 }

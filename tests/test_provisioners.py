@@ -34,6 +34,13 @@ async def test_github_validator_ceilings(db, registry, agent):
                 RequestSpec(agent=a, capability="repo", resource="evil/repo",
                             scope={"permissions": {"contents": "read"}}),
             )
+        # denylisted repo is blocked even though jrt/* is allowlisted
+        with pytest.raises(SpecValidationError, match="never brokered"):
+            await provisioner.validate_request(
+                session,
+                RequestSpec(agent=a, capability="repo", resource="jrt/NixOS-Dots",
+                            scope={"permissions": {"contents": "read"}}),
+            )
         # permission above ceiling (issues capped at read)
         with pytest.raises(SpecValidationError, match="exceeds policy ceiling"):
             await provisioner.validate_request(

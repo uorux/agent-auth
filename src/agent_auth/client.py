@@ -55,6 +55,9 @@ class BrokerClient:
     def me(self):
         return self._request("GET", "/v1/me")
 
+    def catalog(self):
+        return self._request("GET", "/v1/catalog")
+
     def request_access(
         self,
         platform: str,

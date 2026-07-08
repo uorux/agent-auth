@@ -28,6 +28,19 @@ def _safe(fn) -> str:
 
 
 @mcp.tool()
+def list_capabilities() -> str:
+    """List what you can request from this broker before composing a request.
+
+    Returns each enabled platform and the exact roles / groups / repos /
+    permissions you may ask for — with descriptions and each entry's typical
+    routing (auto-approve, human review, llm review). Use it to (1) ask for
+    something valid instead of guessing and getting denied, and (2) pick the
+    narrowest capability that does the job — an auto-approved narrow role beats
+    a broad one that a human has to review."""
+    return _safe(lambda: _client().catalog())
+
+
+@mcp.tool()
 def request_access(
     platform: str,
     capability: str,
@@ -45,10 +58,13 @@ def request_access(
     - homelab: capability="group", resource=<lldap group, e.g. "svc-gitea">
       (once granted, your service account is in the group; authenticate to the
       service yourself — e.g. mint your own Gitea token)
-    - kubernetes: capability="namespace", resource=<namespace>,
-      scope={"role": "view"|"edit"|...} — grants a ServiceAccount in that
-      namespace; get_credential returns a short-lived bearer token for kubectl
-      (--token) or the API
+    - kubernetes: capability=<role>, resource=<namespace> — the capability is
+      the role you want (view, logs-reader, edit, or a narrow custom role like
+      traefik-patcher; ask the operator which roles exist). Grants a
+      ServiceAccount bound to that role in the namespace; get_credential returns
+      a short-lived bearer token for kubectl (--token) or the API. Request the
+      narrowest role that does the job — broad roles (edit/admin) get surfaced
+      to a human, narrow ones are often auto-approved.
     - a2a: capability="talk", resource=<agent name>, scope={"topic": "deploy/*"}
     - google: capability in {calendar.read, calendar.write, gmail.read, drive.read}
 
