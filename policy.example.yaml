@@ -43,6 +43,14 @@ platforms:
       organization_secrets: write
       organization_variables: write
       organization_self_hosted_runners: read
+    # Any request touching these permissions is forced to human review even if a
+    # rule/LLM would clear it (your own scope-pinned auto-approve rule still
+    # applies). Attacker-controllable justification text can't talk the LLM into
+    # a secrets/admin grant.
+    sensitive_permissions:
+      - secrets
+      - administration
+      - organization_secrets
   homelab:
     # Only these LLDAP groups are brokered. Authelia rules per group are
     # configured in Authelia itself, not here.
@@ -76,6 +84,10 @@ platforms:
       logs-reader: "read pod logs (get + list on pods and pods/log)"
       traefik-patcher: "get + patch the traefik Deployment only — nothing else"
       edit: "full read-write in the namespace (broad: can run pods as any SA)"
+    # Always forced to human review (belt-and-suspenders with the surface rule).
+    sensitive_roles:
+      - edit
+      - admin
 
 rules:
   # Low-risk homelab groups: auto-approve, short leash

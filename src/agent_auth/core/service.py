@@ -26,6 +26,10 @@ from .states import DecisionSource, GrantStatus, RequestStatus, RuleAction, can_
 
 log = logging.getLogger(__name__)
 
+# A human editing an approval may exceed policy duration caps deliberately, but
+# a 1-year ceiling catches fat-fingered values (e.g. "9000d").
+HUMAN_MAX_DURATION_SECS = 365 * 86400
+
 
 class Notifier(Protocol):
     """Discord (or other) surface. All methods must swallow their own errors."""
@@ -133,6 +137,20 @@ class RequestService:
             source = (
                 DecisionSource.RULE if decision.source == "rule" else DecisionSource.POLICY
             )
+
+            # Sensitive capabilities always reach a human, even if a YAML rule or
+            # the LLM path would clear them — unless a human's own scope-pinned
+            # rule (source == "rule") already approved this exact request.
+            if (
+                decision.action in (PolicyAction.APPROVE, PolicyAction.LLM)
+                and decision.source != "rule"
+                and self.engine.is_sensitive(request)
+            ):
+                decision.action = PolicyAction.SURFACE
+                request.risk_notes = [
+                    *request.risk_notes,
+                    "sensitive capability — routed to human review",
+                ]
 
             if decision.action == PolicyAction.DENY:
                 request.status = RequestStatus.DENIED
@@ -350,8 +368,39 @@ class RequestService:
             if not await self._guarded_transition(session, request, target):
                 raise TransitionError("request changed state concurrently")
 
+            agent = await session.get(Agent, request.agent_id)
+
+            # Revalidate the final (possibly edited) spec against the platform's
+            # hard ceilings before anything is provisioned — an edited resource
+            # or scope must not bypass allowlists / permission caps. On failure
+            # we raise, the transaction rolls back, and the request stays
+            # awaiting_human for a re-edit.
+            approved_scope = None
+            if decision.approve:
+                final_resource = decision.resource_override or request.resource
+                final_scope = (
+                    decision.scope_override
+                    if decision.scope_override is not None
+                    else request.scope
+                )
+                provisioner = self.registry.get(request.platform)
+                try:
+                    spec = await provisioner.validate_request(
+                        session,
+                        RequestSpec(
+                            agent=agent,
+                            capability=request.capability,
+                            resource=final_resource,
+                            scope=dict(final_scope or {}),
+                        ),
+                    )
+                except SpecValidationError as exc:
+                    raise TransitionError(f"edited approval rejected by validator: {exc}")
+                request.approved_resource = spec.resource
+                request.approved_scope = spec.scope
+                approved_scope = spec.scope
+
             if decision.rule_action is not None:
-                agent = await session.get(Agent, request.agent_id)
                 session.add(
                     Rule(
                         action=decision.rule_action,
@@ -359,7 +408,12 @@ class RequestService:
                         platform=request.platform,
                         capability_pattern=decision.rule_capability_pattern
                         or request.capability,
-                        resource_pattern=decision.rule_resource_pattern or request.resource,
+                        resource_pattern=decision.rule_resource_pattern
+                        or request.approved_resource
+                        or request.resource,
+                        # Pin approved rules to the exact scope so they never
+                        # widen; deny rules stay scope-agnostic (broad).
+                        scope=approved_scope if decision.approve else None,
                         max_duration_secs=decision.duration_secs,
                         created_by=decision.decided_by,
                         notes=decision.reason or "created from decision",
@@ -372,13 +426,10 @@ class RequestService:
             request.decided_at = utcnow()
 
             if decision.approve:
-                if decision.resource_override:
-                    request.approved_resource = decision.resource_override
-                if decision.scope_override is not None:
-                    request.approved_scope = decision.scope_override
-                request.approved_duration_secs = decision.duration_secs or self.engine.cap_duration(
+                base = decision.duration_secs or self.engine.cap_duration(
                     request.requested_duration_secs, None
                 )
+                request.approved_duration_secs = min(base, HUMAN_MAX_DURATION_SECS)
                 await self._provision(session, request)
 
             await session.flush()

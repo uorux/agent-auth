@@ -104,6 +104,48 @@ async def test_disabled_db_rule_ignored(db, policy):
         assert d.action == PolicyAction.SURFACE
 
 
+async def test_scope_pinned_rule_does_not_widen(db, policy):
+    """A rule pinned to contents:write must not auto-approve secrets:write."""
+    engine = PolicyEngine(policy)
+    agent, _ = await make_agent(db, "sde-widen")
+    async with db.session() as session:
+        session.add(
+            Rule(
+                action=RuleAction.AUTO_APPROVE,
+                agent_pattern="sde-widen",
+                platform=Platform.GITHUB,
+                capability_pattern="repo",
+                resource_pattern="jrt/cactus",
+                scope={"permissions": {"contents": "write"}},
+            )
+        )
+        await session.flush()
+
+        exact = _request(agent, Platform.GITHUB, "repo", "jrt/cactus")
+        exact.scope = {"permissions": {"contents": "write"}}
+        d = await engine.evaluate(session, agent, exact)
+        assert d.action == PolicyAction.APPROVE and d.source == "rule"
+
+        wider = _request(agent, Platform.GITHUB, "repo", "jrt/cactus")
+        wider.scope = {"permissions": {"secrets": "write"}}
+        d = await engine.evaluate(session, agent, wider)
+        # falls through the pinned rule to the YAML github → llm rule
+        assert d.action == PolicyAction.LLM
+
+
+async def test_is_sensitive(db, policy):
+    engine = PolicyEngine(policy)
+    agent, _ = await make_agent(db, "s-agent")
+    secrets_req = _request(agent, Platform.GITHUB, "repo", "jrt/x")
+    secrets_req.scope = {"permissions": {"secrets": "write"}}
+    assert engine.is_sensitive(secrets_req) is True
+    contents_req = _request(agent, Platform.GITHUB, "repo", "jrt/x")
+    contents_req.scope = {"permissions": {"contents": "write"}}
+    assert engine.is_sensitive(contents_req) is False
+    edit_req = _request(agent, Platform.KUBERNETES, "edit", "media")
+    assert engine.is_sensitive(edit_req) is True
+
+
 def test_duration_capping(policy):
     engine = PolicyEngine(policy)
     assert engine.cap_duration(3600, 7200) == 3600  # requested below cap

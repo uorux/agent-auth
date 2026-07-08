@@ -39,7 +39,7 @@ class RequestCreate(BaseModel):
     capability: str = Field(min_length=1, max_length=128)
     resource: str = Field(min_length=1, max_length=512)
     scope: dict[str, Any] = Field(default_factory=dict)
-    justification: str = Field(min_length=1)
+    justification: str = Field(min_length=1, max_length=4000)
     requested_duration: str | int
 
     @field_validator("requested_duration")
@@ -76,7 +76,7 @@ class RequestOut(BaseModel):
 
 
 class RetryBody(BaseModel):
-    justification: str = Field(min_length=1)
+    justification: str = Field(min_length=1, max_length=4000)
 
 
 class GrantOut(BaseModel):
@@ -99,10 +99,22 @@ class CredentialOut(BaseModel):
     note: str | None = None
 
 
+_MAX_PAYLOAD_BYTES = 16 * 1024
+
+
 class A2ASendBody(BaseModel):
-    to: str
-    scope: str | None = None
+    to: str = Field(min_length=1, max_length=128)
+    scope: str | None = Field(default=None, max_length=256)
     payload: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("payload")
+    @classmethod
+    def _payload_size(cls, v: dict) -> dict:
+        import json
+
+        if len(json.dumps(v)) > _MAX_PAYLOAD_BYTES:
+            raise ValueError(f"payload exceeds {_MAX_PAYLOAD_BYTES} bytes")
+        return v
 
 
 class A2ACheckOut(BaseModel):
@@ -114,9 +126,21 @@ class A2ACheckOut(BaseModel):
 
 class AgentCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128, pattern=r"^[a-zA-Z0-9._-]+$")
-    description: str = ""
-    webhook_url: str | None = None
-    lldap_username: str | None = None
+    description: str = Field(default="", max_length=2000)
+    webhook_url: str | None = Field(default=None, max_length=512)
+    lldap_username: str | None = Field(default=None, max_length=128)
+
+    @field_validator("webhook_url")
+    @classmethod
+    def _valid_webhook(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        from urllib.parse import urlparse
+
+        parsed = urlparse(v)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError("webhook_url must be an http(s) URL with a host")
+        return v
 
 
 class AgentOut(BaseModel):

@@ -272,6 +272,91 @@ async def test_expiry_scheduler_catchup(db, service):
     assert await service.expire_due_grants() == 0
 
 
+async def test_edited_approval_revalidated(db, service):
+    """An override that violates a platform ceiling is rejected; the request
+    stays awaiting_human for a re-edit."""
+    sender, _ = await make_agent(db, "plain-edit")
+    await make_agent(db, "real-peer")
+    req = await service.create_request(sender.id, a2a_request("real-peer"))
+    assert req.status == RequestStatus.AWAITING_HUMAN
+
+    # resource_override to a non-existent agent → a2a validator rejects it
+    with pytest.raises(TransitionError, match="rejected by validator"):
+        await service.decide(
+            req.id,
+            HumanDecision(approve=True, decided_by="jrt", resource_override="ghost-agent"),
+        )
+    async with db.session() as session:
+        fresh = await session.get(AccessRequest, req.id)
+        assert fresh.status == RequestStatus.AWAITING_HUMAN  # rolled back
+
+    # a valid override succeeds
+    await make_agent(db, "other-peer")
+    decided = await service.decide(
+        req.id,
+        HumanDecision(approve=True, decided_by="jrt", resource_override="other-peer"),
+    )
+    assert decided.status == RequestStatus.GRANTED
+    assert decided.approved_resource == "other-peer"
+
+
+async def test_github_scope_override_ceiling_enforced(db, service, github_mock):
+    """A human editing scope above the permission ceiling is rejected."""
+    agent, _ = await make_agent(db, "dev-edit")
+    body = RequestCreate(
+        platform=Platform.GITHUB,
+        capability="repo",
+        resource="jrt/cactus",
+        scope={"permissions": {"contents": "write"}},
+        justification="push a fix",
+        requested_duration="2h",
+    )
+    # no openrouter mock → llm errors → escalates to awaiting_human
+    import respx
+
+    with respx.mock(assert_all_called=False):
+        req = await service.create_request(agent.id, body)
+        req = await wait_for_status(db, req.id, {RequestStatus.AWAITING_HUMAN})
+
+    with pytest.raises(TransitionError, match="rejected by validator"):
+        await service.decide(
+            req.id,
+            HumanDecision(
+                approve=True,
+                decided_by="jrt",
+                scope_override={"permissions": {"administration": "write"}},
+            ),
+        )
+
+
+async def test_sensitive_scope_forced_to_human(db, service):
+    """secrets:write is sensitive → surfaces even though github routes to llm."""
+    agent, _ = await make_agent(db, "sde-secret")
+    body = RequestCreate(
+        platform=Platform.GITHUB,
+        capability="repo",
+        resource="jrt/cactus",
+        scope={"permissions": {"secrets": "write"}},
+        justification="upload a registry token as an actions secret",
+        requested_duration="2h",
+    )
+    req = await service.create_request(agent.id, body)
+    assert req.status == RequestStatus.AWAITING_HUMAN
+    assert any("sensitive" in n for n in req.risk_notes)
+
+
+async def test_human_duration_capped_at_one_year(db, service):
+    agent, _ = await make_agent(db, "plain-dur")
+    await make_agent(db, "dur-peer")
+    req = await service.create_request(agent.id, a2a_request("dur-peer"))
+    decided = await service.decide(
+        req.id,
+        HumanDecision(approve=True, decided_by="jrt", duration_secs=10 * 365 * 86400),
+    )
+    assert decided.status == RequestStatus.GRANTED
+    assert decided.approved_duration_secs == 365 * 86400
+
+
 async def test_admin_revoke(db, service):
     sender, _ = await make_agent(db, "auto-sender4")
     peer, _ = await make_agent(db, "peer7")

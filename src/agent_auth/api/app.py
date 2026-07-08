@@ -17,7 +17,16 @@ def create_app(
     registry: ProvisionerRegistry,
     events: DecisionEvents,
 ) -> FastAPI:
-    app = FastAPI(title="agent-auth", version="0.1.0")
+    # Docs/schema endpoints are disabled: they'd otherwise serve unauthenticated
+    # on /docs, /redoc, /openapi.json. Agents discover capabilities via
+    # GET /v1/catalog instead.
+    app = FastAPI(
+        title="agent-auth",
+        version="0.1.0",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
     app.state.settings = settings
     app.state.db = db
     app.state.service = service

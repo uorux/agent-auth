@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     kubernetes_insecure_skip_verify: bool = False
 
     a2a_relay_enabled: bool = True
+    # If set, a2a webhook deliveries are signed: X-Agent-Auth-Signature carries
+    # an HMAC-SHA256 of the raw body. Recipients verify with the same secret.
+    webhook_signing_secret: str = ""
 
     log_level: str = "INFO"
 

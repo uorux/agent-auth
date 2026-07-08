@@ -90,6 +90,11 @@ class PolicyEngine:
                 agent.name,
                 request,
             ):
+                # Scope-pinned rules must match the request's exact normalized
+                # scope, so an "approve contents:write" rule never rubber-stamps
+                # a later secrets:write on the same repo. null scope = any.
+                if rule.scope is not None and rule.scope != (request.scope or {}):
+                    continue
                 action = (
                     PolicyAction.APPROVE
                     if rule.action == RuleAction.AUTO_APPROVE
@@ -123,3 +128,14 @@ class PolicyEngine:
         if max_secs is not None:
             caps.append(max_secs)
         return min(caps)
+
+    def is_sensitive(self, request: AccessRequest) -> bool:
+        """A capability/scope that must always reach a human (unless a human's
+        own scope-pinned rule already approved it)."""
+        if request.platform == Platform.GITHUB:
+            perms = (request.scope or {}).get("permissions", {})
+            sensitive = set(self.policy.platforms.github.sensitive_permissions)
+            return any(p in sensitive for p in perms)
+        if request.platform == Platform.KUBERNETES:
+            return request.capability in set(self.policy.platforms.kubernetes.sensitive_roles)
+        return False

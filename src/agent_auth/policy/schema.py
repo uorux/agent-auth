@@ -77,6 +77,12 @@ class GithubPlatformConfig(BaseModel):
     repo_denylist: list[str] = Field(default_factory=list)
     # capability ceiling, e.g. {contents: write, secrets: write}
     permission_ceiling: dict[str, str] = Field(default_factory=dict)
+    # Requests touching these permissions are always surfaced to a human, even
+    # when a policy/YAML rule would auto-approve or LLM-review them. A human's
+    # own saved auto-approve rule (scope-pinned) still applies.
+    sensitive_permissions: list[str] = Field(
+        default_factory=lambda: ["secrets", "administration"]
+    )
 
 
 class HomelabPlatformConfig(BaseModel):
@@ -97,6 +103,9 @@ class KubernetesPlatformConfig(BaseModel):
     # Optional human descriptions (what each role actually grants) surfaced to
     # agents via GET /v1/catalog — the broker can't infer this from a role name.
     role_descriptions: dict[str, str] = Field(default_factory=dict)
+    # Roles always surfaced to a human, even when a rule would auto-approve or
+    # LLM-review them (a human's own scope-pinned auto-approve rule still holds).
+    sensitive_roles: list[str] = Field(default_factory=lambda: ["edit", "admin"])
 
 
 class PlatformsConfig(BaseModel):

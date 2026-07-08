@@ -158,6 +158,9 @@ class Rule(Base, TimestampMixin):
     platform: Mapped[Platform] = mapped_column(_enum(Platform, "platform"))
     capability_pattern: Mapped[str] = mapped_column(String(128), default="*")
     resource_pattern: Mapped[str] = mapped_column(String(512), default="*")
+    # Exact normalized scope this rule was created for; null = any scope.
+    # Prevents an "approve contents:write" rule from rubber-stamping secrets:write.
+    scope: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     max_duration_secs: Mapped[int | None] = mapped_column(Integer, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_by: Mapped[str] = mapped_column(String(128), default="")

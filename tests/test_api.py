@@ -291,6 +291,44 @@ async def test_catalog_requires_auth(api):
     assert (await api.get("/v1/catalog")).status_code == 401
 
 
+async def test_webhook_url_validated(api):
+    bad = await api.post(
+        "/admin/agents", headers=ADMIN, json={"name": "wh-bad", "webhook_url": "ftp://x/h"}
+    )
+    assert bad.status_code == 422
+    ok = await api.post(
+        "/admin/agents",
+        headers=ADMIN,
+        json={"name": "wh-ok", "webhook_url": "https://hooks.internal/agent"},
+    )
+    assert ok.status_code == 200
+
+
+async def test_field_size_caps(api, db):
+    a = (await api.post("/admin/agents", headers=ADMIN, json={"name": "big-agent"})).json()
+    await make_agent(db, "big-peer")
+    # oversized justification
+    resp = await api.post(
+        "/v1/requests",
+        headers=auth(a["api_key"]),
+        json={
+            "platform": "a2a",
+            "capability": "talk",
+            "resource": "big-peer",
+            "justification": "x" * 5000,
+            "requested_duration": "1h",
+        },
+    )
+    assert resp.status_code == 422
+    # oversized a2a payload
+    resp = await api.post(
+        "/v1/a2a/send",
+        headers=auth(a["api_key"]),
+        json={"to": "big-peer", "payload": {"blob": "z" * 20000}},
+    )
+    assert resp.status_code == 422
+
+
 async def test_invalid_duration_rejected(api):
     a = (await api.post("/admin/agents", headers=ADMIN, json={"name": "dur-agent"})).json()
     resp = await api.post(

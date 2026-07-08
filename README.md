@@ -66,7 +66,8 @@ On NixOS, run inside `nix develop` (sets `LD_LIBRARY_PATH` for manylinux wheels)
 Each Hermes instance gets its own agent identity + API key. Three equivalent
 interfaces, all wrapping the same HTTP API:
 
-- **HTTP**: `Authorization: Bearer aa_...` against `/v1/...` (OpenAPI at `/docs`).
+- **HTTP**: `Authorization: Bearer aa_...` against `/v1/...` (interactive docs
+  are disabled; discover the surface with `GET /v1/catalog`).
 - **MCP** (recommended for agents): stdio server with tool docs written for LLMs —
   ```json
   {"mcpServers": {"agent-auth": {
@@ -96,16 +97,27 @@ interfaces, all wrapping the same HTTP API:
 
 See `policy.example.yaml`. Evaluation order: platform validator (hard ceilings) →
 saved rules from Discord's **Edit** modal (newest first) → YAML rules (first match)
-→ default. Approved duration is always `min(requested, rule cap, default cap)`.
+→ default. Approved duration is always `min(requested, rule cap, default cap)`;
+a human editing an approval may exceed policy caps deliberately but is bounded at
+1 year (catches fat-fingered values).
 
 The Discord **Edit** button opens a modal to adjust duration/resource/scope before
 approving, and its *Rule* field persists a rule for future identical requests:
 `approve`, `approve:capability` (any resource), `approve:platform`, or `deny:*`
-variants. Manage saved rules with `agent-auth admin rules` / `rule-delete`.
+variants. **Edited approvals are re-validated against the platform ceilings before
+provisioning** — an override can't push a grant past the repo allowlist, permission
+ceiling, or namespace/role allowlist. Auto-approve rules are **scope-pinned**: a
+rule created for `contents:write` won't rubber-stamp a later `secrets:write` on the
+same repo. Manage saved rules with `agent-auth admin rules` / `rule-delete`.
 
 LLM review calls OpenRouter with a structured verdict schema; the model is set
 per-rule (`constraints.llm_model`) or globally (`llm.model`). Evaluator errors
-always escalate to a human — never auto-approve.
+always escalate to a human — never auto-approve. **Sensitive scopes always reach a
+human**: `platforms.github.sensitive_permissions` (default `secrets`,
+`administration`) and `platforms.kubernetes.sensitive_roles` (default `edit`,
+`admin`) force a request to `surface` even if a YAML rule or the LLM would clear it,
+so attacker-controlled justification text can't talk the model into a broad grant.
+A human's own scope-pinned auto-approve rule still applies.
 
 ## GitHub App setup (one-time)
 
@@ -244,7 +256,13 @@ GITHUB_INSTALLATION_ID=...
 LLDAP_URL=http://lldap:17170
 LLDAP_ADMIN_USER=agent-auth-svc
 LLDAP_ADMIN_PASSWORD=...
+WEBHOOK_SIGNING_SECRET=...    # optional; signs a2a webhook deliveries (X-Agent-Auth-Signature)
 ```
+
+`webhook_url` on a registered agent must be an `http(s)` URL. If
+`WEBHOOK_SIGNING_SECRET` is set, a2a webhook POSTs carry
+`X-Agent-Auth-Signature: sha256=<hmac>` over the raw body; recipients verify with
+the same secret.
 
 The unit runs as a `DynamicUser` with systemd hardening, stores SQLite state in
 `/var/lib/agent-auth/`, and self-migrates on start. Secret files may stay

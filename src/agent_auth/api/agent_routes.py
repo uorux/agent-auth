@@ -224,19 +224,29 @@ async def a2a_send(body: A2ASendBody, request: Request, agent: Agent = Depends(g
 
     delivered_via = "inbox"
     if webhook_url:
+        import hashlib
+        import hmac
+        import json
+
+        raw = json.dumps(
+            {
+                "type": "a2a_message",
+                "message_id": message_id,
+                "from": agent.name,
+                "topic": body.scope,
+                "payload": body.payload,
+                "grant_id": grant.id,
+            }
+        ).encode()
+        headers = {"Content-Type": "application/json"}
+        secret = state.settings.webhook_signing_secret
+        if secret:
+            headers["X-Agent-Auth-Signature"] = "sha256=" + hmac.new(
+                secret.encode(), raw, hashlib.sha256
+            ).hexdigest()
         try:
             async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.post(
-                    webhook_url,
-                    json={
-                        "type": "a2a_message",
-                        "message_id": message_id,
-                        "from": agent.name,
-                        "topic": body.scope,
-                        "payload": body.payload,
-                        "grant_id": grant.id,
-                    },
-                )
+                resp = await client.post(webhook_url, content=raw, headers=headers)
             if resp.status_code < 300:
                 delivered_via = "webhook"
         except httpx.HTTPError:
