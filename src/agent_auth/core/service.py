@@ -9,6 +9,7 @@ from typing import Any, Protocol
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .. import authority as authority_mod
 from ..db import Database
 from ..models import AccessRequest, Agent, Grant, LLMEvaluation, Rule, utcnow
 from ..policy.engine import PolicyEngine
@@ -62,10 +63,13 @@ class HumanDecision:
     duration_secs: int | None = None  # None → requested capped by policy default
     resource_override: str | None = None
     scope_override: dict[str, Any] | None = None
-    # Optional persistent rule created alongside the decision
+    # Optional persistent rule created alongside the decision. Breadth widens the
+    # object axis only (rule_resource_pattern); the approved authority is always
+    # pinned unless rule_any_authority is set, and a null-authority rule can never
+    # bypass the sensitive-capability gate.
     rule_action: RuleAction | None = None
-    rule_capability_pattern: str | None = None
     rule_resource_pattern: str | None = None
+    rule_any_authority: bool = False
 
 
 class RequestService:
@@ -126,9 +130,10 @@ class RequestService:
                 await session.flush()
                 return request
 
-            request.capability = spec.capability
             request.resource = spec.resource
-            request.scope = spec.scope
+            request.authority = authority_mod.fold(
+                request.platform, spec.capability, spec.scope
+            )
             request.risk_notes = spec.notes
             session.add(request)
             await session.flush()
@@ -139,11 +144,12 @@ class RequestService:
             )
 
             # Sensitive capabilities always reach a human, even if a YAML rule or
-            # the LLM path would clear them — unless a human's own scope-pinned
-            # rule (source == "rule") already approved this exact request.
+            # the LLM path would clear them — unless a human's own rule pinned to
+            # this exact authority already approved it. A wildcard/null-authority
+            # rule does NOT count, so it can't silently clear a sensitive role.
             if (
                 decision.action in (PolicyAction.APPROVE, PolicyAction.LLM)
-                and decision.source != "rule"
+                and not decision.pinned_authority
                 and self.engine.is_sensitive(request)
             ):
                 decision.action = PolicyAction.SURFACE
@@ -375,7 +381,7 @@ class RequestService:
             # or scope must not bypass allowlists / permission caps. On failure
             # we raise, the transaction rolls back, and the request stays
             # awaiting_human for a re-edit.
-            approved_scope = None
+            approved_authority = None
             if decision.approve:
                 final_resource = decision.resource_override or request.resource
                 final_scope = (
@@ -397,8 +403,10 @@ class RequestService:
                 except SpecValidationError as exc:
                     raise TransitionError(f"edited approval rejected by validator: {exc}")
                 request.approved_resource = spec.resource
-                request.approved_scope = spec.scope
-                approved_scope = spec.scope
+                request.approved_authority = authority_mod.fold(
+                    request.platform, spec.capability, spec.scope
+                )
+                approved_authority = request.approved_authority
 
             if decision.rule_action is not None:
                 session.add(
@@ -406,14 +414,16 @@ class RequestService:
                         action=decision.rule_action,
                         agent_pattern=agent.name,
                         platform=request.platform,
-                        capability_pattern=decision.rule_capability_pattern
-                        or request.capability,
                         resource_pattern=decision.rule_resource_pattern
                         or request.approved_resource
                         or request.resource,
-                        # Pin approved rules to the exact scope so they never
-                        # widen; deny rules stay scope-agnostic (broad).
-                        scope=approved_scope if decision.approve else None,
+                        # Pin approve rules to the exact authority so they never
+                        # widen the privilege; deny rules and explicit "any
+                        # authority" rules stay agnostic (and never bypass the
+                        # sensitive gate).
+                        authority=approved_authority
+                        if decision.approve and not decision.rule_any_authority
+                        else None,
                         max_duration_secs=decision.duration_secs,
                         created_by=decision.decided_by,
                         notes=decision.reason or "created from decision",
@@ -465,11 +475,10 @@ class RequestService:
             request_id=request.id,
             agent_id=request.agent_id,
             platform=request.platform,
-            capability=request.capability,
             resource=request.approved_resource or request.resource,
-            scope=request.approved_scope
-            if request.approved_scope is not None
-            else request.scope,
+            authority=request.approved_authority
+            if request.approved_authority is not None
+            else request.authority,
             expires_at=utcnow() + timedelta(seconds=request.approved_duration_secs),
         )
         session.add(grant)

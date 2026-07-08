@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import select
 
+from .. import authority as authority_mod
 from ..core.service import HumanDecision, TransitionError
 from ..crypto import generate_api_key
 from ..models import AccessRequest, Agent, Rule
@@ -78,8 +79,11 @@ async def list_rules(request: Request):
                 action=r.action.value,
                 agent_pattern=r.agent_pattern,
                 platform=r.platform,
-                capability_pattern=r.capability_pattern,
+                capability_pattern=authority_mod.label(r.platform, r.authority)
+                if r.authority is not None
+                else "*",
                 resource_pattern=r.resource_pattern,
+                authority=r.authority,
                 max_duration_secs=r.max_duration_secs,
                 enabled=r.enabled,
                 created_by=r.created_by,

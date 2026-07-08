@@ -18,6 +18,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from . import authority as authority_mod
 from .core.states import (
     DecisionSource,
     GrantStatus,
@@ -62,6 +63,35 @@ class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
 
 
+class AuthoritySugar:
+    """Bridges the wire's (capability, scope) pair to the stored `authority` dict.
+
+    Accepts capability=/scope= at construction as sugar (they are two projections
+    of one privilege — see agent_auth.authority) and exposes them back as
+    read-only properties, so serializers, provisioners, and the LLM/Discord
+    surfaces keep speaking capability/scope while `authority` is the single
+    source of truth that security logic compares.
+    """
+
+    def __init__(self, **kw):
+        if "authority" not in kw and ("capability" in kw or "scope" in kw):
+            kw["authority"] = authority_mod.fold(
+                kw["platform"], kw.pop("capability", ""), kw.pop("scope", None)
+            )
+        else:
+            kw.pop("capability", None)
+            kw.pop("scope", None)
+        super().__init__(**kw)
+
+    @property
+    def capability(self) -> str:
+        return authority_mod.split(self.platform, self.authority)[0]
+
+    @property
+    def scope(self) -> dict:
+        return authority_mod.split(self.platform, self.authority)[1]
+
+
 def _enum(e, name: str):
     # values_callable so the DB stores the lowercase .value, not the member name
     return Enum(e, name=name, values_callable=lambda x: [m.value for m in x])
@@ -80,15 +110,15 @@ class Agent(Base, TimestampMixin):
     disabled: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
-class AccessRequest(Base, TimestampMixin):
+class AccessRequest(AuthoritySugar, Base, TimestampMixin):
     __tablename__ = "access_requests"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), index=True)
     platform: Mapped[Platform] = mapped_column(_enum(Platform, "platform"))
-    capability: Mapped[str] = mapped_column(String(128))
     resource: Mapped[str] = mapped_column(String(512))
-    scope: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Canonical privilege (capability+scope folded); see agent_auth.authority.
+    authority: Mapped[dict] = mapped_column(JSON, default=dict)
     justification: Mapped[str] = mapped_column(Text)
     requested_duration_secs: Mapped[int] = mapped_column(Integer)
     risk_notes: Mapped[list] = mapped_column(JSON, default=list)
@@ -102,7 +132,7 @@ class AccessRequest(Base, TimestampMixin):
     decided_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
     decision_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     approved_duration_secs: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    approved_scope: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    approved_authority: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     approved_resource: Mapped[str | None] = mapped_column(String(512), nullable=True)
     decided_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     discord_channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -110,6 +140,12 @@ class AccessRequest(Base, TimestampMixin):
     updated_at: Mapped[datetime] = mapped_column(
         TZDateTime(), default=utcnow, onupdate=utcnow
     )
+
+    @property
+    def approved_scope(self) -> dict | None:
+        if self.approved_authority is None:
+            return None
+        return authority_mod.split(self.platform, self.approved_authority)[1]
 
 
 class LLMEvaluation(Base, TimestampMixin):
@@ -125,7 +161,7 @@ class LLMEvaluation(Base, TimestampMixin):
     raw_response: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
-class Grant(Base, TimestampMixin):
+class Grant(AuthoritySugar, Base, TimestampMixin):
     __tablename__ = "grants"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
@@ -134,9 +170,9 @@ class Grant(Base, TimestampMixin):
     )
     agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), index=True)
     platform: Mapped[Platform] = mapped_column(_enum(Platform, "platform"))
-    capability: Mapped[str] = mapped_column(String(128))
     resource: Mapped[str] = mapped_column(String(512))
-    scope: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Canonical privilege (capability+scope folded); see agent_auth.authority.
+    authority: Mapped[dict] = mapped_column(JSON, default=dict)
     granted_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
     expires_at: Mapped[datetime] = mapped_column(TZDateTime(), index=True)
     status: Mapped[GrantStatus] = mapped_column(
@@ -156,11 +192,13 @@ class Rule(Base, TimestampMixin):
     action: Mapped[RuleAction] = mapped_column(_enum(RuleAction, "rule_action"))
     agent_pattern: Mapped[str] = mapped_column(String(128), default="*")
     platform: Mapped[Platform] = mapped_column(_enum(Platform, "platform"))
-    capability_pattern: Mapped[str] = mapped_column(String(128), default="*")
+    # Glob on the object axis (which repo/namespace/group/agent).
     resource_pattern: Mapped[str] = mapped_column(String(512), default="*")
-    # Exact normalized scope this rule was created for; null = any scope.
-    # Prevents an "approve contents:write" rule from rubber-stamping secrets:write.
-    scope: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Exact privilege this rule was created for; null = any privilege. Pinning
+    # the whole authority (role AND scope, per platform) is what stops an
+    # approval of a narrow request from auto-approving a broader one — and a
+    # null pin never bypasses the sensitive-capability human-review gate.
+    authority: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     max_duration_secs: Mapped[int | None] = mapped_column(Integer, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_by: Mapped[str] = mapped_column(String(128), default="")

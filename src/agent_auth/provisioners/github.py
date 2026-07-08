@@ -197,9 +197,13 @@ class GithubProvisioner:
                 },
             )
         if resp.status_code != 201:
-            raise ProvisionerError(
-                f"GitHub token mint failed ({resp.status_code}): {resp.text[:300]}"
+            log.error(
+                "GitHub token mint failed for %s (%s): %s",
+                grant.resource,
+                resp.status_code,
+                resp.text[:300],
             )
+            raise ProvisionerError(f"GitHub token mint failed ({resp.status_code})")
         data = resp.json()
         expires_at = datetime.fromisoformat(data["expires_at"].replace("Z", "+00:00"))
         return data["token"], expires_at.astimezone(timezone.utc)

@@ -82,7 +82,6 @@ async def test_github_end_to_end_grant_and_credential(db, service, github_mock, 
                 action=RuleAction.AUTO_APPROVE,
                 agent_pattern=a.name,
                 platform=Platform.GITHUB,
-                capability_pattern="*",
                 resource_pattern="jrt/*",
             )
         )

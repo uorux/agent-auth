@@ -11,13 +11,13 @@ from agent_auth.schemas import parse_duration
 from .conftest import make_agent
 
 
-def _request(agent, platform=Platform.A2A, capability="talk", resource="other-agent"):
+def _request(agent, platform=Platform.A2A, capability="talk", resource="other-agent", scope=None):
     return AccessRequest(
         agent_id=agent.id,
         platform=platform,
         capability=capability,
         resource=resource,
-        scope={},
+        scope=scope or {},
         justification="test",
         requested_duration_secs=3600,
     )
@@ -75,7 +75,6 @@ async def test_db_rule_beats_yaml(db, policy):
                 action=RuleAction.AUTO_APPROVE,
                 agent_pattern="denied-but-trusted",
                 platform=Platform.A2A,
-                capability_pattern="talk",
                 resource_pattern="*",
                 max_duration_secs=600,
             )
@@ -114,20 +113,23 @@ async def test_scope_pinned_rule_does_not_widen(db, policy):
                 action=RuleAction.AUTO_APPROVE,
                 agent_pattern="sde-widen",
                 platform=Platform.GITHUB,
-                capability_pattern="repo",
                 resource_pattern="jrt/cactus",
-                scope={"permissions": {"contents": "write"}},
+                authority={"permissions": {"contents": "write"}},
             )
         )
         await session.flush()
 
-        exact = _request(agent, Platform.GITHUB, "repo", "jrt/cactus")
-        exact.scope = {"permissions": {"contents": "write"}}
+        exact = _request(
+            agent, Platform.GITHUB, "repo", "jrt/cactus",
+            scope={"permissions": {"contents": "write"}},
+        )
         d = await engine.evaluate(session, agent, exact)
         assert d.action == PolicyAction.APPROVE and d.source == "rule"
 
-        wider = _request(agent, Platform.GITHUB, "repo", "jrt/cactus")
-        wider.scope = {"permissions": {"secrets": "write"}}
+        wider = _request(
+            agent, Platform.GITHUB, "repo", "jrt/cactus",
+            scope={"permissions": {"secrets": "write"}},
+        )
         d = await engine.evaluate(session, agent, wider)
         # falls through the pinned rule to the YAML github → llm rule
         assert d.action == PolicyAction.LLM
@@ -136,14 +138,70 @@ async def test_scope_pinned_rule_does_not_widen(db, policy):
 async def test_is_sensitive(db, policy):
     engine = PolicyEngine(policy)
     agent, _ = await make_agent(db, "s-agent")
-    secrets_req = _request(agent, Platform.GITHUB, "repo", "jrt/x")
-    secrets_req.scope = {"permissions": {"secrets": "write"}}
+    secrets_req = _request(
+        agent, Platform.GITHUB, "repo", "jrt/x", scope={"permissions": {"secrets": "write"}}
+    )
     assert engine.is_sensitive(secrets_req) is True
-    contents_req = _request(agent, Platform.GITHUB, "repo", "jrt/x")
-    contents_req.scope = {"permissions": {"contents": "write"}}
+    contents_req = _request(
+        agent, Platform.GITHUB, "repo", "jrt/x", scope={"permissions": {"contents": "write"}}
+    )
     assert engine.is_sensitive(contents_req) is False
     edit_req = _request(agent, Platform.KUBERNETES, "edit", "media")
     assert engine.is_sensitive(edit_req) is True
+
+
+async def test_null_authority_rule_cannot_clear_sensitive_role(db, policy):
+    """A broad (null-authority) k8s rule auto-approves narrow roles but must not
+    silently clear a sensitive one — the fix for the scope-pin gap."""
+    from agent_auth.core.service import RequestService
+    from agent_auth.core.states import RequestStatus
+    from agent_auth.schemas import RequestCreate
+
+    engine = PolicyEngine(policy)
+    agent, _ = await make_agent(db, "k8s-broad")
+    async with db.session() as session:
+        session.add(
+            Rule(
+                action=RuleAction.AUTO_APPROVE,
+                agent_pattern="k8s-broad",
+                platform=Platform.KUBERNETES,
+                resource_pattern="*",  # any namespace, any (null) privilege
+            )
+        )
+
+    async def _decide(role):
+        req = AccessRequest(
+            agent_id=agent.id, platform=Platform.KUBERNETES, capability=role,
+            resource="apps-x", scope={}, justification="t", requested_duration_secs=3600,
+        )
+        async with db.session() as session:
+            d = await engine.evaluate(session, agent, req)
+        return d
+
+    # null-authority rule matches both, but the sensitive gate is applied in the
+    # service by RequestService; the rule itself does not pin, so:
+    assert (await _decide("view")).pinned_authority is False
+    assert (await _decide("edit")).pinned_authority is False
+    # is_sensitive still flags edit → service will surface it despite the rule
+    edit_req = _request(agent, Platform.KUBERNETES, "edit", "apps-x")
+    assert engine.is_sensitive(edit_req) is True
+
+
+def test_fold_split_round_trips():
+    """The migration relies on fold/split being lossless per platform."""
+    from agent_auth import authority
+
+    cases = [
+        (Platform.GITHUB, "repo", {"permissions": {"contents": "write", "secrets": "write"}}),
+        (Platform.KUBERNETES, "edit", {}),
+        (Platform.A2A, "talk", {"topic": "deploy/*"}),
+        (Platform.GOOGLE, "calendar.read", {}),
+        (Platform.HOMELAB, "group", {}),
+    ]
+    for platform, cap, scope in cases:
+        folded = authority.fold(platform, cap, scope)
+        cap2, scope2 = authority.split(platform, folded)
+        assert cap2 == cap and scope2 == scope, platform
 
 
 def test_duration_capping(policy):

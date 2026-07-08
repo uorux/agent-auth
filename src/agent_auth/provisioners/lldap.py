@@ -115,7 +115,8 @@ class LldapProvisioner:
                 continue
             break
         if resp.status_code != 200:
-            raise ProvisionerError(f"LLDAP GraphQL error ({resp.status_code}): {resp.text[:300]}")
+            log.error("LLDAP GraphQL error (%s): %s", resp.status_code, resp.text[:300])
+            raise ProvisionerError(f"LLDAP GraphQL error ({resp.status_code})")
         data = resp.json()
         if data.get("errors"):
             msgs = "; ".join(e.get("message", "") for e in data["errors"])
@@ -123,7 +124,8 @@ class LldapProvisioner:
             if "already" in msgs.lower() or "not a member" in msgs.lower():
                 log.info("LLDAP no-op: %s", msgs)
                 return data
-            raise ProvisionerError(f"LLDAP GraphQL error: {msgs}")
+            log.error("LLDAP GraphQL error: %s", msgs)
+            raise ProvisionerError("LLDAP GraphQL error (see broker logs)")
         return data
 
     async def _group_id(self, name: str) -> int:

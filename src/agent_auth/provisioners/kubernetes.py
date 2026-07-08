@@ -164,9 +164,14 @@ class KubernetesProvisioner:
             },
         )
         if resp.status_code not in (200, 201):
-            raise ProvisionerError(
-                f"TokenRequest failed ({resp.status_code}): {resp.text[:300]}"
+            log.error(
+                "TokenRequest failed for %s/%s (%s): %s",
+                namespace,
+                name,
+                resp.status_code,
+                resp.text[:300],
             )
+            raise ProvisionerError(f"TokenRequest failed ({resp.status_code})")
         status = resp.json().get("status", {})
         expires_at = None
         if status.get("expirationTimestamp"):
@@ -214,12 +219,20 @@ class KubernetesProvisioner:
         if resp.status_code == 409:  # already exists → idempotent success
             return
         if resp.status_code not in (200, 201):
+            log.error(
+                "create %s at %s failed (%s): %s",
+                body["kind"],
+                path,
+                resp.status_code,
+                resp.text[:300],
+            )
             raise ProvisionerError(
-                f"create {body['kind']} failed ({resp.status_code}): {resp.text[:300]}"
+                f"create {body['kind']} failed ({resp.status_code})"
             )
 
     async def _delete(self, path: str) -> None:
         resp = await self._request("DELETE", path)
         if resp.status_code in (200, 202, 404):  # 404 → already gone
             return
-        raise ProvisionerError(f"delete failed ({resp.status_code}): {resp.text[:300]}")
+        log.error("delete %s failed (%s): %s", path, resp.status_code, resp.text[:300])
+        raise ProvisionerError(f"delete failed ({resp.status_code})")

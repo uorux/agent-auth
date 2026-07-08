@@ -61,13 +61,15 @@ async def test_validator_ceilings(db, registry, agent):
 async def test_grant_credential_revoke_cycle(db, service, k8s_mock):
     a, _ = await make_agent(db, "deploy-agent")
     async with db.session() as session:
+        # An edit rule must pin the exact role: a wildcard/null-authority rule
+        # would (correctly) no longer auto-approve a sensitive role like edit.
         session.add(
             Rule(
                 action=RuleAction.AUTO_APPROVE,
                 agent_pattern="deploy-agent",
                 platform=Platform.KUBERNETES,
-                capability_pattern="*",
                 resource_pattern="apps-*",
+                authority={"role": "edit"},
             )
         )
 
@@ -116,12 +118,12 @@ async def test_provision_idempotent_on_conflict(db, service, k8s_mock):
     """A 409 AlreadyExists from a prior partial provision is treated as success."""
     a, _ = await make_agent(db, "deploy-agent-2")
     async with db.session() as session:
+        # Null-authority rule: auto-approves any non-sensitive role in apps-*.
         session.add(
             Rule(
                 action=RuleAction.AUTO_APPROVE,
                 agent_pattern="deploy-agent-2",
                 platform=Platform.KUBERNETES,
-                capability_pattern="*",
                 resource_pattern="apps-*",
             )
         )

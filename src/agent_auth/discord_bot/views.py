@@ -178,8 +178,10 @@ class EditModal(discord.ui.Modal):
     """Approve with modifications; optionally persist an auto-approve/deny rule.
 
     Rule field syntax: blank = no rule; otherwise 'approve' or 'deny', with an
-    optional breadth suffix — ':exact' (this capability+resource, default),
-    ':capability' (any resource), ':platform' (anything on this platform).
+    optional breadth suffix that widens the *resource* only — ':exact' (this
+    exact privilege on this resource, default), ':capability' (this exact
+    privilege on any resource), ':platform' (any privilege on this platform;
+    still human-reviewed for sensitive roles/permissions).
     """
 
     def __init__(self, request_id: str, request):
@@ -234,7 +236,7 @@ class EditModal(discord.ui.Modal):
                 await interaction.followup.send(f"Invalid scope JSON: {exc}", ephemeral=True)
                 return
 
-        rule_action, rule_cap, rule_res, rule_deny_now = None, None, None, False
+        rule_action, rule_res, rule_any_auth, rule_deny_now = None, None, False, False
         rule_raw = self.rule.value.strip().lower()
         if rule_raw:
             m = re.fullmatch(r"(approve|deny)(?::(exact|capability|platform))?", rule_raw)
@@ -250,9 +252,10 @@ class EditModal(discord.ui.Modal):
             rule_deny_now = m.group(1) == "deny"
             breadth = m.group(2) or "exact"
             if breadth == "capability":
-                rule_res = "*"
+                rule_res = "*"  # same privilege, any resource
             elif breadth == "platform":
-                rule_cap, rule_res = "*", "*"
+                rule_res = "*"  # any privilege — sensitive roles still surface
+                rule_any_auth = True
 
         decision = HumanDecision(
             # Creating a deny rule from the Edit modal also denies this request.
@@ -263,8 +266,8 @@ class EditModal(discord.ui.Modal):
             resource_override=self.resource.value.strip() or None,
             scope_override=scope_override,
             rule_action=rule_action,
-            rule_capability_pattern=rule_cap,
             rule_resource_pattern=rule_res,
+            rule_any_authority=rule_any_auth,
         )
         await _apply_decision(interaction, self.request_id, decision)
 

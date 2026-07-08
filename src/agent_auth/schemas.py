@@ -184,8 +184,11 @@ class RuleOut(BaseModel):
     action: str
     agent_pattern: str
     platform: Platform
+    # Derived display label for the pinned authority ('*' = any privilege).
     capability_pattern: str
     resource_pattern: str
+    # Exact privilege this rule is pinned to; null = any.
+    authority: dict[str, Any] | None = None
     max_duration_secs: int | None
     enabled: bool
     created_by: str

@@ -6,6 +6,7 @@ from fnmatch import fnmatch
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .. import authority as authority_mod
 from ..core.states import Platform, RuleAction
 from ..models import AccessRequest, Agent, Rule
 from .schema import PolicyAction, PolicyFile, PolicyRule
@@ -20,6 +21,10 @@ class PolicyDecision:
     llm_model: str | None = None
     retry_budget: int | None = None
     rule_id: str | None = None
+    # True when a DB rule pinned this request's exact authority. Only such a rule
+    # may bypass the sensitive-capability gate — a wildcard (null-authority) rule
+    # cannot silently auto-approve a sensitive role/permission.
+    pinned_authority: bool = False
 
 
 def _matches(
@@ -82,32 +87,30 @@ class PolicyEngine:
             .order_by(Rule.created_at.desc())
         )
         for rule in rows.scalars():
-            if _matches(
-                rule.agent_pattern,
-                rule.platform,
-                rule.capability_pattern,
-                rule.resource_pattern,
-                agent.name,
-                request,
-            ):
-                # Scope-pinned rules must match the request's exact normalized
-                # scope, so an "approve contents:write" rule never rubber-stamps
-                # a later secrets:write on the same repo. null scope = any.
-                if rule.scope is not None and rule.scope != (request.scope or {}):
-                    continue
-                action = (
-                    PolicyAction.APPROVE
-                    if rule.action == RuleAction.AUTO_APPROVE
-                    else PolicyAction.DENY
-                )
-                return PolicyDecision(
-                    action=action,
-                    reason=f"matched saved rule ({rule.notes})" if rule.notes else "matched saved rule",
-                    source="rule",
-                    max_duration_secs=rule.max_duration_secs
-                    or self.policy.defaults.max_duration_secs,
-                    rule_id=rule.id,
-                )
+            if not fnmatch(agent.name, rule.agent_pattern):
+                continue
+            if not fnmatch(request.resource, rule.resource_pattern):
+                continue
+            # Authority-pinned rules must match the request's exact normalized
+            # privilege, so an "approve contents:write" rule never rubber-stamps
+            # a later secrets:write, and an "approve view" rule never clears an
+            # edit. null authority = any privilege (but see pinned_authority).
+            if rule.authority is not None and rule.authority != request.authority:
+                continue
+            action = (
+                PolicyAction.APPROVE
+                if rule.action == RuleAction.AUTO_APPROVE
+                else PolicyAction.DENY
+            )
+            return PolicyDecision(
+                action=action,
+                reason=f"matched saved rule ({rule.notes})" if rule.notes else "matched saved rule",
+                source="rule",
+                max_duration_secs=rule.max_duration_secs
+                or self.policy.defaults.max_duration_secs,
+                rule_id=rule.id,
+                pinned_authority=rule.authority is not None,
+            )
         return None
 
     def _from_yaml_rule(self, rule: PolicyRule) -> PolicyDecision:
@@ -130,12 +133,8 @@ class PolicyEngine:
         return min(caps)
 
     def is_sensitive(self, request: AccessRequest) -> bool:
-        """A capability/scope that must always reach a human (unless a human's
-        own scope-pinned rule already approved it)."""
-        if request.platform == Platform.GITHUB:
-            perms = (request.scope or {}).get("permissions", {})
-            sensitive = set(self.policy.platforms.github.sensitive_permissions)
-            return any(p in sensitive for p in perms)
-        if request.platform == Platform.KUBERNETES:
-            return request.capability in set(self.policy.platforms.kubernetes.sensitive_roles)
-        return False
+        """An authority that must always reach a human (unless a human's own
+        authority-pinned rule already approved this exact privilege)."""
+        return authority_mod.is_sensitive(
+            request.platform, request.authority, self.policy.platforms
+        )
