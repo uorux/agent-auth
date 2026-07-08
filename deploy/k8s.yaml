@@ -1,0 +1,136 @@
+# agent-auth on homelab k8s.
+# Prereqs:
+#   kubectl create namespace agent-auth
+#   kubectl -n agent-auth create secret generic agent-auth-env \
+#     --from-literal=DATABASE_URL='postgresql+asyncpg://agent_auth:...@postgres.db:5432/agent_auth' \
+#     --from-literal=ADMIN_TOKEN='...' \
+#     --from-literal=ENCRYPTION_KEY='...' \        # agent-auth admin gen-key
+#     --from-literal=DISCORD_TOKEN='...' \
+#     --from-literal=DISCORD_CHANNEL_ID='...' \
+#     --from-literal=DISCORD_OWNER_ID='...' \
+#     --from-literal=OPENROUTER_API_KEY='...' \
+#     --from-literal=GITHUB_APP_ID='...' \
+#     --from-literal=GITHUB_INSTALLATION_ID='...' \
+#     --from-literal=LLDAP_URL='http://lldap.auth:17170' \
+#     --from-literal=LLDAP_ADMIN_USER='agent-auth-svc' \
+#     --from-literal=LLDAP_ADMIN_PASSWORD='...'
+#   kubectl -n agent-auth create secret generic agent-auth-github-key \
+#     --from-file=app.pem=path/to/github-app-private-key.pem
+#   kubectl -n agent-auth create configmap agent-auth-policy --from-file=policy.yaml
+# RBAC for the kubernetes provisioner (KUBERNETES_API_URL=in-cluster):
+# the broker creates per-grant ServiceAccounts + RoleBindings and mints tokens.
+# `bind` on the allowlisted ClusterRoles lets it create RoleBindings without
+# holding those permissions itself (no privilege escalation).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agent-auth
+  namespace: agent-auth
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: agent-auth-provisioner
+rules:
+  - apiGroups: [""]
+    resources: [serviceaccounts]
+    verbs: [create, delete, get]
+  - apiGroups: [""]
+    resources: [serviceaccounts/token]
+    verbs: [create]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [rolebindings]
+    verbs: [create, delete, get]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterroles]
+    verbs: [bind]
+    resourceNames: [view, edit]   # keep in sync with policy role_allowlist
+---
+# Scope the provisioner to brokered namespaces: repeat this RoleBinding per
+# namespace in namespace_allowlist (or use a ClusterRoleBinding if you accept
+# cluster-wide reach and rely on the policy allowlist alone).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agent-auth-provisioner
+  namespace: personal-site        # ← one per brokered namespace
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: agent-auth-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: agent-auth
+    namespace: agent-auth
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-auth
+  namespace: agent-auth
+spec:
+  replicas: 1  # single replica: in-process long-poll events + expiry scheduler
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: agent-auth
+  template:
+    metadata:
+      labels:
+        app: agent-auth
+    spec:
+      serviceAccountName: agent-auth
+      containers:
+        - name: agent-auth
+          image: git.rooty.dev/jrt/agent-auth:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8400
+          envFrom:
+            - secretRef:
+                name: agent-auth-env
+          env:
+            - name: POLICY_FILE
+              value: /etc/agent-auth/policy.yaml
+            - name: KUBERNETES_API_URL
+              value: in-cluster
+            - name: GITHUB_APP_PRIVATE_KEY_FILE
+              value: /etc/agent-auth/github/app.pem
+          volumeMounts:
+            - name: policy
+              mountPath: /etc/agent-auth
+              readOnly: true
+            - name: github-key
+              mountPath: /etc/agent-auth/github
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8400
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8400
+            initialDelaySeconds: 15
+            periodSeconds: 30
+      volumes:
+        - name: policy
+          configMap:
+            name: agent-auth-policy
+        - name: github-key
+          secret:
+            secretName: agent-auth-github-key
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-auth
+  namespace: agent-auth
+spec:
+  selector:
+    app: agent-auth
+  ports:
+    - port: 80
+      targetPort: 8400

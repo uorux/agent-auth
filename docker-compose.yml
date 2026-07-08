@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: agent_auth
+      POSTGRES_PASSWORD: agent_auth
+      POSTGRES_DB: agent_auth
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_auth"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Uncomment to run the broker in compose too (build the image with `nix build .#dockerImage`)
+  # broker:
+  #   image: git.rooty.dev/jrt/agent-auth:latest
+  #   env_file: .env
+  #   environment:
+  #     DATABASE_URL: postgresql+asyncpg://agent_auth:agent_auth@postgres:5432/agent_auth
+  #   ports:
+  #     - "8400:8400"
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+
+volumes:
+  pgdata:

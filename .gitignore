@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+.envrc.local
+policy.yaml
+*.db
+result
+.pytest_cache/

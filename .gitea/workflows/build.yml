@@ -1,0 +1,47 @@
+name: Build and Deploy agent-auth
+on:
+  push:
+    branches:
+      - 'main'
+  pull_request:
+jobs:
+  build:
+    runs-on: uorux-scale-set
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fix cachix installer
+        run: sudo apt update && sudo apt install -y lzma xz-utils
+      - uses: cachix/install-nix-action@v27
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            system-features = kvm
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Run tests
+        run: |
+          nix develop --command bash -c "uv sync && uv run pytest -q"
+      - name: Log in to Gitea Registry
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: git.rooty.dev
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_TOKEN }}
+      - name: Build and push Docker image
+        if: github.ref == 'refs/heads/main'
+        run: |
+          nix build .#dockerImage
+          docker load < result
+          docker tag agent-auth:latest git.rooty.dev/jrt/agent-auth:latest
+          docker tag agent-auth:latest git.rooty.dev/jrt/agent-auth:${{ github.sha }}
+          docker push git.rooty.dev/jrt/agent-auth:latest
+          docker push git.rooty.dev/jrt/agent-auth:${{ github.sha }}
+      - name: Setup kubectl
+        if: github.ref == 'refs/heads/main'
+        uses: azure/setup-kubectl@v3
+        id: install
+      - name: Restart deployment
+        if: github.ref == 'refs/heads/main'
+        run: kubectl rollout restart deployment agent-auth --namespace agent-auth

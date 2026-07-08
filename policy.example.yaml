@@ -1,0 +1,93 @@
+# agent-auth policy — evaluation order per request:
+#   1. platform validator (hard ceilings below under `platforms:`) — fail = deny
+#   2. saved rules in the DB (created from Discord's Edit modal), newest first
+#   3. the `rules:` list below, first match wins
+#   4. `defaults.action`
+#
+# Durations: approved = min(requested, matched rule's max_duration, defaults.max_duration)
+
+defaults:
+  action: surface          # deny | approve | llm | surface
+  max_duration: 24h
+
+llm:
+  model: anthropic/claude-sonnet-4.5   # OpenRouter model id; per-rule override below
+  retry_budget: 2          # LLM denials the agent may retry before human escalation
+  timeout_secs: 60
+
+platforms:
+  github:
+    # GitHub account owners whose repos are brokered (the app must be
+    # installed on each)
+    repo_allowlist:
+      - "otisdog8/*"
+      - "uorux/*"
+    # Hard ceiling — requests above this are denied before any policy rule runs.
+    # Must be a subset of what the GitHub App itself was granted (keep this list
+    # and the App's permissions in sync; keys are the API permission names).
+    permission_ceiling:
+      contents: write
+      workflows: write      # pushing .github/workflows/* needs this + contents
+      secrets: write
+      variables: write
+      actions: read
+      pull_requests: write
+      issues: write
+      checks: read
+      # org-level — NOT repo-scoped: they apply org-wide on any token that
+      # requests them, so keep sensitive ones on `surface` in the rules below
+      organization_secrets: write
+      organization_variables: write
+      organization_self_hosted_runners: read
+  homelab:
+    # Only these LLDAP groups are brokered. Authelia rules per group are
+    # configured in Authelia itself, not here.
+    allowed_groups:
+      - svc-gitea
+      - svc-sonarr
+      - svc-radarr
+  kubernetes:
+    # Namespaces agents may be granted access to (globs). Never list kube-system.
+    namespace_allowlist:
+      - "apps-*"
+      - personal-site
+    # ClusterRoles agents may request in scope.role
+    role_allowlist:
+      - view
+      - edit
+
+rules:
+  # Low-risk homelab groups: auto-approve, short leash
+  - match: {platform: homelab, resource: svc-sonarr}
+    action: approve
+    constraints: {max_duration: 12h}
+    reason: sonarr api access is low risk
+
+  # Gitea access for the homelab agent: LLM-reviewed
+  - match: {agent: "homelab-*", platform: homelab, resource: svc-gitea}
+    action: llm
+    constraints: {max_duration: 8h}
+
+  # Kubernetes: read-only can be LLM-reviewed; anything mutating asks a human
+  - match: {platform: kubernetes}
+    action: surface
+
+  # GitHub repo access for dev agents: LLM-reviewed with a strong model
+  - match: {agent: "sde-*", platform: github}
+    action: llm
+    constraints:
+      max_duration: 8h
+      llm_model: anthropic/claude-sonnet-4.5
+      retry_budget: 2
+
+  # NOTE: requests whose scope includes organization_* permissions are org-wide;
+  # nothing routes them to auto-approve here, so they fall through to `surface`
+  # (or add an explicit rule for them if that changes).
+
+  # Agent-to-agent chatter between known agents: ask once, then use Edit→rule
+  - match: {platform: a2a}
+    action: surface
+
+  # Google (stub) — always a human decision while unimplemented
+  - match: {platform: google}
+    action: surface
