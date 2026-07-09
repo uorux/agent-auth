@@ -199,6 +199,142 @@ async def test_non_participant_gets_404(api, db):
     ).status_code == 404
 
 
+# ------------------------------------------------- responder-side sessions
+
+
+async def test_responder_session_binding(api, db):
+    """A worker session that accepts a thread owns it: other sessions and the
+    sessionless dispatcher lose access, wakes route to the worker, and the
+    worker's events feed shows only its conversations."""
+    s = await _mk_service(api, "auto-disp")
+    r = await _mk_service(api, "svc-worker-pool")
+    rkey = r["api_key"]
+    await _grant_a2a(api, s["api_key"], "svc-worker-pool")
+    tid = (await _open(api, s["api_key"], "svc-worker-pool")).json()["thread_id"]
+
+    # sessionless dispatcher sees the pending open; a worker session does not
+    disp_events = (await api.get("/v1/a2a/events", headers=auth(rkey))).json()
+    assert [t["thread_id"] for t in disp_events["pending_opens"]] == [tid]
+    worker_sid = await _session(api, rkey, "task-cactus")
+    worker_events = (await api.get("/v1/a2a/events", headers=auth(rkey, worker_sid))).json()
+    assert worker_events["pending_opens"] == []
+
+    # worker accepts WITH its session → thread bound
+    accepted = (
+        await api.post(f"/v1/a2a/threads/{tid}/accept", headers=auth(rkey, worker_sid))
+    ).json()
+    assert accepted["state"] == "open"
+
+    # now the sessionless dispatcher and other sessions are locked out
+    assert (await api.get(f"/v1/a2a/threads/{tid}", headers=auth(rkey))).status_code == 403
+    other_sid = await _session(api, rkey, "task-other")
+    assert (
+        await api.get(f"/v1/a2a/threads/{tid}", headers=auth(rkey, other_sid))
+    ).status_code == 403
+    assert (
+        await api.post(
+            f"/v1/a2a/threads/{tid}/messages", headers=auth(rkey, other_sid), json={"payload": {}}
+        )
+    ).status_code == 403
+    # the owning worker session has full access
+    assert (
+        await api.post(
+            f"/v1/a2a/threads/{tid}/messages",
+            headers=auth(rkey, worker_sid),
+            json={"payload": {"done": 1}},
+        )
+    ).status_code == 200
+
+    # worker's list/events show its thread; the other session's don't
+    assert [t["thread_id"] for t in (
+        await api.get("/v1/a2a/threads", headers=auth(rkey, worker_sid))
+    ).json()] == [tid]
+    assert (await api.get("/v1/a2a/threads", headers=auth(rkey, other_sid))).json() == []
+
+    # wake routing: worker's parked events poll wakes on initiator's message
+    async def send_soon():
+        await asyncio.sleep(0.2)
+        await api.post(
+            f"/v1/a2a/threads/{tid}/messages",
+            headers=auth(s["api_key"]),
+            json={"payload": {"more": True}},
+        )
+
+    task = asyncio.create_task(send_soon())
+    resp = await api.get(
+        "/v1/a2a/events",
+        headers=auth(rkey, worker_sid),
+        params={"wait": 10, "after": worker_events["cursor"] or utcnow().isoformat()},
+    )
+    await task
+    assert [t["thread_id"] for t in resp.json()["activity"]] == [tid]
+
+
+async def test_implicit_accept_binds_replying_session(api, db):
+    s = await _mk_service(api, "auto-disp2")
+    r = await _mk_service(api, "svc-worker2")
+    await _grant_a2a(api, s["api_key"], "svc-worker2")
+    tid = (await _open(api, s["api_key"], "svc-worker2")).json()["thread_id"]
+
+    worker_sid = await _session(api, r["api_key"], "task-x")
+    reply = (
+        await api.post(
+            f"/v1/a2a/threads/{tid}/messages",
+            headers=auth(r["api_key"], worker_sid),
+            json={"payload": {"claimed": True}},
+        )
+    ).json()
+    assert reply["thread_state"] == "open"
+    async with db.session() as dbs:
+        thread = await dbs.get(A2AThread, tid)
+    assert thread.responder_session_id == worker_sid
+    # sessionless accept keeps agent-level behavior (no binding)
+    tid2 = (await _open(api, s["api_key"], "svc-worker2")).json()["thread_id"]
+    await api.post(f"/v1/a2a/threads/{tid2}/accept", headers=auth(r["api_key"]))
+    async with db.session() as dbs:
+        thread2 = await dbs.get(A2AThread, tid2)
+    assert thread2.responder_session_id is None
+    # unbound → any session or none may act
+    assert (
+        await api.get(f"/v1/a2a/threads/{tid2}", headers=auth(r["api_key"]))
+    ).status_code == 200
+
+
+async def test_responder_session_death_closes_thread(api, db, a2a_service, settings):
+    """Worker session idles out → its threads end peer_gone even though the
+    daemon (agent) is alive; initiator sees conversation-level liveness."""
+    s = await _mk_service(api, "auto-disp3")
+    r = await _mk_service(api, "svc-worker3")
+    await _grant_a2a(api, s["api_key"], "svc-worker3")
+    tid = (await _open(api, s["api_key"], "svc-worker3")).json()["thread_id"]
+    worker_sid = await _session(api, r["api_key"], "task-y")
+    await api.post(f"/v1/a2a/threads/{tid}/accept", headers=auth(r["api_key"], worker_sid))
+
+    # initiator's liveness view is the WORKER's, not the daemon's
+    async with db.session() as dbs:
+        row = await dbs.get(AgentSession, worker_sid)
+        row.last_seen_at = utcnow() - timedelta(seconds=settings.liveness_threshold_secs + 60)
+    await api.get("/v1/me", headers=auth(r["api_key"]))  # daemon itself is alive
+    seen = (await api.get(f"/v1/a2a/threads/{tid}", headers=auth(s["api_key"]))).json()
+    assert seen["peer_alive"] is False
+
+    # idle past the session timeout → sweep closes the thread peer_gone
+    async with db.session() as dbs:
+        row = await dbs.get(AgentSession, worker_sid)
+        row.last_seen_at = utcnow() - timedelta(seconds=settings.session_idle_timeout_secs + 60)
+    await a2a_service.sweep()
+    seen = (await api.get(f"/v1/a2a/threads/{tid}", headers=auth(s["api_key"]))).json()
+    assert seen["state"] == "closed" and seen["close_reason"] == "peer_gone"
+
+    # explicit close of a worker session does the same for its threads
+    tid2 = (await _open(api, s["api_key"], "svc-worker3")).json()["thread_id"]
+    worker2 = await _session(api, r["api_key"], "task-z")
+    await api.post(f"/v1/a2a/threads/{tid2}/accept", headers=auth(r["api_key"], worker2))
+    await api.post("/v1/sessions/close", headers=auth(r["api_key"], worker2))
+    seen = (await api.get(f"/v1/a2a/threads/{tid2}", headers=auth(s["api_key"]))).json()
+    assert seen["close_reason"] == "peer_gone"
+
+
 # ------------------------------------------------------ per-session grants
 
 

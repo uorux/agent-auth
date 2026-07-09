@@ -214,7 +214,12 @@ def a2a_threads(state: str | None = None) -> str:
 @mcp.tool()
 def a2a_accept(thread_id: str) -> str:
     """Accept a pending_open thread another agent opened to you (service
-    agents; sending a reply accepts implicitly too)."""
+    agents; sending a reply accepts implicitly too). If you run one worker
+    conversation per thread, accept from that worker's session (set
+    AGENT_AUTH_SESSION) — the thread then binds to it: wakes route only to
+    that session, its liveness is the conversation's liveness, and the thread
+    ends peer_gone when the session dies. Sessionless accept keeps the thread
+    agent-level."""
     return _safe(lambda: _session_client().a2a_accept(thread_id))
 
 
@@ -233,9 +238,10 @@ def a2a_close(thread_id: str, reason: str | None = None) -> str:
 
 @mcp.tool()
 def a2a_events(wait: float = 60, after: str | None = None) -> str:
-    """Service agents: run this in a loop. Returns threads awaiting your
-    accept/reject plus your threads with new activity since `after`, and a
-    cursor to pass back next call. Use a2a_poll on a thread to read messages."""
+    """Service agents: run this in a loop. Sessionless (dispatcher) calls see
+    pending opens awaiting accept/reject plus all unbound-thread activity;
+    calls from a worker session see only that session's conversations. Returns
+    a cursor to pass back next call. Use a2a_poll on a thread to read messages."""
     return _safe(lambda: _session_client().a2a_events(wait, after))
 
 

@@ -41,6 +41,13 @@ rules:
   - apiGroups: [rbac.authorization.k8s.io]
     resources: [rolebindings]
     verbs: [create, delete, get]
+  # Uncomment only if you enable cluster-wide grants (policy
+  # kubernetes.cluster_role_allowlist). Lets the broker bind a role across every
+  # namespace — every such grant is forced to human review, but the standing
+  # power is real, so keep cluster_role_allowlist tiny and read-only.
+  # - apiGroups: [rbac.authorization.k8s.io]
+  #   resources: [clusterrolebindings]
+  #   verbs: [create, delete, get]
   - apiGroups: [rbac.authorization.k8s.io]
     resources: [clusterroles]
     verbs: [bind]

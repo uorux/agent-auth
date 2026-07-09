@@ -160,6 +160,12 @@ class A2AThread(Base, TimestampMixin):
         ForeignKey("agent_sessions.id"), nullable=True
     )
     responder_agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), index=True)
+    # Bound when the responder accepts (or first replies) WITH a session — one
+    # worker conversation owns the thread from then on. Null = the responder
+    # handles it agent-level (sessionless dispatcher).
+    responder_session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("agent_sessions.id"), nullable=True
+    )
     topic: Mapped[str | None] = mapped_column(String(256), nullable=True)
     grant_id: Mapped[str] = mapped_column(ForeignKey("grants.id"))
     state: Mapped[str] = mapped_column(String(16), default="pending_open", index=True)

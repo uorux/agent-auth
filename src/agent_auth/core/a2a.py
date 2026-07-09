@@ -158,9 +158,12 @@ class A2AThreadService:
                 recipient_id = thread.responder_agent_id
             else:
                 if thread.state == THREAD_PENDING_OPEN:
-                    # Replying is accepting.
+                    # Replying is accepting; a sessioned reply also claims the
+                    # thread for that worker conversation.
                     thread.state = THREAD_OPEN
                     thread.accepted_at = utcnow()
+                    if agent_session is not None:
+                        thread.responder_session_id = agent_session.id
                 recipient_id = thread.initiator_agent_id
 
             if dead_grant is None:
@@ -209,6 +212,10 @@ class A2AThreadService:
             thread.state = THREAD_OPEN
             thread.accepted_at = utcnow()
             thread.last_activity_at = utcnow()
+            if agent_session is not None:
+                # Accepting with a session binds the thread to that worker
+                # conversation: its wake key, its liveness, its exclusive access.
+                thread.responder_session_id = agent_session.id
             out = await self._thread_out(db, thread, agent.id)
             wake_key = await self._peer_wake_key(db, thread, agent.id)
         self.events.notify(wake_key)
@@ -264,7 +271,8 @@ class A2AThreadService:
                 (
                     await db.execute(
                         select(A2AThread).where(
-                            A2AThread.initiator_session_id == session_id,
+                            (A2AThread.initiator_session_id == session_id)
+                            | (A2AThread.responder_session_id == session_id),
                             A2AThread.state != THREAD_CLOSED,
                         )
                     )
@@ -302,11 +310,16 @@ class A2AThreadService:
         async with self.db.session() as db:
             query = select(A2AThread).order_by(A2AThread.last_activity_at.desc())
             initiator_side = A2AThread.initiator_agent_id == agent.id
+            responder_side = A2AThread.responder_agent_id == agent.id
             if agent_session is not None:
+                # A sessioned caller sees only its own conversations; unclaimed
+                # responder-side threads are the sessionless dispatcher's view.
                 initiator_side = initiator_side & (
                     A2AThread.initiator_session_id == agent_session.id
                 )
-            responder_side = A2AThread.responder_agent_id == agent.id
+                responder_side = responder_side & (
+                    A2AThread.responder_session_id == agent_session.id
+                )
             if role == "initiator":
                 query = query.where(initiator_side)
             elif role == "responder":
@@ -357,24 +370,30 @@ class A2AThreadService:
     ) -> dict:
         self._require_session(agent, agent_session)
         async with self.db.session() as db:
-            pending = list(
-                (
-                    await db.execute(
-                        select(A2AThread).where(
-                            A2AThread.responder_agent_id == agent.id,
-                            A2AThread.state == THREAD_PENDING_OPEN,
+            # Pending opens are the sessionless dispatcher's queue: a worker
+            # session only tracks conversations it owns.
+            pending = []
+            if agent_session is None:
+                pending = list(
+                    (
+                        await db.execute(
+                            select(A2AThread).where(
+                                A2AThread.responder_agent_id == agent.id,
+                                A2AThread.state == THREAD_PENDING_OPEN,
+                            )
                         )
-                    )
-                ).scalars()
-            )
+                    ).scalars()
+                )
             initiator_side = A2AThread.initiator_agent_id == agent.id
+            responder_side = A2AThread.responder_agent_id == agent.id
             if agent_session is not None:
                 initiator_side = initiator_side & (
                     A2AThread.initiator_session_id == agent_session.id
                 )
-            activity_q = select(A2AThread).where(
-                initiator_side | (A2AThread.responder_agent_id == agent.id)
-            )
+                responder_side = responder_side & (
+                    A2AThread.responder_session_id == agent_session.id
+                )
+            activity_q = select(A2AThread).where(initiator_side | responder_side)
             if after is not None:
                 activity_q = activity_q.where(A2AThread.last_activity_at > after)
             else:
@@ -428,13 +447,13 @@ class A2AThreadService:
                 s.close_reason = SESSION_CLOSE_IDLE
                 counts["sessions_idled"] += 1
             if idle_sessions:
+                dead_ids = [s.id for s in idle_sessions]
                 gone = list(
                     (
                         await db.execute(
                             select(A2AThread).where(
-                                A2AThread.initiator_session_id.in_(
-                                    [s.id for s in idle_sessions]
-                                ),
+                                A2AThread.initiator_session_id.in_(dead_ids)
+                                | A2AThread.responder_session_id.in_(dead_ids),
                                 A2AThread.state != THREAD_CLOSED,
                             )
                         )
@@ -515,10 +534,10 @@ class A2AThreadService:
     async def _own_thread(
         self, db, thread_id: str, agent: Agent, agent_session: AgentSession | None
     ) -> A2AThread:
-        """Participant check + session binding. Conversations are session-lived:
-        an initiator-side thread is visible/usable only to the session that
-        opened it, so a later session of the same agent can neither read nor
-        act on an old session's transcript."""
+        """Participant check + session binding on BOTH sides. Conversations are
+        session-lived: a bound thread is visible/usable only to the session
+        that owns it (opened it, or accepted it), so no other conversation of
+        the same agent can read or act on its transcript."""
         thread = await db.get(A2AThread, thread_id)
         if thread is None or agent.id not in (
             thread.initiator_agent_id,
@@ -527,10 +546,13 @@ class A2AThreadService:
             raise A2AError(404, "unknown thread")
         if thread.initiator_agent_id == agent.id:
             self._require_session(agent, agent_session)
-            if thread.initiator_session_id is not None and (
-                agent_session is None or agent_session.id != thread.initiator_session_id
-            ):
-                raise A2AError(403, "thread is bound to a different session of this agent")
+            bound = thread.initiator_session_id
+        else:
+            # Responders are service agents: sessionless (dispatcher) access is
+            # fine until a worker session claims the thread.
+            bound = thread.responder_session_id
+        if bound is not None and (agent_session is None or agent_session.id != bound):
+            raise A2AError(403, "thread is bound to a different session of this agent")
         return thread
 
     def _require_not_closed(self, thread: A2AThread) -> None:
@@ -583,7 +605,7 @@ class A2AThreadService:
         if thread.initiator_agent_id != exclude_agent_id:
             keys.append(thread.initiator_session_id or thread.initiator_agent_id)
         if thread.responder_agent_id != exclude_agent_id:
-            keys.append(thread.responder_agent_id)
+            keys.append(thread.responder_session_id or thread.responder_agent_id)
         return keys
 
     async def _closure_pings(
@@ -613,7 +635,7 @@ class A2AThreadService:
 
     async def _peer_wake_key(self, db, thread: A2AThread, sender_agent_id: str) -> str:
         if sender_agent_id == thread.initiator_agent_id:
-            return thread.responder_agent_id
+            return thread.responder_session_id or thread.responder_agent_id
         return thread.initiator_session_id or thread.initiator_agent_id
 
     async def _thread_out(self, db, thread: A2AThread, viewer_agent_id: str) -> dict:
@@ -623,8 +645,15 @@ class A2AThreadService:
             role, peer_agent_id = "responder", thread.initiator_agent_id
         peer = await db.get(Agent, peer_agent_id)
         peer_last_seen = peer.last_seen_at if peer else None
-        if peer_agent_id == thread.initiator_agent_id and thread.initiator_session_id:
-            peer_session = await db.get(AgentSession, thread.initiator_session_id)
+        # When the peer's side is session-bound, liveness is the CONVERSATION's
+        # (the worker may be dead while the daemon is healthy, and vice versa).
+        peer_session_id = (
+            thread.initiator_session_id
+            if peer_agent_id == thread.initiator_agent_id
+            else thread.responder_session_id
+        )
+        if peer_session_id:
+            peer_session = await db.get(AgentSession, peer_session_id)
             if peer_session is not None:
                 peer_last_seen = peer_session.last_seen_at
         threshold = timedelta(seconds=self.settings.liveness_threshold_secs)

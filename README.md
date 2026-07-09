@@ -20,7 +20,7 @@ agent ──HTTP/MCP/CLI──▶ broker ──policy──▶ deny | approve | 
 |-----------|---------------|---------------------|-----------------------------------------------------------------------------|
 | `github`  | `repo`        | `owner/repo`        | broker mints GitHub App installation tokens (≤1h, re-minted on demand) scoped to the repo + `scope.permissions` |
 | `homelab` | `group`       | LLDAP group name    | agent's LLDAP service account is added to the group (Authelia rules are per-group); removed at expiry |
-| `kubernetes` | role name (`view`, `edit`, `traefik-patcher`, …) | namespace name | per-grant ServiceAccount + RoleBinding to the named (Cluster)Role; tokens minted on demand via TokenRequest; SA deleted at expiry → all tokens die instantly. The capability *is* the role, so policy rules auto-approve narrow roles and surface broad ones |
+| `kubernetes` | role name (`view`, `edit`, `traefik-patcher`, …) | namespace name (or `*` for cluster-wide) | per-grant ServiceAccount + RoleBinding to the named (Cluster)Role — a ClusterRoleBinding when the namespace is `*`; tokens minted on demand via TokenRequest; SA deleted at expiry → all tokens die instantly. The capability *is* the role, so policy rules auto-approve narrow roles and surface broad ones |
 | `a2a`     | `talk`        | target agent name   | authorizes OPENING conversation threads to that (service) agent — see [a2a threads](#a2a-threads); no credential is minted |
 | `google`  | `calendar.*`… | calendar id / label | stub: decisions recorded, no credential minted (501)                        |
 
@@ -126,6 +126,20 @@ open (carries first message) ─▶ pending_open ─▶ accept / first reply ─
   nobody can open a thread to them. Multiple concurrent instances work: threads
   bind to the opening session and replies route only to it; a later session of
   the same identity cannot read or act on another session's threads.
+- **Responder sessions** (service-agent workers): sessions are uniform
+  machinery — a service agent's per-conversation worker may accept (or first
+  reply to) a thread **with its own session**, binding the thread to that
+  worker: wakes route only to it, other sessions and the sessionless
+  dispatcher lose access, the initiator's `peer_alive` reflects the *worker's*
+  liveness (not the daemon's), and the thread ends `peer_gone` when the worker
+  session dies. The intended Hermes shape: a sessionless dispatcher loops on
+  `/v1/a2a/events` (which shows pending opens + unbound activity), spawns one
+  conversation per thread, and each worker claims its thread by accepting with
+  a fresh session. Sessionless accept keeps today's agent-level behavior. No
+  handoff: if a worker dies, its thread closes `peer_gone` and the initiator
+  reopens. Hermes→hermes chains compose: a worker opens downstream threads
+  from its session, so teardown cascades link by link (and revokes any
+  delegated grants along the way).
 - **One agent identity per folder**: register CLI agents per workspace using
   the `<agent-type>-<folder>-<host>` naming scheme shared with the Hermes
   fleet — e.g. `claude-nixos-dots-uorux` alongside `hermes-homelab-recusant`
@@ -235,7 +249,9 @@ Set `KUBERNETES_API_URL=in-cluster` (or an API server URL plus
 out-of-cluster). The broker needs RBAC to create/delete ServiceAccounts and
 RoleBindings, create `serviceaccounts/token`, and `bind` the allowlisted
 ClusterRoles — see the `agent-auth-provisioner` ClusterRole in `deploy/k8s.yaml`
-(bind it per brokered namespace, or cluster-wide if your allowlist is broad).
+(bind it per brokered namespace, or cluster-wide if your allowlist is broad). If
+you enable cluster-wide grants (below), it also needs create/delete on
+`clusterrolebindings`.
 
 Ceilings: `namespace_allowlist: ["*"]` is fine — containment comes from narrow
 roles and human review, not from walling namespaces off (an agent with gitops
@@ -243,6 +259,15 @@ access reaches them anyway). Keep `role_allowlist` enumerated and prefer
 purpose-built roles over `edit`/`admin`: it must match the ClusterRoles/Roles
 the broker holds `bind` on, so a tight role means a tight grant *and* a tight
 broker credential.
+
+**Cluster-wide grants.** An agent requests cluster scope by asking for the
+namespace `"*"`; the broker binds the role via a `ClusterRoleBinding` (the
+backing ServiceAccount lives in `cluster_grant_namespace`, default `default`)
+instead of a namespaced RoleBinding. This is gated by a *separate*
+`cluster_role_allowlist` — empty by default, so cluster-wide is off until you opt
+a role in — and **every** cluster-wide grant is forced to human review, whatever
+the role and whatever any rule says. Keep the list tiny (read-only roles at
+most); a cluster-wide `edit` is close to `cluster-admin`.
 
 **Narrow capability library.** The capability an agent requests *is* the role
 name, so a single approval grants exactly one capability rather than a tier.
