@@ -194,7 +194,7 @@ class EditModal(discord.ui.Modal):
         )
         self.resource = discord.ui.TextInput(
             label="Resource",
-            default=request.resource[:4000],
+            default=request.resource[:512],
             max_length=512,
         )
         self.scope = discord.ui.TextInput(
@@ -204,9 +204,10 @@ class EditModal(discord.ui.Modal):
             required=False,
         )
         self.rule = discord.ui.TextInput(
-            label="Rule: approve|deny[:exact|:capability|:platform]",
+            # Discord caps modal labels at 45 chars; full syntax goes in the placeholder.
+            label="Rule (optional)",
             required=False,
-            placeholder="blank = decide once; 'approve:capability' = auto-approve future",
+            placeholder="approve|deny[:exact|:capability|:platform] — blank = decide once",
             max_length=32,
         )
         self.notes = discord.ui.TextInput(

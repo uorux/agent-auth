@@ -47,7 +47,17 @@ rules:
     # MUST list exactly the roles in policy role_allowlist. The broker can only
     # hand out roles it can `bind`; adding one here widens its standing power,
     # so prefer the narrow custom roles below over edit/admin.
-    resourceNames: [view, edit, traefik-patcher, logs-reader]
+    resourceNames:
+      - view
+      - edit
+      - traefik-patcher
+      - logs-reader
+      - workload-manager
+      - cm-editor
+      - port-forwarder
+      - job-runner
+      - pod-exec
+      - secret-reader
 ---
 # ─── Narrow capability library ──────────────────────────────────────────────
 # Purpose-built ClusterRoles so a single "allow" grants one capability, not a
@@ -77,6 +87,90 @@ rules:
   - apiGroups: [""]
     resources: [pods, pods/log]
     verbs: [get, list]           # read-only debugging; no exec, no secrets
+---
+# Restart + scale Deployments/StatefulSets. `kubectl rollout restart` is a
+# patch on the workload, so patch here cannot be limited to restarts only —
+# it can also change images/env. Watching rollout status needs pod reads.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: workload-manager
+rules:
+  - apiGroups: ["apps"]
+    resources: [deployments, statefulsets]
+    verbs: [get, list, watch, patch]
+  - apiGroups: ["apps"]
+    resources: [deployments/scale, statefulsets/scale]
+    verbs: [get, patch, update]  # kubectl scale uses the scale subresource
+  - apiGroups: ["apps"]
+    resources: [replicasets]
+    verbs: [get, list, watch]    # rollout status/history walks replicasets
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+---
+# Edit existing ConfigMaps (no create/delete — tweak config, then restart via
+# workload-manager). ConfigMaps can steer what code a pod runs; LLM-review tier.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cm-editor
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, watch, update, patch]
+---
+# Port-forward into pods — reaches anything a pod in the namespace can reach.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: port-forwarder
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [pods/portforward]
+    verbs: [create]
+---
+# Run one-off Jobs (migrations, batch tasks) and read their output. Creating a
+# Job = running arbitrary code in the namespace, possibly as an existing SA —
+# broad in the same way as edit; keep it behind human/LLM review.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: job-runner
+rules:
+  - apiGroups: ["batch"]
+    resources: [jobs]
+    verbs: [create, get, list, watch, delete]
+  - apiGroups: [""]
+    resources: [pods, pods/log]
+    verbs: [get, list]
+---
+# Exec into pods — acting as the pod (its SA token, its network position).
+# sensitive_roles in policy forces human approval; keep durations short.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pod-exec
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [pods/exec]
+    verbs: [create]
+---
+# Read Secrets — deliberately excluded from `view`; sensitive, human-only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: secret-reader
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list]
 ---
 # Scope the provisioner to brokered namespaces: repeat this RoleBinding per
 # namespace in namespace_allowlist (or use a ClusterRoleBinding if you accept

@@ -73,3 +73,17 @@ def test_edit_modal_prefills():
     assert modal.resource.default == "jrt/cactus"
     assert "contents" in modal.scope.default
     assert len(modal.children) == 5  # discord hard limit
+
+
+def test_edit_modal_respects_discord_field_limits():
+    # Discord validates these server-side only (400 Invalid Form Body), so
+    # enforce them here. Use an oversized resource to cover prefill truncation.
+    request = _request()
+    request.resource = "x" * 5000
+    modal = views.EditModal(request.id, request)
+    assert len(modal.title) <= 45
+    for item in modal.children:
+        assert len(item.label) <= 45, item.label
+        assert len(item.placeholder or "") <= 100, item.label
+        if item.default and item.max_length:
+            assert len(item.default) <= item.max_length, item.label

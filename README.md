@@ -167,9 +167,12 @@ broker credential.
 
 **Narrow capability library.** The capability an agent requests *is* the role
 name, so a single approval grants exactly one capability rather than a tier.
-`deploy/k8s.yaml` ships two examples — `traefik-patcher` (`get`+`patch` on the
-one named `traefik` deployment) and `logs-reader` (read pods + logs) — and the
-policy auto-approves them while surfacing `edit`/`admin`. To add your own:
+`deploy/k8s.yaml` ships a library of these, friction scaled to blast radius:
+auto-approved (`traefik-patcher` — `get`+`patch` on the one named `traefik`
+deployment; `logs-reader` — read pods + logs; `workload-manager` — restart and
+scale Deployments/StatefulSets), LLM-reviewed (`cm-editor`, `port-forwarder`,
+`job-runner`), and human-only via `sensitive_roles` (`pod-exec`,
+`secret-reader`, `edit`, `admin`). To add your own:
 
 1. Define a `ClusterRole` with the minimal rules in `deploy/k8s.yaml`.
 2. Append its name to the provisioner's `bind` `resourceNames` (so the broker

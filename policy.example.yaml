@@ -77,17 +77,31 @@ platforms:
       - view
       - logs-reader       # get+list pods and pod logs
       - traefik-patcher   # get+patch on deployments/traefik only
+      - workload-manager  # restart+scale deployments/statefulsets
+      - cm-editor         # edit existing configmaps
+      - port-forwarder    # port-forward into pods
+      - job-runner        # create one-off jobs + read their logs
+      - pod-exec          # exec into pods (sensitive)
+      - secret-reader     # read secrets (sensitive)
       - edit
     # Shown to agents via GET /v1/catalog so they pick the right narrow role.
     role_descriptions:
-      view: "read-only access to all resources in the namespace"
-      logs-reader: "read pod logs (get + list on pods and pods/log)"
+      view: "read-only access to all resources in the namespace, including pod logs and events"
+      logs-reader: "read pod logs only (get + list on pods and pods/log) — prefer over view when logs are all you need"
       traefik-patcher: "get + patch the traefik Deployment only — nothing else"
+      workload-manager: "restart and scale Deployments/StatefulSets (patch + scale subresource; patch can also change images)"
+      cm-editor: "edit existing ConfigMaps (get/list/watch/update/patch; no create or delete)"
+      port-forwarder: "port-forward into pods in the namespace"
+      job-runner: "create one-off Jobs and read their pods/logs (runs arbitrary code — human/LLM reviewed)"
+      pod-exec: "exec into pods (acts as the pod — human approval required)"
+      secret-reader: "read Secrets in the namespace (human approval required)"
       edit: "full read-write in the namespace (broad: can run pods as any SA)"
     # Always forced to human review (belt-and-suspenders with the surface rule).
     sensitive_roles:
       - edit
       - admin
+      - pod-exec
+      - secret-reader
 
 rules:
   # Low-risk homelab groups: auto-approve, short leash
@@ -112,6 +126,23 @@ rules:
   - match: {platform: kubernetes, capability: traefik-patcher}
     action: approve
     constraints: {max_duration: 1h}   # narrow verb on one named resource
+  # Restart/scale is the most common remediation; auto-approve on a short
+  # leash. Note patch on workloads can also change images/env, not just scale.
+  - match: {platform: kubernetes, capability: workload-manager}
+    action: approve
+    constraints: {max_duration: 4h}
+  # Config edits and port-forwards: moderate blast radius, LLM-reviewed
+  - match: {platform: kubernetes, capability: cm-editor}
+    action: llm
+    constraints: {max_duration: 2h}
+  - match: {platform: kubernetes, capability: port-forwarder}
+    action: llm
+    constraints: {max_duration: 2h}
+  # job-runner runs arbitrary code — LLM review with a tight leash; pod-exec
+  # and secret-reader are in sensitive_roles so they always reach a human.
+  - match: {platform: kubernetes, capability: job-runner}
+    action: llm
+    constraints: {max_duration: 2h}
   # edit / admin / anything else → a human decides (Discord shows the namespace)
   - match: {platform: kubernetes}
     action: surface
