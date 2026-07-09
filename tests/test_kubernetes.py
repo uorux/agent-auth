@@ -26,7 +26,7 @@ def k8s_request(namespace="apps-cactus", role="edit", duration="2h"):
 
 def test_sa_name_is_dns1123():
     name = _sa_name("Homelab.Agent_2", "123e4567-e89b-12d3-a456-426614174000")
-    assert name == "aa-homelab-agent-2-123e4567"
+    assert name == "aa-homelab-agent-2-123e4567-e89b-12d3-a456-426614174000"
     long = _sa_name("a" * 80, "123e4567-e89b-12d3-a456-426614174000")
     assert len(long) <= 63 and not long.endswith("-")
 
@@ -116,7 +116,8 @@ async def test_grant_credential_revoke_cycle(db, service, k8s_mock):
 
 
 async def test_provision_idempotent_on_conflict(db, service, k8s_mock):
-    """A 409 AlreadyExists from a prior partial provision is treated as success."""
+    """A 409 AlreadyExists is success ONLY when the existing object is
+    verifiably this grant's own (grant-id annotation matches)."""
     a, _ = await make_agent(db, "deploy-agent-2")
     async with db.session() as session:
         # Null-authority rule: auto-approves any non-sensitive role in apps-*.
@@ -128,11 +129,45 @@ async def test_provision_idempotent_on_conflict(db, service, k8s_mock):
                 resource_pattern="apps-*",
             )
         )
-    k8s_mock.sa_exists = True  # simulate leftover SA from a crashed provision
+    k8s_mock.sa_conflict = "same"  # existing object IS this grant's (retry)
     req = await service.create_request(a.id, k8s_request(role="view"))
     assert req.status == RequestStatus.GRANTED
     assert ("conflict", "ServiceAccount") in k8s_mock.calls
     assert ("create", "RoleBinding") in k8s_mock.calls
+
+
+async def test_provision_refuses_foreign_object_on_conflict(db, service, k8s_mock):
+    """A name collision with an object that is NOT this grant's (squatted or
+    another grant) must fail the provision, never adopt the object."""
+    a, _ = await make_agent(db, "deploy-agent-3")
+    async with db.session() as session:
+        session.add(
+            Rule(
+                action=RuleAction.AUTO_APPROVE,
+                agent_pattern="deploy-agent-3",
+                platform=Platform.KUBERNETES,
+                resource_pattern="apps-*",
+            )
+        )
+    k8s_mock.sa_conflict = "foreign"
+    req = await service.create_request(a.id, k8s_request(role="view"))
+    assert req.status == RequestStatus.PROVISION_FAILED
+    assert "refusing to adopt" in req.decision_reason
+    # the binding was never created against the foreign subject
+    assert ("create", "RoleBinding") not in k8s_mock.calls
+
+
+def test_sa_name_carries_full_grant_id():
+    from agent_auth.provisioners.kubernetes import _sa_name
+
+    gid = "0f4478c8-1a2b-4c3d-8e9f-001122334455"
+    name = _sa_name("hermes-homelab-recusant-with-a-very-long-name", gid)
+    assert gid in name  # full uuid = collision resistance
+    assert len(name) <= 63
+    assert name.startswith("aa-")
+    import re
+
+    assert re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?", name)
 
 
 async def test_wildcard_allowlist(db, agent):

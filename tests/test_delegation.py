@@ -173,6 +173,77 @@ async def test_delegation_validation(api, db):
     )
 
 
+async def test_delegation_respects_responder_session_binding(api, db, lldap_mock):
+    """A thread claimed by one worker session is delegation proof for that
+    session ONLY — not for other workers or the sessionless dispatcher."""
+    hermes = await _mk_agent(api, "hermes-homelab-w", lldap_username="svc-hermes")
+    claude = await _mk_agent(api, "claude-nixos-dots-w", kind="ephemeral")
+    # open WITHOUT implicit accept: claude opens, then worker-a accepts bound
+    sid = (
+        await api.post(
+            "/v1/sessions", headers=auth(claude["api_key"]), json={"label": "nixos-dots"}
+        )
+    ).json()["session_id"]
+    req = (
+        await api.post(
+            "/v1/requests",
+            headers=auth(claude["api_key"], sid),
+            json={
+                "platform": "a2a",
+                "capability": "talk",
+                "resource": "hermes-homelab-w",
+                "justification": "work",
+                "requested_duration": "1h",
+            },
+        )
+    ).json()
+    assert req["status"] == "granted"
+    tid = (
+        await api.post(
+            "/v1/a2a/threads",
+            headers=auth(claude["api_key"], sid),
+            json={"to": "hermes-homelab-w", "payload": {"task": "x"}},
+        )
+    ).json()["thread_id"]
+    worker_a = (
+        await api.post(
+            "/v1/sessions", headers=auth(hermes["api_key"]), json={"label": "worker-a"}
+        )
+    ).json()["session_id"]
+    accepted = (
+        await api.post(f"/v1/a2a/threads/{tid}/accept", headers=auth(hermes["api_key"], worker_a))
+    ).json()
+    assert accepted["state"] == "open"
+
+    async def request_as(session_id):
+        return (
+            await api.post(
+                "/v1/requests",
+                headers=auth(hermes["api_key"], session_id),
+                json=_delegated_body("svc-gitea", tid),
+            )
+        ).json()
+
+    # another worker session: denied
+    worker_b = (
+        await api.post(
+            "/v1/sessions", headers=auth(hermes["api_key"]), json={"label": "worker-b"}
+        )
+    ).json()["session_id"]
+    denied_b = await request_as(worker_b)
+    assert denied_b["status"] == "denied"
+    assert "different session" in denied_b["decision_reason"]
+
+    # sessionless dispatcher: denied
+    denied_disp = await request_as(None)
+    assert denied_disp["status"] == "denied"
+    assert "different session" in denied_disp["decision_reason"]
+
+    # the owning worker session: granted via the delegated pair rule
+    granted = await request_as(worker_a)
+    assert granted["status"] == "granted", granted
+
+
 async def test_delegation_rule_semantics(api, db):
     hermes = await _mk_agent(api, "hermes-homelab-r", lldap_username="svc-hermes")
     claude = await _mk_agent(api, "claude-nixos-dots-r", kind="ephemeral")

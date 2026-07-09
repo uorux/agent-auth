@@ -258,11 +258,15 @@ class RequestService:
                 f"thread is {thread.state}; delegation requires an OPEN thread "
                 "(the other side must have accepted)"
             )
-        if (
-            thread.initiator_agent_id == agent.id
-            and thread.initiator_session_id is not None
-            and thread.initiator_session_id != session_id
-        ):
+        # Session binding on BOTH sides, mirroring a2a._own_thread: a thread
+        # claimed by one worker session is not delegation proof for any other
+        # session (or the sessionless dispatcher) of the same agent.
+        bound = (
+            thread.initiator_session_id
+            if thread.initiator_agent_id == agent.id
+            else thread.responder_session_id
+        )
+        if bound is not None and bound != session_id:
             return "thread belongs to a different session of this agent"
         delegator_id = (
             thread.responder_agent_id

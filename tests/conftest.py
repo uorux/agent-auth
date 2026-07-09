@@ -293,7 +293,11 @@ def k8s_mock():
     class Recorder:
         def __init__(self):
             self.calls: list[tuple[str, str]] = []
-            self.sa_exists = False
+            # None | "same" | "foreign": make the next ServiceAccount create
+            # 409; the follow-up GET returns either the attempted body (a true
+            # retry of this grant) or a foreign object (name squatting).
+            self.sa_conflict: str | None = None
+            self.last_sa_body: dict | None = None
 
     recorder = Recorder()
 
@@ -315,13 +319,21 @@ def k8s_mock():
         if request.method == "POST":
             body = _json.loads(request.content)
             kind = body["kind"]
-            if kind == "ServiceAccount":
-                if recorder.sa_exists:
-                    recorder.calls.append(("conflict", kind))
-                    return httpx.Response(409, json={"reason": "AlreadyExists"})
-                recorder.sa_exists = True
+            if kind == "ServiceAccount" and recorder.sa_conflict:
+                recorder.calls.append(("conflict", kind))
+                recorder.last_sa_body = body
+                return httpx.Response(409, json={"reason": "AlreadyExists"})
             recorder.calls.append(("create", kind))
             return httpx.Response(201, json=body)
+        if request.method == "GET" and "/serviceaccounts/" in path:
+            recorder.calls.append(("get", path.split("/")[-1]))
+            if recorder.sa_conflict == "same" and recorder.last_sa_body:
+                return httpx.Response(200, json=recorder.last_sa_body)
+            if recorder.sa_conflict == "foreign" and recorder.last_sa_body:
+                foreign = _json.loads(_json.dumps(recorder.last_sa_body))
+                foreign["metadata"]["annotations"]["agent-auth/grant-id"] = "someone-else"
+                return httpx.Response(200, json=foreign)
+            return httpx.Response(404, json={})
         if request.method == "DELETE":
             recorder.calls.append(("delete", path.split("/")[-1]))
             return httpx.Response(200, json={})

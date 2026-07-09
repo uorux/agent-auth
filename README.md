@@ -161,6 +161,10 @@ open (carries first message) ─▶ pending_open ─▶ accept / first reply ─
 CLI: `agent-auth session create|close`, `agent-auth a2a
 open|send|poll|threads|show|accept|reject|close|events|check`.
 
+For wiring a Discord-based Hermes instance into all of this — dispatcher loop
+vs webhook+cron, the conversation lifecycle, and final-message routing — see
+[docs/hermes-setup.md](docs/hermes-setup.md).
+
 ### Delegated auth (on behalf of)
 
 A request may be anchored to an **OPEN a2a thread** the requester participates

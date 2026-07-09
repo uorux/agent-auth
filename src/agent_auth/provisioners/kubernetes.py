@@ -29,8 +29,11 @@ CLUSTER_SENTINEL = "*"
 
 
 def _sa_name(agent_name: str, grant_id: str) -> str:
-    base = _DNS1123.sub("-", agent_name.lower()).strip("-")
-    return f"aa-{base}-{grant_id[:8]}"[:63].rstrip("-")
+    # The FULL grant id is the uniqueness carrier (a truncated one invites
+    # collisions); the agent name is a truncated human-readable prefix. Fits
+    # the conventional 63-char budget: 3 + 22 + 1 + 36.
+    base = _DNS1123.sub("-", agent_name.lower()).strip("-")[:22].rstrip("-")
+    return f"aa-{base}-{grant_id}"[:63].rstrip("-")
 
 
 class KubernetesProvisioner:
@@ -276,7 +279,13 @@ class KubernetesProvisioner:
 
     async def _create(self, path: str, body: dict) -> None:
         resp = await self._request("POST", path, json=body)
-        if resp.status_code == 409:  # already exists → idempotent success
+        if resp.status_code == 409:
+            # AlreadyExists is idempotent success ONLY when the existing object
+            # is verifiably this grant's own. Blindly adopting a name squatted
+            # by another grant (or anything pre-created in the namespace) would
+            # break per-grant isolation: our TokenRequests would mint tokens
+            # for a subject bound to someone else's role.
+            await self._verify_ours(path, body)
             return
         if resp.status_code not in (200, 201):
             log.error(
@@ -288,6 +297,39 @@ class KubernetesProvisioner:
             )
             raise ProvisionerError(
                 f"create {body['kind']} failed ({resp.status_code})"
+            )
+
+    async def _verify_ours(self, collection_path: str, body: dict) -> None:
+        name = body["metadata"]["name"]
+        kind = body["kind"]
+        resp = await self._request("GET", f"{collection_path}/{name}")
+        if resp.status_code != 200:
+            raise ProvisionerError(
+                f"{kind} {name!r} already exists but could not be verified "
+                f"({resp.status_code}); refusing to adopt it"
+            )
+        existing = resp.json()
+        want_grant = body["metadata"].get("annotations", {}).get("agent-auth/grant-id")
+        have_grant = ((existing.get("metadata") or {}).get("annotations") or {}).get(
+            "agent-auth/grant-id"
+        )
+        mismatched = []
+        if not want_grant or have_grant != want_grant:
+            mismatched.append("grant-id annotation")
+        if "roleRef" in body and existing.get("roleRef") != body["roleRef"]:
+            mismatched.append("roleRef")
+        if "subjects" in body and existing.get("subjects") != body["subjects"]:
+            mismatched.append("subjects")
+        if mismatched:
+            log.error(
+                "existing %s %s is not this grant's (%s differ)",
+                kind,
+                name,
+                ", ".join(mismatched),
+            )
+            raise ProvisionerError(
+                f"{kind} {name!r} already exists and belongs to something else "
+                f"({', '.join(mismatched)} differ); refusing to adopt it"
             )
 
     async def _delete(self, path: str) -> None:
