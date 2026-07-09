@@ -53,6 +53,10 @@ class ServeConfig:
     redeliver_interval: float = 60.0
     failure_backoff: float = 5.0
     include_activity: bool = False
+    # Header carrying the signature — the FORMAT never changes (sha256=<hex
+    # HMAC-SHA256 of the raw body>), so pointing this at a GitHub-style
+    # verifier's fixed header (X-Hub-Signature-256) interops as-is.
+    sig_header: str = "X-Agent-Auth-Signature"
 
 
 @dataclasses.dataclass
@@ -143,7 +147,7 @@ def run_serve_tick(
         raw = json.dumps(_body(event, thread, payload)).encode()
         headers = {"Content-Type": "application/json"}
         if cfg.secret:
-            headers["X-Agent-Auth-Signature"] = sign_body(cfg.secret, raw)
+            headers[cfg.sig_header] = sign_body(cfg.secret, raw)
         ok = post_fn(cfg.on_open_url, raw, headers)
         attempts[tid] = Attempt(at=now, failed=not ok)
         posted += 1

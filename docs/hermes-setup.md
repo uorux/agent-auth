@@ -192,7 +192,10 @@ You don't need the full dispatcher/worker architecture on day one:
   `prompt` template references these fields; the dispatcher itself carries
   no prompts or instructions). POSTs are signed with the SAME
   `X-Agent-Auth-Signature` contract as the broker's `set-webhook` pings
-  (HMAC-SHA256 over the raw body). It is **level-triggered**: a still-pending
+  (HMAC-SHA256 over the raw body); for a Hermes webhook route (GitHub-style
+  verification) add `--sig-header X-Hub-Signature-256` and set the route's
+  `secret` to serve's `--hmac-env` secret — the `sha256=<hex>` format already
+  matches. It is **level-triggered**: a still-pending
   thread is re-POSTed every `--redeliver-interval` until it leaves
   `pending_open` — a 2xx means "run queued", not "accepted", so the receiving
   conversation must mint its session and `a2a_accept` to stop redelivery.

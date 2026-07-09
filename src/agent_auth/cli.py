@@ -239,6 +239,12 @@ def a2a_serve(
     insecure_no_sign: bool = typer.Option(
         False, "--insecure-no-sign", help="Skip signing (loopback/testing only)"
     ),
+    sig_header: str = typer.Option(
+        "X-Agent-Auth-Signature",
+        "--sig-header",
+        help="Header name carrying the signature (same sha256=<hex> format; e.g. "
+        "X-Hub-Signature-256 for GitHub-style verifiers). Ignored with --insecure-no-sign",
+    ),
     wait: float = typer.Option(60.0, "--wait", help="Events long-poll seconds (server clamps 300)"),
     redeliver_interval: float = typer.Option(
         60.0,
@@ -300,6 +306,7 @@ def a2a_serve(
             redeliver_interval=redeliver_interval,
             failure_backoff=failure_backoff,
             include_activity=include_activity,
+            sig_header=sig_header,
         ),
         state_path=Path(state) if state else default_state_path(),
         poll_interval=poll_interval,

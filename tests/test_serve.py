@@ -137,10 +137,25 @@ def test_signature_matches_shared_contract():
     expected = "sha256=" + hmac.new(b"hook-secret", raw, hashlib.sha256).hexdigest()
     assert sig == expected  # wire format identical to the broker's pings
 
-    # unsigned mode omits the header entirely
+    # header name is configurable; bytes and signature value are unchanged
+    post_gh = StubPost()
+    run_serve_tick(
+        client, None, {}, now=0.0, post_fn=post_gh,
+        cfg=_cfg(sig_header="X-Hub-Signature-256"),
+    )
+    _, raw_gh, headers_gh = post_gh.calls[0]
+    assert raw_gh == raw  # same body bytes
+    assert "X-Agent-Auth-Signature" not in headers_gh
+    assert headers_gh["X-Hub-Signature-256"] == sign_body("hook-secret", raw_gh) == sig
+
+    # unsigned mode omits the header entirely (whatever its name)
     post2 = StubPost()
-    run_serve_tick(client, None, {}, now=0.0, post_fn=post2, cfg=_cfg(secret=None))
+    run_serve_tick(
+        client, None, {}, now=0.0, post_fn=post2,
+        cfg=_cfg(secret=None, sig_header="X-Hub-Signature-256"),
+    )
     assert "X-Agent-Auth-Signature" not in post2.calls[0][2]
+    assert "X-Hub-Signature-256" not in post2.calls[0][2]
 
 
 def test_include_activity_gating():
