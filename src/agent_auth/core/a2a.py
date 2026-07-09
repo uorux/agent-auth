@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import logging
 from datetime import datetime, timedelta
@@ -10,6 +8,7 @@ import httpx
 from sqlalchemy import select, update
 
 from ..config import Settings
+from ..crypto import sign_body
 from ..db import Database
 from ..models import Agent, AgentSession, A2AMessage, A2AThread, Grant, new_uuid, utcnow
 from ..provisioners.a2a import check_grant
@@ -702,9 +701,7 @@ class A2AThreadService:
             raw = json.dumps(event).encode()
             headers = {"Content-Type": "application/json"}
             if secret:
-                headers["X-Agent-Auth-Signature"] = "sha256=" + hmac.new(
-                    secret.encode(), raw, hashlib.sha256
-                ).hexdigest()
+                headers["X-Agent-Auth-Signature"] = sign_body(secret, raw)
             try:
                 async with httpx.AsyncClient(timeout=_WEBHOOK_TIMEOUT_SECS) as client:
                     await client.post(url, content=raw, headers=headers)

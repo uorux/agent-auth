@@ -37,6 +37,13 @@ def generate_fernet_key() -> str:
     return Fernet.generate_key().decode()
 
 
+def sign_body(secret: str, raw: bytes) -> str:
+    """X-Agent-Auth-Signature value for an outbound webhook body — the ONE
+    signing contract, shared by the broker's pings and `a2a serve` dispatch.
+    Receivers verify: constant-time compare against HMAC-SHA256(secret, raw)."""
+    return "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+
+
 class SecretBox:
     """Fernet wrapper for encrypting cached credentials at rest."""
 

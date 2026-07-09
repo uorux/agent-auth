@@ -159,7 +159,10 @@ open (carries first message) ─▶ pending_open ─▶ accept / first reply ─
   `WEBHOOK_SIGNING_SECRET`. Delivery is best-effort; the poll is authoritative.
 
 CLI: `agent-auth session create|close`, `agent-auth a2a
-open|send|poll|threads|show|accept|reject|close|events|check`.
+open|send|poll|threads|show|accept|reject|close|events|check`, plus
+`agent-auth a2a serve --on-open-url <url>` — a resident sessionless dispatcher
+that POSTs each pending thread-open (signed, level-triggered redelivery until
+accepted) to an agent runtime's conversation-start webhook.
 
 For wiring a Discord-based Hermes instance into all of this — dispatcher loop
 vs webhook+cron, the conversation lifecycle, and final-message routing — see

@@ -179,13 +179,26 @@ You don't need the full dispatcher/worker architecture on day one:
   `a2a_close`, close the session. Pure Hermes configuration. Costs: latency =
   cron period, and opens are handled serially inside one conversation. Fine
   at low traffic.
-- **v1 — one nix systemd unit**: the resident sessionless events loop
-  (even just `agent-auth a2a events --wait 60` in a loop) that invokes
-  Hermes's conversation-start entrypoint per pending open — the
-  dispatcher/worker shape described above, with ~2s wake latency and
-  parallel conversations. The only Hermes-side code needed is a generic
-  "start a conversation with this seed" hook, if the cron/webhook triggers
-  don't already expose one.
+- **v1 — one nix systemd unit**: the packaged dispatcher,
+
+  ```bash
+  AGENT_AUTH_WEBHOOK_SECRET=... agent-auth a2a serve \
+      --on-open-url http://hermes-host:PORT/conversation-start
+  ```
+
+  A resident sessionless loop that POSTs each pending open to Hermes's
+  conversation-start webhook as flat JSON
+  (`{event, thread_id, peer, topic, seq, payload}` — the Hermes route's
+  `prompt` template references these fields; the dispatcher itself carries
+  no prompts or instructions). POSTs are signed with the SAME
+  `X-Agent-Auth-Signature` contract as the broker's `set-webhook` pings
+  (HMAC-SHA256 over the raw body). It is **level-triggered**: a still-pending
+  thread is re-POSTed every `--redeliver-interval` until it leaves
+  `pending_open` — a 2xx means "run queued", not "accepted", so the receiving
+  conversation must mint its session and `a2a_accept` to stop redelivery.
+  `serve` never mints sessions or accepts/rejects on its own. ~2s wake
+  latency when idle, parallel conversations, cursor/cooldowns persisted in
+  `--state` so restarts don't POST-storm.
 - The **webhook** method is v1 plus an HTTP endpoint and secret — add it only
   if the resident loop is somehow awkward.
 

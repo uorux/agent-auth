@@ -226,6 +226,86 @@ def a2a_events(
     _run(lambda: _client().a2a_events(wait, after))
 
 
+@a2a.command("serve")
+def a2a_serve(
+    on_open_url: str = typer.Option(
+        ..., "--on-open-url", help="POST target per pending open (runtime's conversation-start webhook)"
+    ),
+    hmac_env: str = typer.Option(
+        "AGENT_AUTH_WEBHOOK_SECRET",
+        "--hmac-env",
+        help="Env var holding the HMAC secret for X-Agent-Auth-Signature",
+    ),
+    insecure_no_sign: bool = typer.Option(
+        False, "--insecure-no-sign", help="Skip signing (loopback/testing only)"
+    ),
+    wait: float = typer.Option(60.0, "--wait", help="Events long-poll seconds (server clamps 300)"),
+    redeliver_interval: float = typer.Option(
+        60.0,
+        "--redeliver-interval",
+        help="Re-POST a still-pending thread no more often than this",
+    ),
+    failure_backoff: float = typer.Option(
+        5.0, "--failure-backoff", help="Shorter cooldown after a non-2xx POST"
+    ),
+    poll_interval: float = typer.Option(
+        5.0, "--poll-interval", help="Min sleep between ticks while work is pending"
+    ),
+    state: str = typer.Option(None, "--state", help="JSON state file (cursor + cooldowns)"),
+    include_activity: bool = typer.Option(
+        False,
+        "--include-activity/--no-include-activity",
+        help="Also dispatch unbound `activity` threads (default: opens only)",
+    ),
+):
+    """Resident sessionless dispatcher: reconcile pending thread-opens against a
+    receiver by POSTing raw thread facts as JSON. Dumb data transport — it never
+    mints sessions, accepts, or rejects; the receiving conversation does that.
+    Redelivery stops only when the thread leaves pending_open (level-triggered)."""
+    import logging as _logging
+    import os as _os
+    from pathlib import Path
+
+    from .serve import ServeConfig, default_state_path, serve_loop
+
+    _logging.basicConfig(level="INFO", format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    secret: str | None
+    if insecure_no_sign:
+        secret = None
+        typer.secho(
+            "WARNING: --insecure-no-sign — dispatch POSTs are UNSIGNED; the receiver "
+            "cannot authenticate them. Loopback/testing only.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+    else:
+        secret = _os.environ.get(hmac_env, "")
+        if not secret:
+            typer.secho(
+                f"{hmac_env} is not set. Set it to the shared webhook secret, or pass "
+                "--insecure-no-sign for loopback testing.",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(1)
+
+    client = _client()
+    client.session_id = ""  # sessionless is mandatory: only then are pending_opens visible
+    serve_loop(
+        client,
+        ServeConfig(
+            on_open_url=on_open_url,
+            secret=secret,
+            wait=wait,
+            redeliver_interval=redeliver_interval,
+            failure_backoff=failure_backoff,
+            include_activity=include_activity,
+        ),
+        state_path=Path(state) if state else default_state_path(),
+        poll_interval=poll_interval,
+    )
+
+
 @admin.command("gen-key")
 def gen_key():
     """Generate a Fernet ENCRYPTION_KEY."""
