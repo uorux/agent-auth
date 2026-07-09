@@ -76,8 +76,14 @@ interfaces, all wrapping the same HTTP API:
   ```
   Tools: `list_capabilities`, `request_access`, `wait_for_decision`,
   `retry_request`, `escalate_request`, `get_credential`, `list_grants`,
-  `check_a2a`, `a2a_open`, `a2a_send`, `a2a_poll`, `a2a_threads`, `a2a_accept`,
-  `a2a_reject`, `a2a_close`, `a2a_events`.
+  `create_session`, `close_session`, `check_a2a`, `a2a_open`, `a2a_send`,
+  `a2a_poll`, `a2a_threads`, `a2a_accept`, `a2a_reject`, `a2a_close`,
+  `a2a_events`. Runtimes that share ONE MCP process across conversations
+  (Hermes): each conversation calls `create_session` once and passes the
+  returned id as `session_key` on every a2a/`request_access` call — explicit
+  keys never touch shared state, so concurrent conversations can't clobber
+  each other. Ephemeral CLI agents (own MCP process per session) keep the
+  automatic cwd-labeled session and never need `session_key`.
 - **CLI**: `agent-auth ...` (same env vars), plus `agent-auth admin ...` with
   `AGENT_AUTH_ADMIN_TOKEN`.
 
@@ -162,7 +168,9 @@ CLI: `agent-auth session create|close`, `agent-auth a2a
 open|send|poll|threads|show|accept|reject|close|events|check`, plus
 `agent-auth a2a serve --on-open-url <url>` — a resident sessionless dispatcher
 that POSTs each pending thread-open (signed, level-triggered redelivery until
-accepted) to an agent runtime's conversation-start webhook.
+accepted) to an agent runtime's conversation-start webhook;
+`--sig-header X-Hub-Signature-256` emits the same `sha256=<hex>` signature
+under a GitHub-style header for receivers that verify a fixed name.
 
 For wiring a Discord-based Hermes instance into all of this — dispatcher loop
 vs webhook+cron, the conversation lifecycle, and final-message routing — see

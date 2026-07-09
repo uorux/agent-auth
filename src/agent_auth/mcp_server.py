@@ -46,6 +46,20 @@ def _session_client() -> BrokerClient:
     return client
 
 
+def _client_for(session_key: str | None) -> BrokerClient:
+    """Session-scoped client for ONE call. An explicit session_key builds a
+    fresh client and never touches the process-global, so concurrent
+    conversations sharing this MCP process (service runtimes like Hermes —
+    one stdio subprocess for all Discord/cron/a2a conversations) can't clobber
+    each other. Omitted → the legacy path: ephemeral cwd-auto session,
+    service sessionless."""
+    if session_key:
+        client = BrokerClient()
+        client.session_id = session_key  # → X-Agent-Session on this call
+        return client
+    return _session_client()
+
+
 def _safe(fn) -> str:
     try:
         return json.dumps(fn(), indent=2, default=str)
@@ -75,6 +89,7 @@ def request_access(
     duration: str = "1h",
     scope: dict[str, Any] | None = None,
     on_behalf_of_thread: str | None = None,
+    session_key: str | None = None,
 ) -> str:
     """Request time-bounded access to a resource. The broker may auto-approve,
     deny, review with an LLM, or ask a human on Discord.
@@ -86,6 +101,11 @@ def request_access(
     thread (its other participant), policy authorizes the pair, and the grant
     is revoked the moment the thread closes — so keep the thread open until
     the work is done, then close it to release the access.
+
+    session_key: your conversation's session id (from create_session). A
+    delegated (on_behalf_of_thread) request MUST pass the SAME session_key
+    that accepted the thread — the broker checks the thread's session binding
+    and denies a mismatched or missing one.
 
     platform/capability/resource conventions:
     - github: capability="repo", resource="owner/repo",
@@ -107,7 +127,7 @@ def request_access(
     duration) — vague justifications get denied. duration examples: "30m", "8h", "2d".
     Then call wait_for_decision with the returned request id."""
     return _safe(
-        lambda: _session_client().request_access(
+        lambda: _client_for(session_key).request_access(
             platform,
             capability,
             resource,
@@ -166,15 +186,50 @@ def get_credential(grant_id: str) -> str:
 
 
 @mcp.tool()
-def check_a2a(peer: str, direction: str = "out", topic: str | None = None) -> str:
-    """Check agent-to-agent permission. direction="out": may I open a thread to
-    peer? direction="in": may peer open one to me? Grants belong to your agent
-    identity (one identity per folder/workspace), so all your sessions share them."""
-    return _safe(lambda: _session_client().a2a_check(peer, direction, topic))
+def create_session(label: str = "session") -> str:
+    """Mint one session at the start of THIS conversation and pass the returned
+    session_id as `session_key` on every subsequent a2a_* / request_access call,
+    so your threads and delegated requests bind to this conversation. One
+    session may span multiple threads (to different peers). If you omit
+    session_key, calls are agent-level (not bound to this conversation)."""
+    # Fresh client: minting must NOT mutate the process-global — concurrent
+    # conversations share this MCP process in service runtimes.
+    return _safe(lambda: BrokerClient().create_session(label))
 
 
 @mcp.tool()
-def a2a_open(to: str, payload: dict[str, Any], topic: str | None = None) -> str:
+def close_session(session_key: str) -> str:
+    """Close this conversation's session when its work is done: threads it
+    owns end peer_gone for their peers and delegated grants get revoked."""
+
+    def go():
+        client = BrokerClient()
+        client.session_id = session_key
+        return client.close_session()
+
+    return _safe(go)
+
+
+@mcp.tool()
+def check_a2a(
+    peer: str,
+    direction: str = "out",
+    topic: str | None = None,
+    session_key: str | None = None,
+) -> str:
+    """Check agent-to-agent permission. direction="out": may I open a thread to
+    peer? direction="in": may peer open one to me? Grants belong to your agent
+    identity (one identity per folder/workspace), so all your sessions share them."""
+    return _safe(lambda: _client_for(session_key).a2a_check(peer, direction, topic))
+
+
+@mcp.tool()
+def a2a_open(
+    to: str,
+    payload: dict[str, Any],
+    topic: str | None = None,
+    session_key: str | None = None,
+) -> str:
     """Open a conversation thread with another agent; payload is your first
     message (it rides the open). Requires an active a2a grant — on 403, call
     request_access(platform="a2a", capability="talk", resource=<to>) first;
@@ -184,65 +239,79 @@ def a2a_open(to: str, payload: dict[str, Any], topic: str | None = None) -> str:
 
     The thread starts pending_open until the peer accepts or replies. Next:
     a2a_poll(thread_id) to wait for the reply."""
-    return _safe(lambda: _session_client().a2a_open(to, payload, topic))
+    return _safe(lambda: _client_for(session_key).a2a_open(to, payload, topic))
 
 
 @mcp.tool()
-def a2a_send(thread_id: str, payload: dict[str, Any]) -> str:
+def a2a_send(
+    thread_id: str, payload: dict[str, Any], session_key: str | None = None
+) -> str:
     """Send a message into an open thread you participate in. Replying to a
-    pending_open thread you received accepts it implicitly."""
-    return _safe(lambda: _session_client().a2a_send(thread_id, payload))
+    pending_open thread you received accepts it implicitly (pass your
+    session_key to bind the thread to this conversation)."""
+    return _safe(lambda: _client_for(session_key).a2a_send(thread_id, payload))
 
 
 @mcp.tool()
-def a2a_poll(thread_id: str, after_seq: int = 0, wait: float = 60) -> str:
+def a2a_poll(
+    thread_id: str,
+    after_seq: int = 0,
+    wait: float = 60,
+    session_key: str | None = None,
+) -> str:
     """Read a thread past your cursor; this is how you wait for a reply. Blocks
     up to `wait` seconds for new messages or a state change, and returns the
     thread status too. Track the highest seq you've processed and pass it back
     as after_seq. If state is "closed", read close_reason — "peer_gone" means
     the other side's session ended: open a new thread, don't try to resume."""
-    return _safe(lambda: _session_client().a2a_poll(thread_id, after_seq, wait))
+    return _safe(lambda: _client_for(session_key).a2a_poll(thread_id, after_seq, wait))
 
 
 @mcp.tool()
-def a2a_threads(state: str | None = None) -> str:
+def a2a_threads(state: str | None = None, session_key: str | None = None) -> str:
     """List your threads (state: pending_open|open|closed), most recently
-    active first, with peer liveness (peer_alive/peer_last_seen_at)."""
-    return _safe(lambda: _session_client().a2a_threads(state))
+    active first, with peer liveness (peer_alive/peer_last_seen_at). With a
+    session_key: only that conversation's threads."""
+    return _safe(lambda: _client_for(session_key).a2a_threads(state))
 
 
 @mcp.tool()
-def a2a_accept(thread_id: str) -> str:
+def a2a_accept(thread_id: str, session_key: str | None = None) -> str:
     """Accept a pending_open thread another agent opened to you (service
-    agents; sending a reply accepts implicitly too). If you run one worker
-    conversation per thread, accept from that worker's session (set
-    AGENT_AUTH_SESSION) — the thread then binds to it: wakes route only to
-    that session, its liveness is the conversation's liveness, and the thread
-    ends peer_gone when the session dies. Sessionless accept keeps the thread
-    agent-level."""
-    return _safe(lambda: _session_client().a2a_accept(thread_id))
+    agents; sending a reply accepts implicitly too). Pass your conversation's
+    session_key (from create_session) — the thread then binds to it: wakes
+    route only to that session, its liveness is the conversation's liveness,
+    and the thread ends peer_gone when the session dies. Sessionless accept
+    keeps the thread agent-level."""
+    return _safe(lambda: _client_for(session_key).a2a_accept(thread_id))
 
 
 @mcp.tool()
-def a2a_reject(thread_id: str, reason: str | None = None) -> str:
+def a2a_reject(
+    thread_id: str, reason: str | None = None, session_key: str | None = None
+) -> str:
     """Reject a pending_open thread another agent opened to you."""
-    return _safe(lambda: _session_client().a2a_reject(thread_id, reason))
+    return _safe(lambda: _client_for(session_key).a2a_reject(thread_id, reason))
 
 
 @mcp.tool()
-def a2a_close(thread_id: str, reason: str | None = None) -> str:
+def a2a_close(
+    thread_id: str, reason: str | None = None, session_key: str | None = None
+) -> str:
     """Close a thread you participate in (hang up). Conversations are
     session-lived: your threads also close automatically if your session ends."""
-    return _safe(lambda: _session_client().a2a_close(thread_id, reason))
+    return _safe(lambda: _client_for(session_key).a2a_close(thread_id, reason))
 
 
 @mcp.tool()
-def a2a_events(wait: float = 60, after: str | None = None) -> str:
+def a2a_events(
+    wait: float = 60, after: str | None = None, session_key: str | None = None
+) -> str:
     """Service agents: run this in a loop. Sessionless (dispatcher) calls see
     pending opens awaiting accept/reject plus all unbound-thread activity;
-    calls from a worker session see only that session's conversations. Returns
+    calls with a session_key see only that conversation's threads. Returns
     a cursor to pass back next call. Use a2a_poll on a thread to read messages."""
-    return _safe(lambda: _session_client().a2a_events(wait, after))
+    return _safe(lambda: _client_for(session_key).a2a_events(wait, after))
 
 
 def run() -> None:

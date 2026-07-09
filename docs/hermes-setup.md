@@ -74,21 +74,27 @@ deployment.
    `POST /v1/a2a/threads/{id}/reject {"reason": "..."}` — the reason reaches
    the initiator as `close_note`. Unhandled opens auto-close after
    `A2A_OPEN_TIMEOUT_SECS` (default 10 min), so failing closed is safe.
-2. **Mint the worker session** — the dispatcher does this, with the agent's
-   own API key: `POST /v1/sessions {"label": "a2a-<peer>-<thread-id[:8]>"}`
-   → `session_id`. The label is cosmetic (routing is by session/thread *id*;
-   the broker appends a random suffix and retries on the unlikely per-agent
-   name clash) — peer + thread-id prefix keeps it greppable. Note the MCP
-   server auto-creates sessions for *ephemeral* agents only; a service
-   agent's worker session always comes from an explicit call like this.
-3. **Spawn the Hermes conversation**: via the Hermes Discord bot, create a
+2. **Spawn the Hermes conversation**: via the Hermes Discord bot, create a
    Discord thread in the agent's channel (name it `a2a: <peer> <tid[:8]>`),
    seeded with:
-   - the opening payload (fetch via `GET /v1/a2a/threads/{id}/messages` —
-     the ping/event carries no payload),
-   - a metadata block: a2a thread id, peer name, topic,
-   - the conversation's MCP env: `AGENT_AUTH_SESSION=<session_id>` (per-
-     conversation MCP server instance, same `AGENT_AUTH_API_KEY`).
+   - the opening payload (delivered in the dispatch POST body, or fetch via
+     `GET /v1/a2a/threads/{id}/messages`),
+   - a metadata block: a2a thread id, peer name, topic.
+
+   No per-conversation env or MCP process is needed: Hermes shares ONE MCP
+   server across all conversations, and each conversation binds itself with
+   an explicit session key (next step).
+3. **The conversation self-mints its session** as its first act:
+   `create_session(label="a2a-<peer>-<tid[:8]>")` → `session_id`, then passes
+   that id as `session_key` on every subsequent a2a/`request_access` tool
+   call. Explicit keys never touch shared MCP state, so concurrent
+   conversations can't clobber each other. The label is cosmetic (routing is
+   by session/thread *id*; the broker suffixes and retries the rare per-agent
+   name clash) — peer + thread-id prefix keeps it greppable. Note the MCP
+   server auto-creates sessions for *ephemeral* agents only; a service
+   conversation's session always comes from this explicit call. This works
+   for ANY conversation origin — Discord-, cron-, or a2a-triggered chats can
+   all mint a session the same way.
 
    The Discord thread is a **workspace and observation surface, not a
    transport** — the a2a peer never sees it, and only what Hermes explicitly
@@ -100,10 +106,22 @@ deployment.
    these threads in an owner-only channel or bot-lock them. Approval
    buttons stay `DISCORD_OWNER_ID`-gated either way — a channel member can
    steer the chat but never approve its access requests.
-4. **Claim**: the worker calls `a2a_accept(thread_id)` from its session. The
+4. **Claim**: the worker calls `a2a_accept(thread_id, session_key=S)`. The
    thread is now bound: wakes route only to this session, the dispatcher and
    other conversations get 403 on it, and the initiator's `peer_alive` tracks
    this session.
+
+The full worker tool sequence, start to finish:
+
+```
+S = create_session(label)                     # first act of the conversation
+a2a_accept(thread_id, session_key=S)          # claim (or reply to implicitly accept)
+a2a_poll(thread_id, after_seq, session_key=S) # converse / wait for follow-ups
+request_access(..., on_behalf_of_thread=thread_id, session_key=S)  # credentials
+a2a_send(thread_id, {result...}, session_key=S)   # final message FIRST
+a2a_close(thread_id, session_key=S)               # then hang up (revokes delegated grants)
+close_session(S)                                  # clean exit
+```
 
 **Topics are optional — start without them.** Grants requested without
 `scope.topic` are unscoped, opens without a topic match them, policy rules and
@@ -125,10 +143,12 @@ During the conversation, the worker drives everything through its MCP tools:
   A parked poll does this automatically; a conversation architecture with no
   resident poll should run a trivial keep-alive tick.
 - **Outbound**: `a2a_send(thread_id, payload)`.
-- **Credentials**: `request_access(..., on_behalf_of_thread=<thread_id>)` —
-  cite ONLY this conversation's thread. Policy authorizes the
-  (hermes, delegator) pair; the grant is revoked when the thread closes, so
-  closing the thread is also releasing the access.
+- **Credentials**: `request_access(..., on_behalf_of_thread=<thread_id>,
+  session_key=S)` — cite ONLY this conversation's thread, and the SAME
+  session_key that accepted it (the broker checks the thread's session
+  binding and denies a mismatch). Policy authorizes the (hermes, delegator)
+  pair; the grant is revoked when the thread closes, so closing the thread
+  is also releasing the access.
 - **Downstream help**: open threads to other agents *from this session*
   (hermes→hermes). If this conversation dies, those downstream threads close
   `peer_gone` automatically — teardown cascades down the chain.
@@ -224,5 +244,6 @@ agent-auth admin set-webhook <id> --url ...   # method 2 only; secret printed ON
 # hermes host
 #  AGENT_AUTH_URL / AGENT_AUTH_API_KEY in the daemon env (sops/agenix)
 #  method 2: AGENT_AUTH_WEBHOOK_SECRET + endpoint + */5 cron catch-up
-#  per-conversation: AGENT_AUTH_SESSION=<session_id> on that conversation's MCP server
+#  one shared MCP server for all conversations; each conversation binds itself
+#  with create_session -> session_key=... on its a2a/request_access calls
 ```
