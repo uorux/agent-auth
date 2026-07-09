@@ -11,7 +11,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import authority as authority_mod
 from ..db import Database
-from ..models import AccessRequest, Agent, Grant, LLMEvaluation, Rule, utcnow
+from ..models import (
+    AccessRequest,
+    Agent,
+    A2AThread,
+    Grant,
+    LLMEvaluation,
+    Rule,
+    utcnow,
+)
 from ..policy.engine import PolicyEngine
 from ..policy.llm import LLMEvaluator
 from ..policy.schema import PolicyAction
@@ -23,7 +31,16 @@ from ..provisioners.base import (
 )
 from ..schemas import RequestCreate
 from .events import KeyedEvents
-from .states import DecisionSource, GrantStatus, RequestStatus, RuleAction, can_transition
+from .states import (
+    THREAD_CLOSED,
+    THREAD_OPEN,
+    DecisionSource,
+    GrantStatus,
+    Platform,
+    RequestStatus,
+    RuleAction,
+    can_transition,
+)
 
 log = logging.getLogger(__name__)
 
@@ -113,6 +130,19 @@ class RequestService:
                 requested_duration_secs=body.duration_secs,
             )
 
+            if body.on_behalf_of_thread:
+                problem = await self._resolve_delegation(
+                    session, request, agent, session_id, body.on_behalf_of_thread
+                )
+                if problem is not None:
+                    request.status = RequestStatus.DENIED
+                    request.decision_source = DecisionSource.POLICY
+                    request.decision_reason = f"delegation: {problem}"
+                    request.decided_at = utcnow()
+                    session.add(request)
+                    await session.flush()
+                    return request
+
             provisioner = self.registry.get(body.platform)
             try:
                 spec = await provisioner.validate_request(
@@ -137,7 +167,8 @@ class RequestService:
             request.authority = authority_mod.fold(
                 request.platform, spec.capability, spec.scope
             )
-            request.risk_notes = spec.notes
+            # Merge: delegation resolution may have noted context already.
+            request.risk_notes = [*(request.risk_notes or []), *spec.notes]
             session.add(request)
             await session.flush()
 
@@ -198,6 +229,58 @@ class RequestService:
         elif status == RequestStatus.AWAITING_HUMAN:
             await self._surface(request_id)
         return request
+
+    async def _resolve_delegation(
+        self,
+        session: AsyncSession,
+        request: AccessRequest,
+        agent: Agent,
+        session_id: str | None,
+        thread_id: str,
+    ) -> str | None:
+        """Anchor the request to an a2a thread; returns a denial reason or None.
+
+        The delegator is DERIVED (the thread's other participant), never
+        client-asserted, and the referenced thread must be the live, mutually
+        consented conversation the requester is part of. Depth 1 only: a2a
+        access itself cannot be delegated (no re-delegation chains).
+        """
+        if request.platform == Platform.A2A:
+            return "a2a access cannot be requested on behalf of another agent"
+        thread = await session.get(A2AThread, thread_id)
+        if thread is None or agent.id not in (
+            thread.initiator_agent_id,
+            thread.responder_agent_id,
+        ):
+            return "unknown thread (you must be a participant of the thread you cite)"
+        if thread.state != THREAD_OPEN:
+            return (
+                f"thread is {thread.state}; delegation requires an OPEN thread "
+                "(the other side must have accepted)"
+            )
+        if (
+            thread.initiator_agent_id == agent.id
+            and thread.initiator_session_id is not None
+            and thread.initiator_session_id != session_id
+        ):
+            return "thread belongs to a different session of this agent"
+        delegator_id = (
+            thread.responder_agent_id
+            if thread.initiator_agent_id == agent.id
+            else thread.initiator_agent_id
+        )
+        delegator = await session.get(Agent, delegator_id)
+        if delegator is None or delegator.disabled:
+            return "delegator agent is disabled"
+        request.delegation_thread_id = thread.id
+        request.delegator_agent_id = delegator_id
+        # risk_notes has no value yet pre-flush (column default applies later)
+        request.risk_notes = [
+            *(request.risk_notes or []),
+            f"on behalf of {delegator.name} (a2a thread topic "
+            f"{thread.topic or '(none)'})",
+        ]
+        return None
 
     # ------------------------------------------------------------- LLM path
 
@@ -412,10 +495,19 @@ class RequestService:
                 approved_authority = request.approved_authority
 
             if decision.rule_action is not None:
+                # Rules born from a delegated decision pin the delegator, so
+                # they only ever re-apply to the same (delegate, delegator)
+                # pair; rules from plain decisions never match delegated
+                # requests (fail-safe, see PolicyEngine).
+                delegator_pattern = None
+                if request.delegator_agent_id is not None:
+                    delegator = await session.get(Agent, request.delegator_agent_id)
+                    delegator_pattern = delegator.name if delegator else None
                 session.add(
                     Rule(
                         action=decision.rule_action,
                         agent_pattern=agent.name,
+                        delegator_pattern=delegator_pattern,
                         platform=request.platform,
                         resource_pattern=decision.rule_resource_pattern
                         or request.approved_resource
@@ -474,16 +566,40 @@ class RequestService:
     async def _provision(self, session: AsyncSession, request: AccessRequest) -> None:
         if not await self._guarded_transition(session, request, RequestStatus.PROVISIONING):
             raise TransitionError("request changed state concurrently")
+
+        expires_at = utcnow() + timedelta(seconds=request.approved_duration_secs)
+        if request.delegation_thread_id is not None:
+            # Approval may land long after the request: the thread (and its
+            # backing a2a grant) must still be alive, and the delegated grant
+            # never outlives the conversation that authorized it.
+            thread = await session.get(A2AThread, request.delegation_thread_id)
+            backing = await session.get(Grant, thread.grant_id) if thread else None
+            if (
+                thread is None
+                or thread.state != THREAD_OPEN
+                or backing is None
+                or backing.status != GrantStatus.ACTIVE
+                or backing.expires_at <= utcnow()
+            ):
+                await self._guarded_transition(session, request, RequestStatus.PROVISION_FAILED)
+                request.decision_reason = (
+                    request.decision_reason or ""
+                ) + " | provisioning failed: delegation thread is no longer open"
+                return
+            expires_at = min(expires_at, backing.expires_at)
+
         grant = Grant(
             request_id=request.id,
             agent_id=request.agent_id,
             session_id=request.session_id,
+            delegation_thread_id=request.delegation_thread_id,
+            delegator_agent_id=request.delegator_agent_id,
             platform=request.platform,
             resource=request.approved_resource or request.resource,
             authority=request.approved_authority
             if request.approved_authority is not None
             else request.authority,
-            expires_at=utcnow() + timedelta(seconds=request.approved_duration_secs),
+            expires_at=expires_at,
         )
         session.add(grant)
         await session.flush()
@@ -549,6 +665,35 @@ class RequestService:
                 # Retried on the next tick; grant stays ACTIVE.
                 log.exception("failed to expire grant %s; will retry", grant.id)
         return expired
+
+    async def revoke_delegated_for_closed_threads(self) -> int:
+        """Scheduler pass: delegated grants die with their thread. Runs right
+        after the a2a sweep so same-tick closures cascade immediately."""
+        async with self.db.session() as session:
+            rows = (
+                await session.execute(
+                    select(Grant.id, A2AThread.close_reason)
+                    .join(A2AThread, A2AThread.id == Grant.delegation_thread_id)
+                    .where(
+                        Grant.status == GrantStatus.ACTIVE,
+                        A2AThread.state == THREAD_CLOSED,
+                    )
+                )
+            ).all()
+        revoked = 0
+        for grant_id, close_reason in rows:
+            try:
+                await self.revoke_grant(
+                    grant_id,
+                    f"delegation thread closed ({close_reason or 'closed'})",
+                    "scheduler",
+                )
+                revoked += 1
+            except TransitionError:
+                pass  # raced with expiry/manual revoke — already inactive
+            except Exception:
+                log.exception("failed to revoke delegated grant %s; will retry", grant_id)
+        return revoked
 
     # ------------------------------------------------------------- helpers
 

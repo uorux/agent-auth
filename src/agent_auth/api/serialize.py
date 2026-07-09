@@ -28,6 +28,10 @@ async def request_out(
     if agent_name is None:
         agent = await session.get(Agent, request.agent_id)
         agent_name = agent.name if agent else "?"
+    delegator_name = None
+    if request.delegator_agent_id is not None:
+        delegator = await session.get(Agent, request.delegator_agent_id)
+        delegator_name = delegator.name if delegator else "?"
     grant = (
         await session.execute(select(Grant.id).where(Grant.request_id == request.id))
     ).scalar_one_or_none()
@@ -51,12 +55,14 @@ async def request_out(
         approved_scope=request.approved_scope,
         approved_resource=request.approved_resource,
         grant_id=grant,
+        delegator=delegator_name,
+        delegation_thread_id=request.delegation_thread_id,
         created_at=request.created_at,
         guidance=guidance,
     )
 
 
-def grant_out(grant: Grant, agent_name: str) -> GrantOut:
+def grant_out(grant: Grant, agent_name: str, delegator_name: str | None = None) -> GrantOut:
     return GrantOut(
         id=grant.id,
         request_id=grant.request_id,
@@ -68,4 +74,6 @@ def grant_out(grant: Grant, agent_name: str) -> GrantOut:
         granted_at=grant.granted_at,
         expires_at=grant.expires_at,
         status=grant.status,
+        delegator=delegator_name,
+        delegation_thread_id=grant.delegation_thread_id,
     )

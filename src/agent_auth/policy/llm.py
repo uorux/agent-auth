@@ -84,6 +84,9 @@ class LLMEvaluator:
             history += (
                 f"\n- Attempt {ev.attempt}: verdict={ev.verdict}; reasoning: {ev.reasoning}"
             )
+        # risk_notes carry validator context, incl. the structural "on behalf
+        # of <delegator> (a2a thread topic ...)" line for delegated requests.
+        notes = "".join(f"\n- {n}" for n in (request.risk_notes or []))
         user_prompt = f"""\
 Agent: {agent.name}
 Agent description: {agent.description or "(none)"}
@@ -96,6 +99,8 @@ Request:
 - Requested duration: {format_duration(request.requested_duration_secs)}
 - Policy maximum duration: {format_duration(max_duration_secs)}
 - Justification: {request.justification}
+
+Context notes:{notes or " (none)"}
 
 Prior attempts on this request:{history or " (none — first attempt)"}
 

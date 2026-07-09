@@ -74,9 +74,18 @@ def request_access(
     justification: str,
     duration: str = "1h",
     scope: dict[str, Any] | None = None,
+    on_behalf_of_thread: str | None = None,
 ) -> str:
     """Request time-bounded access to a resource. The broker may auto-approve,
     deny, review with an LLM, or ask a human on Discord.
+
+    on_behalf_of_thread (delegation): when another agent asked you, in an a2a
+    thread, to do work that needs this access, pass THAT thread's id — only
+    the thread whose conversation is asking for this request, never any other
+    thread you happen to have open. The broker derives the delegator from the
+    thread (its other participant), policy authorizes the pair, and the grant
+    is revoked the moment the thread closes — so keep the thread open until
+    the work is done, then close it to release the access.
 
     platform/capability/resource conventions:
     - github: capability="repo", resource="owner/repo",
@@ -98,8 +107,14 @@ def request_access(
     duration) — vague justifications get denied. duration examples: "30m", "8h", "2d".
     Then call wait_for_decision with the returned request id."""
     return _safe(
-        lambda: _client().request_access(
-            platform, capability, resource, justification, duration, scope
+        lambda: _session_client().request_access(
+            platform,
+            capability,
+            resource,
+            justification,
+            duration,
+            scope,
+            on_behalf_of_thread=on_behalf_of_thread,
         )
     )
 

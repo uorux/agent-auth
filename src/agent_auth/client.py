@@ -75,6 +75,7 @@ class BrokerClient:
         justification: str,
         duration: str,
         scope: dict | None = None,
+        on_behalf_of_thread: str | None = None,
     ):
         return self._request(
             "POST",
@@ -86,6 +87,7 @@ class BrokerClient:
                 "scope": scope or {},
                 "justification": justification,
                 "requested_duration": duration,
+                "on_behalf_of_thread": on_behalf_of_thread,
             },
         )
 

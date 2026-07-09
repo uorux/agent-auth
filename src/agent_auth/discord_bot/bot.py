@@ -7,7 +7,7 @@ import discord
 from ..config import Settings
 from ..core.service import RequestService
 from ..db import Database
-from ..models import AccessRequest, Agent, Grant
+from ..models import AccessRequest, Agent, A2AThread, Grant
 from . import embeds, views
 
 log = logging.getLogger(__name__)
@@ -39,12 +39,23 @@ class DiscordNotifier:
     async def surface(self, request: AccessRequest, agent: Agent) -> None:
         try:
             await self.bot.wait_until_ready()
+            delegator = thread = None
+            if request.delegator_agent_id is not None:
+                async with self.db.session() as session:
+                    delegator = await session.get(Agent, request.delegator_agent_id)
+                    if request.delegation_thread_id is not None:
+                        thread = await session.get(A2AThread, request.delegation_thread_id)
             channel = self.bot.get_channel(
                 self.settings.discord_channel_id
             ) or await self.bot.fetch_channel(self.settings.discord_channel_id)
+            mention = (
+                f"<@{self.settings.discord_owner_id}> access request from **{agent.name}**"
+            )
+            if delegator is not None:
+                mention += f" on behalf of **{delegator.name}**"
             message = await channel.send(
-                content=f"<@{self.settings.discord_owner_id}> access request from **{agent.name}**",
-                embed=embeds.build_request_embed(request, agent),
+                content=mention,
+                embed=embeds.build_request_embed(request, agent, delegator, thread),
                 view=views.pending_view(request.id),
             )
             async with self.db.session() as session:

@@ -44,6 +44,24 @@ def _matches(
     )
 
 
+def _delegator_matches(
+    pattern: str | None, delegator_name: str | None, grants_access: bool
+) -> bool:
+    """Delegation axis of rule matching.
+
+    A rule that names a delegator is delegation-specific: it matches only
+    delegated requests whose delegator fits the glob. A rule with no delegator
+    pattern was written without delegation in mind — it still applies its
+    deny/surface (fail-safe) to delegated requests, but must never be the
+    thing that auto-approves or LLM-clears one.
+    """
+    if pattern is not None:
+        return delegator_name is not None and fnmatch(delegator_name, pattern)
+    if delegator_name is None:
+        return True
+    return not grants_access
+
+
 class PolicyEngine:
     """Layered evaluation: DB rules (human-created) → YAML rules → default.
 
@@ -57,7 +75,12 @@ class PolicyEngine:
     async def evaluate(
         self, session: AsyncSession, agent: Agent, request: AccessRequest
     ) -> PolicyDecision:
-        db_decision = await self._match_db_rules(session, agent, request)
+        delegator_name = None
+        if request.delegator_agent_id is not None:
+            delegator = await session.get(Agent, request.delegator_agent_id)
+            delegator_name = delegator.name if delegator else "?"
+
+        db_decision = await self._match_db_rules(session, agent, request, delegator_name)
         if db_decision is not None:
             return db_decision
 
@@ -65,6 +88,10 @@ class PolicyEngine:
             m = rule.match
             if _matches(
                 m.agent, m.platform, m.capability, m.resource, agent.name, request
+            ) and _delegator_matches(
+                m.delegator,
+                delegator_name,
+                grants_access=rule.action in (PolicyAction.APPROVE, PolicyAction.LLM),
             ):
                 return self._from_yaml_rule(rule)
 
@@ -79,7 +106,11 @@ class PolicyEngine:
         )
 
     async def _match_db_rules(
-        self, session: AsyncSession, agent: Agent, request: AccessRequest
+        self,
+        session: AsyncSession,
+        agent: Agent,
+        request: AccessRequest,
+        delegator_name: str | None,
     ) -> PolicyDecision | None:
         rows = await session.execute(
             select(Rule)
@@ -90,6 +121,12 @@ class PolicyEngine:
             if not fnmatch(agent.name, rule.agent_pattern):
                 continue
             if not fnmatch(request.resource, rule.resource_pattern):
+                continue
+            if not _delegator_matches(
+                rule.delegator_pattern,
+                delegator_name,
+                grants_access=rule.action == RuleAction.AUTO_APPROVE,
+            ):
                 continue
             # Authority-pinned rules must match the request's exact normalized
             # privilege, so an "approve contents:write" rule never rubber-stamps

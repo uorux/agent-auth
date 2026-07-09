@@ -43,6 +43,12 @@ class ExpiryScheduler:
                         log.info("a2a sweep: %s", counts)
                 except Exception:
                     log.exception("a2a sweep failed")
+                try:
+                    revoked = await self.service.revoke_delegated_for_closed_threads()
+                    if revoked:
+                        log.info("revoked %d delegated grant(s) for closed threads", revoked)
+                except Exception:
+                    log.exception("delegated-grant cascade failed")
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.interval_secs)
             except TimeoutError:

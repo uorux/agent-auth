@@ -103,6 +103,7 @@ async def list_rules(request: Request):
                 id=r.id,
                 action=r.action.value,
                 agent_pattern=r.agent_pattern,
+                delegator_pattern=r.delegator_pattern,
                 platform=r.platform,
                 capability_pattern=authority_mod.label(r.platform, r.authority)
                 if r.authority is not None

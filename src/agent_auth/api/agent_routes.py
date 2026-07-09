@@ -28,13 +28,15 @@ router = APIRouter(prefix="/v1")
 @router.get("/me")
 async def me(caller: Caller = Depends(get_caller)):
     agent = caller.agent
+    # webhook_secret is deliberately NOT here: it's show-once at admin
+    # create/rotate-webhook-secret. Exposing it on every authenticated call
+    # would let anything holding the API key mint forged signed pings.
     out = {
         "id": agent.id,
         "name": agent.name,
         "description": agent.description,
         "kind": agent.kind,
         "webhook_url": agent.webhook_url,
-        "webhook_secret": agent.webhook_secret,
         "lldap_username": agent.lldap_username,
     }
     if caller.session is not None:
@@ -145,8 +147,21 @@ async def list_grants(
         except ValueError:
             raise HTTPException(400, f"invalid status {status!r}")
     async with state.db.session() as session:
-        grants = (await session.execute(query.order_by(Grant.granted_at.desc()))).scalars()
-        return [grant_out(g, agent.name) for g in grants]
+        from sqlalchemy import select as _select
+
+        grants = list(
+            (await session.execute(query.order_by(Grant.granted_at.desc()))).scalars()
+        )
+        delegator_ids = {g.delegator_agent_id for g in grants if g.delegator_agent_id}
+        names: dict[str, str] = {}
+        if delegator_ids:
+            rows = await session.execute(
+                _select(Agent.id, Agent.name).where(Agent.id.in_(delegator_ids))
+            )
+            names = dict(rows.all())
+        return [
+            grant_out(g, agent.name, names.get(g.delegator_agent_id)) for g in grants
+        ]
 
 
 @router.get("/grants/{grant_id}/credential", response_model=CredentialOut)
@@ -156,6 +171,18 @@ async def get_credential(grant_id: str, request: Request, agent: Agent = Depends
         grant = await session.get(Grant, grant_id)
         if grant is None or grant.agent_id != agent.id:
             raise HTTPException(404, "unknown grant")
+        # Delegated grants stop minting the moment their thread closes — the
+        # scheduler revokes them within a tick, but credentials must not be
+        # issuable in the gap.
+        if grant.delegation_thread_id is not None:
+            from ..core.states import THREAD_OPEN
+            from ..models import A2AThread
+
+            thread = await session.get(A2AThread, grant.delegation_thread_id)
+            if thread is None or thread.state != THREAD_OPEN:
+                raise HTTPException(
+                    403, "delegation thread is closed; credential no longer issuable"
+                )
         provisioner = state.registry.get(grant.platform)
         try:
             return await provisioner.get_credential(session, grant)

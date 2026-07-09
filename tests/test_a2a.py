@@ -679,9 +679,12 @@ async def test_rotate_webhook_secret(api, db):
         await api.post(f"/admin/agents/{r['id']}/rotate-webhook-secret", headers=ADMIN)
     ).json()
     assert rotated["webhook_secret"] and rotated["webhook_secret"] != r["webhook_secret"]
-    # the agent can read its own secret for verifier config
+    # show-once: NOT recoverable via /v1/me (API-key holders must not be able
+    # to mint forged signed pings) nor via listings
     me = (await api.get("/v1/me", headers=auth(r["api_key"]))).json()
-    assert me["webhook_secret"] == rotated["webhook_secret"]
+    assert "webhook_secret" not in me
+    listing = (await api.get("/admin/agents", headers=ADMIN)).json()
+    assert all(a.get("webhook_secret") is None for a in listing)
 
 
 # ------------------------------------------------------------------ legacy

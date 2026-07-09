@@ -55,6 +55,11 @@ def request(
     justification: str = typer.Option(..., "--why", "-j", help="Why you need this"),
     duration: str = typer.Option("1h", "--duration", "-d", help="e.g. 30m, 8h, 2d"),
     scope: str = typer.Option("{}", "--scope", "-s", help="JSON scope object"),
+    on_behalf_of_thread: str = typer.Option(
+        None,
+        "--on-behalf-of-thread",
+        help="a2a thread id whose conversation asked for this work (delegated request)",
+    ),
     wait: bool = typer.Option(False, "--wait", "-w", help="Block until decided"),
 ):
     """Submit an access request."""
@@ -62,7 +67,13 @@ def request(
 
     def go():
         req = client.request_access(
-            platform, capability, resource, justification, duration, json.loads(scope)
+            platform,
+            capability,
+            resource,
+            justification,
+            duration,
+            json.loads(scope),
+            on_behalf_of_thread=on_behalf_of_thread,
         )
         if wait and req["status"] in (
             "pending",

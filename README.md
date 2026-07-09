@@ -140,12 +140,37 @@ open (carries first message) ─▶ pending_open ─▶ accept / first reply ─
   `{type: a2a_thread_open|a2a_message|a2a_thread_closed, thread_id, seq, from,
   topic}` with **no payload**; fetch via the cursor read. Signed
   `X-Agent-Auth-Signature: sha256=<hmac>` with the agent's `webhook_secret`
-  (shown once at create / `rotate-webhook-secret`, also via `GET /v1/me`),
-  falling back to the global `WEBHOOK_SIGNING_SECRET`. Delivery is best-effort;
-  the poll is authoritative.
+  (shown ONCE at admin create / `rotate-webhook-secret` — record it then; it
+  is not readable afterwards, by design), falling back to the global
+  `WEBHOOK_SIGNING_SECRET`. Delivery is best-effort; the poll is authoritative.
 
 CLI: `agent-auth session create|close`, `agent-auth a2a
 open|send|poll|threads|show|accept|reject|close|events|check`.
+
+### Delegated auth (on behalf of)
+
+A request may be anchored to an **OPEN a2a thread** the requester participates
+in (`on_behalf_of_thread` in the request body / MCP tool / `--on-behalf-of-thread`
+CLI flag) — pass only the thread whose conversation asked for the work. The
+broker derives the delegator (the thread's other participant; never
+client-asserted), so "hermes acting for claude" is backed by a real, mutually
+consented conversation, not a justification string.
+
+- **Policy authorizes the pair**: rules gain a `delegator:` glob. Rules without
+  one still deny/surface delegated requests but never auto-approve or
+  LLM-clear them — pre-delegation rules can't be laundered through. Approving
+  a delegated request on Discord with Edit→rule pins the delegator, so the
+  saved rule only re-applies to the same pair.
+- **The grant lives and dies with the thread**: expiry is capped at the
+  thread's backing a2a grant; when the thread closes (close, reject,
+  `peer_gone`, `idle_timeout`, grant revocation), credentials stop being
+  issuable immediately and the scheduler revokes the grant within a tick.
+  Hanging up is revocation.
+- **Depth 1 only**: a2a access itself cannot be delegated (no re-delegation
+  chains), and platform validator ceilings apply unchanged — delegation can
+  select rules, never widen them.
+- The Discord embed and LLM review both show "on behalf of `<delegator>`
+  (thread topic)" so the reviewer sees the pair, not just the delegate.
 
 ## Policy
 

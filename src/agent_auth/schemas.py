@@ -41,6 +41,9 @@ class RequestCreate(BaseModel):
     scope: dict[str, Any] = Field(default_factory=dict)
     justification: str = Field(min_length=1, max_length=4000)
     requested_duration: str | int
+    # Delegation: id of the OPEN a2a thread whose conversation asked for this
+    # work — only that thread; the other participant becomes the delegator.
+    on_behalf_of_thread: str | None = Field(default=None, max_length=36)
 
     @field_validator("requested_duration")
     @classmethod
@@ -70,6 +73,8 @@ class RequestOut(BaseModel):
     approved_scope: dict[str, Any] | None = None
     approved_resource: str | None = None
     grant_id: str | None = None
+    delegator: str | None = None
+    delegation_thread_id: str | None = None
     created_at: datetime
     # Actionable hint for agents: e.g. "you may retry with a better justification"
     guidance: str | None = None
@@ -90,6 +95,8 @@ class GrantOut(BaseModel):
     granted_at: datetime
     expires_at: datetime
     status: GrantStatus
+    delegator: str | None = None
+    delegation_thread_id: str | None = None
 
 
 class CredentialOut(BaseModel):
@@ -207,6 +214,8 @@ class RuleOut(BaseModel):
     id: str
     action: str
     agent_pattern: str
+    # Delegator glob for delegated requests; null = rule never auto-approves them.
+    delegator_pattern: str | None = None
     platform: Platform
     # Derived display label for the pinned authority ('*' = any privilege).
     capability_pattern: str

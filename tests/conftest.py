@@ -72,6 +72,19 @@ TEST_POLICY = {
             "action": "approve",
             "constraints": {"max_duration": "12h"},
         },
+        # Delegated pair: hermes-* may join svc-gitea when a claude-* asked it
+        # to (via an open a2a thread). Rules without `delegator` never
+        # auto-approve delegated requests.
+        {
+            "match": {
+                "platform": "homelab",
+                "resource": "svc-gitea",
+                "agent": "hermes-*",
+                "delegator": "claude-*",
+            },
+            "action": "approve",
+            "constraints": {"max_duration": "1h"},
+        },
         # k8s: role-matched routing — read-only auto-approves, edit surfaces
         {
             "match": {"platform": "kubernetes", "capability": "view"},

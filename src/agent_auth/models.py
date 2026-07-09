@@ -187,6 +187,15 @@ class AccessRequest(AuthoritySugar, Base, TimestampMixin):
     session_id: Mapped[str | None] = mapped_column(
         ForeignKey("agent_sessions.id"), nullable=True
     )
+    # Delegation ("on behalf of"): set when the requester anchored this request
+    # to an OPEN a2a thread it participates in. The delegator is the thread's
+    # other participant — derived, never client-asserted. Depth 1 only.
+    delegation_thread_id: Mapped[str | None] = mapped_column(
+        ForeignKey("a2a_threads.id"), nullable=True
+    )
+    delegator_agent_id: Mapped[str | None] = mapped_column(
+        ForeignKey("agents.id"), nullable=True
+    )
     platform: Mapped[Platform] = mapped_column(_enum(Platform, "platform"))
     resource: Mapped[str] = mapped_column(String(512))
     # Canonical privilege (capability+scope folded); see agent_auth.authority.
@@ -245,6 +254,14 @@ class Grant(AuthoritySugar, Base, TimestampMixin):
     session_id: Mapped[str | None] = mapped_column(
         ForeignKey("agent_sessions.id"), nullable=True
     )
+    # Copied from the request; a delegated grant lives and dies with its
+    # thread (closed thread → revoked by the scheduler, credential fetch 403s).
+    delegation_thread_id: Mapped[str | None] = mapped_column(
+        ForeignKey("a2a_threads.id"), nullable=True
+    )
+    delegator_agent_id: Mapped[str | None] = mapped_column(
+        ForeignKey("agents.id"), nullable=True
+    )
     platform: Mapped[Platform] = mapped_column(_enum(Platform, "platform"))
     resource: Mapped[str] = mapped_column(String(512))
     # Canonical privilege (capability+scope folded); see agent_auth.authority.
@@ -267,6 +284,10 @@ class Rule(Base, TimestampMixin):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     action: Mapped[RuleAction] = mapped_column(_enum(RuleAction, "rule_action"))
     agent_pattern: Mapped[str] = mapped_column(String(128), default="*")
+    # Glob on the delegator's name for delegated requests. None = this rule was
+    # written without delegation in mind: it still denies delegated requests
+    # (fail-safe) but never auto-approves them.
+    delegator_pattern: Mapped[str | None] = mapped_column(String(128), nullable=True)
     platform: Mapped[Platform] = mapped_column(_enum(Platform, "platform"))
     # Glob on the object axis (which repo/namespace/group/agent).
     resource_pattern: Mapped[str] = mapped_column(String(512), default="*")

@@ -5,7 +5,7 @@ import json
 import discord
 
 from ..core.states import RequestStatus
-from ..models import AccessRequest, Agent, Grant
+from ..models import AccessRequest, Agent, A2AThread, Grant
 from ..schemas import format_duration
 
 COLOR_PENDING = 0xF1C40F  # yellow
@@ -20,7 +20,12 @@ def _trim(text: str, limit: int = 1000) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def build_request_embed(request: AccessRequest, agent: Agent) -> discord.Embed:
+def build_request_embed(
+    request: AccessRequest,
+    agent: Agent,
+    delegator: Agent | None = None,
+    delegation_thread: A2AThread | None = None,
+) -> discord.Embed:
     emoji = _PLATFORM_EMOJI.get(request.platform.value, "🔑")
     embed = discord.Embed(
         title=f"{emoji} Access request: {request.platform.value}/{request.capability}",
@@ -28,6 +33,16 @@ def build_request_embed(request: AccessRequest, agent: Agent) -> discord.Embed:
         color=COLOR_PENDING,
     )
     embed.add_field(name="Agent", value=agent.name, inline=True)
+    if delegator is not None:
+        topic = delegation_thread.topic if delegation_thread else None
+        embed.add_field(
+            name="🤝 On behalf of",
+            value=_trim(
+                f"**{delegator.name}**" + (f" (thread topic `{topic}`)" if topic else ""),
+                256,
+            ),
+            inline=True,
+        )
     embed.add_field(name="Resource", value=_trim(request.resource, 256), inline=True)
     embed.add_field(
         name="Requested duration",

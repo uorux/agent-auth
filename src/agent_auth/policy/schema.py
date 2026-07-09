@@ -22,6 +22,10 @@ class Match(BaseModel):
     platform: Platform | None = None
     capability: str = "*"
     resource: str = "*"
+    # Glob on the delegator's name for on-behalf-of requests. Omitted = the
+    # rule was written without delegation in mind: deny/surface still apply to
+    # delegated requests (fail-safe), approve/llm never do.
+    delegator: str | None = None
 
 
 class Constraints(BaseModel):

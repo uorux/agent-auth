@@ -172,6 +172,18 @@ rules:
   # a2a grants are agent-level (all sessions of a folder share them); the grant
   # only lets them OPEN threads to service agents — the responder can still
   # reject, and replies inside a thread need no reverse grant.
+  #
+  # Delegation ("on behalf of"): an agent may anchor a request to an OPEN a2a
+  # thread; the thread's other participant becomes the delegator and rules with
+  # a `delegator:` glob authorize the PAIR. Rules WITHOUT `delegator:` never
+  # auto-approve delegated requests (they fall through to surface), so nothing
+  # written before delegation existed can be laundered through it. Example —
+  # hermes may run homelab jobs when a claude folder asked it to:
+  #
+  #   - match: {agent: "hermes-homelab-*", platform: kubernetes, capability: job-runner,
+  #             delegator: "claude-*"}
+  #     action: approve
+  #     constraints: {max_duration: 2h}
   - match: {agent: "claude-*", platform: a2a}
     action: approve
     constraints: {max_duration: 12h}
