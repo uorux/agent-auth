@@ -21,7 +21,7 @@ agent ──HTTP/MCP/CLI──▶ broker ──policy──▶ deny | approve | 
 | `github`  | `repo`        | `owner/repo`        | broker mints GitHub App installation tokens (≤1h, re-minted on demand) scoped to the repo + `scope.permissions` |
 | `homelab` | `group`       | LLDAP group name    | agent's LLDAP service account is added to the group (Authelia rules are per-group); removed at expiry |
 | `kubernetes` | role name (`view`, `edit`, `traefik-patcher`, …) | namespace name | per-grant ServiceAccount + RoleBinding to the named (Cluster)Role; tokens minted on demand via TokenRequest; SA deleted at expiry → all tokens die instantly. The capability *is* the role, so policy rules auto-approve narrow roles and surface broad ones |
-| `a2a`     | `talk`        | target agent name   | check-based: `GET /v1/a2a/check`, plus optional relay `POST /v1/a2a/send` → webhook or inbox |
+| `a2a`     | `talk`        | target agent name   | authorizes OPENING conversation threads to that (service) agent — see [a2a threads](#a2a-threads); no credential is minted |
 | `google`  | `calendar.*`… | calendar id / label | stub: decisions recorded, no credential minted (501)                        |
 
 Note the Gitea flow: the broker grants the homelab agent the `svc-gitea` LLDAP
@@ -76,7 +76,8 @@ interfaces, all wrapping the same HTTP API:
   ```
   Tools: `list_capabilities`, `request_access`, `wait_for_decision`,
   `retry_request`, `escalate_request`, `get_credential`, `list_grants`,
-  `check_a2a`, `a2a_send`, `a2a_inbox`, `a2a_ack`.
+  `check_a2a`, `a2a_open`, `a2a_send`, `a2a_poll`, `a2a_threads`, `a2a_accept`,
+  `a2a_reject`, `a2a_close`, `a2a_events`.
 - **CLI**: `agent-auth ...` (same env vars), plus `agent-auth admin ...` with
   `AGENT_AUTH_ADMIN_TOKEN`.
 
@@ -92,6 +93,59 @@ interfaces, all wrapping the same HTTP API:
    justification (limited attempts), or `escalate_request` to a human.
 4. On `granted`: `get_credential(grant_id)` when a token is needed (GitHub);
    re-fetch rather than caching — minting stops the moment the grant ends.
+
+## a2a threads
+
+Agent-to-agent messaging is TCP-like conversations through the broker, not a
+mailbox. An a2a grant (platform `a2a`, capability `talk`, resource = target
+agent, optional `scope={"topic": "deploy/*"}`) authorizes **opening threads**;
+everything after that is thread lifecycle:
+
+```
+open (carries first message) ─▶ pending_open ─▶ accept / first reply ─▶ open ─▶ close
+                                     └▶ reject / open_timeout ─▶ closed
+```
+
+- **Fast-open**: `POST /v1/a2a/threads {to, topic?, payload}` — the first
+  message rides the open. The responder `accept`s, `reject`s, or just replies
+  (implicit accept). Unanswered opens close after `A2A_OPEN_TIMEOUT_SECS`.
+- **Cursor reads, no acks**: messages carry a per-thread `seq`.
+  `GET /v1/a2a/threads/{id}/messages?after_seq=N&wait=60` long-polls for the
+  reply — this is how a CLI agent waits in-session. `GET /v1/a2a/events?wait=`
+  is the service-agent loop: pending opens awaiting you + threads with new
+  activity since your cursor.
+- **Liveness**: any authenticated call (long-polls included) refreshes
+  last-seen; thread status reports `peer_alive`/`peer_last_seen_at`. Threads
+  close automatically: `open_timeout`, `idle_timeout`, `peer_gone` (the peer's
+  session ended), `grant_revoked` (the backing grant was revoked/expired —
+  either side's next send also detects this immediately).
+- **Agent kinds & sessions**: `service` agents (Hermes) are always-on and may
+  register a `webhook_url`; `ephemeral` agents (Claude Code, Codex) must mint a
+  session (`POST /v1/sessions {label}`, then send `X-Agent-Session`; the MCP
+  server does this automatically, labeled by cwd) and are **initiate-only** —
+  nobody can open a thread to them. Multiple concurrent instances work: threads
+  bind to the opening session and replies route only to it; a later session of
+  the same identity cannot read or act on another session's threads.
+- **One agent identity per folder**: register CLI agents per workspace using
+  the `<agent-type>-<folder>-<host>` naming scheme shared with the Hermes
+  fleet — e.g. `claude-nixos-dots-uorux` alongside `hermes-homelab-recusant`
+  (`kind=ephemeral`) — with the key in that folder's
+  env (direnv/.env). The key is the permission boundary — folder-level policy
+  is plain agent-name matching (your homelab folder's claude can hold
+  kubernetes grants; your kernel folder's claude can't even ask as that
+  identity). Grants — a2a included — are agent-level, so all sessions of a
+  folder share them; the responder replies under the initiator's grant, no
+  reverse grant needed.
+- **Webhook pings** (service agents only): notify-only —
+  `{type: a2a_thread_open|a2a_message|a2a_thread_closed, thread_id, seq, from,
+  topic}` with **no payload**; fetch via the cursor read. Signed
+  `X-Agent-Auth-Signature: sha256=<hmac>` with the agent's `webhook_secret`
+  (shown once at create / `rotate-webhook-secret`, also via `GET /v1/me`),
+  falling back to the global `WEBHOOK_SIGNING_SECRET`. Delivery is best-effort;
+  the poll is authoritative.
+
+CLI: `agent-auth session create|close`, `agent-auth a2a
+open|send|poll|threads|show|accept|reject|close|events|check`.
 
 ## Policy
 
@@ -259,13 +313,21 @@ GITHUB_INSTALLATION_ID=...
 LLDAP_URL=http://lldap:17170
 LLDAP_ADMIN_USER=agent-auth-svc
 LLDAP_ADMIN_PASSWORD=...
-WEBHOOK_SIGNING_SECRET=...    # optional; signs a2a webhook deliveries (X-Agent-Auth-Signature)
+WEBHOOK_SIGNING_SECRET=...    # optional; fallback HMAC key for a2a webhook pings
+# a2a thread lifecycle knobs (defaults shown)
+#A2A_OPEN_TIMEOUT_SECS=600
+#A2A_THREAD_IDLE_TIMEOUT_SECS=3600
+#SESSION_IDLE_TIMEOUT_SECS=900
+#LIVENESS_THRESHOLD_SECS=120
 ```
 
-`webhook_url` on a registered agent must be an `http(s)` URL. If
-`WEBHOOK_SIGNING_SECRET` is set, a2a webhook POSTs carry
-`X-Agent-Auth-Signature: sha256=<hmac>` over the raw body; recipients verify with
-the same secret.
+`webhook_url` on a registered agent must be an `http(s)` URL (admin-set; the
+broker POSTs to it verbatim, so keep it that way — self-service URLs would be
+an SSRF vector). Webhook POSTs are notify-only pings (no message payload — pull
+via the cursor read) signed with the agent's own `webhook_secret` when set,
+else `WEBHOOK_SIGNING_SECRET`: `X-Agent-Auth-Signature: sha256=<hmac>` over the
+raw body. If neither secret exists the ping is skipped entirely — unsigned
+pings are never sent, and polling remains authoritative.
 
 The unit runs as a `DynamicUser` with systemd hardening, stores SQLite state in
 `/var/lib/agent-auth/`, and self-migrates on start. Secret files may stay

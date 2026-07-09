@@ -125,7 +125,8 @@ async def test_request_isolation_between_agents(api, db):
     ).status_code == 200
 
 
-async def test_a2a_check_send_inbox_ack(api, db, service):
+async def test_a2a_thread_smoke(api, db, service):
+    """End-to-end thread flow; the edge cases live in test_a2a.py."""
     sender = (await api.post("/admin/agents", headers=ADMIN, json={"name": "auto-s"})).json()
     recipient = (await api.post("/admin/agents", headers=ADMIN, json={"name": "auto-r"})).json()
     skey, rkey = sender["api_key"], recipient["api_key"]
@@ -133,10 +134,10 @@ async def test_a2a_check_send_inbox_ack(api, db, service):
     # no grant yet
     check = (await api.get("/v1/a2a/check", headers=auth(skey), params={"peer": "auto-r"})).json()
     assert check["allowed"] is False
-    send = await api.post(
-        "/v1/a2a/send", headers=auth(skey), json={"to": "auto-r", "payload": {"hi": 1}}
+    resp = await api.post(
+        "/v1/a2a/threads", headers=auth(skey), json={"to": "auto-r", "payload": {"hi": 1}}
     )
-    assert send.status_code == 403
+    assert resp.status_code == 403
 
     # auto-* rule auto-approves a2a
     req = (
@@ -156,7 +157,6 @@ async def test_a2a_check_send_inbox_ack(api, db, service):
 
     check = (await api.get("/v1/a2a/check", headers=auth(skey), params={"peer": "auto-r"})).json()
     assert check["allowed"] is True
-    # recipient verifies inbound
     check_in = (
         await api.get(
             "/v1/a2a/check", headers=auth(rkey), params={"peer": "auto-s", "direction": "in"}
@@ -164,29 +164,53 @@ async def test_a2a_check_send_inbox_ack(api, db, service):
     ).json()
     assert check_in["allowed"] is True
 
-    # send lands in inbox (no webhook configured)
-    send = (
+    # fast-open: first message rides the open
+    thread = (
         await api.post(
-            "/v1/a2a/send",
+            "/v1/a2a/threads",
             headers=auth(skey),
             json={"to": "auto-r", "payload": {"task": "deploy cactus"}},
         )
     ).json()
-    assert send["delivered_via"] == "inbox"
+    assert thread["state"] == "pending_open"
+    tid = thread["thread_id"]
 
-    inbox = (await api.get("/v1/a2a/inbox", headers=auth(rkey))).json()
-    assert len(inbox) == 1
-    assert inbox[0]["from"] == "auto-s"
-    assert inbox[0]["payload"]["body"] == {"task": "deploy cactus"}
+    # recipient sees the pending open, replies (implicit accept)
+    events = (await api.get("/v1/a2a/events", headers=auth(rkey))).json()
+    assert [t["thread_id"] for t in events["pending_opens"]] == [tid]
+    reply = (
+        await api.post(
+            f"/v1/a2a/threads/{tid}/messages",
+            headers=auth(rkey),
+            json={"payload": {"ok": True}},
+        )
+    ).json()
+    assert reply["thread_state"] == "open"
+    assert reply["seq"] == 2
 
-    ack = await api.post(f"/v1/a2a/inbox/{inbox[0]['message_id']}/ack", headers=auth(rkey))
-    assert ack.status_code == 200
-    assert (await api.get("/v1/a2a/inbox", headers=auth(rkey))).json() == []
+    # sender cursor-reads the reply
+    read = (
+        await api.get(
+            f"/v1/a2a/threads/{tid}/messages",
+            headers=auth(skey),
+            params={"after_seq": 1},
+        )
+    ).json()
+    assert [m["payload"] for m in read["messages"]] == [{"ok": True}]
+    assert read["thread"]["state"] == "open"
 
-    # sender can't read recipient's inbox message
+    # close
+    closed = (
+        await api.post(f"/v1/a2a/threads/{tid}/close", headers=auth(rkey), json={})
+    ).json()
+    assert closed["state"] == "closed"
+    assert closed["close_reason"] == "closed"
+
+    # legacy endpoints are gone
     assert (
-        await api.post(f"/v1/a2a/inbox/{inbox[0]['message_id']}/ack", headers=auth(skey))
-    ).status_code == 404
+        await api.post("/v1/a2a/send", headers=auth(skey), json={"to": "auto-r", "payload": {}})
+    ).status_code in (404, 405)
+    assert (await api.get("/v1/a2a/inbox", headers=auth(skey))).status_code in (404, 405)
 
 
 async def test_admin_rules_and_revoke(api, db, service):
@@ -277,10 +301,13 @@ async def test_catalog(api, db):
     assert gh["repo_allowlist"] == ["jrt/*"]
     assert gh["permission_ceiling"]["contents"] == "write"
 
-    # a2a: peers list other registered agents, not self
-    a2a = by_platform["a2a"]
+    # a2a: peers list other SERVICE agents, not self, not ephemeral agents
+    await make_agent(db, "cat-cli", kind="ephemeral")
+    resp = await api.get("/v1/catalog", headers=auth(a["api_key"]))
+    a2a = {p["platform"]: p for p in resp.json()["platforms"]}["a2a"]
     assert "cat-peer" in a2a["peers"]
     assert "cat-agent" not in a2a["peers"]
+    assert "cat-cli" not in a2a["peers"]
 
     # unused fields are omitted (response_model_exclude_none)
     assert "roles" not in gh
@@ -322,7 +349,7 @@ async def test_field_size_caps(api, db):
     assert resp.status_code == 422
     # oversized a2a payload
     resp = await api.post(
-        "/v1/a2a/send",
+        "/v1/a2a/threads",
         headers=auth(a["api_key"]),
         json={"to": "big-peer", "payload": {"blob": "z" * 20000}},
     )

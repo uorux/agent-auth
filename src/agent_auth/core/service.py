@@ -22,7 +22,7 @@ from ..provisioners.base import (
     SpecValidationError,
 )
 from ..schemas import RequestCreate
-from .events import DecisionEvents
+from .events import KeyedEvents
 from .states import DecisionSource, GrantStatus, RequestStatus, RuleAction, can_transition
 
 log = logging.getLogger(__name__)
@@ -78,7 +78,7 @@ class RequestService:
         db: Database,
         engine: PolicyEngine,
         registry: ProvisionerRegistry,
-        events: DecisionEvents,
+        events: KeyedEvents,
         llm: LLMEvaluator | None = None,
         notifier: Notifier | None = None,
     ):
@@ -95,13 +95,16 @@ class RequestService:
 
     # ---------------------------------------------------------------- create
 
-    async def create_request(self, agent_id: str, body: RequestCreate) -> AccessRequest:
+    async def create_request(
+        self, agent_id: str, body: RequestCreate, session_id: str | None = None
+    ) -> AccessRequest:
         async with self.db.session() as session:
             agent = await session.get(Agent, agent_id)
             assert agent is not None
 
             request = AccessRequest(
                 agent_id=agent.id,
+                session_id=session_id,
                 platform=body.platform,
                 capability=body.capability,
                 resource=body.resource,
@@ -474,6 +477,7 @@ class RequestService:
         grant = Grant(
             request_id=request.id,
             agent_id=request.agent_id,
+            session_id=request.session_id,
             platform=request.platform,
             resource=request.approved_resource or request.resource,
             authority=request.approved_authority

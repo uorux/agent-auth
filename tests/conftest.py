@@ -8,7 +8,8 @@ import respx
 
 from agent_auth.api.app import create_app
 from agent_auth.config import Settings
-from agent_auth.core.events import DecisionEvents
+from agent_auth.core.a2a import A2AThreadService
+from agent_auth.core.events import KeyedEvents
 from agent_auth.core.service import RequestService
 from agent_auth.crypto import SecretBox, generate_api_key, generate_fernet_key
 from agent_auth.db import Database
@@ -64,6 +65,12 @@ TEST_POLICY = {
             "match": {"platform": "a2a", "agent": "auto-*"},
             "action": "approve",
             "constraints": {"max_duration": "2h"},
+        },
+        # CLI agents (one identity per folder): frictionless a2a opens.
+        {
+            "match": {"platform": "a2a", "agent": "claude-*"},
+            "action": "approve",
+            "constraints": {"max_duration": "12h"},
         },
         # k8s: role-matched routing — read-only auto-approves, edit surfaces
         {
@@ -148,8 +155,8 @@ def registry(policy, secret_box, tmp_path) -> ProvisionerRegistry:
 
 
 @pytest.fixture
-def events() -> DecisionEvents:
-    return DecisionEvents()
+def events() -> KeyedEvents:
+    return KeyedEvents()
 
 
 @pytest.fixture
@@ -175,8 +182,13 @@ def settings(tmp_path) -> Settings:
 
 
 @pytest.fixture
-def app(settings, db, service, registry, events):
-    return create_app(settings, db, service, registry, events)
+def a2a_service(db, settings) -> A2AThreadService:
+    return A2AThreadService(db, settings, KeyedEvents())
+
+
+@pytest.fixture
+def app(settings, db, service, registry, events, a2a_service):
+    return create_app(settings, db, service, registry, events, a2a_service)
 
 
 @pytest.fixture

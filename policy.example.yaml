@@ -159,7 +159,26 @@ rules:
   # nothing routes them to auto-approve here, so they fall through to `surface`
   # (or add an explicit rule for them if that changes).
 
-  # Agent-to-agent chatter between known agents: ask once, then use Edit→rule
+  # CLI agents (Claude Code / Codex): register one agent PER FOLDER with its
+  # key in that folder's env, named <agent-type>-<folder>-<host> to match the
+  # rest of the fleet (hermes-homelab-recusant, claude-nixos-dots-uorux, ...).
+  # The key is the permission boundary, so folder-level rules are just agent
+  # name matches — e.g. only the homelab folder's claude may touch kubernetes:
+  #
+  #   - match: {agent: "claude-homelab-*", platform: kubernetes, capability: view}
+  #     action: approve
+  #     constraints: {max_duration: 8h}
+  #
+  # a2a grants are agent-level (all sessions of a folder share them); the grant
+  # only lets them OPEN threads to service agents — the responder can still
+  # reject, and replies inside a thread need no reverse grant.
+  - match: {agent: "claude-*", platform: a2a}
+    action: approve
+    constraints: {max_duration: 12h}
+  - match: {agent: "codex-*", platform: a2a}
+    action: approve
+    constraints: {max_duration: 12h}
+  # Unknown pairs: ask once, then use Edit→rule
   - match: {platform: a2a}
     action: surface
 

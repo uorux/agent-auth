@@ -12,14 +12,19 @@ from .base import RequestSpec, SpecValidationError
 
 
 class A2AProvisioner:
-    """Check-based agent-to-agent grants.
+    """Check-based agent-to-agent grants backing thread conversations.
 
     The ACTIVE grant row is the artifact: provision/revoke are no-ops and
-    enforcement happens when either side calls check_grant. Message relay
-    (webhook/inbox) lives in the API layer and consults check_grant too.
+    enforcement happens when a thread is opened or a message sent (the thread
+    lifecycle lives in core.a2a). A grant authorizes the whole conversation —
+    the responder replies under the initiator's grant, so revoking it closes
+    the thread in both directions.
 
-    Convention: capability="talk", resource=<recipient agent name>,
-    scope={"topic": <optional glob>}.
+    Convention: capability="talk", resource=<responder agent name>,
+    scope={"topic": <optional glob>}. Grants belong to the agent identity —
+    for CLI agents that identity is one folder/workspace (claude-<folder>,
+    key in that folder's env), so all sessions of a folder share its grants
+    while each session keeps its own threads.
     """
 
     platform = Platform.A2A
@@ -34,8 +39,11 @@ class A2AProvisioner:
             raise SpecValidationError(f"unknown target agent {spec.resource!r}")
         if recipient.id == spec.agent.id:
             raise SpecValidationError("agent cannot request a2a access to itself")
-        if not recipient.webhook_url:
-            spec.notes.append("recipient has no webhook; relay messages land in its inbox")
+        if recipient.kind != "service":
+            raise SpecValidationError(
+                f"a2a targets must be service agents; {spec.resource!r} is ephemeral "
+                "and can only initiate threads itself"
+            )
         return spec
 
     async def provision(self, session: AsyncSession, grant: Grant) -> dict:
@@ -47,7 +55,7 @@ class A2AProvisioner:
     async def get_credential(self, session: AsyncSession, grant: Grant) -> CredentialOut:
         return CredentialOut(
             kind="a2a_grant",
-            note="a2a grants are check-based; use /v1/a2a/check and /v1/a2a/send",
+            note="a2a grants are check-based; open a thread via POST /v1/a2a/threads",
         )
 
 
@@ -56,8 +64,18 @@ async def check_grant(
     sender_agent_id: str,
     recipient_name: str,
     topic: str | None = None,
+    any_topic: bool = False,
 ) -> Grant | None:
-    """Active, unexpired grant allowing sender → recipient (topic glob-matched)."""
+    """Active, unexpired grant allowing sender → recipient (topic glob-matched).
+
+    Topic: a topic-scoped grant (scope.topic other than "*") only matches an
+    explicit topic that satisfies the glob — topic=None matches unscoped grants
+    only, so omitting the topic can never widen a narrow grant. any_topic=True
+    (the informational check endpoint) answers "is there any grant at all".
+
+    Grants are agent-level: sessions of the same agent share them (the folder's
+    key IS the permission boundary; sessions only scope threads/liveness).
+    """
     now = utcnow()
     rows = await session.execute(
         select(Grant).where(
@@ -70,6 +88,11 @@ async def check_grant(
     )
     for grant in rows.scalars():
         pattern = (grant.scope or {}).get("topic", "*")
-        if topic is None or fnmatch(topic, pattern):
+        if any_topic:
+            return grant
+        if topic is None:
+            if pattern == "*":
+                return grant
+        elif fnmatch(topic, pattern):
             return grant
     return None

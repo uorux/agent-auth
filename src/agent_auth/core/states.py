@@ -42,6 +42,35 @@ class RuleAction(str, enum.Enum):
     AUTO_DENY = "auto_deny"
 
 
+# --- agents & a2a threads (plain strings in the DB, not enums) ---
+
+AGENT_KINDS = ("service", "ephemeral")
+
+THREAD_PENDING_OPEN = "pending_open"
+THREAD_OPEN = "open"
+THREAD_CLOSED = "closed"
+THREAD_STATES = (THREAD_PENDING_OPEN, THREAD_OPEN, THREAD_CLOSED)
+
+# Why a thread reached CLOSED. "closed" = a participant hung up normally.
+CLOSE_REJECTED = "rejected"
+CLOSE_CLOSED = "closed"
+CLOSE_OPEN_TIMEOUT = "open_timeout"
+CLOSE_IDLE_TIMEOUT = "idle_timeout"
+CLOSE_PEER_GONE = "peer_gone"
+CLOSE_GRANT_REVOKED = "grant_revoked"
+CLOSE_REASONS = (
+    CLOSE_REJECTED,
+    CLOSE_CLOSED,
+    CLOSE_OPEN_TIMEOUT,
+    CLOSE_IDLE_TIMEOUT,
+    CLOSE_PEER_GONE,
+    CLOSE_GRANT_REVOKED,
+)
+
+SESSION_CLOSE_IDLE = "idle"
+SESSION_CLOSE_CLOSED = "closed"
+
+
 # Statuses an agent is still waiting on (long-poll keeps blocking while in these).
 # AWAITING_HUMAN is included: the agent is blocked on the human, so the poll holds
 # until the decision lands (or times out, returning the current status + guidance).

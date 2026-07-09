@@ -16,10 +16,16 @@ class BrokerError(Exception):
 class BrokerClient:
     """Thin sync client over the broker HTTP API, shared by the CLI and MCP server."""
 
-    def __init__(self, base_url: str | None = None, api_key: str | None = None):
+    def __init__(
+        self,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        session_id: str | None = None,
+    ):
         self.base_url = (base_url or os.environ.get("AGENT_AUTH_URL", "http://localhost:8400")).rstrip("/")
         self.api_key = api_key or os.environ.get("AGENT_AUTH_API_KEY", "")
         self.admin_token = os.environ.get("AGENT_AUTH_ADMIN_TOKEN", "")
+        self.session_id = session_id or os.environ.get("AGENT_AUTH_SESSION", "")
 
     def _request(
         self,
@@ -36,11 +42,14 @@ class BrokerClient:
                 0,
                 "AGENT_AUTH_ADMIN_TOKEN not set" if admin else "AGENT_AUTH_API_KEY not set",
             )
+        headers = {"Authorization": f"Bearer {token}"}
+        if self.session_id and not admin:
+            headers["X-Agent-Session"] = self.session_id
         with httpx.Client(timeout=timeout) as client:
             resp = client.request(
                 method,
                 f"{self.base_url}{path}",
-                headers={"Authorization": f"Bearer {token}"},
+                headers=headers,
                 **kwargs,
             )
         if resp.status_code >= 400:
@@ -105,25 +114,79 @@ class BrokerClient:
     def credential(self, grant_id: str):
         return self._request("GET", f"/v1/grants/{grant_id}/credential")
 
+    # sessions
+    def create_session(self, label: str):
+        out = self._request("POST", "/v1/sessions", json={"label": label})
+        self.session_id = out["session_id"]
+        return out
+
+    def close_session(self):
+        return self._request("POST", "/v1/sessions/close")
+
+    # a2a threads
     def a2a_check(self, peer: str, direction: str = "out", topic: str | None = None):
         params: dict[str, Any] = {"peer": peer, "direction": direction}
         if topic:
             params["topic"] = topic
         return self._request("GET", "/v1/a2a/check", params=params)
 
-    def a2a_send(self, to: str, payload: dict, topic: str | None = None):
+    def a2a_open(self, to: str, payload: dict, topic: str | None = None):
         return self._request(
-            "POST", "/v1/a2a/send", json={"to": to, "scope": topic, "payload": payload}
+            "POST", "/v1/a2a/threads", json={"to": to, "topic": topic, "payload": payload}
         )
 
-    def a2a_inbox(self):
-        return self._request("GET", "/v1/a2a/inbox")
+    def a2a_send(self, thread_id: str, payload: dict):
+        return self._request(
+            "POST", f"/v1/a2a/threads/{thread_id}/messages", json={"payload": payload}
+        )
 
-    def a2a_ack(self, message_id: str):
-        return self._request("POST", f"/v1/a2a/inbox/{message_id}/ack")
+    def a2a_poll(self, thread_id: str, after_seq: int = 0, wait: float = 0):
+        return self._request(
+            "GET",
+            f"/v1/a2a/threads/{thread_id}/messages",
+            params={"after_seq": after_seq, "wait": wait},
+            timeout=wait + 10,
+        )
+
+    def a2a_threads(self, state: str | None = None, role: str | None = None):
+        params: dict[str, Any] = {}
+        if state:
+            params["state"] = state
+        if role:
+            params["role"] = role
+        return self._request("GET", "/v1/a2a/threads", params=params)
+
+    def a2a_thread(self, thread_id: str):
+        return self._request("GET", f"/v1/a2a/threads/{thread_id}")
+
+    def a2a_accept(self, thread_id: str):
+        return self._request("POST", f"/v1/a2a/threads/{thread_id}/accept")
+
+    def a2a_reject(self, thread_id: str, reason: str | None = None):
+        return self._request(
+            "POST", f"/v1/a2a/threads/{thread_id}/reject", json={"reason": reason}
+        )
+
+    def a2a_close(self, thread_id: str, reason: str | None = None):
+        return self._request(
+            "POST", f"/v1/a2a/threads/{thread_id}/close", json={"reason": reason}
+        )
+
+    def a2a_events(self, wait: float = 0, after: str | None = None):
+        params: dict[str, Any] = {"wait": wait}
+        if after:
+            params["after"] = after
+        return self._request("GET", "/v1/a2a/events", params=params, timeout=wait + 10)
 
     # admin operations
-    def admin_create_agent(self, name: str, description: str = "", webhook_url: str | None = None, lldap_username: str | None = None):
+    def admin_create_agent(
+        self,
+        name: str,
+        description: str = "",
+        webhook_url: str | None = None,
+        lldap_username: str | None = None,
+        kind: str = "service",
+    ):
         return self._request(
             "POST",
             "/admin/agents",
@@ -131,9 +194,15 @@ class BrokerClient:
             json={
                 "name": name,
                 "description": description,
+                "kind": kind,
                 "webhook_url": webhook_url,
                 "lldap_username": lldap_username,
             },
+        )
+
+    def admin_rotate_webhook_secret(self, agent_id: str):
+        return self._request(
+            "POST", f"/admin/agents/{agent_id}/rotate-webhook-secret", admin=True
         )
 
     def admin_list_agents(self):

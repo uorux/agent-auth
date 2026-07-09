@@ -101,10 +101,13 @@ async def build_catalog(
         )
 
     if registry.enabled(Platform.A2A):
+        # Only service agents can receive threads (ephemeral = initiate-only).
         peers = (
             await session.execute(
                 select(Agent.name).where(
-                    Agent.id != agent.id, Agent.disabled.is_(False)
+                    Agent.id != agent.id,
+                    Agent.disabled.is_(False),
+                    Agent.kind == "service",
                 )
             )
         ).scalars().all()

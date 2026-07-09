@@ -7,7 +7,8 @@ import uvicorn
 
 from .api.app import create_app
 from .config import Settings, get_settings
-from .core.events import DecisionEvents
+from .core.a2a import A2AThreadService
+from .core.events import KeyedEvents
 from .core.scheduler import ExpiryScheduler
 from .core.service import RequestService
 from .crypto import SecretBox
@@ -93,7 +94,7 @@ async def serve(settings: Settings) -> None:
     )
     policy = load_policy(settings.policy_file)
     db = Database(settings.database_url)
-    events = DecisionEvents()
+    events = KeyedEvents()
     registry = build_registry(settings, policy)
     llm = (
         LLMEvaluator(
@@ -108,8 +109,9 @@ async def serve(settings: Settings) -> None:
         log.info("llm evaluator disabled (OPENROUTER_API_KEY not set); 'llm' rules escalate to human")
 
     service = RequestService(db, PolicyEngine(policy), registry, events, llm=llm)
-    app = create_app(settings, db, service, registry, events)
-    scheduler = ExpiryScheduler(service)
+    a2a = A2AThreadService(db, settings, KeyedEvents())
+    app = create_app(settings, db, service, registry, events, a2a)
+    scheduler = ExpiryScheduler(service, a2a)
 
     server = uvicorn.Server(
         uvicorn.Config(

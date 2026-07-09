@@ -43,9 +43,17 @@ class Settings(BaseSettings):
     kubernetes_insecure_skip_verify: bool = False
 
     a2a_relay_enabled: bool = True
-    # If set, a2a webhook deliveries are signed: X-Agent-Auth-Signature carries
-    # an HMAC-SHA256 of the raw body. Recipients verify with the same secret.
+    # Fallback HMAC key for webhook pings when an agent has no per-agent
+    # webhook_secret: X-Agent-Auth-Signature carries an HMAC-SHA256 of the raw
+    # body. Recipients verify with the same secret.
     webhook_signing_secret: str = ""
+    # a2a thread lifecycle. Long-poll waits clamp to 300s, safely inside the
+    # session idle timeout — and the poll loop refreshes last-seen every
+    # iteration, so a parked poll never idles out its own session.
+    a2a_open_timeout_secs: int = 600  # pending_open → closed(open_timeout)
+    a2a_thread_idle_timeout_secs: int = 3600  # open + no activity → closed(idle_timeout)
+    session_idle_timeout_secs: int = 900  # idle session → closed; its threads → peer_gone
+    liveness_threshold_secs: int = 120  # peer_alive = last seen within this
 
     log_level: str = "INFO"
 

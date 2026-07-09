@@ -79,15 +79,22 @@ def main() -> None:
     req = wait_decided(sde, req, "a2a")
     assert req["status"] == "granted", "a2a request was not granted; aborting"
 
-    banner("3. homelab-agent verifies inbound grant + receives a relayed message")
+    banner("3. sde-agent opens a thread; homelab-agent replies and closes")
     check = homelab.a2a_check("sde-agent", direction="in", topic="deploy/webapp")
     print(f"  inbound check: {check}")
-    sent = sde.a2a_send("homelab-agent", {"task": "please help me deploy 'cactus'"}, topic="deploy/webapp")
-    print(f"  message relayed via {sent['delivered_via']}")
-    inbox = homelab.a2a_inbox()
-    print(f"  homelab inbox: {inbox[-1]['payload'] if inbox else '(webhook-delivered)'}")
-    if inbox:
-        homelab.a2a_ack(inbox[-1]["message_id"])
+    thread = sde.a2a_open(
+        "homelab-agent", {"task": "please help me deploy 'cactus'"}, topic="deploy/webapp"
+    )
+    print(f"  thread {thread['thread_id']} state={thread['state']}")
+    events = homelab.a2a_events()
+    assert events["pending_opens"], "homelab-agent sees no pending open"
+    tid = events["pending_opens"][-1]["thread_id"]
+    read = homelab.a2a_poll(tid)
+    print(f"  homelab received: {read['messages'][-1]['payload']}")
+    homelab.a2a_send(tid, {"ok": True, "note": "on it"})  # implicit accept
+    reply = sde.a2a_poll(tid, after_seq=1, wait=10)
+    print(f"  sde received reply: {reply['messages'][-1]['payload']}")
+    homelab.a2a_close(tid, reason="task handed off")
 
     banner("4. homelab-agent requests LLDAP group svc-gitea")
     req = homelab.request_access(

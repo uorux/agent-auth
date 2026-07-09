@@ -9,9 +9,14 @@ from .client import BrokerClient, BrokerError
 
 app = typer.Typer(help="agent-auth broker CLI", no_args_is_help=True)
 admin = typer.Typer(help="Admin operations (AGENT_AUTH_ADMIN_TOKEN)", no_args_is_help=True)
-a2a = typer.Typer(help="Agent-to-agent messaging", no_args_is_help=True)
+a2a = typer.Typer(help="Agent-to-agent threads", no_args_is_help=True)
+session = typer.Typer(
+    help="Agent sessions (ephemeral agents need one for a2a; AGENT_AUTH_SESSION)",
+    no_args_is_help=True,
+)
 app.add_typer(admin, name="admin")
 app.add_typer(a2a, name="a2a")
+app.add_typer(session, name="session")
 
 
 def _client() -> BrokerClient:
@@ -108,6 +113,33 @@ def cred(grant_id: str):
     _run(lambda: _client().credential(grant_id))
 
 
+@session.command("create")
+def session_create(
+    label: str = typer.Option(None, "--label", "-l", help="Defaults to cwd basename"),
+):
+    """Mint a session; export AGENT_AUTH_SESSION=<session_id> to use it."""
+    import os
+
+    if label is None:
+        label = os.path.basename(os.getcwd()) or "session"
+        label = "".join(c for c in label if c.isalnum() or c in "._-")[:64] or "session"
+
+    def go():
+        out = _client().create_session(label)
+        typer.secho(
+            f"export AGENT_AUTH_SESSION={out['session_id']}", fg=typer.colors.GREEN, err=True
+        )
+        return out
+
+    _run(go)
+
+
+@session.command("close")
+def session_close():
+    """Close the current session (AGENT_AUTH_SESSION); its threads end peer_gone."""
+    _run(lambda: _client().close_session())
+
+
 @a2a.command("check")
 def a2a_check(
     peer: str,
@@ -117,23 +149,70 @@ def a2a_check(
     _run(lambda: _client().a2a_check(peer, direction, topic))
 
 
-@a2a.command("send")
-def a2a_send(
+@a2a.command("open")
+def a2a_open(
     to: str,
-    payload: str = typer.Option(..., "--payload", "-p", help="JSON payload"),
+    payload: str = typer.Option(..., "--payload", "-p", help="JSON payload (first message)"),
     topic: str = typer.Option(None),
 ):
-    _run(lambda: _client().a2a_send(to, json.loads(payload), topic))
+    """Open a thread; it stays pending_open until the peer accepts or replies."""
+    _run(lambda: _client().a2a_open(to, json.loads(payload), topic))
 
 
-@a2a.command("inbox")
-def a2a_inbox():
-    _run(lambda: _client().a2a_inbox())
+@a2a.command("send")
+def a2a_send(
+    thread_id: str,
+    payload: str = typer.Option(..., "--payload", "-p", help="JSON payload"),
+):
+    """Send a message into an open thread."""
+    _run(lambda: _client().a2a_send(thread_id, json.loads(payload)))
 
 
-@a2a.command("ack")
-def a2a_ack(message_id: str):
-    _run(lambda: _client().a2a_ack(message_id))
+@a2a.command("poll")
+def a2a_poll(
+    thread_id: str,
+    after_seq: int = typer.Option(0, help="Return messages with seq greater than this"),
+    wait: float = typer.Option(0, help="Long-poll seconds (0 = return immediately)"),
+):
+    """Read a thread past your cursor; --wait blocks for the reply."""
+    _run(lambda: _client().a2a_poll(thread_id, after_seq, wait))
+
+
+@a2a.command("threads")
+def a2a_threads(
+    state: str = typer.Option(None, help="pending_open|open|closed"),
+    role: str = typer.Option(None, help="initiator|responder"),
+):
+    _run(lambda: _client().a2a_threads(state, role))
+
+
+@a2a.command("show")
+def a2a_show(thread_id: str):
+    _run(lambda: _client().a2a_thread(thread_id))
+
+
+@a2a.command("accept")
+def a2a_accept(thread_id: str):
+    _run(lambda: _client().a2a_accept(thread_id))
+
+
+@a2a.command("reject")
+def a2a_reject(thread_id: str, reason: str = typer.Option(None, "--reason", "-r")):
+    _run(lambda: _client().a2a_reject(thread_id, reason))
+
+
+@a2a.command("close")
+def a2a_close(thread_id: str, reason: str = typer.Option(None, "--reason", "-r")):
+    _run(lambda: _client().a2a_close(thread_id, reason))
+
+
+@a2a.command("events")
+def a2a_events(
+    wait: float = typer.Option(0, help="Long-poll seconds"),
+    after: str = typer.Option(None, help="Cursor from the previous call"),
+):
+    """Pending opens awaiting you + threads with new activity (service loop)."""
+    _run(lambda: _client().a2a_events(wait, after))
 
 
 @admin.command("gen-key")
@@ -148,11 +227,22 @@ def gen_key():
 def agent_create(
     name: str,
     description: str = typer.Option("", "--description"),
+    kind: str = typer.Option("service", "--kind", help="service | ephemeral (CLI agents)"),
     webhook_url: str = typer.Option(None, "--webhook-url"),
     lldap_username: str = typer.Option(None, "--lldap-username"),
 ):
-    """Register an agent; prints its API key ONCE."""
-    _run(lambda: _client().admin_create_agent(name, description, webhook_url, lldap_username))
+    """Register an agent; prints its API key (and webhook secret) ONCE."""
+    _run(
+        lambda: _client().admin_create_agent(
+            name, description, webhook_url, lldap_username, kind=kind
+        )
+    )
+
+
+@admin.command("rotate-webhook-secret")
+def rotate_webhook_secret(agent_id: str):
+    """Mint/replace an agent's per-agent webhook HMAC key; prints it ONCE."""
+    _run(lambda: _client().admin_rotate_webhook_secret(agent_id))
 
 
 @admin.command("agents")

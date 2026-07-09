@@ -3,11 +3,12 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from ..config import Settings
-from ..core.events import DecisionEvents
+from ..core.a2a import A2AThreadService
+from ..core.events import KeyedEvents
 from ..core.service import RequestService
 from ..db import Database
 from ..provisioners.base import ProvisionerRegistry
-from . import admin_routes, agent_routes
+from . import a2a_routes, admin_routes, agent_routes
 
 
 def create_app(
@@ -15,7 +16,8 @@ def create_app(
     db: Database,
     service: RequestService,
     registry: ProvisionerRegistry,
-    events: DecisionEvents,
+    events: KeyedEvents,
+    a2a: A2AThreadService,
 ) -> FastAPI:
     # Docs/schema endpoints are disabled: they'd otherwise serve unauthenticated
     # on /docs, /redoc, /openapi.json. Agents discover capabilities via
@@ -32,8 +34,11 @@ def create_app(
     app.state.service = service
     app.state.registry = registry
     app.state.events = events
+    app.state.a2a = a2a
+    app.state.a2a_events = a2a.events
 
     app.include_router(agent_routes.router)
+    app.include_router(a2a_routes.router)
     app.include_router(admin_routes.router)
 
     @app.get("/healthz")

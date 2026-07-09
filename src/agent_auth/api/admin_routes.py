@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import secrets
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -15,19 +17,23 @@ from .serialize import request_out
 router = APIRouter(prefix="/admin", dependencies=[Depends(require_admin)])
 
 
-def _agent_out(agent: Agent, api_key: str | None = None) -> AgentOut:
+def _agent_out(
+    agent: Agent, api_key: str | None = None, webhook_secret: str | None = None
+) -> AgentOut:
     return AgentOut(
         id=agent.id,
         name=agent.name,
         description=agent.description,
+        kind=agent.kind,
         webhook_url=agent.webhook_url,
         lldap_username=agent.lldap_username,
         disabled=agent.disabled,
         api_key=api_key,
+        webhook_secret=webhook_secret,
     )
 
 
-@router.post("/agents", response_model=AgentOut)
+@router.post("/agents", response_model=AgentOut, response_model_exclude_none=True)
 async def create_agent(body: AgentCreate, request: Request):
     state = request.app.state
     full_key, key_id, key_hash = generate_api_key()
@@ -37,17 +43,20 @@ async def create_agent(body: AgentCreate, request: Request):
         ).scalar_one_or_none()
         if existing is not None:
             raise HTTPException(409, f"agent {body.name!r} already exists")
+        webhook_secret = secrets.token_urlsafe(32) if body.webhook_url else None
         agent = Agent(
             name=body.name,
             description=body.description,
+            kind=body.kind,
             key_id=key_id,
             api_key_hash=key_hash,
             webhook_url=body.webhook_url,
+            webhook_secret=webhook_secret,
             lldap_username=body.lldap_username,
         )
         session.add(agent)
         await session.flush()
-        return _agent_out(agent, api_key=full_key)
+        return _agent_out(agent, api_key=full_key, webhook_secret=webhook_secret)
 
 
 @router.get("/agents", response_model=list[AgentOut])
@@ -67,6 +76,22 @@ async def rotate_key(agent_id: str, request: Request):
         agent.key_id = key_id
         agent.api_key_hash = key_hash
         return _agent_out(agent, api_key=full_key)
+
+
+@router.post(
+    "/agents/{agent_id}/rotate-webhook-secret",
+    response_model=AgentOut,
+    response_model_exclude_none=True,
+)
+async def rotate_webhook_secret(agent_id: str, request: Request):
+    """Mint (or replace) the per-agent HMAC key for webhook pings — also how
+    pre-existing agents opt out of the global-secret fallback."""
+    async with request.app.state.db.session() as session:
+        agent = await session.get(Agent, agent_id)
+        if agent is None:
+            raise HTTPException(404, "unknown agent")
+        agent.webhook_secret = secrets.token_urlsafe(32)
+        return _agent_out(agent, webhook_secret=agent.webhook_secret)
 
 
 @router.get("/rules", response_model=list[RuleOut])

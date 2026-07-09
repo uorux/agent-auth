@@ -102,19 +102,40 @@ class CredentialOut(BaseModel):
 _MAX_PAYLOAD_BYTES = 16 * 1024
 
 
-class A2ASendBody(BaseModel):
+def _check_payload_size(v: dict) -> dict:
+    import json
+
+    if len(json.dumps(v)) > _MAX_PAYLOAD_BYTES:
+        raise ValueError(f"payload exceeds {_MAX_PAYLOAD_BYTES} bytes")
+    return v
+
+
+class SessionCreate(BaseModel):
+    label: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9._-]+$")
+
+
+class SessionOut(BaseModel):
+    session_id: str
+    name: str
+    created_at: datetime
+
+
+class ThreadOpenBody(BaseModel):
     to: str = Field(min_length=1, max_length=128)
-    scope: str | None = Field(default=None, max_length=256)
+    topic: str | None = Field(default=None, max_length=256)
     payload: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("payload")
-    @classmethod
-    def _payload_size(cls, v: dict) -> dict:
-        import json
+    _size = field_validator("payload")(_check_payload_size)
 
-        if len(json.dumps(v)) > _MAX_PAYLOAD_BYTES:
-            raise ValueError(f"payload exceeds {_MAX_PAYLOAD_BYTES} bytes")
-        return v
+
+class ThreadMessageBody(BaseModel):
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+    _size = field_validator("payload")(_check_payload_size)
+
+
+class ThreadCloseBody(BaseModel):
+    reason: str | None = Field(default=None, max_length=2000)
 
 
 class A2ACheckOut(BaseModel):
@@ -127,6 +148,7 @@ class A2ACheckOut(BaseModel):
 class AgentCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128, pattern=r"^[a-zA-Z0-9._-]+$")
     description: str = Field(default="", max_length=2000)
+    kind: str = Field(default="service", pattern=r"^(service|ephemeral)$")
     webhook_url: str | None = Field(default=None, max_length=512)
     lldap_username: str | None = Field(default=None, max_length=128)
 
@@ -147,10 +169,12 @@ class AgentOut(BaseModel):
     id: str
     name: str
     description: str
+    kind: str = "service"
     webhook_url: str | None
     lldap_username: str | None
     disabled: bool
     api_key: str | None = None  # only set on create/rotate
+    webhook_secret: str | None = None  # only set on create/rotate-webhook-secret
 
 
 class CatalogEntry(BaseModel):

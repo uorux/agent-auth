@@ -7,6 +7,7 @@ Configure per-agent:
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -15,9 +16,34 @@ from .client import BrokerClient, BrokerError
 
 mcp = FastMCP("agent-auth")
 
+# One client per MCP server process so the a2a session (minted lazily below)
+# sticks for the life of this agent instance — exactly the intended lifetime
+# of an ephemeral agent's session.
+_CLIENT: BrokerClient | None = None
+_KIND: str | None = None
+
 
 def _client() -> BrokerClient:
-    return BrokerClient()
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = BrokerClient()
+    return _CLIENT
+
+
+def _session_client() -> BrokerClient:
+    """Client for a2a calls: ephemeral agents get a session auto-created on
+    first use (label = cwd basename); service agents skip session machinery."""
+    global _KIND
+    client = _client()
+    if client.session_id:
+        return client
+    if _KIND is None:
+        _KIND = client.me().get("kind", "service")
+    if _KIND == "ephemeral":
+        label = os.path.basename(os.getcwd()) or "session"
+        label = "".join(c for c in label if c.isalnum() or c in "._-")[:64] or "session"
+        client.create_session(label)
+    return client
 
 
 def _safe(fn) -> str:
@@ -126,30 +152,76 @@ def get_credential(grant_id: str) -> str:
 
 @mcp.tool()
 def check_a2a(peer: str, direction: str = "out", topic: str | None = None) -> str:
-    """Check agent-to-agent permission. direction="out": may I message peer?
-    direction="in": may peer message me? Recipients should verify inbound
-    messages with direction="in" before acting on them."""
-    return _safe(lambda: _client().a2a_check(peer, direction, topic))
+    """Check agent-to-agent permission. direction="out": may I open a thread to
+    peer? direction="in": may peer open one to me? Grants belong to your agent
+    identity (one identity per folder/workspace), so all your sessions share them."""
+    return _safe(lambda: _session_client().a2a_check(peer, direction, topic))
 
 
 @mcp.tool()
-def a2a_send(to: str, payload: dict[str, Any], topic: str | None = None) -> str:
-    """Send a message to another agent through the broker relay. Requires an
-    active a2a grant (request one with request_access platform="a2a")."""
-    return _safe(lambda: _client().a2a_send(to, payload, topic))
+def a2a_open(to: str, payload: dict[str, Any], topic: str | None = None) -> str:
+    """Open a conversation thread with another agent; payload is your first
+    message (it rides the open). Requires an active a2a grant — on 403, call
+    request_access(platform="a2a", capability="talk", resource=<to>) first;
+    grants belong to your agent identity, so other sessions in this folder may
+    already have one (check list_grants). If your grant is topic-scoped you
+    MUST pass a topic matching its glob.
+
+    The thread starts pending_open until the peer accepts or replies. Next:
+    a2a_poll(thread_id) to wait for the reply."""
+    return _safe(lambda: _session_client().a2a_open(to, payload, topic))
 
 
 @mcp.tool()
-def a2a_inbox() -> str:
-    """Fetch unacknowledged messages other agents sent you, oldest first.
-    Acknowledge each with a2a_ack after processing."""
-    return _safe(lambda: _client().a2a_inbox())
+def a2a_send(thread_id: str, payload: dict[str, Any]) -> str:
+    """Send a message into an open thread you participate in. Replying to a
+    pending_open thread you received accepts it implicitly."""
+    return _safe(lambda: _session_client().a2a_send(thread_id, payload))
 
 
 @mcp.tool()
-def a2a_ack(message_id: str) -> str:
-    """Acknowledge an inbox message so it is not delivered again."""
-    return _safe(lambda: _client().a2a_ack(message_id))
+def a2a_poll(thread_id: str, after_seq: int = 0, wait: float = 60) -> str:
+    """Read a thread past your cursor; this is how you wait for a reply. Blocks
+    up to `wait` seconds for new messages or a state change, and returns the
+    thread status too. Track the highest seq you've processed and pass it back
+    as after_seq. If state is "closed", read close_reason — "peer_gone" means
+    the other side's session ended: open a new thread, don't try to resume."""
+    return _safe(lambda: _session_client().a2a_poll(thread_id, after_seq, wait))
+
+
+@mcp.tool()
+def a2a_threads(state: str | None = None) -> str:
+    """List your threads (state: pending_open|open|closed), most recently
+    active first, with peer liveness (peer_alive/peer_last_seen_at)."""
+    return _safe(lambda: _session_client().a2a_threads(state))
+
+
+@mcp.tool()
+def a2a_accept(thread_id: str) -> str:
+    """Accept a pending_open thread another agent opened to you (service
+    agents; sending a reply accepts implicitly too)."""
+    return _safe(lambda: _session_client().a2a_accept(thread_id))
+
+
+@mcp.tool()
+def a2a_reject(thread_id: str, reason: str | None = None) -> str:
+    """Reject a pending_open thread another agent opened to you."""
+    return _safe(lambda: _session_client().a2a_reject(thread_id, reason))
+
+
+@mcp.tool()
+def a2a_close(thread_id: str, reason: str | None = None) -> str:
+    """Close a thread you participate in (hang up). Conversations are
+    session-lived: your threads also close automatically if your session ends."""
+    return _safe(lambda: _session_client().a2a_close(thread_id, reason))
+
+
+@mcp.tool()
+def a2a_events(wait: float = 60, after: str | None = None) -> str:
+    """Service agents: run this in a loop. Returns threads awaiting your
+    accept/reject plus your threads with new activity since `after`, and a
+    cursor to pass back next call. Use a2a_poll on a thread to read messages."""
+    return _safe(lambda: _session_client().a2a_events(wait, after))
 
 
 def run() -> None:
