@@ -84,6 +84,17 @@ platforms:
       - pod-exec          # exec into pods (sensitive)
       - secret-reader     # read secrets (sensitive)
       - edit
+    # Roles an agent may request CLUSTER-WIDE, by asking for namespace "*". These
+    # bind via a ClusterRoleBinding across every namespace, so keep the list tiny
+    # (read-only roles at most) — and note every cluster-wide grant is forced to
+    # human review no matter what, regardless of sensitive_roles or any rule.
+    # Omit or leave empty to disable cluster-wide grants entirely.
+    cluster_role_allowlist:
+      - view
+    # Namespace that hosts the per-grant ServiceAccount backing a cluster-wide
+    # grant (the ClusterRoleBinding is what makes it cluster-scoped). The broker
+    # needs SA create/delete rights here; default is "default".
+    cluster_grant_namespace: agent-auth
     # Shown to agents via GET /v1/catalog so they pick the right narrow role.
     role_descriptions:
       view: "read-only access to all resources in the namespace, including pod logs and events"

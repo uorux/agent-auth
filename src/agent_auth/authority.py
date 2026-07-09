@@ -27,7 +27,13 @@ def fold(platform: Platform, capability: str, scope: dict[str, Any] | None) -> d
     if platform == Platform.GITHUB:
         return {"permissions": dict(scope.get("permissions", {}))}
     if platform == Platform.KUBERNETES:
-        return {"role": capability}
+        # Cluster-wide is a distinct privilege from the same role in a namespace,
+        # so it folds into a distinct authority — an auto-approve rule pinned to
+        # a namespaced grant can never rubber-stamp its cluster-wide cousin.
+        authority = {"role": capability}
+        if scope.get("cluster"):
+            authority["cluster"] = True
+        return authority
     if platform == Platform.A2A:
         return dict(scope)
     if platform == Platform.GOOGLE:
@@ -41,7 +47,8 @@ def split(platform: Platform, authority: dict[str, Any] | None) -> tuple[str, di
     if platform == Platform.GITHUB:
         return "repo", {"permissions": dict(authority.get("permissions", {}))}
     if platform == Platform.KUBERNETES:
-        return authority.get("role", ""), {}
+        scope = {"cluster": True} if authority.get("cluster") else {}
+        return authority.get("role", ""), scope
     if platform == Platform.A2A:
         return "talk", dict(authority)
     if platform == Platform.GOOGLE:
@@ -54,6 +61,9 @@ def label(platform: Platform, authority: dict[str, Any] | None) -> str:
     if platform == Platform.GITHUB:
         perms = (authority or {}).get("permissions", {})
         return "+".join(f"{k}:{v}" for k, v in sorted(perms.items())) or "repo"
+    if platform == Platform.KUBERNETES:
+        role = (authority or {}).get("role") or "*"
+        return f"{role} (cluster-wide)" if (authority or {}).get("cluster") else role
     return split(platform, authority)[0] or "*"
 
 
@@ -64,5 +74,9 @@ def is_sensitive(platform: Platform, authority: dict[str, Any] | None, platforms
         sensitive = set(platforms_cfg.github.sensitive_permissions)
         return any(p in sensitive for p in authority.get("permissions", {}))
     if platform == Platform.KUBERNETES:
+        # Cluster-wide binds a ClusterRole across every namespace — always a
+        # human's call, whatever the role or how routing would otherwise clear it.
+        if authority.get("cluster"):
+            return True
         return authority.get("role") in set(platforms_cfg.kubernetes.sensitive_roles)
     return False

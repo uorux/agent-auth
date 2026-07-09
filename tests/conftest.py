@@ -42,6 +42,8 @@ TEST_POLICY = {
         "kubernetes": {
             "namespace_allowlist": ["apps-*", "personal-site"],
             "role_allowlist": ["view", "logs-reader", "edit"],
+            "cluster_role_allowlist": ["view", "edit"],
+            "cluster_grant_namespace": "agent-auth",
             "role_descriptions": {"view": "read-only in the namespace"},
         },
     },

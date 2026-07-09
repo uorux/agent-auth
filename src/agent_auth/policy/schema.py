@@ -104,6 +104,15 @@ class KubernetesPlatformConfig(BaseModel):
     # ClusterRole/Role names agents may request. The broker's own RBAC must
     # hold `bind` on exactly these. Prefer narrow custom roles over edit/admin.
     role_allowlist: list[str] = Field(default_factory=lambda: ["view"])
+    # Roles grantable CLUSTER-WIDE (request namespace "*"), bound via a
+    # ClusterRoleBinding across every namespace. Separate from role_allowlist so
+    # cluster scope is opt-in per role; empty (default) = cluster-wide disabled.
+    # Every cluster-wide grant is sensitive (always human-reviewed) regardless.
+    cluster_role_allowlist: list[str] = Field(default_factory=list)
+    # Namespace that hosts the per-grant ServiceAccount backing a cluster-wide
+    # grant (the SA must live somewhere; the ClusterRoleBinding is what makes it
+    # cluster-scoped). The broker needs SA create/delete rights here.
+    cluster_grant_namespace: str = "default"
     # Optional human descriptions (what each role actually grants) surfaced to
     # agents via GET /v1/catalog — the broker can't infer this from a role name.
     role_descriptions: dict[str, str] = Field(default_factory=dict)

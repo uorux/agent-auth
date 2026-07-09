@@ -152,6 +152,17 @@ class A2ACheckOut(BaseModel):
     reason: str | None = None
 
 
+def validate_webhook_url(v: str | None) -> str | None:
+    if v is None:
+        return v
+    from urllib.parse import urlparse
+
+    parsed = urlparse(v)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError("webhook_url must be an http(s) URL with a host")
+    return v
+
+
 class AgentCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128, pattern=r"^[a-zA-Z0-9._-]+$")
     description: str = Field(default="", max_length=2000)
@@ -159,17 +170,14 @@ class AgentCreate(BaseModel):
     webhook_url: str | None = Field(default=None, max_length=512)
     lldap_username: str | None = Field(default=None, max_length=128)
 
-    @field_validator("webhook_url")
-    @classmethod
-    def _valid_webhook(cls, v: str | None) -> str | None:
-        if v is None:
-            return v
-        from urllib.parse import urlparse
+    _valid_webhook = field_validator("webhook_url")(validate_webhook_url)
 
-        parsed = urlparse(v)
-        if parsed.scheme not in ("http", "https") or not parsed.netloc:
-            raise ValueError("webhook_url must be an http(s) URL with a host")
-        return v
+
+class SetWebhookBody(BaseModel):
+    # null clears the webhook (and its secret)
+    webhook_url: str | None = Field(default=None, max_length=512)
+
+    _valid_webhook = field_validator("webhook_url")(validate_webhook_url)
 
 
 class AgentOut(BaseModel):
@@ -198,6 +206,8 @@ class PlatformCatalog(BaseModel):
     capability_hint: str
     resource_hint: str
     roles: list[CatalogEntry] | None = None
+    # Roles requestable cluster-wide via resource "*" (always human-reviewed).
+    cluster_roles: list[str] | None = None
     namespace_allowlist: list[str] | None = None
     repo_allowlist: list[str] | None = None
     permission_ceiling: dict[str, str] | None = None

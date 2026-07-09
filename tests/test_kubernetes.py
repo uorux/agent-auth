@@ -4,6 +4,7 @@ from datetime import timedelta
 
 import pytest
 
+from agent_auth.core.service import HumanDecision
 from agent_auth.core.states import GrantStatus, Platform, RequestStatus, RuleAction
 from agent_auth.models import Grant, Rule, utcnow
 from agent_auth.provisioners.base import ProvisionerError, RequestSpec, SpecValidationError
@@ -161,6 +162,91 @@ async def test_wildcard_allowlist(db, agent):
                 session,
                 RequestSpec(agent=a, capability="cluster-admin", resource="anything"),
             )
+
+
+async def test_cluster_wide_validation(db, registry, agent):
+    a, _ = agent
+    provisioner = registry.get(Platform.KUBERNETES)
+    async with db.session() as session:
+        # A cluster-grantable role via the sentinel namespace "*".
+        spec = await provisioner.validate_request(
+            session,
+            RequestSpec(agent=a, capability="view", resource="*"),
+        )
+        assert spec.resource == "*"
+        assert spec.scope == {"cluster": True}
+        assert any("CLUSTER-WIDE" in n for n in spec.notes)
+
+        # A role that's namespace-grantable but not cluster-grantable is rejected
+        # (edit is in cluster_role_allowlist here; logs-reader is not).
+        with pytest.raises(SpecValidationError, match="not grantable cluster-wide"):
+            await provisioner.validate_request(
+                session,
+                RequestSpec(agent=a, capability="logs-reader", resource="*"),
+            )
+
+
+async def test_cluster_wide_disabled_by_default(db, agent):
+    from agent_auth.policy.schema import KubernetesPlatformConfig
+    from agent_auth.provisioners.kubernetes import KubernetesProvisioner
+
+    a, _ = agent
+    provisioner = KubernetesProvisioner(
+        api_url="https://k8s.test",
+        config=KubernetesPlatformConfig(role_allowlist=["view"]),  # no cluster allowlist
+        token="t",
+    )
+    async with db.session() as session:
+        with pytest.raises(SpecValidationError, match="cluster-wide grants are not enabled"):
+            await provisioner.validate_request(
+                session,
+                RequestSpec(agent=a, capability="view", resource="*"),
+            )
+
+
+async def test_cluster_wide_always_surfaces_then_grants(db, service, k8s_mock):
+    """Cluster-wide is always human-reviewed — even 'view', which auto-approves
+    namespaced — and provisions a ClusterRoleBinding, not a RoleBinding."""
+    a, _ = await make_agent(db, "ops-agent", lldap_username=None)
+
+    req = await service.create_request(a.id, k8s_request(namespace="*", role="view"))
+    # Namespaced view auto-approves (conftest rule); cluster-wide view does not.
+    assert req.status == RequestStatus.AWAITING_HUMAN
+
+    decided = await service.decide(
+        req.id, HumanDecision(approve=True, decided_by="jrt", duration_secs=1800)
+    )
+    assert decided.status in (RequestStatus.GRANTED, RequestStatus.PROVISIONING)
+    assert ("create", "ClusterRoleBinding") in k8s_mock.calls
+    assert ("create", "RoleBinding") not in k8s_mock.calls
+
+    async with db.session() as session:
+        from sqlalchemy import select
+
+        grant = (
+            await session.execute(select(Grant).where(Grant.request_id == req.id))
+        ).scalar_one()
+        assert grant.provisioner_state["cluster"] is True
+        assert grant.provisioner_state["namespace"] == "agent-auth"  # cluster_grant_namespace
+        sa = grant.provisioner_state["service_account"]
+
+        # Token still mints against the hosting namespace's SA.
+        provisioner = service.registry.get(Platform.KUBERNETES)
+        cred = await provisioner.get_credential(session, grant)
+        assert cred.kind == "kubernetes_token"
+
+    # Revocation deletes the ClusterRoleBinding + the SA.
+    async with db.session() as session:
+        from sqlalchemy import update
+
+        await session.execute(
+            update(Grant)
+            .where(Grant.id == grant.id)
+            .values(expires_at=utcnow() - timedelta(seconds=1))
+        )
+    assert await service.expire_due_grants() == 1
+    deletes = [c for c in k8s_mock.calls if c[0] == "delete"]
+    assert ("delete", sa) in deletes
 
 
 async def test_role_matched_routing(db, service, k8s_mock):

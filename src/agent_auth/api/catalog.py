@@ -94,9 +94,10 @@ async def build_catalog(
             PlatformCatalog(
                 platform=Platform.KUBERNETES,
                 capability_hint="<role name>",
-                resource_hint="<namespace>",
+                resource_hint='<namespace>, or "*" for cluster-wide',
                 namespace_allowlist=k.namespace_allowlist,
                 roles=roles,
+                cluster_roles=k.cluster_role_allowlist or None,
             )
         )
 

@@ -256,6 +256,15 @@ def rotate_webhook_secret(agent_id: str):
     _run(lambda: _client().admin_rotate_webhook_secret(agent_id))
 
 
+@admin.command("set-webhook")
+def set_webhook(
+    agent_id: str,
+    url: str = typer.Option(None, "--url", help="http(s) endpoint; omit to clear"),
+):
+    """Set/replace an existing agent's webhook URL; prints the new secret ONCE."""
+    _run(lambda: _client().admin_set_webhook(agent_id, url))
+
+
 @admin.command("agents")
 def agents_list():
     _run(lambda: _client().admin_list_agents())

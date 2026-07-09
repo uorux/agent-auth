@@ -207,6 +207,14 @@ class BrokerClient:
             "POST", f"/admin/agents/{agent_id}/rotate-webhook-secret", admin=True
         )
 
+    def admin_set_webhook(self, agent_id: str, webhook_url: str | None):
+        return self._request(
+            "POST",
+            f"/admin/agents/{agent_id}/set-webhook",
+            admin=True,
+            json={"webhook_url": webhook_url},
+        )
+
     def admin_list_agents(self):
         return self._request("GET", "/admin/agents", admin=True)
 

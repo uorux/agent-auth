@@ -10,7 +10,14 @@ from .. import authority as authority_mod
 from ..core.service import HumanDecision, TransitionError
 from ..crypto import generate_api_key
 from ..models import AccessRequest, Agent, Rule
-from ..schemas import AgentCreate, AgentOut, RequestOut, RuleOut, parse_duration
+from ..schemas import (
+    AgentCreate,
+    AgentOut,
+    RequestOut,
+    RuleOut,
+    SetWebhookBody,
+    parse_duration,
+)
 from .deps import require_admin
 from .serialize import request_out
 
@@ -91,6 +98,23 @@ async def rotate_webhook_secret(agent_id: str, request: Request):
         if agent is None:
             raise HTTPException(404, "unknown agent")
         agent.webhook_secret = secrets.token_urlsafe(32)
+        return _agent_out(agent, webhook_secret=agent.webhook_secret)
+
+
+@router.post(
+    "/agents/{agent_id}/set-webhook",
+    response_model=AgentOut,
+    response_model_exclude_none=True,
+)
+async def set_webhook(agent_id: str, body: SetWebhookBody, request: Request):
+    """Set/replace an existing agent's webhook_url (null clears it). Setting a
+    URL mints a fresh webhook_secret, shown ONCE in the response."""
+    async with request.app.state.db.session() as session:
+        agent = await session.get(Agent, agent_id)
+        if agent is None:
+            raise HTTPException(404, "unknown agent")
+        agent.webhook_url = body.webhook_url
+        agent.webhook_secret = secrets.token_urlsafe(32) if body.webhook_url else None
         return _agent_out(agent, webhook_secret=agent.webhook_secret)
 
 

@@ -673,6 +673,46 @@ async def test_unsigned_pings_never_sent(api, db, settings):
     assert not route.called
 
 
+async def test_set_webhook_on_existing_agent(api, db):
+    """Agents registered without a webhook can be wired up later; setting the
+    URL mints a fresh show-once secret, clearing removes both."""
+    r = await _mk_service(api, "svc-late-hook")  # no webhook at create
+    assert "webhook_secret" not in r
+
+    out = (
+        await api.post(
+            f"/admin/agents/{r['id']}/set-webhook",
+            headers=ADMIN,
+            json={"webhook_url": "http://late.test/cb"},
+        )
+    ).json()
+    assert out["webhook_url"] == "http://late.test/cb"
+    assert out["webhook_secret"]
+
+    # invalid URL rejected
+    bad = await api.post(
+        f"/admin/agents/{r['id']}/set-webhook",
+        headers=ADMIN,
+        json={"webhook_url": "ftp://nope/x"},
+    )
+    assert bad.status_code == 422
+
+    # clearing removes URL and secret
+    cleared = (
+        await api.post(f"/admin/agents/{r['id']}/set-webhook", headers=ADMIN, json={})
+    ).json()
+    assert cleared.get("webhook_url") is None  # exclude_none drops cleared fields
+    from sqlalchemy import select
+
+    from agent_auth.models import Agent
+
+    async with db.session() as dbs:
+        row = (
+            await dbs.execute(select(Agent).where(Agent.name == "svc-late-hook"))
+        ).scalar_one()
+    assert row.webhook_url is None and row.webhook_secret is None
+
+
 async def test_rotate_webhook_secret(api, db):
     r = await _mk_service(api, "svc-rot", webhook_url="http://rot.test/cb")
     rotated = (

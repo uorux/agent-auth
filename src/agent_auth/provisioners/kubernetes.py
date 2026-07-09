@@ -24,6 +24,8 @@ _IN_CLUSTER_CA = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 _MIN_TOKEN_SECS = 600
 _MAX_TOKEN_SECS = 3600
 _DNS1123 = re.compile(r"[^a-z0-9-]+")
+# Request namespace that means "cluster-wide" instead of a single namespace.
+CLUSTER_SENTINEL = "*"
 
 
 def _sa_name(agent_name: str, grant_id: str) -> str:
@@ -32,17 +34,19 @@ def _sa_name(agent_name: str, grant_id: str) -> str:
 
 
 class KubernetesProvisioner:
-    """Namespace-scoped Kubernetes access via per-grant ServiceAccounts.
+    """Kubernetes access via per-grant ServiceAccounts.
 
-    provision  = create ServiceAccount + RoleBinding (to an allowlisted
-                 ClusterRole) in the target namespace.
+    provision  = create ServiceAccount + a binding to an allowlisted ClusterRole.
+                 Namespaced by default (RoleBinding in the target namespace);
+                 cluster-wide when the request namespace is "*" (ClusterRoleBinding,
+                 SA hosted in config.cluster_grant_namespace).
     credential = short-lived token from the TokenRequest API, capped at the
                  grant's remaining lifetime (>=10m, k8s minimum).
-    revoke     = delete the RoleBinding and ServiceAccount — every token minted
-                 for it dies immediately, so revocation is instant and total.
+    revoke     = delete the binding and ServiceAccount — every token minted for
+                 it dies immediately, so revocation is instant and total.
 
-    Convention: capability="namespace", resource=<namespace>,
-    scope={"role": <ClusterRole name>}.
+    Convention: capability=<role>, resource=<namespace> ("*" = cluster-wide).
+    Cluster-wide grants use a separate allowlist and are always human-reviewed.
     """
 
     platform = Platform.KUBERNETES
@@ -74,11 +78,32 @@ class KubernetesProvisioner:
         # The capability IS the role (view / edit / traefik-patcher / ...), so
         # policy rules can auto-approve narrow roles and surface broad ones.
         role = spec.capability.strip()
+        namespace = spec.resource.strip().lower()
+
+        # Sentinel: namespace "*" means cluster-wide (a ClusterRoleBinding across
+        # every namespace), gated by its own allowlist. scope={"cluster": True}
+        # folds into a distinct, always-sensitive authority (see authority.py).
+        if namespace == CLUSTER_SENTINEL:
+            if not self.config.cluster_role_allowlist:
+                raise SpecValidationError("cluster-wide grants are not enabled")
+            if role not in self.config.cluster_role_allowlist:
+                raise SpecValidationError(
+                    f"role {role!r} is not grantable cluster-wide; allowed: "
+                    f"{self.config.cluster_role_allowlist}"
+                )
+            spec.capability = role
+            spec.resource = CLUSTER_SENTINEL
+            spec.scope = {"cluster": True}
+            spec.notes.append(
+                f"binds role {role!r} CLUSTER-WIDE across all namespaces — very broad; "
+                "always human-reviewed"
+            )
+            return spec
+
         if role not in self.config.role_allowlist:
             raise SpecValidationError(
                 f"role {role!r} is not grantable; allowed: {self.config.role_allowlist}"
             )
-        namespace = spec.resource.strip().lower()
         if not re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?", namespace):
             raise SpecValidationError(f"invalid namespace name {namespace!r}")
         if not any(fnmatch(namespace, p) for p in self.config.namespace_allowlist):
@@ -97,40 +122,70 @@ class KubernetesProvisioner:
     async def provision(self, session: AsyncSession, grant: Grant) -> dict:
         agent = await session.get(Agent, grant.agent_id)
         assert agent is not None
-        namespace = grant.resource
         role = grant.capability
         name = _sa_name(agent.name, grant.id)
-        meta = {
-            "name": name,
-            "namespace": namespace,
-            "labels": {"app.kubernetes.io/managed-by": "agent-auth"},
-            "annotations": {
-                "agent-auth/agent": agent.name,
-                "agent-auth/grant-id": grant.id,
-                "agent-auth/expires-at": grant.expires_at.isoformat(),
-            },
+        cluster = grant.resource == CLUSTER_SENTINEL
+        # The SA always lives in a real namespace; cluster scope comes from
+        # binding it via a ClusterRoleBinding rather than a namespaced one.
+        sa_namespace = self.config.cluster_grant_namespace if cluster else grant.resource
+        annotations = {
+            "agent-auth/agent": agent.name,
+            "agent-auth/grant-id": grant.id,
+            "agent-auth/expires-at": grant.expires_at.isoformat(),
         }
+        labels = {"app.kubernetes.io/managed-by": "agent-auth"}
         await self._create(
-            f"/api/v1/namespaces/{namespace}/serviceaccounts",
-            {"apiVersion": "v1", "kind": "ServiceAccount", "metadata": meta},
-        )
-        await self._create(
-            f"/apis/rbac.authorization.k8s.io/v1/namespaces/{namespace}/rolebindings",
+            f"/api/v1/namespaces/{sa_namespace}/serviceaccounts",
             {
-                "apiVersion": "rbac.authorization.k8s.io/v1",
-                "kind": "RoleBinding",
-                "metadata": meta,
-                "roleRef": {
-                    "apiGroup": "rbac.authorization.k8s.io",
-                    "kind": "ClusterRole",
-                    "name": role,
+                "apiVersion": "v1",
+                "kind": "ServiceAccount",
+                "metadata": {
+                    "name": name,
+                    "namespace": sa_namespace,
+                    "labels": labels,
+                    "annotations": annotations,
                 },
-                "subjects": [
-                    {"kind": "ServiceAccount", "name": name, "namespace": namespace}
-                ],
             },
         )
-        return {"namespace": namespace, "service_account": name, "role": role}
+        subject = {"kind": "ServiceAccount", "name": name, "namespace": sa_namespace}
+        role_ref = {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": role,
+        }
+        if cluster:
+            await self._create(
+                "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings",
+                {
+                    "apiVersion": "rbac.authorization.k8s.io/v1",
+                    "kind": "ClusterRoleBinding",
+                    "metadata": {"name": name, "labels": labels, "annotations": annotations},
+                    "roleRef": role_ref,
+                    "subjects": [subject],
+                },
+            )
+        else:
+            await self._create(
+                f"/apis/rbac.authorization.k8s.io/v1/namespaces/{sa_namespace}/rolebindings",
+                {
+                    "apiVersion": "rbac.authorization.k8s.io/v1",
+                    "kind": "RoleBinding",
+                    "metadata": {
+                        "name": name,
+                        "namespace": sa_namespace,
+                        "labels": labels,
+                        "annotations": annotations,
+                    },
+                    "roleRef": role_ref,
+                    "subjects": [subject],
+                },
+            )
+        return {
+            "namespace": sa_namespace,
+            "service_account": name,
+            "role": role,
+            "cluster": cluster,
+        }
 
     async def revoke(self, session: AsyncSession, grant: Grant) -> None:
         state = grant.provisioner_state or {}
@@ -138,9 +193,14 @@ class KubernetesProvisioner:
         name = state.get("service_account")
         if not namespace or not name:
             return
-        await self._delete(
-            f"/apis/rbac.authorization.k8s.io/v1/namespaces/{namespace}/rolebindings/{name}"
-        )
+        if state.get("cluster"):
+            await self._delete(
+                f"/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{name}"
+            )
+        else:
+            await self._delete(
+                f"/apis/rbac.authorization.k8s.io/v1/namespaces/{namespace}/rolebindings/{name}"
+            )
         # Deleting the ServiceAccount invalidates every token minted for it.
         await self._delete(f"/api/v1/namespaces/{namespace}/serviceaccounts/{name}")
 
