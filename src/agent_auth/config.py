@@ -35,7 +35,9 @@ class Settings(BaseSettings):
     lldap_admin_user: str = ""
     lldap_admin_password: str = ""
 
-    # "in-cluster" for the pod's own credentials, or an API server URL
+    # "in-cluster" for the pod's own credentials, or an API server URL.
+    # Accepts a comma-separated list of endpoints (one per control-plane node)
+    # to fail over when an apiserver is down.
     kubernetes_api_url: str = ""
     kubernetes_token: str = ""
     kubernetes_token_file: str = ""

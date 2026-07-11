@@ -22,7 +22,7 @@ class BrokerClient:
         api_key: str | None = None,
         session_id: str | None = None,
     ):
-        self.base_url = (base_url or os.environ.get("AGENT_AUTH_URL", "http://localhost:8400")).rstrip("/")
+        self.base_url = (base_url or os.environ.get("AGENT_AUTH_URL", "https://agent-auth.rooty.dev")).rstrip("/")
         self.api_key = api_key or os.environ.get("AGENT_AUTH_API_KEY", "")
         self.admin_token = os.environ.get("AGENT_AUTH_ADMIN_TOKEN", "")
         self.session_id = session_id or os.environ.get("AGENT_AUTH_SESSION", "")

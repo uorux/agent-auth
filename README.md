@@ -72,7 +72,7 @@ interfaces, all wrapping the same HTTP API:
   ```json
   {"mcpServers": {"agent-auth": {
       "command": "agent-auth-mcp",
-      "env": {"AGENT_AUTH_URL": "https://auth.rooty.dev", "AGENT_AUTH_API_KEY": "aa_..."}}}}
+      "env": {"AGENT_AUTH_URL": "https://agent-auth.rooty.dev", "AGENT_AUTH_API_KEY": "aa_..."}}}}
   ```
   Tools: `list_capabilities`, `request_access`, `wait_for_decision`,
   `retry_request`, `escalate_request`, `get_credential`, `list_grants`,
@@ -261,7 +261,10 @@ broker beyond best effort); enforcement is refusal to re-mint.
 
 Set `KUBERNETES_API_URL=in-cluster` (or an API server URL plus
 `KUBERNETES_TOKEN`/`KUBERNETES_TOKEN_FILE` and `KUBERNETES_CA_FILE` for
-out-of-cluster). The broker needs RBAC to create/delete ServiceAccounts and
+out-of-cluster). For an HA control plane, give a comma-separated list of
+apiserver URLs (e.g. `https://cp1:6443,https://cp2:6443,https://cp3:6443`) and
+the broker fails over to the next when one is unreachable. The broker needs
+RBAC to create/delete ServiceAccounts and
 RoleBindings, create `serviceaccounts/token`, and `bind` the allowlisted
 ClusterRoles — see the `agent-auth-provisioner` ClusterRole in `deploy/k8s.yaml`
 (bind it per brokered namespace, or cluster-wide if your allowlist is broad). If

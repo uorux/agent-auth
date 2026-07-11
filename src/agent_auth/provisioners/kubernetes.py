@@ -66,14 +66,25 @@ class KubernetesProvisioner:
         if api_url == "in-cluster":
             host = os.environ.get("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
             port = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
-            api_url = f"https://{host}:{port}"
+            api_urls = [f"https://{host}:{port}"]
             token_file = token_file or _IN_CLUSTER_TOKEN
             ca_file = ca_file or _IN_CLUSTER_CA
-        self.api_url = api_url.rstrip("/")
+        else:
+            # Comma-separated list lets us name several control-plane endpoints
+            # (one per apiserver) and fail over when a node is down.
+            api_urls = [u.strip() for u in api_url.split(",") if u.strip()]
+        if not api_urls:
+            raise ValueError("kubernetes api_url is empty")
+        self.api_urls = [u.rstrip("/") for u in api_urls]
         self.config = config
         self._token = token
         self._token_file = token_file
         self._verify: bool | str = False if insecure_skip_verify else (ca_file or True)
+
+    @property
+    def api_url(self) -> str:
+        # The endpoint we currently prefer (last one that answered).
+        return self.api_urls[0]
 
     # ------------------------------------------------------------ interface
 
@@ -266,16 +277,34 @@ class KubernetesProvisioner:
         return self._token
 
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
-        try:
-            async with httpx.AsyncClient(timeout=20, verify=self._verify) as client:
-                return await client.request(
-                    method,
-                    f"{self.api_url}{path}",
-                    headers={"Authorization": f"Bearer {self._bearer()}"},
-                    **kwargs,
-                )
-        except httpx.HTTPError as exc:
-            raise ProvisionerError(f"kubernetes API unreachable: {exc}")
+        # Try each control-plane endpoint in turn so a single downed apiserver
+        # doesn't fail the request. A transport error (connect/timeout) means
+        # that node is unreachable — move on; an HTTP status response comes back
+        # normally and is the caller's to interpret. Reassign (not mutate)
+        # api_urls so concurrent requests iterating the old list are unaffected.
+        endpoints = self.api_urls
+        last_exc: httpx.HTTPError | None = None
+        headers = {"Authorization": f"Bearer {self._bearer()}"}
+        async with httpx.AsyncClient(timeout=20, verify=self._verify) as client:
+            for i, base in enumerate(endpoints):
+                try:
+                    resp = await client.request(
+                        method, f"{base}{path}", headers=headers, **kwargs
+                    )
+                except httpx.HTTPError as exc:
+                    last_exc = exc
+                    log.warning(
+                        "kubernetes API %s unreachable (%s)%s",
+                        base,
+                        exc,
+                        "; trying next endpoint" if i + 1 < len(endpoints) else "",
+                    )
+                    continue
+                if i:
+                    # Promote the endpoint that answered for subsequent calls.
+                    self.api_urls = endpoints[i:] + endpoints[:i]
+                return resp
+        raise ProvisionerError(f"kubernetes API unreachable: {last_exc}")
 
     async def _create(self, path: str, body: dict) -> None:
         resp = await self._request("POST", path, json=body)

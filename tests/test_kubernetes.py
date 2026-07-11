@@ -297,3 +297,49 @@ async def test_role_matched_routing(db, service, k8s_mock):
     # edit on the very same namespace → surfaced to a human
     edit_req = await service.create_request(a.id, k8s_request("personal-site", role="edit"))
     assert edit_req.status == RequestStatus.AWAITING_HUMAN
+
+
+async def test_multi_endpoint_failover():
+    """A downed apiserver is skipped; the next control-plane node answers, and
+    that endpoint is promoted so later calls start there."""
+    import httpx
+    import respx
+
+    from agent_auth.policy.schema import KubernetesPlatformConfig
+    from agent_auth.provisioners.kubernetes import KubernetesProvisioner
+
+    provisioner = KubernetesProvisioner(
+        api_url="https://cp1.test:6443, https://cp2.test:6443",
+        config=KubernetesPlatformConfig(),
+        token="t",
+    )
+    assert provisioner.api_urls == ["https://cp1.test:6443", "https://cp2.test:6443"]
+
+    with respx.mock(assert_all_called=False) as mock:
+        mock.route(host="cp1.test").mock(side_effect=httpx.ConnectError("down"))
+        mock.route(host="cp2.test").mock(return_value=httpx.Response(200, json={}))
+
+        resp = await provisioner._request("GET", "/healthz")
+        assert resp.status_code == 200
+        # cp2 answered → promoted to the front for the next call.
+        assert provisioner.api_urls[0] == "https://cp2.test:6443"
+
+
+async def test_all_endpoints_down_raises():
+    import httpx
+    import respx
+
+    from agent_auth.policy.schema import KubernetesPlatformConfig
+    from agent_auth.provisioners.kubernetes import KubernetesProvisioner
+
+    provisioner = KubernetesProvisioner(
+        api_url="https://cp1.test:6443,https://cp2.test:6443",
+        config=KubernetesPlatformConfig(),
+        token="t",
+    )
+    with respx.mock(assert_all_called=False) as mock:
+        mock.route(host__in=["cp1.test", "cp2.test"]).mock(
+            side_effect=httpx.ConnectError("down")
+        )
+        with pytest.raises(ProvisionerError, match="unreachable"):
+            await provisioner._request("GET", "/healthz")

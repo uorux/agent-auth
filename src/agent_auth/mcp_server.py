@@ -1,7 +1,7 @@
 """Stdio MCP server exposing the broker to agents.
 
 Configure per-agent:
-    AGENT_AUTH_URL=https://auth.example  AGENT_AUTH_API_KEY=aa_...  agent-auth-mcp
+    AGENT_AUTH_URL=https://agent-auth.rooty.dev  AGENT_AUTH_API_KEY=aa_...  agent-auth-mcp
 """
 
 from __future__ import annotations
