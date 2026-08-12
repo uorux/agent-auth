@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 
 import httpx
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.states import GrantStatus, Platform
@@ -24,6 +25,11 @@ mutation RemoveUserFromGroup($user: String!, $group: Int!) {
 }
 """
 _GROUPS_QUERY = "query { groups { id displayName } }"
+_USER_GROUPS_QUERY = """
+query UserGroups($user: String!) {
+  user(userId: $user) { groups { id } }
+}
+"""
 
 
 class LldapProvisioner:
@@ -68,7 +74,7 @@ class LldapProvisioner:
         agent = await session.get(Agent, grant.agent_id)
         assert agent is not None and agent.lldap_username
         group_id = await self._group_id(grant.resource)
-        await self._mutate(_ADD_MUTATION, agent.lldap_username, group_id)
+        await self._mutate(_ADD_MUTATION, agent.lldap_username, group_id, want_member=True)
         return {"lldap_user": agent.lldap_username, "group": grant.resource, "group_id": group_id}
 
     async def revoke(self, session: AsyncSession, grant: Grant) -> None:
@@ -77,7 +83,33 @@ class LldapProvisioner:
         group_id = state.get("group_id")
         if not user or group_id is None:
             return
-        await self._mutate(_REMOVE_MUTATION, user, group_id)
+        # Membership is one (user, group) fact shared by every grant on the
+        # group — only the LAST effective grant may remove it. expires_at is
+        # checked too (not just ACTIVE) so that when several grants lapse in
+        # the same scheduler tick, one of them still performs the removal.
+        keeper = (
+            await session.execute(
+                select(Grant.id)
+                .where(
+                    Grant.id != grant.id,
+                    Grant.agent_id == grant.agent_id,
+                    Grant.platform == Platform.HOMELAB,
+                    Grant.resource == grant.resource,
+                    Grant.status == GrantStatus.ACTIVE,
+                    Grant.expires_at > utcnow(),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if keeper is not None:
+            log.info(
+                "keeping %r in group %r: still backed by active grant %s",
+                user,
+                grant.resource,
+                keeper,
+            )
+            return
+        await self._mutate(_REMOVE_MUTATION, user, group_id, want_member=False)
 
     async def get_credential(self, session: AsyncSession, grant: Grant) -> CredentialOut:
         if grant.status != GrantStatus.ACTIVE or grant.expires_at <= utcnow():
@@ -120,10 +152,6 @@ class LldapProvisioner:
         data = resp.json()
         if data.get("errors"):
             msgs = "; ".join(e.get("message", "") for e in data["errors"])
-            # Idempotency: membership already in the desired state is success.
-            if "already" in msgs.lower() or "not a member" in msgs.lower():
-                log.info("LLDAP no-op: %s", msgs)
-                return data
             log.error("LLDAP GraphQL error: %s", msgs)
             raise ProvisionerError("LLDAP GraphQL error (see broker logs)")
         return data
@@ -138,5 +166,28 @@ class LldapProvisioner:
             raise ProvisionerError(f"LLDAP group {name!r} does not exist")
         return self._group_ids[name]
 
-    async def _mutate(self, mutation: str, user: str, group_id: int) -> None:
-        await self._graphql(mutation, {"user": user, "group": group_id})
+    async def _mutate(
+        self, mutation: str, user: str, group_id: int, *, want_member: bool
+    ) -> None:
+        try:
+            await self._graphql(mutation, {"user": user, "group": group_id})
+        except ProvisionerError as exc:
+            # LLDAP reports duplicate adds / absent removes as opaque database
+            # errors, so verify the end state instead of parsing messages:
+            # membership already where we wanted it is success.
+            try:
+                member = group_id in await self._user_group_ids(user)
+            except ProvisionerError:
+                raise exc from None
+            if member != want_member:
+                raise
+            log.info(
+                "LLDAP no-op: %r already %s group %s",
+                user,
+                "in" if want_member else "out of",
+                group_id,
+            )
+
+    async def _user_group_ids(self, user: str) -> set[int]:
+        data = await self._graphql(_USER_GROUPS_QUERY, {"user": user})
+        return {g["id"] for g in data["data"]["user"]["groups"]}

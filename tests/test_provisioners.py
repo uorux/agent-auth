@@ -149,18 +149,19 @@ async def test_github_installation_resolution(db, registry, agent):
     provisioner.installation_id = ""
 
 
+def homelab_request(resource="svc-sonarr", duration="30m"):
+    return RequestCreate(
+        platform=Platform.HOMELAB,
+        capability="group",
+        resource=resource,
+        justification="need sonarr api for the media pipeline task",
+        requested_duration=duration,
+    )
+
+
 async def test_lldap_grant_and_expiry_removes_group(db, service, lldap_mock):
     a, _ = await make_agent(db, "homelab-agent", lldap_username="svc-homelab-agent")
-    req = await service.create_request(
-        a.id,
-        RequestCreate(
-            platform=Platform.HOMELAB,
-            capability="group",
-            resource="svc-sonarr",
-            justification="need sonarr api for the media pipeline task",
-            requested_duration="30m",
-        ),
-    )
+    req = await service.create_request(a.id, homelab_request())
     assert req.status == RequestStatus.GRANTED  # auto-approve rule for svc-sonarr
     assert lldap_mock.mutations == [("add", {"user": "svc-homelab-agent", "group": 4})]
 
@@ -179,6 +180,112 @@ async def test_lldap_grant_and_expiry_removes_group(db, service, lldap_mock):
 
     await service.expire_due_grants()
     assert lldap_mock.mutations[-1] == ("remove", {"user": "svc-homelab-agent", "group": 4})
+
+
+async def test_lldap_provision_when_already_member(db, service, lldap_mock):
+    """Membership predating the grant (manual add, or an earlier broker life)
+    must provision cleanly — LLDAP rejects the duplicate add with an opaque
+    database error, and the provisioner verifies state instead of failing."""
+    a, _ = await make_agent(db, "homelab-agent", lldap_username="svc-homelab-agent")
+    lldap_mock.memberships.add(("svc-homelab-agent", 4))
+
+    req = await service.create_request(a.id, homelab_request())
+    assert req.status == RequestStatus.GRANTED
+    assert lldap_mock.mutations == []  # no state change; add resolved by verification
+
+
+async def test_lldap_overlapping_grants_share_membership(db, service, lldap_mock):
+    """Two active grants on one group: the first to end must not remove the
+    membership out from under the survivor; the last effective grant does."""
+    from sqlalchemy import select, update
+
+    a, _ = await make_agent(db, "homelab-agent", lldap_username="svc-homelab-agent")
+    req1 = await service.create_request(a.id, homelab_request(duration="30m"))
+    req2 = await service.create_request(a.id, homelab_request(duration="2h"))
+    assert req1.status == req2.status == RequestStatus.GRANTED
+    assert ("svc-homelab-agent", 4) in lldap_mock.memberships
+
+    async with db.session() as session:
+        g1 = (
+            await session.execute(select(Grant).where(Grant.request_id == req1.id))
+        ).scalar_one()
+        g2 = (
+            await session.execute(select(Grant).where(Grant.request_id == req2.id))
+        ).scalar_one()
+        await session.execute(
+            update(Grant)
+            .where(Grant.id == g1.id)
+            .values(expires_at=utcnow() - timedelta(seconds=1))
+        )
+
+    await service.expire_due_grants()
+    assert ("svc-homelab-agent", 4) in lldap_mock.memberships  # survivor keeps access
+    async with db.session() as session:
+        assert (await session.get(Grant, g1.id)).status == GrantStatus.EXPIRED
+        assert (await session.get(Grant, g2.id)).status == GrantStatus.ACTIVE
+        await session.execute(
+            update(Grant)
+            .where(Grant.id == g2.id)
+            .values(expires_at=utcnow() - timedelta(seconds=1))
+        )
+
+    await service.expire_due_grants()
+    assert ("svc-homelab-agent", 4) not in lldap_mock.memberships  # last one removes
+    async with db.session() as session:
+        assert (await session.get(Grant, g2.id)).status == GrantStatus.EXPIRED
+
+
+async def test_lldap_same_tick_expiry_removes_membership(db, service, lldap_mock):
+    """Both overlapping grants due in one tick: exactly one performs the
+    removal (the other resolves via verification) and both end EXPIRED."""
+    from sqlalchemy import select, update
+
+    a, _ = await make_agent(db, "homelab-agent", lldap_username="svc-homelab-agent")
+    req1 = await service.create_request(a.id, homelab_request())
+    req2 = await service.create_request(a.id, homelab_request())
+    assert req1.status == req2.status == RequestStatus.GRANTED
+
+    async with db.session() as session:
+        await session.execute(
+            update(Grant)
+            .where(Grant.agent_id == a.id)
+            .values(expires_at=utcnow() - timedelta(seconds=1))
+        )
+    assert await service.expire_due_grants() == 2
+    assert ("svc-homelab-agent", 4) not in lldap_mock.memberships
+    assert [m for m in lldap_mock.mutations if m[0] == "remove"] == [
+        ("remove", {"user": "svc-homelab-agent", "group": 4})
+    ]
+    async with db.session() as session:
+        grants = (
+            (await session.execute(select(Grant).where(Grant.agent_id == a.id))).scalars().all()
+        )
+        assert all(g.status == GrantStatus.EXPIRED for g in grants)
+
+
+async def test_lldap_revoke_when_membership_already_gone(db, service, lldap_mock):
+    """Out-of-band removal must not wedge the grant in ACTIVE retry-forever:
+    the failed remove is verified against actual state and treated as done."""
+    from sqlalchemy import select, update
+
+    a, _ = await make_agent(db, "homelab-agent", lldap_username="svc-homelab-agent")
+    req = await service.create_request(a.id, homelab_request())
+    assert req.status == RequestStatus.GRANTED
+
+    lldap_mock.memberships.clear()  # someone removed the user behind our back
+    async with db.session() as session:
+        grant = (
+            await session.execute(select(Grant).where(Grant.request_id == req.id))
+        ).scalar_one()
+        await session.execute(
+            update(Grant)
+            .where(Grant.id == grant.id)
+            .values(expires_at=utcnow() - timedelta(seconds=1))
+        )
+
+    assert await service.expire_due_grants() == 1
+    async with db.session() as session:
+        assert (await session.get(Grant, grant.id)).status == GrantStatus.EXPIRED
 
 
 async def test_lldap_validator(db, registry):

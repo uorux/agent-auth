@@ -248,11 +248,15 @@ def github_mock():
 
 @pytest.fixture
 def lldap_mock():
-    """Mocks LLDAP login + GraphQL; records mutations in .calls."""
+    """Mocks LLDAP login + GraphQL with real membership semantics: duplicate
+    adds and absent removes fail with the opaque database errors real LLDAP
+    emits, and the per-user groups query answers from .memberships. Only
+    mutations that changed state are recorded in .mutations."""
 
     class Recorder:
         def __init__(self):
             self.mutations: list[tuple[str, dict]] = []
+            self.memberships: set[tuple[str, int]] = set()  # (user, group_id)
 
     recorder = Recorder()
 
@@ -261,6 +265,14 @@ def lldap_mock():
 
         payload = _json.loads(request.content)
         query = payload.get("query", "")
+        variables = payload.get("variables", {})
+        if "UserGroups" in query:
+            groups = [
+                {"id": gid}
+                for (user, gid) in sorted(recorder.memberships)
+                if user == variables["user"]
+            ]
+            return httpx.Response(200, json={"data": {"user": {"groups": groups}}})
         if "groups {" in query or "groups{" in query.replace(" ", ""):
             return httpx.Response(
                 200,
@@ -275,7 +287,26 @@ def lldap_mock():
                 },
             )
         name = "add" if "addUserToGroup" in query else "remove"
-        recorder.mutations.append((name, payload.get("variables", {})))
+        key = (variables["user"], variables["group"])
+        if name == "add" and key in recorder.memberships:
+            return httpx.Response(
+                200,
+                json={
+                    "errors": [
+                        {
+                            "message": 'Internal server error: "UNIQUE constraint '
+                            'failed: memberships.user_id, memberships.group_id"'
+                        }
+                    ]
+                },
+            )
+        if name == "remove" and key not in recorder.memberships:
+            return httpx.Response(
+                200,
+                json={"errors": [{"message": 'Internal server error: "Entity not found"'}]},
+            )
+        (recorder.memberships.add if name == "add" else recorder.memberships.discard)(key)
+        recorder.mutations.append((name, variables))
         return httpx.Response(200, json={"data": {f"{name}UserToGroup": {"ok": True}}})
 
     with respx.mock(assert_all_called=False) as mock:
