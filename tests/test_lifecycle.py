@@ -122,6 +122,74 @@ async def test_human_edit_creates_rule_and_next_request_auto_approves(db, servic
     assert req2.approved_duration_secs == 900  # rule max_duration caps it
 
 
+class RecordingNotifier:
+    def __init__(self):
+        self.applied: list[tuple] = []
+
+    async def surface(self, request, agent):
+        pass
+
+    async def update_outcome(self, request, grant):
+        pass
+
+    async def update_grant_ended(self, request, grant):
+        pass
+
+    async def rule_applied(self, request, agent, rule, grant):
+        self.applied.append(
+            (request.status, rule.id if rule else None, grant.id if grant else None)
+        )
+
+
+async def test_rule_decisions_notify_channel(db, service):
+    notifier = RecordingNotifier()
+    service.set_notifier(notifier)
+
+    # YAML policy auto-approve is not a saved rule — nothing to announce
+    sender, _ = await make_agent(db, "auto-sender-log")
+    peer, _ = await make_agent(db, "peer-log")
+    req = await service.create_request(sender.id, a2a_request("peer-log"))
+    assert req.status == RequestStatus.GRANTED
+    assert notifier.applied == []
+
+    # a rule created via Edit announces the next auto-approval, with its grant
+    agent, _ = await make_agent(db, "plain-agent-log")
+    req = await service.create_request(agent.id, a2a_request("peer-log"))
+    await service.decide(
+        req.id,
+        HumanDecision(
+            approve=True,
+            decided_by="jrt",
+            duration_secs=900,
+            rule_action=RuleAction.AUTO_APPROVE,
+            rule_resource_pattern="*",
+        ),
+    )
+    req2 = await service.create_request(agent.id, a2a_request("peer-log"))
+    assert req2.status == RequestStatus.GRANTED
+    assert len(notifier.applied) == 1
+    status, rule_id, grant_id = notifier.applied[0]
+    assert status == RequestStatus.GRANTED
+    assert rule_id is not None and grant_id is not None
+
+    # auto-deny rules announce too (newest rule wins over the older approve-*)
+    other, _ = await make_agent(db, "other-peer")
+    async with db.session() as session:
+        session.add(
+            Rule(
+                action=RuleAction.AUTO_DENY,
+                agent_pattern="plain-agent-log",
+                platform=Platform.A2A,
+                resource_pattern="other-peer",
+            )
+        )
+    req3 = await service.create_request(agent.id, a2a_request("other-peer"))
+    assert req3.status == RequestStatus.DENIED
+    assert len(notifier.applied) == 2
+    assert notifier.applied[1][0] == RequestStatus.DENIED
+    assert notifier.applied[1][2] is None  # denials carry no grant
+
+
 async def test_llm_approve_flow(db, service, github_mock):
     agent, _ = await make_agent(db, "dev-agent")
     body = RequestCreate(

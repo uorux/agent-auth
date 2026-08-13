@@ -287,5 +287,5 @@ async def _apply_decision(
     if decision.approve and request.approved_duration_secs:
         extra = f" for {format_duration(request.approved_duration_secs)}"
     if decision.rule_action is not None:
-        extra += " (rule saved)"
+        extra += " (rule saved — manage with /rules)"
     await interaction.followup.send(f"{verb} `{request_id[:8]}`{extra}.", ephemeral=True)

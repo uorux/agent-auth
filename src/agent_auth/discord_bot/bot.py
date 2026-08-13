@@ -4,11 +4,13 @@ import logging
 
 import discord
 
+from discord import app_commands
+
 from ..config import Settings
 from ..core.service import RequestService
 from ..db import Database
-from ..models import AccessRequest, Agent, A2AThread, Grant
-from . import embeds, views
+from ..models import AccessRequest, Agent, A2AThread, Grant, Rule
+from . import embeds, rules, views
 
 log = logging.getLogger(__name__)
 
@@ -19,12 +21,35 @@ class AgentAuthBot(discord.Client):
         self.settings = settings
         self.db = db
         self.service = service
+        self.tree = app_commands.CommandTree(self)
+        self._commands_synced = False
+        rules.register(self)
 
     async def setup_hook(self) -> None:
         self.add_dynamic_items(views.ApproveButton, views.DenyButton, views.EditButton)
 
     async def on_ready(self) -> None:
         log.info("discord bot ready as %s", self.user)
+        await self._sync_commands()
+
+    async def _sync_commands(self) -> None:
+        """Sync slash commands to the approvals channel's guild — guild-scoped
+        sync is instant, global takes up to an hour to propagate."""
+        if self._commands_synced:
+            return  # on_ready refires on reconnect; sync once per process
+        try:
+            channel = self.get_channel(
+                self.settings.discord_channel_id
+            ) or await self.fetch_channel(self.settings.discord_channel_id)
+            guild = getattr(channel, "guild", None)
+            if guild is None:
+                await self.tree.sync()
+            else:
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+            self._commands_synced = True
+        except Exception:
+            log.exception("failed to sync slash commands")
 
 
 class DiscordNotifier:
@@ -77,6 +102,18 @@ class DiscordNotifier:
             )
         except Exception:
             log.exception("failed to update outcome for request %s", request.id)
+
+    async def rule_applied(
+        self, request: AccessRequest, agent: Agent, rule: Rule | None, grant: Grant | None
+    ) -> None:
+        try:
+            await self.bot.wait_until_ready()
+            channel = self.bot.get_channel(
+                self.settings.discord_channel_id
+            ) or await self.bot.fetch_channel(self.settings.discord_channel_id)
+            await channel.send(embed=embeds.build_rule_applied_embed(request, agent, rule, grant))
+        except Exception:
+            log.exception("failed to log rule application for request %s", request.id)
 
     async def update_grant_ended(self, request: AccessRequest, grant: Grant) -> None:
         try:

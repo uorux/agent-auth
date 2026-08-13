@@ -55,6 +55,9 @@ class Notifier(Protocol):
     async def surface(self, request: AccessRequest, agent: Agent) -> None: ...
     async def update_outcome(self, request: AccessRequest, grant: Grant | None) -> None: ...
     async def update_grant_ended(self, request: AccessRequest, grant: Grant) -> None: ...
+    async def rule_applied(
+        self, request: AccessRequest, agent: Agent, rule: Rule | None, grant: Grant | None
+    ) -> None: ...
 
 
 class NullNotifier:
@@ -65,6 +68,11 @@ class NullNotifier:
         pass
 
     async def update_grant_ended(self, request: AccessRequest, grant: Grant) -> None:
+        pass
+
+    async def rule_applied(
+        self, request: AccessRequest, agent: Agent, rule: Rule | None, grant: Grant | None
+    ) -> None:
         pass
 
 
@@ -192,12 +200,20 @@ class RequestService:
                     "sensitive capability — routed to human review",
                 ]
 
+            # Set after the sensitive gate: a matched rule that got surfaced
+            # anyway was not the decider, so it must not be announced as one.
+            applied_rule_id = (
+                decision.rule_id
+                if source == DecisionSource.RULE
+                and decision.action in (PolicyAction.APPROVE, PolicyAction.DENY)
+                else None
+            )
+
             if decision.action == PolicyAction.DENY:
                 request.status = RequestStatus.DENIED
                 request.decision_source = source
                 request.decision_reason = decision.reason
                 request.decided_at = utcnow()
-                return request
 
             if decision.action == PolicyAction.APPROVE:
                 duration = self.engine.cap_duration(
@@ -205,7 +221,6 @@ class RequestService:
                 )
                 await self._approve(session, request, source, "policy", decision.reason, duration)
                 await self._provision(session, request)
-                return request
 
             if decision.action == PolicyAction.LLM:
                 if self.llm is None:
@@ -228,6 +243,8 @@ class RequestService:
             self._spawn_llm_eval(request_id)
         elif status == RequestStatus.AWAITING_HUMAN:
             await self._surface(request_id)
+        elif applied_rule_id is not None:
+            await self._notify_rule_applied(request_id, applied_rule_id)
         return request
 
     async def _resolve_delegation(
@@ -709,6 +726,18 @@ class RequestService:
             await self.notifier.surface(request, agent)
         except Exception:
             log.exception("notifier.surface failed for %s", request_id)
+
+    async def _notify_rule_applied(self, request_id: str, rule_id: str) -> None:
+        async with self.db.session() as session:
+            request = await session.get(AccessRequest, request_id)
+            agent = await session.get(Agent, request.agent_id)
+            # None if the rule was deleted since matching; notifier copes.
+            rule = await session.get(Rule, rule_id)
+            grant = await self._grant_for(session, request_id)
+        try:
+            await self.notifier.rule_applied(request, agent, rule, grant)
+        except Exception:
+            log.exception("notifier.rule_applied failed for %s", request_id)
 
     async def _guarded_transition(
         self, session: AsyncSession, request: AccessRequest, new: RequestStatus

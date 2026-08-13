@@ -5,7 +5,7 @@ import json
 import discord
 
 from ..core.states import RequestStatus
-from ..models import AccessRequest, Agent, A2AThread, Grant
+from ..models import AccessRequest, Agent, A2AThread, Grant, Rule
 from ..schemas import format_duration
 
 COLOR_PENDING = 0xF1C40F  # yellow
@@ -87,6 +87,39 @@ def apply_outcome(
     if request.decision_reason:
         line += f"\n> {_trim(request.decision_reason, 500)}"
     embed.add_field(name="Outcome", value=line, inline=False)
+    return embed
+
+
+def build_rule_applied_embed(
+    request: AccessRequest, agent: Agent, rule: Rule | None, grant: Grant | None
+) -> discord.Embed:
+    """Single audit line for a request decided by a saved rule — no buttons,
+    the decision already happened."""
+    emoji = _PLATFORM_EMOJI.get(request.platform.value, "🔑")
+    if request.status == RequestStatus.DENIED:
+        verb, color = "auto-denied", COLOR_DENIED
+    elif request.status == RequestStatus.PROVISION_FAILED:
+        verb, color = "auto-approved (provisioning **failed**)", COLOR_DENIED
+    else:
+        verb, color = "auto-approved", COLOR_APPROVED
+    resource = request.approved_resource or request.resource
+    line = (
+        f"{emoji} Rule {verb}: **{agent.name}** → "
+        f"{request.platform.value}/{request.capability} on `{_trim(resource, 256)}`"
+    )
+    if grant is not None and grant.status.value == "active":
+        line += (
+            f" for **{format_duration(request.approved_duration_secs)}**"
+            f" — expires <t:{int(grant.expires_at.timestamp())}:R>"
+        )
+    rule_ref = f"rule `{rule.id[:8]}`" if rule is not None else "a since-deleted rule"
+    line += f"\nby {rule_ref}"
+    if rule is not None and rule.notes:
+        line += f" ({_trim(rule.notes, 200)})"
+    line += " — manage with /rules"
+    embed = discord.Embed(description=line, color=color)
+    embed.set_footer(text=f"request {request.id}")
+    embed.timestamp = request.decided_at
     return embed
 
 
