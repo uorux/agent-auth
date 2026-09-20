@@ -332,7 +332,12 @@ def agent_create(
         "CLI instances (Claude Code, Codex): initiate-only, never receivable",
     ),
     webhook_url: str = typer.Option(None, "--webhook-url"),
-    lldap_username: str = typer.Option(None, "--lldap-username"),
+    lldap_username: str = typer.Option(
+        None,
+        "--lldap-username",
+        help="Pre-existing LLDAP account to use as-is. Omit to let the broker "
+        "create a managed account (svc-<name>) at the agent's first homelab grant.",
+    ),
 ):
     """Register an agent; prints its API key (and webhook secret) ONCE."""
     if kind == "service" and not webhook_url:
@@ -350,6 +355,13 @@ def agent_create(
             name, description, webhook_url, lldap_username, kind=kind
         )
     )
+
+
+@admin.command("rotate-lldap-password")
+def rotate_lldap_password(agent_id: str):
+    """Rotate a broker-managed LLDAP account's password (delivered to the agent
+    on its next homelab credential fetch, never printed)."""
+    _run(lambda: _client().admin_rotate_lldap_password(agent_id))
 
 
 @admin.command("rotate-webhook-secret")

@@ -202,6 +202,11 @@ class BrokerClient:
             },
         )
 
+    def admin_rotate_lldap_password(self, agent_id: str):
+        return self._request(
+            "POST", f"/admin/agents/{agent_id}/rotate-lldap-password", admin=True
+        )
+
     def admin_rotate_webhook_secret(self, agent_id: str):
         return self._request(
             "POST", f"/admin/agents/{agent_id}/rotate-webhook-secret", admin=True

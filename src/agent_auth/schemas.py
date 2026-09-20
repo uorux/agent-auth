@@ -102,6 +102,8 @@ class GrantOut(BaseModel):
 class CredentialOut(BaseModel):
     kind: str
     value: str | None = None
+    # Login name when the credential is an account (kind="lldap_account").
+    username: str | None = None
     expires_at: datetime | None = None
     note: str | None = None
 
@@ -216,6 +218,8 @@ class AgentOut(BaseModel):
     kind: str = "service"
     webhook_url: str | None
     lldap_username: str | None
+    # True when the broker created the LLDAP account and holds its password.
+    lldap_managed: bool = False
     disabled: bool
     # A "service" agent that has never been seen and has no webhook is almost
     # always a mis-registered ephemeral one — it will be advertised as a peer

@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     lldap_url: str = ""
     lldap_admin_user: str = ""
     lldap_admin_password: str = ""
+    # Path to LLDAP's `lldap_set_password` tool (ships with the lldap package).
+    # Passwords are set through OPAQUE registration, which only that client
+    # implements; the broker shells out to it with its admin JWT.
+    lldap_set_password_bin: str = "lldap_set_password"
 
     # "in-cluster" for the pod's own credentials, or an API server URL.
     # Accepts a comma-separated list of endpoints (one per control-plane node)

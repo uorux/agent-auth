@@ -157,6 +157,8 @@ def registry(policy, secret_box, tmp_path) -> ProvisionerRegistry:
             admin_user="admin",
             admin_password="pw",
             config=policy.platforms.homelab,
+            secret_box=secret_box,
+            set_password_bin="/nonexistent/lldap_set_password",  # patched by lldap_mock
         )
     )
     registry.register(
@@ -254,18 +256,33 @@ def github_mock():
 
 
 @pytest.fixture
-def lldap_mock():
+def lldap_mock(monkeypatch):
     """Mocks LLDAP login + GraphQL with real membership semantics: duplicate
     adds and absent removes fail with the opaque database errors real LLDAP
     emits, and the per-user groups query answers from .memberships. Only
-    mutations that changed state are recorded in .mutations."""
+    mutations that changed state are recorded in .mutations. Managed accounts:
+    createUser lands in .users (duplicate → error, like LLDAP), the existence
+    query answers from it, and lldap_set_password is replaced by a recorder
+    (.passwords, user → latest password) unless .set_password_fails is set."""
 
     class Recorder:
         def __init__(self):
             self.mutations: list[tuple[str, dict]] = []
             self.memberships: set[tuple[str, int]] = set()  # (user, group_id)
+            self.users: dict[str, dict] = {}  # user id → CreateUserInput
+            self.passwords: dict[str, str] = {}
+            self.set_password_fails = False
 
     recorder = Recorder()
+
+    async def fake_set_password(self, username, password):
+        from agent_auth.provisioners.base import ProvisionerError
+
+        if recorder.set_password_fails:
+            raise ProvisionerError("lldap_set_password failed (see broker logs)")
+        recorder.passwords[username] = password
+
+    monkeypatch.setattr(LldapProvisioner, "_run_set_password", fake_set_password)
 
     def graphql_handler(request):
         import json as _json
@@ -273,6 +290,30 @@ def lldap_mock():
         payload = _json.loads(request.content)
         query = payload.get("query", "")
         variables = payload.get("variables", {})
+        if "UserExists" in query:
+            if variables["user"] in recorder.users:
+                return httpx.Response(200, json={"data": {"user": {"id": variables["user"]}}})
+            return httpx.Response(
+                200,
+                json={"data": None, "errors": [{"message": "Entity not found: `user`"}]},
+            )
+        if "createUser" in query:
+            user = variables["user"]
+            if user["id"] in recorder.users:
+                return httpx.Response(
+                    200,
+                    json={
+                        "errors": [
+                            {
+                                "message": 'Internal server error: "UNIQUE constraint '
+                                'failed: users.user_id"'
+                            }
+                        ]
+                    },
+                )
+            recorder.users[user["id"]] = user
+            recorder.mutations.append(("createUser", user))
+            return httpx.Response(200, json={"data": {"createUser": {"id": user["id"]}}})
         if "UserGroups" in query:
             groups = [
                 {"id": gid}

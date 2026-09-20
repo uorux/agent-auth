@@ -93,6 +93,14 @@ class HomelabPlatformConfig(BaseModel):
     allowed_groups: list[str] = Field(default_factory=list)
     # Optional human descriptions surfaced to agents via GET /v1/catalog.
     group_descriptions: dict[str, str] = Field(default_factory=dict)
+    # Managed accounts: an agent registered without --lldap-username gets an
+    # LLDAP service account created by the broker at its first homelab grant,
+    # named <managed_username_prefix><agent name> with a generated password.
+    # Requires ENCRYPTION_KEY (the password is stored Fernet-wrapped).
+    managed_accounts: bool = True
+    managed_username_prefix: str = Field(default="svc-", max_length=32)
+    # LLDAP requires an email per user; nothing is ever sent to it.
+    managed_email_domain: str = Field(default="agents.invalid", min_length=1)
 
 
 class KubernetesPlatformConfig(BaseModel):

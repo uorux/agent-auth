@@ -54,6 +54,11 @@ platforms:
   homelab:
     # Only these LLDAP groups are brokered. Authelia rules per group are
     # configured in Authelia itself, not here.
+    # Agents registered without --lldap-username get a broker-created account
+    # (svc-<agent name>, generated password) at their first homelab grant.
+    # managed_accounts: true
+    # managed_username_prefix: svc-
+    # managed_email_domain: agents.invalid   # LLDAP requires an email; never mailed
     allowed_groups:
       - svc-gitea
       - svc-sonarr

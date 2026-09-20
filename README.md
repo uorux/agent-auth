@@ -19,7 +19,7 @@ agent ──HTTP/MCP/CLI──▶ broker ──policy──▶ deny | approve | 
 | platform  | capability    | resource            | grant means                                                                 |
 |-----------|---------------|---------------------|-----------------------------------------------------------------------------|
 | `github`  | `repo`        | `owner/repo`        | broker mints GitHub App installation tokens (≤1h, re-minted on demand) scoped to the repo + `scope.permissions` |
-| `homelab` | `group`       | LLDAP group name    | agent's LLDAP service account is added to the group (Authelia rules are per-group); removed at expiry |
+| `homelab` | `group`       | LLDAP group name    | agent's LLDAP service account is added to the group (Authelia rules are per-group); removed at expiry. Agents without a hand-registered account get a broker-managed one (`svc-<name>`, generated password) at their first grant; the credential fetch returns username + password |
 | `kubernetes` | role name (`view`, `edit`, `traefik-patcher`, …) | namespace name (or `*` for cluster-wide) | per-grant ServiceAccount + RoleBinding to the named (Cluster)Role — a ClusterRoleBinding when the namespace is `*`; tokens minted on demand via TokenRequest; SA deleted at expiry → all tokens die instantly. The capability *is* the role, so policy rules auto-approve narrow roles and surface broad ones |
 | `a2a`     | `talk`        | target agent name   | authorizes OPENING conversation threads to that (service) agent — see [a2a threads](#a2a-threads); no credential is minted |
 | `google`  | `calendar.*`… | calendar id / label | stub: decisions recorded, no credential minted (501)                        |
@@ -278,12 +278,27 @@ broker beyond best effort); enforcement is refusal to re-mint.
 
 ## LLDAP setup
 
-- Create a service account per agent in LLDAP (e.g. `svc-homelab-agent`) and set
-  it as the agent's `lldap_username` at registration.
 - Create per-capability groups (`svc-gitea`, `svc-sonarr`, …) and point Authelia
   access rules at them; list them in `platforms.homelab.allowed_groups`.
-- The broker's LLDAP admin account needs group-management rights; its JWT is
-  cached and refreshed on 401 (~1 day expiry).
+- The broker's LLDAP account must be in `lldap_admin` — LLDAP has no finer role
+  that can change group membership (or create users). Its JWT is cached and
+  refreshed on 401 (~1 day expiry).
+- **Managed accounts (default):** register agents without `--lldap-username`.
+  At the agent's first homelab grant the broker creates
+  `<managed_username_prefix><agent name>` (default `svc-<name>`) via GraphQL
+  `createUser`, sets a random 43-char password with LLDAP's own
+  `lldap_set_password` tool (OPAQUE registration has no plain-JSON form), and
+  stores it Fernet-wrapped on the agent row. The agent reads username and
+  password from `GET /v1/grants/{id}/credential` (`kind: lldap_account`) —
+  same value on every fetch until `agent-auth admin rotate-lldap-password
+  <agent-id>`, which is never printed, only delivered through the next fetch.
+  Requires `ENCRYPTION_KEY` and `lldap_set_password` on the broker's PATH (or
+  `LLDAP_SET_PASSWORD_BIN`); the nixpkgs `lldap` package ships the binary.
+  Set `platforms.homelab.managed_accounts: false` to turn it off.
+- **Hand-registered accounts:** pass `--lldap-username` at registration to use
+  an account you created yourself. The broker only manages its group
+  membership, never learns its password, and the credential fetch stays the
+  informational `lldap_group` note.
 
 ## Kubernetes setup
 
@@ -409,6 +424,7 @@ GITHUB_INSTALLATION_ID=...
 LLDAP_URL=http://lldap:17170
 LLDAP_ADMIN_USER=agent-auth-svc
 LLDAP_ADMIN_PASSWORD=...
+#LLDAP_SET_PASSWORD_BIN=lldap_set_password   # for managed accounts; needs ENCRYPTION_KEY
 WEBHOOK_SIGNING_SECRET=...    # optional; fallback HMAC key for a2a webhook pings
 # a2a thread lifecycle knobs (defaults shown)
 #A2A_OPEN_TIMEOUT_SECS=600

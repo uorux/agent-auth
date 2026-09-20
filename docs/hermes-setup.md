@@ -233,8 +233,10 @@ conversation works because cron is the durable part.
 
 ```bash
 # broker
-agent-auth admin agent-create hermes-homelab-recusant --description "homelab executor" \
-    --lldap-username svc-hermes            # key printed ONCE
+agent-auth admin agent-create hermes-homelab-recusant --description "homelab executor"
+    # key printed ONCE; the LLDAP account (svc-hermes-homelab-recusant) is
+    # created by the broker at the first homelab grant — pass --lldap-username
+    # only to reuse an account you made by hand
 agent-auth admin set-webhook <id> --url ...   # method 2 only; secret printed ONCE
 
 # policy.yaml

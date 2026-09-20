@@ -5,7 +5,9 @@ from datetime import timedelta
 import pytest
 
 from agent_auth.core.states import GrantStatus, Platform, RequestStatus
-from agent_auth.models import Grant, utcnow
+from sqlalchemy import select
+
+from agent_auth.models import Agent, Grant, utcnow
 from agent_auth.provisioners.base import ProvisionerError, SpecValidationError, RequestSpec
 from agent_auth.schemas import RequestCreate
 
@@ -290,13 +292,6 @@ async def test_lldap_revoke_when_membership_already_gone(db, service, lldap_mock
 
 async def test_lldap_validator(db, registry):
     provisioner = registry.get(Platform.HOMELAB)
-    no_lldap, _ = await make_agent(db, "no-lldap-agent")
-    async with db.session() as session:
-        with pytest.raises(SpecValidationError, match="no LLDAP service account"):
-            await provisioner.validate_request(
-                session,
-                RequestSpec(agent=no_lldap, capability="group", resource="svc-gitea"),
-            )
     with_lldap, _ = await make_agent(db, "lldap-agent", lldap_username="svc-x")
     async with db.session() as session:
         with pytest.raises(SpecValidationError, match="not brokered"):
@@ -333,3 +328,133 @@ async def test_google_stub(db, service):
     )
     assert bad.status == RequestStatus.DENIED
     assert "unknown google capability" in bad.decision_reason
+
+
+# -- LLDAP managed accounts ---------------------------------------------------
+
+
+async def test_lldap_managed_account_created_on_first_grant(db, service, lldap_mock):
+    """An agent registered without an LLDAP account gets one at its first
+    homelab grant: svc-<name>, generated password, then the group add."""
+    a, _ = await make_agent(db, "hermes-homelab-box")
+    req = await service.create_request(a.id, homelab_request())
+    assert req.status == RequestStatus.GRANTED
+
+    assert lldap_mock.users["svc-hermes-homelab-box"]["email"].endswith("@agents.invalid")
+    assert [m[0] for m in lldap_mock.mutations] == ["createUser", "add"]
+    assert lldap_mock.mutations[1][1]["user"] == "svc-hermes-homelab-box"
+    password = lldap_mock.passwords["svc-hermes-homelab-box"]
+    assert len(password) >= 32
+
+    async with db.session() as session:
+        agent = await session.get(Agent, a.id)
+        assert agent.lldap_username == "svc-hermes-homelab-box"
+        assert agent.lldap_password_encrypted and password not in agent.lldap_password_encrypted
+        grant = (
+            await session.execute(select(Grant).where(Grant.request_id == req.id))
+        ).scalar_one()
+        cred = await service.registry.get(Platform.HOMELAB).get_credential(session, grant)
+    assert cred.kind == "lldap_account"
+    assert cred.username == "svc-hermes-homelab-box"
+    assert cred.value == password
+
+    # Second grant reuses the account: no second createUser, same password.
+    req2 = await service.create_request(a.id, homelab_request())
+    assert req2.status == RequestStatus.GRANTED
+    assert [m[0] for m in lldap_mock.mutations].count("createUser") == 1
+    assert lldap_mock.passwords["svc-hermes-homelab-box"] == password
+
+
+async def test_lldap_hand_registered_account_untouched(db, service, lldap_mock):
+    """--lldap-username accounts stay unmanaged: no createUser, no password,
+    and the credential is the informational note as before."""
+    a, _ = await make_agent(db, "homelab-agent", lldap_username="svc-homelab-agent")
+    req = await service.create_request(a.id, homelab_request())
+    assert req.status == RequestStatus.GRANTED
+    assert lldap_mock.users == {} and lldap_mock.passwords == {}
+    async with db.session() as session:
+        grant = (
+            await session.execute(select(Grant).where(Grant.request_id == req.id))
+        ).scalar_one()
+        cred = await service.registry.get(Platform.HOMELAB).get_credential(session, grant)
+        assert (await session.get(Agent, a.id)).lldap_password_encrypted is None
+    assert cred.kind == "lldap_group" and cred.value is None
+    assert cred.username == "svc-homelab-agent"
+
+
+async def test_lldap_managed_account_adopts_leftover_user(db, service, lldap_mock):
+    """Crash between createUser and the password step leaves an account with
+    the managed name and no row: the retry adopts it (sets a password) rather
+    than failing on the duplicate create."""
+    a, _ = await make_agent(db, "hermes-homelab-box")
+    lldap_mock.users["svc-hermes-homelab-box"] = {"id": "svc-hermes-homelab-box"}
+    req = await service.create_request(a.id, homelab_request())
+    assert req.status == RequestStatus.GRANTED
+    assert "createUser" not in [m[0] for m in lldap_mock.mutations]
+    assert "svc-hermes-homelab-box" in lldap_mock.passwords
+
+
+async def test_lldap_managed_account_password_failure_fails_provisioning(
+    db, service, lldap_mock
+):
+    """If lldap_set_password fails the grant fails closed and the agent row is
+    left untouched — nothing claims an account whose password nobody knows."""
+    a, _ = await make_agent(db, "hermes-homelab-box")
+    lldap_mock.set_password_fails = True
+    req = await service.create_request(a.id, homelab_request())
+    assert req.status == RequestStatus.PROVISION_FAILED
+    assert "lldap_set_password failed" in (req.decision_reason or "")
+    async with db.session() as session:
+        agent = await session.get(Agent, a.id)
+        assert agent.lldap_username is None and agent.lldap_password_encrypted is None
+    assert ("svc-hermes-homelab-box", 4) not in lldap_mock.memberships
+
+
+async def test_lldap_rotate_password(db, service, lldap_mock):
+    a, _ = await make_agent(db, "hermes-homelab-box")
+    req = await service.create_request(a.id, homelab_request())
+    assert req.status == RequestStatus.GRANTED
+    first = lldap_mock.passwords["svc-hermes-homelab-box"]
+    provisioner = service.registry.get(Platform.HOMELAB)
+
+    async with db.session() as session:
+        agent = await session.get(Agent, a.id)
+        await provisioner.rotate_password(session, agent)
+    second = lldap_mock.passwords["svc-hermes-homelab-box"]
+    assert second != first
+    async with db.session() as session:
+        grant = (
+            await session.execute(select(Grant).where(Grant.request_id == req.id))
+        ).scalar_one()
+        cred = await provisioner.get_credential(session, grant)
+    assert cred.value == second
+
+    # Hand-registered accounts cannot be rotated: the broker never owned them.
+    b, _ = await make_agent(db, "manual-agent", lldap_username="svc-manual")
+    async with db.session() as session:
+        with pytest.raises(ProvisionerError, match="no broker-managed"):
+            await provisioner.rotate_password(session, await session.get(Agent, b.id))
+
+
+async def test_lldap_validator_without_managed_accounts(db, registry, policy, secret_box):
+    """Managed accounts off (policy flag) or unavailable (no secret box) →
+    agents without an lldap_username are rejected up front, as before."""
+    from agent_auth.provisioners.lldap import LldapProvisioner
+
+    agent, _ = await make_agent(db, "no-lldap-agent")
+    off = policy.platforms.homelab.model_copy(update={"managed_accounts": False})
+    for prov in (
+        LldapProvisioner("http://x", "a", "p", config=off, secret_box=secret_box),
+        LldapProvisioner("http://x", "a", "p", config=policy.platforms.homelab),
+    ):
+        async with db.session() as session:
+            with pytest.raises(SpecValidationError, match="no LLDAP service account"):
+                await prov.validate_request(
+                    session, RequestSpec(agent=agent, capability="group", resource="svc-gitea")
+                )
+    # With both available, validation passes and creation is deferred to provision.
+    async with db.session() as session:
+        spec = await registry.get(Platform.HOMELAB).validate_request(
+            session, RequestSpec(agent=agent, capability="group", resource="svc-gitea")
+        )
+    assert spec.resource == "svc-gitea"

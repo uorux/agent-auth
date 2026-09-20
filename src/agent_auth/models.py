@@ -108,6 +108,11 @@ class Agent(Base, TimestampMixin):
     api_key_hash: Mapped[str] = mapped_column(String(64))
     webhook_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     lldap_username: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Set only for LLDAP accounts the broker created itself (managed accounts):
+    # the Fernet-wrapped password it generated, handed to the agent through
+    # homelab credential fetches. NULL = pre-existing account registered by
+    # hand; the broker never knows or touches its password.
+    lldap_password_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     disabled: Mapped[bool] = mapped_column(Boolean, default=False)
     # "service" = always-on (may host a webhook, can receive a2a threads);
     # "ephemeral" = short-lived CLI instances that operate through sessions

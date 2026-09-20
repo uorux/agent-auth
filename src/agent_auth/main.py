@@ -61,12 +61,19 @@ def build_registry(settings: Settings, policy) -> ProvisionerRegistry:
     else:
         log.info("github provisioner disabled (GITHUB_APP_ID not set)")
     if settings.lldap_url:
+        if not settings.encryption_key:
+            log.warning(
+                "ENCRYPTION_KEY unset: LLDAP managed accounts disabled; agents need "
+                "a hand-registered --lldap-username for homelab grants"
+            )
         registry.register(
             LldapProvisioner(
                 url=settings.lldap_url,
                 admin_user=settings.lldap_admin_user,
                 admin_password=settings.lldap_admin_password,
                 config=policy.platforms.homelab,
+                secret_box=SecretBox(settings.encryption_key) if settings.encryption_key else None,
+                set_password_bin=settings.lldap_set_password_bin,
             )
         )
     else:

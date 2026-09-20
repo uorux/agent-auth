@@ -191,7 +191,9 @@ def list_grants(status: str = "active") -> str:
 def get_credential(grant_id: str) -> str:
     """Fetch the live credential for an active grant. GitHub grants return a
     short-lived installation token — refetch rather than storing it; it stops
-    being issued the moment the grant expires."""
+    being issued the moment the grant expires. Homelab grants return your LLDAP
+    service account (kind lldap_account: username + password) when the broker
+    manages it; log in to Authelia-protected services with those."""
     return _safe(lambda: _client().credential(grant_id))
 
 

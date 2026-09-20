@@ -38,6 +38,7 @@ def _agent_out(
         kind=agent.kind,
         webhook_url=agent.webhook_url,
         lldap_username=agent.lldap_username,
+        lldap_managed=agent.lldap_password_encrypted is not None,
         disabled=agent.disabled,
         last_seen_at=agent.last_seen_at,
         api_key=api_key,
@@ -104,6 +105,33 @@ async def rotate_webhook_secret(agent_id: str, request: Request):
             raise HTTPException(404, "unknown agent")
         agent.webhook_secret = secrets.token_urlsafe(32)
         return _agent_out(agent, webhook_secret=agent.webhook_secret)
+
+
+@router.post(
+    "/agents/{agent_id}/rotate-lldap-password",
+    response_model=AgentOut,
+    response_model_exclude_none=True,
+)
+async def rotate_lldap_password(agent_id: str, request: Request):
+    """Replace the password of the agent's broker-managed LLDAP account. The
+    agent picks the new one up on its next homelab credential fetch; it is
+    never printed. Refused for hand-registered accounts."""
+    from ..provisioners.base import ProvisionerError, SpecValidationError
+
+    state = request.app.state
+    try:
+        provisioner = state.registry.get(Platform.HOMELAB)
+    except SpecValidationError as exc:
+        raise HTTPException(501, str(exc))
+    async with state.db.session() as session:
+        agent = await session.get(Agent, agent_id)
+        if agent is None:
+            raise HTTPException(404, "unknown agent")
+        try:
+            await provisioner.rotate_password(session, agent)
+        except ProvisionerError as exc:
+            raise HTTPException(409, str(exc))
+        return _agent_out(agent)
 
 
 @router.post(
