@@ -32,6 +32,18 @@ async def _mk_service(api, name: str, webhook_url: str | None = None) -> dict:
         body["webhook_url"] = webhook_url
     resp = await api.post("/admin/agents", headers=ADMIN, json=body)
     assert resp.status_code == 200
+    out = resp.json()
+    if not webhook_url:
+        # A resident daemon polls for inbound threads on startup; without that
+        # the broker rightly reports it as not listening and refuses opens.
+        await _listen(api, out["api_key"])
+    return out
+
+
+async def _listen(api, key: str):
+    """One non-blocking events poll — marks the agent as reading inbound threads."""
+    resp = await api.get("/v1/a2a/events", headers=auth(key), params={"wait": 0})
+    assert resp.status_code == 200
     return resp.json()
 
 
@@ -710,6 +722,194 @@ async def test_peer_liveness_fields(api, db, settings):
         )
     seen = (await api.get(f"/v1/a2a/threads/{tid}", headers=auth(s["api_key"]))).json()
     assert seen["peer_alive"] is False
+
+
+async def test_requesting_access_does_not_make_a_peer_reachable(api, db, settings):
+    """The bug this gate exists for: a Claude Code instance mis-registered as
+    `service` is busy calling the broker, so last_seen_at stays fresh — but
+    nothing on its side ever reads an inbound thread. Reachability keys on
+    last_listen_at precisely so that agent is not advertised as answerable."""
+    from sqlalchemy import select
+
+    from agent_auth.models import Agent
+
+    s = await _mk_service(api, "auto-reach")
+    resp = await api.post("/admin/agents", headers=ADMIN, json={"name": "svc-busy"})
+    busy = resp.json()
+    await _grant_a2a(api, s["api_key"], "svc-busy")
+
+    # svc-busy makes plenty of outbound calls; none of them is listening.
+    for _ in range(3):
+        assert (await api.get("/v1/me", headers=auth(busy["api_key"]))).status_code == 200
+    assert (await api.get("/v1/grants", headers=auth(busy["api_key"]))).status_code == 200
+
+    async with db.session() as dbs:
+        row = (
+            await dbs.execute(select(Agent).where(Agent.name == "svc-busy"))
+        ).scalar_one()
+        assert row.last_seen_at is not None  # looks alive...
+        assert row.last_listen_at is None  # ...but has never listened
+
+    check = (
+        await api.get("/v1/a2a/check", headers=auth(s["api_key"]), params={"peer": "svc-busy"})
+    ).json()
+    assert check["allowed"] is True  # permission is fine
+    assert check["peer"]["reachable"] is False  # nobody is home
+    assert check["peer"]["why"] == "idle"
+    assert "not listening" in check["reason"]
+
+    resp = await _open(api, s["api_key"], "svc-busy")
+    assert resp.status_code == 409
+    assert "not listening" in resp.json()["detail"]
+
+    # once it actually polls for inbound threads, the open goes through
+    await _listen(api, busy["api_key"])
+    assert (await _open(api, s["api_key"], "svc-busy")).status_code == 200
+
+
+async def test_listening_ages_out(api, db, settings):
+    s = await _mk_service(api, "auto-age")
+    r = await _mk_service(api, "svc-age")  # _mk_service polls on creation
+    await _grant_a2a(api, s["api_key"], "svc-age")
+    assert (await _open(api, s["api_key"], "svc-age")).status_code == 200
+
+    from sqlalchemy import select
+
+    from agent_auth.models import Agent
+
+    async with db.session() as dbs:
+        row = (await dbs.execute(select(Agent).where(Agent.name == "svc-age"))).scalar_one()
+        row.last_listen_at = utcnow() - timedelta(
+            seconds=settings.a2a_listen_threshold_secs + 60
+        )
+    assert (await _open(api, s["api_key"], "svc-age")).status_code == 409
+
+
+async def test_ephemeral_peer_is_403_not_409(api, db):
+    """Structural (never receivable) stays distinguishable from transient
+    (nobody listening right now), since only one of them is worth retrying."""
+    s = await _mk_service(api, "auto-kinds")
+    await _mk_ephemeral(api, "claude-cli")
+    # No grant needed: an unaddressable peer is refused before permission is
+    # even consulted (and the a2a validator already denies such grants).
+    resp = await _open(api, s["api_key"], "claude-cli")
+    assert resp.status_code == 403
+    assert "initiate-only" in resp.json()["detail"]
+
+    check = (
+        await api.get("/v1/a2a/check", headers=auth(s["api_key"]), params={"peer": "claude-cli"})
+    ).json()
+    assert check["peer"]["addressable"] is False
+    assert check["peer"]["why"] == "ephemeral"
+
+
+async def test_set_kind_demotes_and_orphans_inbound_threads(api, db):
+    """Retrofit path for agents registered before kind was chosen carefully:
+    flip to ephemeral in place, keeping the API key, and don't leave anyone
+    waiting on a thread the agent can no longer answer."""
+    from sqlalchemy import select
+
+    from agent_auth.models import Agent
+
+    s = await _mk_service(api, "auto-demote")
+    mis = await _mk_service(api, "claude-mis", webhook_url="https://example.test/h")
+    await _grant_a2a(api, s["api_key"], "claude-mis")
+    tid = (await _open(api, s["api_key"], "claude-mis")).json()["thread_id"]
+
+    resp = await api.post(
+        f"/admin/agents/{mis['id']}/set-kind", headers=ADMIN, json={"kind": "ephemeral"}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["kind"] == "ephemeral"
+    # webhook is meaningless on an agent that cannot receive threads
+    # (response_model_exclude_none omits it rather than sending null)
+    assert "webhook_url" not in resp.json()
+
+    # the API key still works — no rotation needed
+    assert (await api.get("/v1/me", headers=auth(mis["api_key"]))).status_code == 200
+    assert (await api.get("/v1/me", headers=auth(mis["api_key"]))).json()["kind"] == "ephemeral"
+
+    # the initiator is told peer_gone rather than waiting out the idle sweep
+    seen = (await api.get(f"/v1/a2a/threads/{tid}", headers=auth(s["api_key"]))).json()
+    assert seen["state"] == "closed"
+    assert seen["close_reason"] == "peer_gone"
+
+    # and it drops out of the catalog / refuses new opens
+    cat = (await api.get("/v1/catalog", headers=auth(s["api_key"]))).json()
+    a2a = {p["platform"]: p for p in cat["platforms"]}["a2a"]
+    assert "claude-mis" not in {p["name"] for p in a2a["peers"]}
+    resp = await _open(api, s["api_key"], "claude-mis")
+    assert resp.status_code == 403
+    assert "initiate-only" in resp.json()["detail"]
+
+    async with db.session() as dbs:
+        row = (
+            await dbs.execute(select(Agent).where(Agent.name == "claude-mis"))
+        ).scalar_one()
+        assert row.webhook_secret is None
+
+
+async def test_set_kind_promotes_back_to_service(api):
+    e = await _mk_ephemeral(api, "was-cli")
+    resp = await api.post(
+        f"/admin/agents/{e['id']}/set-kind", headers=ADMIN, json={"kind": "service"}
+    )
+    assert resp.status_code == 200
+    s = await _mk_service(api, "auto-promote")
+    await _grant_a2a(api, s["api_key"], "was-cli")
+    # promoted, but still not listening → transient 409, not structural 403
+    assert (await _open(api, s["api_key"], "was-cli")).status_code == 409
+    await _listen(api, e["api_key"])
+    assert (await _open(api, s["api_key"], "was-cli")).status_code == 200
+
+
+async def test_set_kind_demotion_revokes_grants_targeting_it(api, db):
+    """A talk grant to an agent that can no longer receive threads must not
+    outlive the reclassification — otherwise it dangles in list_grants and
+    sits ready to ride the moment someone flips the kind back."""
+    s = await _mk_service(api, "auto-revoker")
+    mis = await _mk_service(api, "claude-mis2", webhook_url="https://example.test/h")
+    gid = await _grant_a2a(api, s["api_key"], "claude-mis2")
+
+    resp = await api.post(
+        f"/admin/agents/{mis['id']}/set-kind", headers=ADMIN, json={"kind": "ephemeral"}
+    )
+    assert resp.status_code == 200
+
+    grants = (await api.get("/v1/grants", headers=auth(s["api_key"]))).json()
+    assert gid not in {g["id"] for g in grants}
+    from agent_auth.models import Grant
+
+    async with db.session() as dbs:
+        row = await dbs.get(Grant, gid)
+        assert row.status == "revoked"
+        assert "ephemeral" in row.revoke_reason
+
+    # the open is refused structurally, and even a re-promotion does not
+    # resurrect the old grant: the initiator has to ask again
+    assert (await _open(api, s["api_key"], "claude-mis2")).status_code == 403
+    resp = await api.post(
+        f"/admin/agents/{mis['id']}/set-kind", headers=ADMIN, json={"kind": "service"}
+    )
+    assert resp.status_code == 200
+    await _listen(api, mis["api_key"])
+    resp = await _open(api, s["api_key"], "claude-mis2")
+    assert resp.status_code == 403
+    assert "no active a2a grant" in resp.json()["detail"]
+
+
+async def test_set_kind_rejects_garbage(api):
+    a = await _mk_service(api, "svc-kindcheck")
+    assert (
+        await api.post(
+            f"/admin/agents/{a['id']}/set-kind", headers=ADMIN, json={"kind": "persistent"}
+        )
+    ).status_code == 422
+    assert (
+        await api.post(
+            "/admin/agents/nope/set-kind", headers=ADMIN, json={"kind": "ephemeral"}
+        )
+    ).status_code == 404
 
 
 # ---------------------------------------------------------------- webhooks

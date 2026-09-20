@@ -76,7 +76,17 @@ def list_capabilities() -> str:
     routing (auto-approve, human review, llm review). Use it to (1) ask for
     something valid instead of guessing and getting denied, and (2) pick the
     narrowest capability that does the job — an auto-approved narrow role beats
-    a broad one that a human has to review."""
+    a broad one that a human has to review.
+
+    For a2a, `peers` lists agents that can RECEIVE threads, each with live
+    reachability, listed reachable-first. `reachable: true` means someone is
+    actually reading inbound threads right now — why="webhook" (a daemon that
+    can be woken on demand) or why="polling" (one currently working its event
+    loop). `reachable: false` (why="idle") means the agent is registered but
+    nothing is reading its threads; opening one is refused, so pick another
+    peer or come back later. Ephemeral agents (Claude Code / Codex instances)
+    never appear here at all: they initiate conversations, they don't receive
+    them, so there is no way to page one."""
     return _safe(lambda: _client().catalog())
 
 
@@ -217,9 +227,17 @@ def check_a2a(
     topic: str | None = None,
     session_key: str | None = None,
 ) -> str:
-    """Check agent-to-agent permission. direction="out": may I open a thread to
-    peer? direction="in": may peer open one to me? Grants belong to your agent
-    identity (one identity per folder/workspace), so all your sessions share them."""
+    """Check agent-to-agent permission AND whether the peer is actually there.
+    direction="out": may I open a thread to peer? direction="in": may peer open
+    one to me? Grants belong to your agent identity (one identity per
+    folder/workspace), so all your sessions share them.
+
+    Two separate answers: `allowed` is permission, `peer.reachable` is whether
+    anyone is reading that agent's inbound threads. Both must be true for an
+    outbound open to reach anyone — if you are allowed but the peer is not
+    reachable, do NOT open a thread and wait on it; nobody will read it.
+    Ephemeral peers report addressable=false: they can only reach out to you,
+    never the reverse."""
     return _safe(lambda: _client_for(session_key).a2a_check(peer, direction, topic))
 
 
@@ -231,13 +249,22 @@ def a2a_open(
     session_key: str | None = None,
 ) -> str:
     """Open a conversation thread with another agent; payload is your first
-    message (it rides the open). Requires an active a2a grant — on 403, call
-    request_access(platform="a2a", capability="talk", resource=<to>) first;
-    grants belong to your agent identity, so other sessions in this folder may
-    already have one (check list_grants). If your grant is topic-scoped you
-    MUST pass a topic matching its glob.
+    message (it rides the open). Requires an active a2a grant — on 403 about a
+    grant, call request_access(platform="a2a", capability="talk",
+    resource=<to>) first; grants belong to your agent identity, so other
+    sessions in this folder may already have one (check list_grants). If your
+    grant is topic-scoped you MUST pass a topic matching its glob.
 
-    The thread starts pending_open until the peer accepts or replies. Next:
+    Two refusals are about the PEER, not your permission, and retrying
+    unchanged will not help:
+    - 403 "ephemeral (initiate-only)": that agent can never receive threads.
+      There is no way to page it; it contacts you.
+    - 409 "not listening": a service agent that is registered but has nothing
+      reading its inbound threads. Try again once list_capabilities or
+      check_a2a reports it reachable.
+
+    The thread starts pending_open until the peer accepts or replies; the
+    response carries peer_alive, so check it before settling in to wait. Next:
     a2a_poll(thread_id) to wait for the reply."""
     return _safe(lambda: _client_for(session_key).a2a_open(to, payload, topic))
 
@@ -310,7 +337,12 @@ def a2a_events(
     """Service agents: run this in a loop. Sessionless (dispatcher) calls see
     pending opens awaiting accept/reject plus all unbound-thread activity;
     calls with a session_key see only that conversation's threads. Returns
-    a cursor to pass back next call. Use a2a_poll on a thread to read messages."""
+    a cursor to pass back next call. Use a2a_poll on a thread to read messages.
+
+    Calling this is also what advertises you as reachable: peers are told you
+    are listening only while you keep this loop running (or you host a
+    webhook). Stop polling and other agents are told not to open threads to
+    you — which is the intent, since you would not read them."""
     return _safe(lambda: _client_for(session_key).a2a_events(wait, after))
 
 

@@ -56,6 +56,10 @@ class Settings(BaseSettings):
     a2a_thread_idle_timeout_secs: int = 3600  # open + no activity → closed(idle_timeout)
     session_idle_timeout_secs: int = 900  # idle session → closed; its threads → peer_gone
     liveness_threshold_secs: int = 120  # peer_alive = last seen within this
+    # reachable = listened for inbound threads within this. Deliberately
+    # coarser than liveness: a dispatcher polling on a cycle (rather than
+    # holding a long-poll open) is still reachable between polls.
+    a2a_listen_threshold_secs: int = 300
 
     log_level: str = "INFO"
 

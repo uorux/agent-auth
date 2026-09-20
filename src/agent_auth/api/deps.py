@@ -72,6 +72,30 @@ async def get_agent(caller: Caller = Depends(get_caller)) -> Agent:
     return caller.agent
 
 
+async def mark_listening(state, caller: Caller) -> None:
+    """Record that this agent is reading its inbound threads.
+
+    Only the a2a inbound surfaces call this. Keeping it separate from
+    last_seen_at is the whole point: an agent that merely requests access is
+    not thereby reachable (see agent_auth.core.a2a.reachability).
+    """
+    now = utcnow()
+    async with state.db.session() as db:
+        agent = await db.get(Agent, caller.agent.id)
+        if agent is not None and _touch_listen(agent, now):
+            caller.agent.last_listen_at = now
+
+
+def _touch_listen(agent: Agent, now) -> bool:
+    if (
+        agent.last_listen_at is None
+        or now - agent.last_listen_at > _LAST_SEEN_WRITE_INTERVAL
+    ):
+        agent.last_listen_at = now
+        return True
+    return False
+
+
 async def require_admin(
     request: Request,
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer),

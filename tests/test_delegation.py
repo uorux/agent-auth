@@ -28,6 +28,16 @@ async def _mk_agent(api, name: str, kind: str = "service", **extra) -> dict:
     resp = await api.post(
         "/admin/agents", headers=ADMIN, json={"name": name, "kind": kind, **extra}
     )
+    if kind == "service" and not extra.get("webhook_url") and resp.status_code == 200:
+        # Resident daemons poll for inbound threads; otherwise the broker
+        # reports them as not listening and refuses opens to them.
+        assert (
+            await api.get(
+                "/v1/a2a/events",
+                headers={"Authorization": f"Bearer {resp.json()['api_key']}"},
+                params={"wait": 0},
+            )
+        ).status_code == 200
     assert resp.status_code == 200, resp.text
     return resp.json()
 

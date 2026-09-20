@@ -8,18 +8,19 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import select
 
-from ..core.a2a import A2AError
+from ..core.a2a import A2AError, reachability, unreachable_detail
 from ..models import Agent, AgentSession, utcnow
 from ..provisioners import a2a as a2a_mod
 from ..schemas import (
     A2ACheckOut,
+    PeerEntry,
     SessionCreate,
     SessionOut,
     ThreadCloseBody,
     ThreadMessageBody,
     ThreadOpenBody,
 )
-from .deps import Caller, get_caller
+from .deps import Caller, get_caller, mark_listening
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1")
@@ -121,9 +122,13 @@ async def get_thread(thread_id: str, request: Request, caller: Caller = Depends(
 async def accept_thread(thread_id: str, request: Request, caller: Caller = Depends(get_caller)):
     state = _a2a(request)
     try:
-        return await state.a2a.accept(caller.agent, caller.session, thread_id)
+        out = await state.a2a.accept(caller.agent, caller.session, thread_id)
     except A2AError as exc:
         _raise(exc)
+    # Accepting proves inbound threads are being processed, even by a responder
+    # that found this one some other way than the events poll.
+    await mark_listening(state, caller)
+    return out
 
 
 @router.post("/a2a/threads/{thread_id}/reject")
@@ -197,6 +202,7 @@ async def read_messages(
             return first
         await state.a2a_events.wait(wake_key, timeout=min(remaining, 2.0))
         await _touch_caller(state, caller)
+        await mark_listening(state, caller)
         try:
             result = await state.a2a.read_messages(
                 caller.agent, caller.session, thread_id, after_seq
@@ -216,11 +222,17 @@ async def a2a_events(
     after: datetime | None = None,
 ):
     """Pending opens awaiting my accept + my threads with activity since the
-    cursor. Service agents run this in a loop; wait>0 long-polls."""
+    cursor. Service agents run this in a loop; wait>0 long-polls.
+
+    Calling this is what marks the agent reachable: it is the surface on which
+    inbound threads are noticed, so a service agent that never polls it (and
+    hosts no webhook) is correctly advertised as not listening.
+    """
     state = _a2a(request)
     if after is not None and after.tzinfo is None:
         after = after.replace(tzinfo=timezone.utc)
     wait = min(max(wait, 0), _MAX_WAIT_SECS)
+    await mark_listening(state, caller)
     deadline = asyncio.get_event_loop().time() + wait
     wake_key = state.a2a.wake_key(caller.agent, caller.session)
     while True:
@@ -246,7 +258,12 @@ async def a2a_check(
     topic: str | None = None,
 ):
     """direction=out: may I open a thread to peer? direction=in: may peer open
-    one to me? Grants are agent-level; sessions of one agent share them."""
+    one to me? Grants are agent-level; sessions of one agent share them.
+
+    Answers two independent questions: `allowed` (permission) and `peer`
+    (reachability). Both must hold for an outbound open to go anywhere — a
+    permitted peer that nothing is listening on is a 409 at open time.
+    """
     state = _a2a(request)
     async with state.db.session() as db:
         peer_agent = (
@@ -254,6 +271,10 @@ async def a2a_check(
         ).scalar_one_or_none()
         if peer_agent is None:
             return A2ACheckOut(allowed=False, reason=f"unknown agent {peer!r}")
+        peer_out = PeerEntry(
+            description=peer_agent.description or None,
+            **reachability(peer_agent, state.settings.a2a_listen_threshold_secs),
+        )
         # topic=None here means "any grant at all" — informational only; the
         # open/send paths enforce strict topic matching.
         if direction == "out":
@@ -267,8 +288,17 @@ async def a2a_check(
         else:
             raise HTTPException(400, "direction must be 'out' or 'in'")
     if grant is None:
-        return A2ACheckOut(allowed=False, reason="no active a2a grant")
-    return A2ACheckOut(allowed=True, grant_id=grant.id, expires_at=grant.expires_at)
+        return A2ACheckOut(allowed=False, reason="no active a2a grant", peer=peer_out)
+    reason = None
+    if direction == "out" and not peer_out.reachable:
+        reason = unreachable_detail(peer_out.model_dump())
+    return A2ACheckOut(
+        allowed=True,
+        grant_id=grant.id,
+        expires_at=grant.expires_at,
+        reason=reason,
+        peer=peer_out,
+    )
 
 
 async def _touch_caller(state, caller: Caller) -> None:

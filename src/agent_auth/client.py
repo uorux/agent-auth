@@ -215,6 +215,14 @@ class BrokerClient:
             json={"webhook_url": webhook_url},
         )
 
+    def admin_set_kind(self, agent_id: str, kind: str):
+        return self._request(
+            "POST",
+            f"/admin/agents/{agent_id}/set-kind",
+            admin=True,
+            json={"kind": kind},
+        )
+
     def admin_list_agents(self):
         return self._request("GET", "/admin/agents", admin=True)
 

@@ -113,7 +113,14 @@ class Agent(Base, TimestampMixin):
     # "ephemeral" = short-lived CLI instances that operate through sessions
     # and can only initiate threads, never receive them.
     kind: Mapped[str] = mapped_column(String(16), default="service")
+    # Any authenticated call refreshes last_seen_at, so it measures OUTBOUND
+    # activity: an agent busy requesting access looks alive even when nothing
+    # reads its inbound threads. last_listen_at is touched only by the a2a
+    # inbound surfaces (events poll, accept), so it is the one that answers
+    # "would a thread opened to this agent actually be read?" — see
+    # agent_auth.core.a2a.reachability.
     last_seen_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    last_listen_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     # Per-agent HMAC key for webhook pings; must stay recoverable for signing,
     # so it is stored plaintext (same trust level as the env-var global secret;
     # Fernet-wrapping under encryption_key is a possible future hardening).

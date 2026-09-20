@@ -325,11 +325,26 @@ def gen_key():
 def agent_create(
     name: str,
     description: str = typer.Option("", "--description"),
-    kind: str = typer.Option("service", "--kind", help="service | ephemeral (CLI agents)"),
+    kind: str = typer.Option(
+        "service",
+        "--kind",
+        help="service = always-on, can RECEIVE a2a threads | ephemeral = "
+        "CLI instances (Claude Code, Codex): initiate-only, never receivable",
+    ),
     webhook_url: str = typer.Option(None, "--webhook-url"),
     lldap_username: str = typer.Option(None, "--lldap-username"),
 ):
     """Register an agent; prints its API key (and webhook secret) ONCE."""
+    if kind == "service" and not webhook_url:
+        # The common misregistration: a CLI agent left on the default kind gets
+        # advertised as a peer and other agents open threads it never reads.
+        typer.secho(
+            f"warning: {name} is 'service' with no --webhook-url, so it will be "
+            "advertised as an a2a peer and must keep an a2a_events long-poll "
+            "running to be reachable. For a CLI agent, pass --kind ephemeral.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
     _run(
         lambda: _client().admin_create_agent(
             name, description, webhook_url, lldap_username, kind=kind
@@ -352,8 +367,29 @@ def set_webhook(
     _run(lambda: _client().admin_set_webhook(agent_id, url))
 
 
+@admin.command("set-kind")
+def set_kind(
+    agent_id: str,
+    kind: str = typer.Argument(..., help="service | ephemeral"),
+):
+    """Reclassify an existing agent WITHOUT rotating its API key.
+
+    The fix for a CLI agent registered on the default kind: as 'service' it is
+    advertised as an a2a peer and other agents open threads it never reads.
+    Demoting to 'ephemeral' also clears its webhook, closes any thread it
+    was responding to (initiators get peer_gone), and revokes every active
+    a2a grant that targets it — nobody may hold a talk grant to an agent that
+    cannot receive threads.
+    """
+    if kind not in ("service", "ephemeral"):
+        raise typer.BadParameter("kind must be 'service' or 'ephemeral'")
+    _run(lambda: _client().admin_set_kind(agent_id, kind))
+
+
 @admin.command("agents")
 def agents_list():
+    """List agents with kind and last-seen — a 'service' agent that has never
+    been seen, or that never polls, is usually a mis-registered CLI agent."""
     _run(lambda: _client().admin_list_agents())
 
 

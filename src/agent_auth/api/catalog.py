@@ -3,12 +3,13 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..core.a2a import reachability
 from ..core.states import Platform
 from ..models import AccessRequest, Agent
 from ..policy.engine import PolicyEngine
 from ..policy.schema import PolicyAction
 from ..provisioners.base import ProvisionerRegistry
-from ..schemas import CatalogEntry, CatalogOut, PlatformCatalog
+from ..schemas import CatalogEntry, CatalogOut, PeerEntry, PlatformCatalog
 
 _DISPOSITION = {
     PolicyAction.APPROVE: "auto-approve",
@@ -45,6 +46,7 @@ async def build_catalog(
     agent: Agent,
     registry: ProvisionerRegistry,
     engine: PolicyEngine,
+    listen_threshold_secs: int = 300,
 ) -> CatalogOut:
     """What this agent may request, per enabled platform — the menu it needs
     before composing a request."""
@@ -102,22 +104,31 @@ async def build_catalog(
         )
 
     if registry.enabled(Platform.A2A):
-        # Only service agents can receive threads (ephemeral = initiate-only).
-        peers = (
+        # Only service agents can receive threads (ephemeral = initiate-only),
+        # and each carries its live reachability so callers can skip peers that
+        # nothing is currently listening on.
+        rows = (
             await session.execute(
-                select(Agent.name).where(
+                select(Agent).where(
                     Agent.id != agent.id,
                     Agent.disabled.is_(False),
                     Agent.kind == "service",
                 )
             )
         ).scalars().all()
+        peers = [
+            PeerEntry(
+                description=peer.description or None,
+                **reachability(peer, listen_threshold_secs),
+            )
+            for peer in rows
+        ]
         platforms.append(
             PlatformCatalog(
                 platform=Platform.A2A,
                 capability_hint="talk",
                 resource_hint="<agent name>",
-                peers=sorted(peers),
+                peers=sorted(peers, key=lambda p: (not p.reachable, p.name)),
             )
         )
 

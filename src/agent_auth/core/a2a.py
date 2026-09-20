@@ -32,6 +32,76 @@ log = logging.getLogger(__name__)
 _WEBHOOK_TIMEOUT_SECS = 5
 
 
+# ------------------------------------------------------------- reachability
+
+# Why a peer can (or can't) be reached right now. `addressable` is structural
+# (may a thread be opened to it at all); `reachable` is momentary (is anyone
+# actually going to read it).
+REACH_WEBHOOK = "webhook"  # resident, can be woken even while not polling
+REACH_POLLING = "polling"  # seen within the liveness threshold
+REACH_IDLE = "idle"  # service agent, but nothing has been listening
+REACH_EPHEMERAL = "ephemeral"  # initiate-only: cannot receive threads at all
+
+
+def reachability(agent: Agent, listen_threshold_secs: int, now: datetime | None = None) -> dict:
+    """Whether opening a thread to `agent` has any chance of being answered.
+
+    Deliberately keyed on last_listen_at, NOT last_seen_at. last_seen_at is
+    refreshed by any authenticated call, so an agent that only ever *requests*
+    access — the classic Claude Code instance mis-registered as `service` —
+    reads as alive while nothing on its side ever reads an inbound thread.
+    Listening is the property that matters here, and only the a2a inbound
+    surfaces record it.
+
+    One definition shared by the catalog, /a2a/check, and open_thread, so the
+    menu, the pre-flight check, and the actual open can never disagree. Kept a
+    pure function (no DB, no service instance) precisely so every surface can
+    call it.
+    """
+    now = now or utcnow()
+    last_listen = agent.last_listen_at
+    out = {
+        "name": agent.name,
+        "kind": agent.kind,
+        "last_seen_at": agent.last_seen_at.isoformat() if agent.last_seen_at else None,
+        "last_listen_at": last_listen.isoformat() if last_listen else None,
+        "has_webhook": bool(agent.webhook_url),
+    }
+    if agent.kind != "service":
+        # Ephemeral agents drive their own conversations; nothing is listening
+        # on their identity for inbound threads.
+        return {**out, "addressable": False, "reachable": False, "why": REACH_EPHEMERAL}
+    if agent.webhook_url:
+        # Wake-able on demand: it need not be holding a poll open to be reached.
+        return {**out, "addressable": True, "reachable": True, "why": REACH_WEBHOOK}
+    listening = last_listen is not None and now - last_listen <= timedelta(
+        seconds=listen_threshold_secs
+    )
+    return {
+        "addressable": True,
+        "reachable": listening,
+        "why": REACH_POLLING if listening else REACH_IDLE,
+        **out,
+    }
+
+
+def unreachable_detail(reach: dict) -> str:
+    """Caller-facing explanation for a peer that won't answer."""
+    name = reach["name"]
+    if reach["why"] == REACH_EPHEMERAL:
+        return (
+            f"{name!r} is ephemeral (initiate-only) and cannot receive threads; "
+            "it reaches out to you, not the other way around"
+        )
+    listened = reach.get("last_listen_at") or "never"
+    return (
+        f"{name!r} is registered but not listening for threads (no webhook, last "
+        f"polled {listened}); opening one now would sit unanswered until it times "
+        "out. Pick a peer that reports reachable, or retry once it is back — "
+        "list_capabilities and the a2a check both report peer reachability."
+    )
+
+
 class A2AError(Exception):
     def __init__(self, status: int, detail: str):
         self.status = status
@@ -69,9 +139,10 @@ class A2AThreadService:
             ).scalar_one_or_none()
             if responder is None or responder.disabled:
                 raise A2AError(404, f"unknown agent {to!r}")
-            if responder.kind != "service":
+            reach = reachability(responder, self.settings.a2a_listen_threshold_secs)
+            if not reach["addressable"]:
                 # Initiate-only: ephemeral agents can never receive threads.
-                raise A2AError(403, f"{to!r} is ephemeral and cannot receive threads")
+                raise A2AError(403, unreachable_detail(reach))
             self._require_session(agent, agent_session)
             grant = await check_grant(db, agent.id, responder.name, topic)
             if grant is None:
@@ -82,6 +153,12 @@ class A2AThreadService:
                     f'"talk", "resource": "{to}"}} — topic-scoped grants also require '
                     "an explicit matching topic on the open",
                 )
+            if not reach["reachable"]:
+                # Permission first, liveness last: an unanswerable open is a
+                # transient 409, not a permission problem. Fail fast rather than
+                # parking the caller in a2a_poll until the pending_open sweep
+                # gives up minutes later.
+                raise A2AError(409, unreachable_detail(reach))
             thread_id = new_uuid()
             now = utcnow()
             thread = A2AThread(
@@ -418,6 +495,35 @@ class A2AThreadService:
 
     def wake_key(self, agent: Agent, agent_session: AgentSession | None) -> str:
         return agent_session.id if agent_session is not None else agent.id
+
+    async def orphan_inbound_threads(self, agent_id: str) -> int:
+        """Close every non-closed thread this agent is the RESPONDER on.
+
+        Used when an agent stops being able to receive threads (reclassified
+        ephemeral). Initiators get peer_gone — the same signal they would get
+        if the peer's session had died — instead of waiting out the idle sweep
+        on a conversation that can never be answered.
+        """
+        notices: list[str] = []
+        pings: list = []
+        async with self.db.session() as db:
+            threads = list(
+                (
+                    await db.execute(
+                        select(A2AThread).where(
+                            A2AThread.responder_agent_id == agent_id,
+                            A2AThread.state != THREAD_CLOSED,
+                        )
+                    )
+                ).scalars()
+            )
+            for thread in threads:
+                await self._close(db, thread, CLOSE_PEER_GONE, closed_by=None)
+                notices.extend(self._closure_notices(thread))
+                pings.extend(await self._closure_pings(db, thread))
+        self._fire_notices(notices)
+        await self._deliver_pings(pings)
+        return len(threads)
 
     # --------------------------------------------------------------- sweep
 

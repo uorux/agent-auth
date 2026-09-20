@@ -50,7 +50,13 @@ async def catalog(request: Request, agent: Agent = Depends(get_agent)):
     (with descriptions and typical routing) available to it."""
     state = request.app.state
     async with state.db.session() as session:
-        return await build_catalog(session, agent, state.registry, state.service.engine)
+        return await build_catalog(
+            session,
+            agent,
+            state.registry,
+            state.service.engine,
+            state.settings.a2a_listen_threshold_secs,
+        )
 
 
 @router.post("/requests", response_model=RequestOut)

@@ -145,11 +145,36 @@ class ThreadCloseBody(BaseModel):
     reason: str | None = Field(default=None, max_length=2000)
 
 
+class PeerEntry(BaseModel):
+    """An a2a peer plus whether talking to it right now is worth doing.
+
+    `addressable` is structural (service agents can receive threads; ephemeral
+    ones are initiate-only); `reachable` is momentary — a service agent with no
+    webhook that nothing has polled from is addressable but idle.
+    """
+
+    name: str
+    description: str | None = None
+    kind: str = "service"
+    addressable: bool = True
+    reachable: bool = True
+    # "webhook" | "polling" | "idle" | "ephemeral"
+    why: str = "webhook"
+    last_seen_at: str | None = None
+    # When this agent last read its inbound threads — the signal `reachable`
+    # keys on. last_seen_at (any authenticated call) is NOT the same thing.
+    last_listen_at: str | None = None
+    has_webhook: bool = False
+
+
 class A2ACheckOut(BaseModel):
     allowed: bool
     grant_id: str | None = None
     expires_at: datetime | None = None
     reason: str | None = None
+    # Liveness of the peer, independent of permission: `allowed` can be true
+    # while `peer` says nobody is listening.
+    peer: PeerEntry | None = None
 
 
 def validate_webhook_url(v: str | None) -> str | None:
@@ -173,6 +198,10 @@ class AgentCreate(BaseModel):
     _valid_webhook = field_validator("webhook_url")(validate_webhook_url)
 
 
+class SetKindBody(BaseModel):
+    kind: str = Field(pattern=r"^(service|ephemeral)$")
+
+
 class SetWebhookBody(BaseModel):
     # null clears the webhook (and its secret)
     webhook_url: str | None = Field(default=None, max_length=512)
@@ -188,6 +217,10 @@ class AgentOut(BaseModel):
     webhook_url: str | None
     lldap_username: str | None
     disabled: bool
+    # A "service" agent that has never been seen and has no webhook is almost
+    # always a mis-registered ephemeral one — it will be advertised as a peer
+    # and never answer.
+    last_seen_at: datetime | None = None
     api_key: str | None = None  # only set on create/rotate
     webhook_secret: str | None = None  # only set on create/rotate-webhook-secret
 
@@ -213,7 +246,7 @@ class PlatformCatalog(BaseModel):
     permission_ceiling: dict[str, str] | None = None
     groups: list[CatalogEntry] | None = None
     capabilities: list[str] | None = None
-    peers: list[str] | None = None
+    peers: list[PeerEntry] | None = None
 
 
 class CatalogOut(BaseModel):

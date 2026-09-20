@@ -157,6 +157,24 @@ async def test_a2a_thread_smoke(api, db, service):
 
     check = (await api.get("/v1/a2a/check", headers=auth(skey), params={"peer": "auto-r"})).json()
     assert check["allowed"] is True
+    # ...but nothing is listening on auto-r yet: permitted is not reachable, and
+    # the open fails fast rather than parking the sender on a dead thread.
+    assert check["peer"]["reachable"] is False
+    assert check["peer"]["why"] == "idle"
+    assert (
+        await api.post(
+            "/v1/a2a/threads", headers=auth(skey), json={"to": "auto-r", "payload": {"x": 1}}
+        )
+    ).status_code == 409
+
+    # the recipient starts its dispatcher loop → now reachable
+    assert (
+        await api.get("/v1/a2a/events", headers=auth(rkey), params={"wait": 0})
+    ).status_code == 200
+    check = (await api.get("/v1/a2a/check", headers=auth(skey), params={"peer": "auto-r"})).json()
+    assert check["peer"]["reachable"] is True
+    assert check["peer"]["why"] == "polling"
+
     check_in = (
         await api.get(
             "/v1/a2a/check", headers=auth(rkey), params={"peer": "auto-s", "direction": "in"}
@@ -305,9 +323,31 @@ async def test_catalog(api, db):
     await make_agent(db, "cat-cli", kind="ephemeral")
     resp = await api.get("/v1/catalog", headers=auth(a["api_key"]))
     a2a = {p["platform"]: p for p in resp.json()["platforms"]}["a2a"]
-    assert "cat-peer" in a2a["peers"]
-    assert "cat-agent" not in a2a["peers"]
-    assert "cat-cli" not in a2a["peers"]
+    peers = {p["name"]: p for p in a2a["peers"]}
+    assert "cat-peer" in peers
+    assert "cat-agent" not in peers
+    assert "cat-cli" not in peers
+    # cat-peer is registered but has never polled and has no webhook, so it is
+    # advertised as present-but-not-listening rather than as a live peer.
+    assert peers["cat-peer"]["addressable"] is True
+    assert peers["cat-peer"]["reachable"] is False
+    assert peers["cat-peer"]["why"] == "idle"
+
+    # a webhook makes an agent wake-able without polling
+    await api.post(
+        "/admin/agents",
+        headers=ADMIN,
+        json={"name": "cat-hooked", "webhook_url": "https://example.test/hook"},
+    )
+    a2a = {
+        p["platform"]: p
+        for p in (await api.get("/v1/catalog", headers=auth(a["api_key"]))).json()["platforms"]
+    }["a2a"]
+    peers = {p["name"]: p for p in a2a["peers"]}
+    assert peers["cat-hooked"]["reachable"] is True
+    assert peers["cat-hooked"]["why"] == "webhook"
+    # reachable peers sort ahead of idle ones
+    assert a2a["peers"][0]["name"] == "cat-hooked"
 
     # unused fields are omitted (response_model_exclude_none)
     assert "roles" not in gh

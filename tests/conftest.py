@@ -13,7 +13,7 @@ from agent_auth.core.events import KeyedEvents
 from agent_auth.core.service import RequestService
 from agent_auth.crypto import SecretBox, generate_api_key, generate_fernet_key
 from agent_auth.db import Database
-from agent_auth.models import Agent, Base
+from agent_auth.models import Agent, Base, utcnow
 from agent_auth.policy.engine import PolicyEngine
 from agent_auth.policy.llm import LLMEvaluator
 from agent_auth.policy.schema import PolicyFile
@@ -214,8 +214,15 @@ async def api(app):
 
 
 async def make_agent(db, name: str, **kwargs) -> tuple[Agent, str]:
-    """Create an agent directly in the DB; returns (agent, api_key)."""
+    """Create an agent directly in the DB; returns (agent, api_key).
+
+    Service agents default to just-seen: a test service agent stands in for a
+    running daemon, and a2a opens are refused against one nothing is listening
+    on. Pass last_seen_at explicitly to model an agent that has gone away.
+    """
     full_key, key_id, key_hash = generate_api_key()
+    if kwargs.get("kind", "service") == "service":
+        kwargs.setdefault("last_seen_at", utcnow())
     agent = Agent(name=name, key_id=key_id, api_key_hash=key_hash, **kwargs)
     async with db.session() as session:
         session.add(agent)

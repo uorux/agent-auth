@@ -125,8 +125,29 @@ open (carries first message) ─▶ pending_open ─▶ accept / first reply ─
   close automatically: `open_timeout`, `idle_timeout`, `peer_gone` (the peer's
   session ended), `grant_revoked` (the backing grant was revoked/expired —
   either side's next send also detects this immediately).
+- **Reachability** (is anyone home?) is a *separate* signal from liveness, and
+  the one consulted before a thread exists. Last-seen tracks **outbound**
+  activity, so an agent busy requesting access looks alive even when nothing on
+  its side ever reads an inbound thread — the classic Claude-Code-registered-as-
+  `service` case. Reachability instead keys on `last_listen_at`, touched only by
+  the inbound surfaces (`GET /v1/a2a/events`, thread accept), within
+  `a2a_listen_threshold_secs` (300s; deliberately coarser than the 120s liveness
+  threshold, so a dispatcher between polls still counts). A peer is reachable if
+  it hosts a `webhook_url` (wake-able on demand, `why: "webhook"`) or has
+  listened recently (`why: "polling"`); otherwise `why: "idle"`.
+  `GET /v1/catalog` returns a2a `peers` as objects carrying these fields
+  (reachable ones sorted first), `GET /v1/a2a/check` returns the same under
+  `peer` alongside the permission answer, and an open to an idle peer fails fast
+  with **409** instead of parking the caller until the `open_timeout` sweep.
+  Structural vs transient stays distinguishable: unaddressable (ephemeral) is
+  **403** and never worth retrying; 409 is.
 - **Agent kinds & sessions**: `service` agents (Hermes) are always-on and may
-  register a `webhook_url`; `ephemeral` agents (Claude Code, Codex) must mint a
+  register a `webhook_url` — but note that registering as `service` does not by
+  itself make an agent answerable: it must either host a webhook or keep the
+  `/v1/a2a/events` loop running, or peers are told it is idle. `agent-create`
+  warns when a `service` agent is registered with neither, since that shape is
+  almost always an `ephemeral` agent left on the default `--kind`;
+  `ephemeral` agents (Claude Code, Codex) must mint a
   session (`POST /v1/sessions {label}`, then send `X-Agent-Session`; the MCP
   server does this automatically, labeled by cwd) and are **initiate-only** —
   nobody can open a thread to them. Multiple concurrent instances work: threads
@@ -163,6 +184,13 @@ open (carries first message) ─▶ pending_open ─▶ accept / first reply ─
   (shown ONCE at admin create / `rotate-webhook-secret` — record it then; it
   is not readable afterwards, by design), falling back to the global
   `WEBHOOK_SIGNING_SECRET`. Delivery is best-effort; the poll is authoritative.
+
+Retrofit: `agent-auth admin agents` lists `kind` and `last_seen_at`; anything
+`service` that has never been seen (or is never seen polling) is the shape to
+reclassify with `admin set-kind`. Demotion to `ephemeral` drops the webhook,
+closes the threads it was responding to (`peer_gone`), and revokes every a2a
+grant that targets it — a talk grant to a peer that cannot receive threads is
+never allowed to exist, whether requested after or before the reclassification.
 
 CLI: `agent-auth session create|close`, `agent-auth a2a
 open|send|poll|threads|show|accept|reject|close|events|check`, plus
