@@ -451,26 +451,57 @@ class Runtime(Protocol):
     async def stop(self, h: RunHandle) -> None
 ```
 
-- **Claude**
+Prototyped on 2026-10-03 against Claude Code 2.1.280 and codex-cli 0.156.1.
+"Verified" below means observed, not assumed.
+
+- **Claude** (verified with a live model)
   - Invocation: `claude -p --input-format stream-json --output-format
-    stream-json --verbose`.
-  - `--session-id <uuid>` on the first start and `--resume <uuid>` after,
-    with the id chosen by sandboxd.
-  - Also: `--mcp-config <generated>` and `--append-system-prompt <sandbox
-    context>`. Permissions are bypassed because the unit is the sandbox.
-  - **[verify]** the flags against the pinned version. Consider
-    `claude-agent-sdk`.
-- **Codex**
-  - `codex app-server` (JSON-RPC over stdio): thread start/resume by id, a
-    turn per inbound message, streamed items, turn completion, interrupt.
+    stream-json --verbose`, with `--session-id <uuid>` on the first start and
+    `--resume <uuid>` after.
+    - The chosen id is honored.
+    - Resume **continues the same id and the same transcript file**
+      (`~/.claude/projects/<cwd-slug>/<id>.jsonl`); it does not fork.
+  - **One process takes many turns**: writing another `{"type":"user",…}`
+    line to stdin after a `result` starts the next turn. Lines written while
+    a turn is running queue up, and **each becomes its own turn with its own
+    `result`**. That is exactly the `send()` contract.
+  - Also passed: `--mcp-config <generated>` and `--append-system-prompt
+    <sandbox context>`. Permissions are bypassed because the unit is the
+    sandbox.
+  - **Spawn with a clean environment.** A `CLAUDE_CODE_CHILD_SESSION` marker
+    inherited from a parent Claude process turns transcript saving off in
+    the TUI ("restart with CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1"). That
+    would silently break resume. sandboxd builds each unit's env from
+    scratch, never from its own.
+- **Codex** (protocol verified; live turns not run, since there is no auth in
+  the test environment)
+  - `codex app-server` JSON-RPC methods exist as assumed: `initialize`,
+    `thread/start`, `thread/resume`, `turn/start`, `turn/interrupt`, plus
+    `turn/steer` (`{threadId, expectedTurnId, input}`) and
+    `thread/inject_items`. Notifications include `turn/started`,
+    `turn/completed`, `item/started|completed`, `item/agentMessage/delta`,
+    `thread/status/changed` and `error`.
+  - `--listen unix://PATH` serves **WebSocket over a unix socket**. Long
+    paths are symlinked to `/tmp/codex-daemon-<uid>/<hash>`, which lands in
+    the project's persistent `/tmp`. **Several clients can share one
+    server**: after `thread/resume`, every client receives every event of the
+    thread, and any client can start turns. sandboxd uses this for
+    interactive attach (§6.8).
+  - The session file (`$CODEX_HOME/sessions/YYYY/MM/DD/rollout-…-<id>.jsonl`)
+    is written at the **first turn**. `thread/resume` of a thread with no
+    turns fails with "no rollout found", so sandboxd never parks a codex
+    conversation before its first turn.
+  - `CODEX_HOME` must not be under `/tmp`, because codex refuses to create
+    its helper binaries there. Project homes live in
+    `/var/lib/sandbox/homes/<p>`, which is fine.
   - Codex's own sandbox is set to full access inside the unit.
-  - **[verify]** method names against the pinned version.
 - **Mid-turn delivery**
-  - Baseline: delivery at the turn boundary.
-  - Claude can also get a doorbell: a `PostToolUse` hook that checks sandboxd
-    and injects "new a2a message on thread X". **[verify]** that hooks can
-    output that.
-  - Codex gets boundary delivery plus the `a2a_poll` tool.
+  - Codex: `turn/steer` adds input to the running turn, which is better than
+    the turn-boundary baseline assumed in revision 2. sandboxd steers a2a
+    messages into an active turn, and starts a turn otherwise.
+  - Claude: queued stdin lines become the next turns (verified). A
+    `PostToolUse` hook doorbell for true mid-turn injection is still
+    **[verify]**.
 - **Auth: subscription OAuth** **[decided]**
   - Claude: one long-lived `claude setup-token` token, root-only on the VM
     disk, injected as `CLAUDE_CODE_OAUTH_TOKEN`.
@@ -573,25 +604,34 @@ over tailnet SSH, which `jrt` already has):
     tmux session (`tmux -L conv-<id>`), so a dropped SSH connection detaches
     instead of killing the process.
   - `avm attach` = `ssh -t … tmux attach`.
-  - Claude: `claude --resume <session-id>` (interactive) with the same
-    `--mcp-config` and appended system prompt.
-  - Codex: `codex resume <thread-id>`.
-  - **[verify]** that sessions written by `claude -p` stream-json and by
-    `codex app-server` resume cleanly in the TUIs, and vice versa. Both store
-    transcripts on disk by session id, but the formats are runtime-internal.
-- **One writer per session**
+- **Claude: hand the session over, one writer at a time** (verified)
   - `attach` waits for the headless process to reach a turn boundary (or
-    interrupts it with `--now`), stops it, and starts the TUI.
+    interrupts it with `--now`), stops it, and starts
+    `claude --resume <session-id>` in the TUI, with the same `--mcp-config`
+    and appended system prompt.
+  - Prototype result: a session created by `claude -p` stream-json opened in
+    the TUI with its full history. A turn taken in the TUI was then visible
+    to the next headless `--resume`, still on the same id and file.
   - Detaching from tmux leaves the TUI running; that is the `attached` state.
   - Exiting the TUI, or `avm stop`, returns the conversation to `parked`,
     after which inbound messages resume it headless again.
+- **Codex: share the live process, no handover** (protocol verified)
+  - sandboxd runs codex conversations under
+    `codex app-server --listen unix://…/conv-<id>.sock` and stays connected
+    as a client.
+  - `avm attach` starts `codex --remote unix://…/conv-<id>.sock resume
+    <thread-id>` in tmux, a second client of the same live server. The TUI
+    connected and reached its login screen in the test (no auth there).
+  - Both clients see every event, so you and sandboxd are on one live thread
+    with no stop/resume.
+  - **[verify] with auth**: the TUI's rendering of turns started by the
+    other client.
 - **Inbound a2a while attached**
-  - Messages queue in sandboxd.
-  - Claude: a `UserPromptSubmit` hook prepends queued messages to your next
-    prompt as context, and a status line (`a2a: 2 queued`) shows them.
-    **[verify]** hook and status-line contracts.
-  - Codex: shown in the tmux status bar and delivered when you detach, or
-    on demand via `avm send`.
+  - Codex: sandboxd `turn/steer`s the message into your active turn, or
+    starts a turn when the thread is idle. You see it arrive in the TUI.
+  - Claude: messages queue in sandboxd. A `UserPromptSubmit` hook prepends
+    them to your next prompt as context, and a status line (`a2a: 2 queued`)
+    shows them. **[verify]** the hook and status-line contracts.
 - **No idle processes, with one exception**: an attached TUI is never
   reaped while a client is attached. With no client attached, it is parked
   after `interactiveIdle` (default 30 min) of no input.
