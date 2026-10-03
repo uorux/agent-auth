@@ -194,5 +194,103 @@
             };
           };
         };
+
+      # The per-host daemon. Import on every host; it dials out to the broker
+      # (no inbound ports). Pair once per host:
+      #   broker admin:  agent-auth admin daemon-pair <hostname>
+      #   on the host:   sudo agent-auth-hostd pair <code>
+      # State (the host's identity key) lives in /var/lib/agent-auth-hostd —
+      # persist it on impermanence hosts, or the host must re-pair after reboot.
+      nixosModules.hostd = { config, lib, pkgs, ... }:
+        let
+          cfg = config.services.agent-auth-hostd;
+          stateDir = "/var/lib/agent-auth-hostd";
+          env = {
+            AGENT_AUTH_HOSTD_BROKER_URL = cfg.brokerUrl;
+            AGENT_AUTH_HOSTD_BROKER_KEY = cfg.brokerPublicKey;
+            AGENT_AUTH_HOSTD_NAME = cfg.name;
+            AGENT_AUTH_HOSTD_STATE_DIR = stateDir;
+          };
+          # `agent-auth-hostd pair <code>` on the host picks up the same
+          # broker URL, pinned key and name as the service.
+          cli = pkgs.writeShellScriptBin "agent-auth-hostd" ''
+            ${lib.concatStringsSep "\n" (lib.mapAttrsToList (k: v: "export ${k}=${lib.escapeShellArg v}") env)}
+            exec ${cfg.package}/bin/agent-auth-hostd "$@"
+          '';
+        in
+        {
+          options.services.agent-auth-hostd = {
+            enable = lib.mkEnableOption "agent-auth host daemon";
+
+            package = lib.mkOption {
+              type = lib.types.package;
+              default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+              defaultText = lib.literalExpression "agent-auth.packages.<system>.default";
+            };
+
+            brokerUrl = lib.mkOption {
+              type = lib.types.str;
+              example = "https://agent-auth.recusant.rooty.dev";
+            };
+
+            brokerPublicKey = lib.mkOption {
+              type = lib.types.strMatching "ed25519:[A-Za-z0-9_-]{43}";
+              description = ''
+                The broker's public signing key (`agent-auth admin broker-key`).
+                Pinned here, in the host's own config, so a compromised network
+                path or broker URL can't substitute another broker.
+              '';
+            };
+
+            name = lib.mkOption {
+              type = lib.types.strMatching "[a-z0-9][a-z0-9-]{0,62}";
+              default = config.networking.hostName;
+              defaultText = lib.literalExpression "config.networking.hostName";
+            };
+          };
+
+          config = lib.mkIf cfg.enable {
+            environment.systemPackages = [ cli ];
+
+            systemd.services.agent-auth-hostd = {
+              description = "agent-auth host daemon";
+              wantedBy = [ "multi-user.target" ];
+              wants = [ "network-online.target" ];
+              after = [ "network-online.target" ];
+              environment = env;
+              serviceConfig = {
+                ExecStart = "${cfg.package}/bin/agent-auth-hostd run";
+                StateDirectory = "agent-auth-hostd";
+                StateDirectoryMode = "0700";
+                Restart = "always";
+                RestartSec = 10;
+
+                # Phase 1 only connects and reports, so it is locked down
+                # hard. Running approved jobs (a later phase) needs systemd-run
+                # and will relax exactly what that requires.
+                NoNewPrivileges = true;
+                ProtectSystem = "strict";
+                ProtectHome = true;
+                PrivateTmp = true;
+                PrivateDevices = true;
+                ProtectKernelTunables = true;
+                ProtectKernelModules = true;
+                ProtectKernelLogs = true;
+                ProtectControlGroups = true;
+                ProtectClock = true;
+                ProtectProc = "invisible";
+                RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
+                RestrictNamespaces = true;
+                RestrictRealtime = true;
+                RestrictSUIDSGID = true;
+                LockPersonality = true;
+                CapabilityBoundingSet = "";
+                SystemCallFilter = [ "@system-service" "~@privileged" ];
+                SystemCallArchitectures = "native";
+                UMask = "0077";
+              };
+            };
+          };
+        };
     };
 }

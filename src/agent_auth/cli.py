@@ -442,5 +442,59 @@ def revoke(grant_id: str, reason: str = typer.Option("revoked by admin", "--reas
     _run(lambda: _client().admin_revoke_grant(grant_id, reason))
 
 
+@admin.command("gen-signing-key")
+def gen_signing_key():
+    """Generate BROKER_SIGNING_KEY (ed25519 seed) and print its public key,
+    which every daemon pins as brokerPublicKey."""
+    from .daemon_common.crypto import (
+        fingerprint,
+        generate_private_key,
+        private_key_to_text,
+        public_key_text,
+    )
+
+    key = generate_private_key()
+    public = public_key_text(key)
+    typer.echo(f"BROKER_SIGNING_KEY={private_key_to_text(key)}")
+    typer.echo(f"# public key (pin in daemons): {public}")
+    typer.echo(f"# fingerprint: {fingerprint(public)}")
+
+
+@admin.command("daemon-pair")
+def daemon_pair(
+    name: str = typer.Argument(help="the host's name, e.g. excelsior"),
+    role: str = typer.Option("host", "--role", help="host (hostd) | sandbox (sandboxd)"),
+):
+    """Issue a one-time pairing code; run `agent-auth-hostd pair <code>` on the host."""
+    try:
+        res = _client().admin_create_pairing_code(role, name)
+    except BrokerError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        sys.exit(1)
+    from .daemon_common.crypto import fingerprint
+
+    typer.echo(f"pairing code for {role}:{name}: {res['code']}")
+    typer.echo(f"expires: {res['expires_at']}")
+    typer.echo(f"broker key fingerprint (the daemon prints it too): {fingerprint(res['broker_public_key'])}")
+
+
+@admin.command("daemons")
+def daemons_list():
+    """Paired daemons with online state, last heartbeat and key fingerprint."""
+    _run(lambda: _client().admin_list_daemons())
+
+
+@admin.command("daemon-unpair")
+def daemon_unpair(daemon_id: str):
+    """Forget a daemon's key and drop its connection; it must pair again."""
+    _run(lambda: _client().admin_unpair_daemon(daemon_id))
+
+
+@admin.command("broker-key")
+def broker_key():
+    """The broker's public signing key (what daemons pin)."""
+    _run(lambda: _client().admin_broker_key())
+
+
 if __name__ == "__main__":
     app()

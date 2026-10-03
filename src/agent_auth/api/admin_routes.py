@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from .. import authority as authority_mod
+from ..core.daemons import DaemonsDisabled
 from ..core.service import HumanDecision, TransitionError
 from ..crypto import generate_api_key
 from ..core.states import GrantStatus, Platform
@@ -315,3 +316,49 @@ async def revoke_grant(grant_id: str, request: Request, reason: str = "revoked b
     except TransitionError as exc:
         raise HTTPException(409, str(exc))
     return {"ok": True, "grant_id": grant.id, "status": grant.status.value}
+
+
+# --- paired daemons ----------------------------------------------------------
+
+
+class PairingCodeCreate(BaseModel):
+    role: str
+    name: str
+
+
+@router.post("/daemons/pairing-codes")
+async def create_pairing_code(body: PairingCodeCreate, request: Request):
+    hub = request.app.state.daemons
+    try:
+        code, expires_at = await hub.create_pairing_code(body.role, body.name)
+    except DaemonsDisabled as exc:
+        raise HTTPException(503, str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    return {
+        "role": body.role,
+        "name": body.name,
+        "code": code,
+        "expires_at": expires_at,
+        "broker_public_key": hub.public_key,
+    }
+
+
+@router.get("/daemons")
+async def list_daemons(request: Request):
+    return await request.app.state.daemons.list_daemons()
+
+
+@router.delete("/daemons/{daemon_id}")
+async def unpair_daemon(daemon_id: str, request: Request):
+    if not await request.app.state.daemons.unpair(daemon_id):
+        raise HTTPException(404, "daemon not found")
+    return {"ok": True}
+
+
+@router.get("/broker-key")
+async def broker_key(request: Request):
+    try:
+        return {"broker_public_key": request.app.state.daemons.public_key}
+    except DaemonsDisabled as exc:
+        raise HTTPException(503, str(exc)) from None

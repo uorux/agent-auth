@@ -353,3 +353,44 @@ class A2AMessage(Base, TimestampMixin):
     __table_args__ = (
         Index("ix_a2a_messages_thread_seq", "thread_id", "seq", unique=True),
     )
+
+
+class Daemon(Base, TimestampMixin):
+    """A paired daemon: hostd on a physical host (role "host") or sandboxd in
+    an agent VM (role "sandbox"). The public key, bound at pairing, is the
+    only credential: every connection proves possession of its private half."""
+
+    __tablename__ = "daemons"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    role: Mapped[str] = mapped_column(String(16))
+    name: Mapped[str] = mapped_column(String(128))
+    public_key: Mapped[str] = mapped_column(String(128))
+    paired_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+    last_seen_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # The daemon's latest self-reported heartbeat status. Informational only:
+    # never an input to an authorization decision.
+    last_status: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    __table_args__ = (UniqueConstraint("role", "name", name="uq_daemons_role_name"),)
+
+
+class DaemonPairingCode(Base, TimestampMixin):
+    """A one-time code admitting one (role, name) to pair. Single use, short-lived."""
+
+    __tablename__ = "daemon_pairing_codes"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    role: Mapped[str] = mapped_column(String(16))
+    name: Mapped[str] = mapped_column(String(128))
+    # The HMAC key derived from the code (hex), not a one-way verifier: proofs
+    # are HMACs, so the broker must hold the key. Read access to the DB during
+    # a code's lifetime is therefore enough to pair as that daemon. Codes live
+    # minutes and burn on first use, which bounds that window.
+    pairing_key: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[datetime] = mapped_column(TZDateTime())
+    used_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    failed_attempts: Mapped[int] = mapped_column(Integer, default=0)
+
+    __table_args__ = (Index("ix_daemon_pairing_codes_role_name", "role", "name"),)

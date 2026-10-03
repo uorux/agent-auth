@@ -65,6 +65,16 @@ class Settings(BaseSettings):
     # holding a long-poll open) is still reachable between polls.
     a2a_listen_threshold_secs: int = 300
 
+    # Paired daemons (hostd on hosts, sandboxd in agent VMs). The broker signs
+    # everything it sends them with this ed25519 seed (agent-auth admin
+    # gen-signing-key); daemons pin its public key from their own config.
+    # Empty = the daemon endpoints are disabled.
+    broker_signing_key: str = ""
+    daemon_heartbeat_secs: int = 30
+    daemon_pairing_code_ttl_secs: int = 600
+    # Wrong proofs a pairing code tolerates before it is burned.
+    daemon_pairing_max_attempts: int = 5
+
     log_level: str = "INFO"
 
 

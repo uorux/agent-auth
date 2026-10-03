@@ -361,6 +361,41 @@ Tokens are short-lived (≤1h, capped at the grant's remaining life) and every
 token dies the moment the grant expires or is revoked, because the
 ServiceAccount itself is deleted.
 
+## Paired daemons (hostd)
+
+Hosts run `agent-auth-hostd`, a daemon that dials out to the broker over a
+signed WebSocket (`/v1/daemons/connect`). It is the foundation for running
+approved commands outside agent VMs; see
+[docs/sandbox-design.md](docs/sandbox-design.md). Today (phase 1) it only
+pairs, connects and reports heartbeats. It accepts no work.
+
+- **Broker key**: `agent-auth admin gen-signing-key` prints `BROKER_SIGNING_KEY`
+  (put it in the broker's env secret) and the public key. Every daemon
+  **pins** that public key in its own config, so the broker is verified
+  against the host's config, not against whatever answers on the network.
+  Without `BROKER_SIGNING_KEY`, the daemon endpoints are disabled (503).
+- **Pairing**: `agent-auth admin daemon-pair <hostname>` issues a one-time
+  code (10 min, single use, burned after 5 wrong proofs). On the host, run
+  `sudo agent-auth-hostd pair <code>`. Both sides prove knowledge of the code
+  over the exact keys exchanged, and both print key fingerprints to compare.
+  Re-pairing replaces the key and drops the old connection.
+- **Connections**: mutual challenge–response on every connect, then every
+  message is an ed25519-signed envelope naming its sender and recipient, with
+  a short expiry and replay protection.
+- **Fleet health**: `agent-auth admin daemons` / Discord `/hosts` list paired
+  daemons with online state, version and last heartbeat;
+  `agent-auth admin daemon-unpair <id>` forgets one.
+
+```nix
+imports = [ inputs.agent-auth.nixosModules.hostd ];
+services.agent-auth-hostd = {
+  enable = true;
+  brokerUrl = "https://agent-auth.recusant.rooty.dev";
+  brokerPublicKey = "ed25519:…";   # agent-auth admin broker-key
+};
+# impermanence: persist /var/lib/agent-auth-hostd (the host's identity key)
+```
+
 ## Deploy (recommended: native NixOS service)
 
 Why not on the k8s cluster: the homelab agent will eventually hold gitops-repo

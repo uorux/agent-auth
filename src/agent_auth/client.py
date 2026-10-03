@@ -261,3 +261,19 @@ class BrokerClient:
         return self._request(
             "POST", f"/admin/grants/{grant_id}/revoke", admin=True, params={"reason": reason}
         )
+
+    # --- paired daemons -------------------------------------------------------
+
+    def admin_create_pairing_code(self, role: str, name: str):
+        return self._request(
+            "POST", "/admin/daemons/pairing-codes", admin=True, json={"role": role, "name": name}
+        )
+
+    def admin_list_daemons(self):
+        return self._request("GET", "/admin/daemons", admin=True)
+
+    def admin_unpair_daemon(self, daemon_id: str):
+        return self._request("DELETE", f"/admin/daemons/{daemon_id}", admin=True)
+
+    def admin_broker_key(self):
+        return self._request("GET", "/admin/broker-key", admin=True)

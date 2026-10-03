@@ -8,6 +8,7 @@ import uvicorn
 from .api.app import create_app
 from .config import Settings, get_settings
 from .core.a2a import A2AThreadService
+from .core.daemons import DaemonHub
 from .core.events import KeyedEvents
 from .core.scheduler import ExpiryScheduler
 from .core.service import RequestService
@@ -117,7 +118,10 @@ async def serve(settings: Settings) -> None:
 
     service = RequestService(db, PolicyEngine(policy), registry, events, llm=llm)
     a2a = A2AThreadService(db, settings, KeyedEvents())
-    app = create_app(settings, db, service, registry, events, a2a)
+    daemons = DaemonHub(db, settings)
+    if not daemons.enabled:
+        log.info("daemon channel disabled (BROKER_SIGNING_KEY not set)")
+    app = create_app(settings, db, service, registry, events, a2a, daemons)
     scheduler = ExpiryScheduler(service, a2a)
 
     server = uvicorn.Server(
@@ -133,7 +137,7 @@ async def serve(settings: Settings) -> None:
 
     bot: AgentAuthBot | None = None
     if settings.discord_token:
-        bot = AgentAuthBot(settings, db, service)
+        bot = AgentAuthBot(settings, db, service, daemons)
         service.set_notifier(DiscordNotifier(bot, db, settings))
         tasks.append(asyncio.create_task(bot.start(settings.discord_token), name="discord"))
     else:

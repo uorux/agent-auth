@@ -7,23 +7,32 @@ import discord
 from discord import app_commands
 
 from ..config import Settings
+from ..core.daemons import DaemonHub
 from ..core.service import RequestService
 from ..db import Database
 from ..models import AccessRequest, Agent, A2AThread, Grant, Rule
-from . import embeds, rules, views
+from . import embeds, hosts, rules, views
 
 log = logging.getLogger(__name__)
 
 
 class AgentAuthBot(discord.Client):
-    def __init__(self, settings: Settings, db: Database, service: RequestService):
+    def __init__(
+        self,
+        settings: Settings,
+        db: Database,
+        service: RequestService,
+        daemons: DaemonHub | None = None,
+    ):
         super().__init__(intents=discord.Intents.default())
         self.settings = settings
         self.db = db
         self.service = service
+        self.daemons = daemons
         self.tree = app_commands.CommandTree(self)
         self._commands_synced = False
         rules.register(self)
+        hosts.register(self)
 
     async def setup_hook(self) -> None:
         self.add_dynamic_items(views.ApproveButton, views.DenyButton, views.EditButton)
