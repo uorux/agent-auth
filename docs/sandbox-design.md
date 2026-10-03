@@ -545,11 +545,17 @@ exceptions:
 port, and arquitens has its firewall off, so allowing the node IPs would open
 every service on them.
 
-**[proposed]** The shared `lib/vm/core` net piece gains `allowPorts`,
-lowered to a host nftables rule that matches the `-net` unit's cgroup
-(`socket cgroupv2 level 2 "system.slice/agent-vm-net.service"`) and accepts
-only the listed `ip:port` pairs. This is host-side, so a compromised VM can't
-remove it. App VMs can use it too.
+**[decided, built]** The shared `lib/vm/core` net piece has `portFilter`: the
+agent VM's passt runs as its own uid (`sbx-agentvm-net`), and host iptables
+rules matched on that uid (`-m owner --uid-owner`) accept only the listed
+`ip:port` pairs. The addresses are also in the unit's `IPAddressAllow`, since
+the cgroup filter and the firewall must both pass a packet. This is host-side,
+so a compromised VM can't remove it.
+- A cgroup match was the first idea, but iptables and nft resolve the cgroup
+  path when the rule loads, before the unit's cgroup exists.
+- The hosts run the iptables firewall, not nftables.
+- App VMs can't use the filter while their passt runs as the desktop user,
+  because an owner match would filter that user's own traffic.
 
 **[verify]** whether the gateway names and `agent-auth.recusant.rooty.dev`
 resolve through the guest's public resolvers. `allowNames` forwards DNS to the
