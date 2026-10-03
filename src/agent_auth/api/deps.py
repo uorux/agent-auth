@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import math
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -16,6 +17,20 @@ _bearer = HTTPBearer(auto_error=False)
 # Liveness bookkeeping: skip the UPDATE when last_seen is this fresh. Keeps hot
 # paths read-only; the skew is invisible against the 120s liveness threshold.
 _LAST_SEEN_WRITE_INTERVAL = timedelta(seconds=20)
+
+
+def clamp_wait(value: float, lo: float, hi: float) -> float:
+    """Clamp a client-supplied long-poll duration.
+
+    Plain min/max do NOT clamp NaN (every comparison is False), and pydantic
+    accepts ``?wait=nan`` for a float. A NaN timeout reaches asyncio as a NaN
+    timer and crashes the event loop's selector — taking the scheduler and the
+    Discord bot down with the API. NaN therefore means "no wait"; ±inf clamp
+    normally.
+    """
+    if math.isnan(value):
+        return lo
+    return min(max(value, lo), hi)
 
 
 @dataclass

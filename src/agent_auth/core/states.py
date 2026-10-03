@@ -31,6 +31,9 @@ class DecisionSource(str, enum.Enum):
 
 
 class GrantStatus(str, enum.Enum):
+    # Row committed, provisioner not yet finished: the durable record that an
+    # external mutation MAY exist. Never issuable; reaped if left behind.
+    PROVISIONING = "provisioning"
     ACTIVE = "active"
     EXPIRED = "expired"
     REVOKED = "revoked"

@@ -1,7 +1,7 @@
-"""Thread-anchored delegated auth: a request cites the OPEN a2a thread whose
-conversation asked for the work; the thread's other participant becomes the
-structural delegator, policy authorizes the pair, and the grant dies with the
-thread."""
+"""Thread-anchored delegated auth: the RESPONDER of an OPEN a2a thread cites
+it as the conversation that asked for the work; the thread's initiator becomes
+the structural delegator, policy authorizes the pair, and the grant dies with
+the thread."""
 
 from __future__ import annotations
 
@@ -166,9 +166,18 @@ async def test_delegation_validation(api, db):
     await api.post(f"/v1/a2a/threads/{tid}/close", headers=auth(hermes["api_key"]), json={})
     await denied(hermes["api_key"], _delegated_body("svc-gitea", tid), "OPEN thread")
 
-    # ephemeral initiator citing its own thread from the wrong session
+    # the INITIATOR citing its own thread — from the opening session or any
+    # other — is never delegation proof: it is the side that asked, and
+    # letting it name the responder as "delegator" would make any pair rule
+    # satisfiable by opening a thread and waiting for the auto-accept.
     tid3, sid3 = await _open_thread(
         api, claude["api_key"], hermes["api_key"], "hermes-homelab-v"
+    )
+    await denied(
+        claude["api_key"],
+        _delegated_body("svc-gitea", tid3),
+        "only the responder",
+        session_id=sid3,
     )
     sid_other = (
         await api.post(
@@ -178,7 +187,7 @@ async def test_delegation_validation(api, db):
     await denied(
         claude["api_key"],
         _delegated_body("svc-gitea", tid3),
-        "different session",
+        "only the responder",
         session_id=sid_other,
     )
 

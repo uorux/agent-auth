@@ -42,7 +42,8 @@ class RequestCreate(BaseModel):
     justification: str = Field(min_length=1, max_length=4000)
     requested_duration: str | int
     # Delegation: id of the OPEN a2a thread whose conversation asked for this
-    # work — only that thread; the other participant becomes the delegator.
+    # work — only that thread, and only as its responder; the thread's
+    # initiator becomes the delegator.
     on_behalf_of_thread: str | None = Field(default=None, max_length=36)
 
     @field_validator("requested_duration")
@@ -129,12 +130,25 @@ class SessionOut(BaseModel):
     created_at: datetime
 
 
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
 class ThreadOpenBody(BaseModel):
     to: str = Field(min_length=1, max_length=128)
     topic: str | None = Field(default=None, max_length=256)
     payload: dict[str, Any] = Field(default_factory=dict)
 
     _size = field_validator("payload")(_check_payload_size)
+
+    @field_validator("topic")
+    @classmethod
+    def _topic_single_line(cls, v: str | None) -> str | None:
+        # The topic is rendered into reviewer-facing context (LLM prompt, the
+        # Discord embed, risk notes) as a single quoted token; a newline in it
+        # would let the initiator forge further lines of broker context.
+        if v is not None and _CONTROL_CHARS.search(v):
+            raise ValueError("topic must not contain control characters or newlines")
+        return v
 
 
 class ThreadMessageBody(BaseModel):

@@ -206,12 +206,15 @@ vs webhook+cron, the conversation lifecycle, and final-message routing — see
 
 ### Delegated auth (on behalf of)
 
-A request may be anchored to an **OPEN a2a thread** the requester participates
-in (`on_behalf_of_thread` in the request body / MCP tool / `--on-behalf-of-thread`
-CLI flag) — pass only the thread whose conversation asked for the work. The
-broker derives the delegator (the thread's other participant; never
-client-asserted), so "hermes acting for claude" is backed by a real, mutually
-consented conversation, not a justification string.
+A request may be anchored to an **OPEN a2a thread the requester is
+responding to** (`on_behalf_of_thread` in the request body / MCP tool /
+`--on-behalf-of-thread` CLI flag) — pass only the thread whose conversation
+asked for the work. The broker derives the delegator (the thread's
+**initiator**, i.e. the side that asked; never client-asserted), so "hermes
+acting for claude" is backed by a real, mutually consented conversation, not a
+justification string. Direction is enforced: a thread you opened yourself is
+never delegation proof — otherwise "acting for X" could be manufactured by
+opening a thread to X and waiting for X's dispatcher to accept it.
 
 - **Policy authorizes the pair**: rules gain a `delegator:` glob. Rules without
   one still deny/surface delegated requests but never auto-approve or
@@ -264,7 +267,9 @@ A human's own scope-pinned auto-approve rule still applies.
 3. Install the app on each account whose repos you broker (personal and/or
    orgs), selecting the repos. The broker resolves the right installation per
    repo automatically — `GITHUB_INSTALLATION_ID` is optional and only pins a
-   single installation.
+   single installation; with it set, only repos owned by that installation's
+   account are mintable (the token endpoint takes bare repo names, so the
+   broker refuses any other owner rather than silently re-targeting).
 4. Set `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY_FILE`, and mirror the
    ceiling in `platforms.github.permission_ceiling`.
 5. Note the app is its own principal: installation tokens carry the *app's*

@@ -144,9 +144,10 @@ During the conversation, the worker drives everything through its MCP tools:
   resident poll should run a trivial keep-alive tick.
 - **Outbound**: `a2a_send(thread_id, payload)`.
 - **Credentials**: `request_access(..., on_behalf_of_thread=<thread_id>,
-  session_key=S)` — cite ONLY this conversation's thread, and the SAME
-  session_key that accepted it (the broker checks the thread's session
-  binding and denies a mismatch). Policy authorizes the (hermes, delegator)
+  session_key=S)` — cite ONLY this conversation's thread (the one opened TO
+  you; threads you opened are refused), and the SAME session_key that
+  accepted it (the broker checks the thread's session binding and denies a
+  mismatch). Policy authorizes the (hermes, delegator)
   pair; the grant is revoked when the thread closes, so closing the thread
   is also releasing the access.
 - **Downstream help**: open threads to other agents *from this session*

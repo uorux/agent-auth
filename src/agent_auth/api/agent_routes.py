@@ -18,7 +18,7 @@ from ..schemas import (
     RetryBody,
 )
 from .catalog import build_catalog
-from .deps import Caller, get_agent, get_caller
+from .deps import Caller, clamp_wait, get_agent, get_caller
 from .serialize import grant_out, request_out
 
 log = logging.getLogger(__name__)
@@ -95,7 +95,7 @@ async def wait_request(
 ):
     """Long-poll: returns when the request leaves a waiting status or on timeout."""
     state = request.app.state
-    timeout = min(max(timeout, 1), 300)
+    timeout = clamp_wait(timeout, 1, 300)
     deadline = asyncio.get_event_loop().time() + timeout
     while True:
         async with state.db.session() as session:

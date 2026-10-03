@@ -104,13 +104,15 @@ def request_access(
     """Request time-bounded access to a resource. The broker may auto-approve,
     deny, review with an LLM, or ask a human on Discord.
 
-    on_behalf_of_thread (delegation): when another agent asked you, in an a2a
-    thread, to do work that needs this access, pass THAT thread's id — only
-    the thread whose conversation is asking for this request, never any other
-    thread you happen to have open. The broker derives the delegator from the
-    thread (its other participant), policy authorizes the pair, and the grant
-    is revoked the moment the thread closes — so keep the thread open until
-    the work is done, then close it to release the access.
+    on_behalf_of_thread (delegation): when another agent opened an a2a thread
+    TO YOU and asked, in it, for work that needs this access, pass THAT
+    thread's id — only the thread whose conversation is asking for this
+    request, never any other thread you happen to have open. You must be the
+    thread's responder; threads you opened yourself are refused. The broker
+    derives the delegator from the thread (its initiator), policy authorizes
+    the pair, and the grant is revoked the moment the thread closes — so keep
+    the thread open until the work is done, then close it to release the
+    access.
 
     session_key: your conversation's session id (from create_session). A
     delegated (on_behalf_of_thread) request MUST pass the SAME session_key

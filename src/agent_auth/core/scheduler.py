@@ -8,6 +8,11 @@ from .service import RequestService
 
 log = logging.getLogger(__name__)
 
+# A grant still PROVISIONING after this long was interrupted: the longest
+# legitimate provision (k8s control-plane failover, LLDAP create + password
+# subprocess + group add) finishes well inside it.
+STALE_PROVISIONING_SECS = 15 * 60
+
 
 class ExpiryScheduler:
     """Revokes grants past expires_at and sweeps a2a lifecycle timeouts (idle
@@ -28,8 +33,20 @@ class ExpiryScheduler:
 
     async def run(self) -> None:
         log.info("expiry scheduler started (interval %ss)", self.interval_secs)
+        first_tick = True
         while not self._stop.is_set():
-            # Grants first: the a2a sweep then closes their threads same-tick.
+            # Interrupted provisions first: on the boot tick every PROVISIONING
+            # row is an orphan (single process — nothing is in flight yet).
+            try:
+                reaped = await self.service.reap_stale_provisioning(
+                    0 if first_tick else STALE_PROVISIONING_SECS
+                )
+                if reaped:
+                    log.info("reaped %d interrupted provision(s)", reaped)
+            except Exception:
+                log.exception("stale-provisioning reap failed")
+            first_tick = False
+            # Grants next: the a2a sweep then closes their threads same-tick.
             try:
                 expired = await self.service.expire_due_grants()
                 if expired:

@@ -39,7 +39,8 @@ class GithubProvisioner:
 
     The app may be installed on several accounts (personal + orgs); the
     installation for a repo is resolved via GET /repos/{owner}/{repo}/installation
-    and cached. Setting installation_id pins a single installation instead.
+    and cached. Setting installation_id pins a single installation instead;
+    only repos owned by that installation's account are then mintable.
 
     Convention: capability="repo", resource="owner/repo",
     scope={"permissions": {"contents": "write", "secrets": "write", ...}}.
@@ -63,6 +64,9 @@ class GithubProvisioner:
         self.config = config
         self.secret_box = secret_box
         self._installation_cache: dict[str, int] = {}
+        # Account (owner login, lowercased) the pinned installation belongs to;
+        # resolved once on first use.
+        self._pinned_account: str | None = None
 
     async def validate_request(self, session: AsyncSession, spec: RequestSpec) -> RequestSpec:
         if spec.capability != "repo":
@@ -163,6 +167,19 @@ class GithubProvisioner:
         """Resolve which installation covers this repo; the app may be
         installed on multiple accounts (personal + orgs)."""
         if self.installation_id:
+            # The token endpoint takes BARE repo names resolved against the
+            # installation's account, so the owner half of `resource` — the
+            # half the allow/denylists were checked against — would otherwise
+            # be silently discarded: "other-org/nixos-dots" would mint a token
+            # for the pinned account's "nixos-dots". Refuse owner mismatches.
+            owner = repo.split("/", 1)[0]
+            account = await self._pinned_account_login()
+            if owner != account:
+                raise ProvisionerError(
+                    f"repo {repo!r} is not covered by the pinned installation "
+                    f"(GITHUB_INSTALLATION_ID belongs to {account!r}); unset it "
+                    "to resolve installations per repo"
+                )
             return self.installation_id
         if repo in self._installation_cache:
             return str(self._installation_cache[repo])
@@ -183,6 +200,27 @@ class GithubProvisioner:
         installation_id = resp.json()["id"]
         self._installation_cache[repo] = installation_id
         return str(installation_id)
+
+    async def _pinned_account_login(self) -> str:
+        if self._pinned_account is not None:
+            return self._pinned_account
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(
+                f"{self.api_url}/app/installations/{self.installation_id}",
+                headers=self._app_headers(),
+            )
+        if resp.status_code != 200:
+            raise ProvisionerError(
+                f"lookup of pinned installation {self.installation_id!r} failed "
+                f"({resp.status_code})"
+            )
+        login = (resp.json().get("account") or {}).get("login")
+        if not login:
+            raise ProvisionerError(
+                f"pinned installation {self.installation_id!r} has no account login"
+            )
+        self._pinned_account = str(login).lower()
+        return self._pinned_account
 
     async def _mint(self, grant: Grant) -> tuple[str, datetime]:
         owner_repo = grant.resource.split("/", 1)[1]

@@ -119,7 +119,14 @@ class LldapProvisioner:
         user = state.get("lldap_user")
         group_id = state.get("group_id")
         if not user or group_id is None:
-            return
+            # No recorded state: provisioning was interrupted before the
+            # outcome was written (reaper path). The membership may exist
+            # anyway, so derive the pair from the agent + resource.
+            agent = await session.get(Agent, grant.agent_id)
+            user = agent.lldap_username if agent else None
+            if not user:
+                return  # no account was ever created — nothing to be a member
+            group_id = await self._group_id(grant.resource)
         # Membership is one (user, group) fact shared by every grant on the
         # group — only the LAST effective grant may remove it. expires_at is
         # checked too (not just ACTIVE) so that when several grants lapse in

@@ -20,7 +20,7 @@ from ..schemas import (
     ThreadMessageBody,
     ThreadOpenBody,
 )
-from .deps import Caller, get_caller, mark_listening
+from .deps import Caller, clamp_wait, get_caller, mark_listening
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1")
@@ -186,7 +186,7 @@ async def read_messages(
     """Cursor read; wait>0 long-polls until a new message or state change.
     The poll loop refreshes the caller's last-seen — it doubles as keep-alive."""
     state = _a2a(request)
-    wait = min(max(wait, 0), _MAX_WAIT_SECS)
+    wait = clamp_wait(wait, 0, _MAX_WAIT_SECS)
     deadline = asyncio.get_event_loop().time() + wait
     wake_key = state.a2a.wake_key(caller.agent, caller.session)
     try:
@@ -231,7 +231,7 @@ async def a2a_events(
     state = _a2a(request)
     if after is not None and after.tzinfo is None:
         after = after.replace(tzinfo=timezone.utc)
-    wait = min(max(wait, 0), _MAX_WAIT_SECS)
+    wait = clamp_wait(wait, 0, _MAX_WAIT_SECS)
     await mark_listening(state, caller)
     deadline = asyncio.get_event_loop().time() + wait
     wake_key = state.a2a.wake_key(caller.agent, caller.session)

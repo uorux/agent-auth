@@ -144,11 +144,21 @@ async def test_github_installation_resolution(db, registry, agent):
         with pytest.raises(ProvisionerError, match="not installed"):
             await provisioner._installation_for("jrt/ghost")
 
-    # pinned mode short-circuits the lookup entirely
+    # pinned mode skips the per-repo lookup but still binds the repo OWNER to
+    # the installation's account: the token endpoint takes bare repo names, so
+    # an unchecked owner would let "other/nixos-dots" mint for jrt/nixos-dots.
     provisioner.installation_id = "77"
-    with respx.mock(assert_all_called=False):
+    with respx.mock(assert_all_called=False) as mock:
+        pinned = mock.get(f"{GITHUB_API_URL}/app/installations/77").respond(
+            200, json={"id": 77, "account": {"login": "JRT"}}
+        )
         assert await provisioner._installation_for("jrt/anything") == "77"
+        assert await provisioner._installation_for("jrt/other") == "77"
+        assert pinned.call_count == 1  # account resolved once
+        with pytest.raises(ProvisionerError, match="not covered by the pinned"):
+            await provisioner._installation_for("other-org/anything")
     provisioner.installation_id = ""
+    provisioner._pinned_account = None
 
 
 def homelab_request(resource="svc-sonarr", duration="30m"):

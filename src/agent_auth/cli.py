@@ -58,7 +58,8 @@ def request(
     on_behalf_of_thread: str = typer.Option(
         None,
         "--on-behalf-of-thread",
-        help="a2a thread id whose conversation asked for this work (delegated request)",
+        help="a2a thread id whose conversation asked for this work (delegated "
+        "request; you must be the thread's responder)",
     ),
     wait: bool = typer.Option(False, "--wait", "-w", help="Block until decided"),
 ):

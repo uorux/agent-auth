@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
 from datetime import timedelta
@@ -184,6 +185,7 @@ class RequestService:
             source = (
                 DecisionSource.RULE if decision.source == "rule" else DecisionSource.POLICY
             )
+            pending_grant_id: str | None = None
 
             # Sensitive capabilities always reach a human, even if a YAML rule or
             # the LLM path would clear them — unless a human's own rule pinned to
@@ -220,7 +222,7 @@ class RequestService:
                     request.requested_duration_secs, decision.max_duration_secs
                 )
                 await self._approve(session, request, source, "policy", decision.reason, duration)
-                await self._provision(session, request)
+                pending_grant_id = await self._begin_provision(session, request)
 
             if decision.action == PolicyAction.LLM:
                 if self.llm is None:
@@ -239,6 +241,9 @@ class RequestService:
             status = request.status
 
         # Post-commit side effects
+        if pending_grant_id is not None:
+            await self._finish_provision(pending_grant_id)
+            request = await self._reload_request(request_id)
         if status == RequestStatus.LLM_EVALUATING:
             self._spawn_llm_eval(request_id)
         elif status == RequestStatus.AWAITING_HUMAN:
@@ -257,10 +262,11 @@ class RequestService:
     ) -> str | None:
         """Anchor the request to an a2a thread; returns a denial reason or None.
 
-        The delegator is DERIVED (the thread's other participant), never
-        client-asserted, and the referenced thread must be the live, mutually
-        consented conversation the requester is part of. Depth 1 only: a2a
-        access itself cannot be delegated (no re-delegation chains).
+        The delegator is DERIVED (the thread's initiator — the side that
+        asked), never client-asserted; the requester must be the thread's
+        RESPONDER, and the thread must be the live, mutually consented
+        conversation. Depth 1 only: a2a access itself cannot be delegated (no
+        re-delegation chains).
         """
         if request.platform == Platform.A2A:
             return "a2a access cannot be requested on behalf of another agent"
@@ -275,31 +281,37 @@ class RequestService:
                 f"thread is {thread.state}; delegation requires an OPEN thread "
                 "(the other side must have accepted)"
             )
-        # Session binding on BOTH sides, mirroring a2a._own_thread: a thread
-        # claimed by one worker session is not delegation proof for any other
-        # session (or the sessionless dispatcher) of the same agent.
-        bound = (
-            thread.initiator_session_id
-            if thread.initiator_agent_id == agent.id
-            else thread.responder_session_id
-        )
+        # Direction matters: only the RESPONDER may act on a thread's behalf.
+        # The initiator is the side that asked; letting it cite its own thread
+        # would make "acting for X" something you can manufacture by opening a
+        # thread to X and waiting for X's dispatcher to accept it — no request
+        # from X ever needed. The responder answering a thread X opened is the
+        # only shape in which X demonstrably asked for something.
+        if thread.responder_agent_id != agent.id:
+            return (
+                "you opened this thread; only the responder may act on a thread's "
+                "behalf (the delegator must be the side that asked)"
+            )
+        # Session binding, mirroring a2a._own_thread: a thread claimed by one
+        # worker session is not delegation proof for any other session (or the
+        # sessionless dispatcher) of the same agent.
+        bound = thread.responder_session_id
         if bound is not None and bound != session_id:
             return "thread belongs to a different session of this agent"
-        delegator_id = (
-            thread.responder_agent_id
-            if thread.initiator_agent_id == agent.id
-            else thread.initiator_agent_id
-        )
+        delegator_id = thread.initiator_agent_id
         delegator = await session.get(Agent, delegator_id)
         if delegator is None or delegator.disabled:
             return "delegator agent is disabled"
         request.delegation_thread_id = thread.id
         request.delegator_agent_id = delegator_id
-        # risk_notes has no value yet pre-flush (column default applies later)
+        # risk_notes has no value yet pre-flush (column default applies later).
+        # The topic is initiator-supplied text and this note is rendered as
+        # broker context for the LLM reviewer and the Discord embed — quote it
+        # so it cannot masquerade as a further context line.
         request.risk_notes = [
             *(request.risk_notes or []),
             f"on behalf of {delegator.name} (a2a thread topic "
-            f"{thread.topic or '(none)'})",
+            f"{json.dumps(thread.topic) if thread.topic else '(none)'})",
         ]
         return None
 
@@ -350,6 +362,7 @@ class RequestService:
 
         verdict = await self.llm.evaluate(model, agent, request, max_duration, priors)
 
+        pending_grant_id: str | None = None
         async with self.db.session() as session:
             request = await session.get(AccessRequest, request_id)
             if request is None or request.status != RequestStatus.LLM_EVALUATING:
@@ -380,7 +393,7 @@ class RequestService:
                 request.decision_reason = verdict.reasoning
                 request.approved_duration_secs = duration
                 request.decided_at = utcnow()
-                await self._provision(session, request)
+                pending_grant_id = await self._begin_provision(session, request)
             elif verdict.verdict == "deny":
                 if request.attempt >= retry_budget:
                     if await self._guarded_transition(
@@ -402,6 +415,8 @@ class RequestService:
             await session.flush()
             status = request.status
 
+        if pending_grant_id is not None:
+            await self._finish_provision(pending_grant_id)
         self.events.notify(request_id)
         if status == RequestStatus.AWAITING_HUMAN:
             await self._surface(request_id)
@@ -489,6 +504,7 @@ class RequestService:
             # we raise, the transaction rolls back, and the request stays
             # awaiting_human for a re-edit.
             approved_authority = None
+            pending_grant_id: str | None = None
             if decision.approve:
                 final_resource = decision.resource_override or request.resource
                 final_scope = (
@@ -556,11 +572,16 @@ class RequestService:
                     request.requested_duration_secs, None
                 )
                 request.approved_duration_secs = min(base, HUMAN_MAX_DURATION_SECS)
-                await self._provision(session, request)
+                pending_grant_id = await self._begin_provision(session, request)
 
             await session.flush()
             grant = await self._grant_for(session, request_id)
 
+        if pending_grant_id is not None:
+            await self._finish_provision(pending_grant_id)
+            async with self.db.session() as session:
+                request = await session.get(AccessRequest, request_id)
+                grant = await self._grant_for(session, request_id)
         self.events.notify(request_id)
         await self.notifier.update_outcome(request, grant)
         return request
@@ -584,7 +605,19 @@ class RequestService:
         request.approved_duration_secs = duration_secs
         request.decided_at = utcnow()
 
-    async def _provision(self, session: AsyncSession, request: AccessRequest) -> None:
+    async def _begin_provision(self, session: AsyncSession, request: AccessRequest) -> str | None:
+        """First half of provisioning, INSIDE the deciding transaction: create
+        the grant row in status PROVISIONING and move the request along.
+        Returns the grant id to hand to `_finish_provision` after commit, or
+        None when provisioning already failed here (DB-only checks).
+
+        The provisioner itself never runs in here. It does external I/O
+        (GitHub mint, k8s SA+binding, LLDAP membership) that must not sit
+        inside an uncommitted transaction: a rollback after the external
+        mutation would leave live access with no grant row for the scheduler
+        to ever revoke, and on SQLite the write lock would be held across the
+        whole call, failing every other writer in the process.
+        """
         if not await self._guarded_transition(session, request, RequestStatus.PROVISIONING):
             raise TransitionError("request changed state concurrently")
 
@@ -606,7 +639,7 @@ class RequestService:
                 request.decision_reason = (
                     request.decision_reason or ""
                 ) + " | provisioning failed: delegation thread is no longer open"
-                return
+                return None
             expires_at = min(expires_at, backing.expires_at)
 
         grant = Grant(
@@ -621,22 +654,92 @@ class RequestService:
             if request.approved_authority is not None
             else request.authority,
             expires_at=expires_at,
+            status=GrantStatus.PROVISIONING,
         )
         session.add(grant)
         await session.flush()
-        provisioner = self.registry.get(request.platform)
-        try:
-            grant.provisioner_state = await provisioner.provision(session, grant)
-        except Exception as exc:
-            if not isinstance(exc, ProvisionerError):
-                log.exception("unexpected provisioning error for request %s", request.id)
-            log.error("provisioning failed for request %s: %s", request.id, exc)
-            grant.status = GrantStatus.PROVISION_FAILED
-            grant.revoke_reason = str(exc)
-            await self._guarded_transition(session, request, RequestStatus.PROVISION_FAILED)
-            request.decision_reason = (request.decision_reason or "") + f" | provisioning failed: {exc}"
-            return
-        await self._guarded_transition(session, request, RequestStatus.GRANTED)
+        return grant.id
+
+    async def _finish_provision(self, grant_id: str) -> None:
+        """Second half, in its own transaction after the decision committed:
+        run the provisioner and record the outcome. The PROVISIONING row is
+        already durable, so an interruption here (cancel, crash, commit
+        failure) leaves evidence for `reap_stale_provisioning` rather than an
+        orphaned external grant."""
+        async with self.db.session() as session:
+            grant = await session.get(Grant, grant_id)
+            if grant is None or grant.status != GrantStatus.PROVISIONING:
+                return
+            request = await session.get(AccessRequest, grant.request_id)
+            assert request is not None
+            provisioner = self.registry.get(grant.platform)
+            try:
+                grant.provisioner_state = await provisioner.provision(session, grant)
+            except Exception as exc:
+                if not isinstance(exc, ProvisionerError):
+                    log.exception("unexpected provisioning error for request %s", request.id)
+                log.error("provisioning failed for request %s: %s", request.id, exc)
+                grant.status = GrantStatus.PROVISION_FAILED
+                grant.revoke_reason = str(exc)
+                await self._guarded_transition(session, request, RequestStatus.PROVISION_FAILED)
+                request.decision_reason = (
+                    request.decision_reason or ""
+                ) + f" | provisioning failed: {exc}"
+                return
+            grant.status = GrantStatus.ACTIVE
+            await self._guarded_transition(session, request, RequestStatus.GRANTED)
+
+    async def reap_stale_provisioning(self, max_age_secs: float) -> int:
+        """Scheduler pass: grants left in PROVISIONING had their provisioner
+        interrupted after the row was committed but before the outcome was
+        recorded. The external side effect may or may not exist, so run the
+        (idempotent) revoke and fail the grant closed. `max_age_secs=0` is the
+        boot catch-up — the broker is single-process, so nothing can still be
+        in flight at startup; later ticks only touch rows older than any
+        provisioner could legitimately take."""
+        cutoff = utcnow() - timedelta(seconds=max_age_secs)
+        async with self.db.session() as session:
+            stale = list(
+                (
+                    await session.execute(
+                        select(Grant.id).where(
+                            Grant.status == GrantStatus.PROVISIONING,
+                            Grant.created_at <= cutoff,
+                        )
+                    )
+                ).scalars()
+            )
+        reaped = 0
+        for grant_id in stale:
+            try:
+                async with self.db.session() as session:
+                    grant = await session.get(Grant, grant_id)
+                    if grant is None or grant.status != GrantStatus.PROVISIONING:
+                        continue
+                    provisioner = self.registry.get(grant.platform)
+                    await provisioner.revoke(session, grant)
+                    grant.status = GrantStatus.PROVISION_FAILED
+                    grant.revoked_at = utcnow()
+                    grant.revoke_reason = "provisioning interrupted; external state reverted"
+                    request = await session.get(AccessRequest, grant.request_id)
+                    await self._guarded_transition(session, request, RequestStatus.PROVISION_FAILED)
+                    request.decision_reason = (
+                        request.decision_reason or ""
+                    ) + " | provisioning failed: interrupted (broker restarted mid-provision)"
+                    request_id = request.id
+                reaped += 1
+                log.warning("reaped interrupted provisioning for grant %s", grant_id)
+                self.events.notify(request_id)
+            except Exception:
+                # Stays PROVISIONING (never issuable); retried next tick.
+                log.exception("failed to reap stale provisioning grant %s; will retry", grant_id)
+        return reaped
+
+    async def _reload_request(self, request_id: str) -> AccessRequest:
+        async with self.db.session() as session:
+            request = await session.get(AccessRequest, request_id)
+            assert request is not None
+            return request
 
     async def revoke_grant(self, grant_id: str, reason: str, revoked_by: str = "") -> Grant:
         async with self.db.session() as session:
