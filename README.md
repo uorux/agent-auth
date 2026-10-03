@@ -19,6 +19,7 @@ agent ──HTTP/MCP/CLI──▶ broker ──policy──▶ deny | approve | 
 | platform  | capability    | resource            | grant means                                                                 |
 |-----------|---------------|---------------------|-----------------------------------------------------------------------------|
 | `github`  | `repo`        | `owner/repo`        | broker mints GitHub App installation tokens (≤1h, re-minted on demand) scoped to the repo + `scope.permissions` |
+| `github`  | `create`      | `org/name`          | broker **creates** the repo in an org listed in `create_owners` (`scope.visibility`: `private`, or `public` = always human-reviewed), using an Administration token it mints, uses once and revokes — the agent never sees it. Already exists → reported, not an error. Access afterwards is a normal `repo` grant; nothing is deleted at expiry |
 | `homelab` | `group`       | LLDAP group name    | agent's LLDAP service account is added to the group (Authelia rules are per-group); removed at expiry. Agents without a hand-registered account get a broker-managed one (`svc-<name>`, generated password) at their first grant; the credential fetch returns username + password |
 | `kubernetes` | role name (`view`, `edit`, `traefik-patcher`, …) | namespace name (or `*` for cluster-wide) | per-grant ServiceAccount + RoleBinding to the named (Cluster)Role — a ClusterRoleBinding when the namespace is `*`; tokens minted on demand via TokenRequest; SA deleted at expiry → all tokens die instantly. The capability *is* the role, so policy rules auto-approve narrow roles and surface broad ones |
 | `a2a`     | `talk`        | target agent name   | authorizes OPENING conversation threads to that (service) agent — see [a2a threads](#a2a-threads); no credential is minted |
@@ -272,7 +273,15 @@ A human's own scope-pinned auto-approve rule still applies.
    broker refuses any other owner rather than silently re-targeting).
 4. Set `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY_FILE`, and mirror the
    ceiling in `platforms.github.permission_ceiling`.
-5. Note the app is its own principal: installation tokens carry the *app's*
+5. **Repo creation** (optional): give the app the **Administration: write**
+   repository permission, accept it on each org installation you list in
+   `platforms.github.create_owners`, and keep those orgs inside
+   `repo_allowlist`. Organizations only — an installation token can't create
+   repos under a personal account. Check whether a newly created repo joins
+   a *selected-repositories* installation; if it doesn't, the create grant's
+   credential says so, and `repo` grants on it fail until you add it (or
+   install the app on all repositories of that org).
+6. Note the app is its own principal: installation tokens carry the *app's*
    permissions as approved at install time — they never inherit or act with
    any user's org role.
 

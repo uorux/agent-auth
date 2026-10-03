@@ -262,6 +262,10 @@ class PlatformCatalog(BaseModel):
     namespace_allowlist: list[str] | None = None
     repo_allowlist: list[str] | None = None
     permission_ceiling: dict[str, str] | None = None
+    # github: orgs where capability "create" makes a new repo ("org/name",
+    # scope {"visibility": "private"|"public"}; public always human-reviewed).
+    create_owners: list[str] | None = None
+    create_disposition: str | None = None
     groups: list[CatalogEntry] | None = None
     capabilities: list[str] | None = None
     peers: list[PeerEntry] | None = None

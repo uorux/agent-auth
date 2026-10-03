@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,6 +23,9 @@ log = logging.getLogger(__name__)
 _PERM_LEVELS = {"read": 1, "write": 2, "admin": 3}
 # Refresh the cached installation token when less than this much validity remains.
 _MIN_TOKEN_VALIDITY = timedelta(minutes=5)
+# GitHub's repository name charset; "." and ".." are reserved.
+_REPO_NAME = re.compile(r"^[a-z0-9._-]{1,100}$")
+_VISIBILITIES = ("private", "public")
 
 
 def _fnmatch_any(name: str, patterns: list[str]) -> bool:
@@ -44,6 +48,15 @@ class GithubProvisioner:
 
     Convention: capability="repo", resource="owner/repo",
     scope={"permissions": {"contents": "write", "secrets": "write", ...}}.
+
+    capability="create", resource="org/name", scope={"visibility": "private"}
+    creates the repo instead (organizations in `create_owners` only). The
+    broker does the creating itself, with an Administration:write token it
+    mints for that one call and revokes straight after — far broader than
+    "create one repo" (it could delete or reconfigure any repo the
+    installation covers), so it never leaves the broker. Access to the new
+    repo is an ordinary "repo" grant afterwards. Nothing is undone at expiry:
+    the broker never deletes repos.
     """
 
     platform = Platform.GITHUB
@@ -69,8 +82,10 @@ class GithubProvisioner:
         self._pinned_account: str | None = None
 
     async def validate_request(self, session: AsyncSession, spec: RequestSpec) -> RequestSpec:
+        if spec.capability == "create":
+            return self._validate_create(spec)
         if spec.capability != "repo":
-            raise SpecValidationError("github capability must be 'repo'")
+            raise SpecValidationError("github capability must be 'repo' or 'create'")
         repo = spec.resource.strip().strip("/").lower()
         if repo.count("/") != 1:
             raise SpecValidationError("github resource must be 'owner/repo'")
@@ -104,13 +119,45 @@ class GithubProvisioner:
         spec.scope = {"permissions": normalized}
         return spec
 
+    def _validate_create(self, spec: RequestSpec) -> RequestSpec:
+        repo = spec.resource.strip().strip("/").lower()
+        if repo.count("/") != 1:
+            raise SpecValidationError("github create resource must be 'org/name'")
+        owner, name = repo.split("/")
+        if owner not in {o.lower() for o in self.config.create_owners}:
+            raise SpecValidationError(
+                f"repos can't be created under {owner!r} (platforms.github.create_owners)"
+            )
+        if not _REPO_NAME.match(name) or name in (".", "..") or name.endswith(".git"):
+            raise SpecValidationError(f"invalid repository name {name!r}")
+        if _fnmatch_any(repo, self.config.repo_denylist):
+            raise SpecValidationError(f"repo {repo!r} is never brokered (denylist)")
+        if self.config.repo_allowlist and not _fnmatch_any(repo, self.config.repo_allowlist):
+            raise SpecValidationError(f"repo {repo!r} is not in the allowlist")
+        unknown = set(spec.scope) - {"visibility"}
+        if unknown:
+            raise SpecValidationError(f"unknown scope keys for create: {sorted(unknown)}")
+        visibility = str(spec.scope.get("visibility", "private")).lower()
+        if visibility not in _VISIBILITIES:
+            raise SpecValidationError("scope.visibility must be 'private' or 'public'")
+        spec.notes.append(f"creates a new {visibility} repo {repo}")
+        if visibility == "public":
+            spec.notes.append("PUBLIC: everything pushed to it is visible to anyone")
+        spec.resource = repo
+        spec.scope = {"visibility": visibility}
+        return spec
+
     async def provision(self, session: AsyncSession, grant: Grant) -> dict:
+        if grant.capability == "create":
+            return await self._create(grant)
         # Minting a token scoped to the repo proves the installation covers it.
         token, expires_at = await self._mint(grant)
         await self._cache_token(session, grant, token, expires_at)
         return {"repo": grant.resource, "permissions": grant.scope["permissions"]}
 
     async def revoke(self, session: AsyncSession, grant: Grant) -> None:
+        if grant.capability == "create":
+            return  # nothing to undo: the broker never deletes repos
         cred = await self._cached(session, grant)
         if cred is not None:
             try:
@@ -128,6 +175,20 @@ class GithubProvisioner:
     async def get_credential(self, session: AsyncSession, grant: Grant) -> CredentialOut:
         if grant.status != GrantStatus.ACTIVE or grant.expires_at <= utcnow():
             raise ProvisionerError("grant is not active; refusing to mint a token")
+        if grant.capability == "create":
+            # No token: the repo exists now. Report what happened.
+            state = grant.provisioner_state or {}
+            note = (
+                f"{'created' if state.get('created') else 'already existed'}: "
+                f"{state.get('repo')} ({state.get('visibility')}). Request a 'repo' "
+                "grant on it for access."
+            )
+            if not state.get("installation_covers", True):
+                note += (
+                    " The broker's GitHub App installation does not cover it yet, so repo "
+                    "grants on it will fail until it is added to the installation."
+                )
+            return CredentialOut(kind="github_repo", value=state.get("html_url"), note=note)
         cred = await self._cached(session, grant)
         if cred is not None and cred.expires_at - utcnow() > _MIN_TOKEN_VALIDITY:
             token = self.secret_box.decrypt(cred.value_encrypted)
@@ -221,6 +282,112 @@ class GithubProvisioner:
             )
         self._pinned_account = str(login).lower()
         return self._pinned_account
+
+    async def _create(self, grant: Grant) -> dict:
+        org, name = grant.resource.split("/", 1)
+        visibility = grant.scope["visibility"]
+        installation_id = await self._org_installation(org)
+        token = await self._admin_token(installation_id, org)
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"{self.api_url}/orgs/{org}/repos",
+                    headers=self._token_headers(token),
+                    json={
+                        "name": name,
+                        "visibility": visibility,
+                        "private": visibility == "private",
+                    },
+                )
+                if resp.status_code == 201:
+                    repo, created = resp.json(), True
+                elif resp.status_code == 422:
+                    # Most likely the name is taken. Idempotent for retries
+                    # (an orchestrator re-running project setup, a re-provision
+                    # after a crash): adopt it if it's visible to the app.
+                    existing = await client.get(
+                        f"{self.api_url}/repos/{org}/{name}",
+                        headers=self._token_headers(token),
+                    )
+                    if existing.status_code != 200:
+                        log.error("GitHub repo create for %s failed: %s", grant.resource, resp.text[:300])
+                        raise ProvisionerError(f"GitHub repo create failed (422): {resp.text[:200]}")
+                    repo, created = existing.json(), False
+                else:
+                    log.error(
+                        "GitHub repo create for %s failed (%s): %s",
+                        grant.resource,
+                        resp.status_code,
+                        resp.text[:300],
+                    )
+                    raise ProvisionerError(f"GitHub repo create failed ({resp.status_code})")
+        finally:
+            await self._revoke_token(token)
+        covered = await self._installation_covers(grant.resource)
+        if created:
+            log.info("created GitHub repo %s (%s)", grant.resource, visibility)
+        return {
+            "action": "create",
+            "repo": grant.resource,
+            "html_url": repo.get("html_url"),
+            "repo_id": repo.get("id"),
+            "visibility": repo.get("visibility", visibility),
+            "created": created,
+            "installation_covers": covered,
+        }
+
+    async def _org_installation(self, org: str) -> str:
+        if self.installation_id:
+            account = await self._pinned_account_login()
+            if account != org:
+                raise ProvisionerError(
+                    f"org {org!r} is not the pinned installation's account ({account!r})"
+                )
+            return self.installation_id
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"{self.api_url}/orgs/{org}/installation", headers=self._app_headers()
+            )
+        if resp.status_code != 200:
+            raise ProvisionerError(
+                f"the GitHub App is not installed on org {org!r} ({resp.status_code})"
+            )
+        return str(resp.json()["id"])
+
+    async def _admin_token(self, installation_id: str, org: str) -> str:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{self.api_url}/app/installations/{installation_id}/access_tokens",
+                headers=self._app_headers(),
+                json={"permissions": {"administration": "write", "metadata": "read"}},
+            )
+        if resp.status_code != 201:
+            log.error("GitHub admin token mint for %s failed (%s): %s", org, resp.status_code, resp.text[:300])
+            raise ProvisionerError(
+                f"could not mint an Administration token for {org!r} ({resp.status_code}); "
+                "does the GitHub App have Administration: write there?"
+            )
+        return resp.json()["token"]
+
+    async def _revoke_token(self, token: str) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                await client.delete(
+                    f"{self.api_url}/installation/token", headers=self._token_headers(token)
+                )
+        except Exception:
+            # It expires within the hour regardless.
+            log.warning("failed to revoke the Administration token after a repo create")
+
+    async def _installation_covers(self, repo: str) -> bool:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"{self.api_url}/repos/{repo}/installation", headers=self._app_headers()
+            )
+        if resp.status_code == 200:
+            self._installation_cache[repo] = resp.json()["id"]
+            return True
+        return False
 
     async def _mint(self, grant: Grant) -> tuple[str, datetime]:
         owner_repo = grant.resource.split("/", 1)[1]

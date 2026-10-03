@@ -50,7 +50,7 @@ def catalog():
 @app.command()
 def request(
     platform: str = typer.Argument(help="github | homelab | kubernetes | a2a | google"),
-    capability: str = typer.Argument(help="e.g. repo, group, view/edit (k8s role), talk, calendar.read"),
+    capability: str = typer.Argument(help="e.g. repo, create (new github repo), group, view/edit (k8s role), talk, calendar.read"),
     resource: str = typer.Argument(help="e.g. jrt/myrepo, svc-gitea, media (k8s namespace), homelab-agent"),
     justification: str = typer.Option(..., "--why", "-j", help="Why you need this"),
     duration: str = typer.Option("1h", "--duration", "-d", help="e.g. 30m, 8h, 2d"),

@@ -122,6 +122,11 @@ def request_access(
     platform/capability/resource conventions:
     - github: capability="repo", resource="owner/repo",
       scope={"permissions": {"contents": "write", "secrets": "write"}}
+    - github, new repo: capability="create", resource="org/name",
+      scope={"visibility": "private"} (orgs listed under create_owners in
+      list_capabilities; "public" always goes to a human). The broker creates
+      it; get_credential(grant_id) then reports its URL. Request a "repo" grant
+      on it for access. Creating one that already exists just reports it.
     - homelab: capability="group", resource=<lldap group, e.g. "svc-gitea">
       (once granted, your service account is in the group; authenticate to the
       service yourself — e.g. mint your own Gitea token)

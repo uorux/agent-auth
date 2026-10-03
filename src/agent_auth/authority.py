@@ -25,6 +25,11 @@ def fold(platform: Platform, capability: str, scope: dict[str, Any] | None) -> d
     """Collapse a request's (capability, scope) into its canonical authority."""
     scope = scope or {}
     if platform == Platform.GITHUB:
+        # Creating a repo is a different privilege from any access to one, so
+        # it folds into a distinct authority: no rule pinned to repo access
+        # can ever approve a create, and vice versa.
+        if capability == "create":
+            return {"action": "create", "visibility": scope.get("visibility", "private")}
         return {"permissions": dict(scope.get("permissions", {}))}
     if platform == Platform.KUBERNETES:
         # Cluster-wide is a distinct privilege from the same role in a namespace,
@@ -45,6 +50,8 @@ def split(platform: Platform, authority: dict[str, Any] | None) -> tuple[str, di
     """Reconstruct (capability, scope) from authority — the inverse of fold."""
     authority = authority or {}
     if platform == Platform.GITHUB:
+        if authority.get("action") == "create":
+            return "create", {"visibility": authority.get("visibility", "private")}
         return "repo", {"permissions": dict(authority.get("permissions", {}))}
     if platform == Platform.KUBERNETES:
         scope = {"cluster": True} if authority.get("cluster") else {}
@@ -59,6 +66,8 @@ def split(platform: Platform, authority: dict[str, Any] | None) -> tuple[str, di
 def label(platform: Platform, authority: dict[str, Any] | None) -> str:
     """Short human/policy-facing name for an authority (used in admin listings)."""
     if platform == Platform.GITHUB:
+        if (authority or {}).get("action") == "create":
+            return f"create:{authority.get('visibility', 'private')}"
         perms = (authority or {}).get("permissions", {})
         return "+".join(f"{k}:{v}" for k, v in sorted(perms.items())) or "repo"
     if platform == Platform.KUBERNETES:
@@ -71,6 +80,9 @@ def is_sensitive(platform: Platform, authority: dict[str, Any] | None, platforms
     """Does this authority always require a human, regardless of policy routing?"""
     authority = authority or {}
     if platform == Platform.GITHUB:
+        # A public repo publishes whatever is pushed to it: a human's call.
+        if authority.get("action") == "create":
+            return authority.get("visibility") != "private"
         sensitive = set(platforms_cfg.github.sensitive_permissions)
         return any(p in sensitive for p in authority.get("permissions", {}))
     if platform == Platform.KUBERNETES:

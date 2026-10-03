@@ -87,6 +87,14 @@ class GithubPlatformConfig(BaseModel):
     sensitive_permissions: list[str] = Field(
         default_factory=lambda: ["secrets", "administration"]
     )
+    # Organizations the broker may create repos in (capability "create",
+    # resource "org/name"). Empty = creation disabled. The new repo must also
+    # pass repo_allowlist/repo_denylist. The GitHub App needs Administration:
+    # write on these installations; the broker uses it for the create call
+    # alone and never hands that token out. Creating a PUBLIC repo always
+    # reaches a human. Organizations only: an installation token can't create
+    # repos under a personal account.
+    create_owners: list[str] = Field(default_factory=list)
 
 
 class HomelabPlatformConfig(BaseModel):

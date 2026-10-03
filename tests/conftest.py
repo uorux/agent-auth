@@ -37,6 +37,7 @@ TEST_POLICY = {
             "repo_allowlist": ["jrt/*"],
             "repo_denylist": ["jrt/nixos-dots"],
             "permission_ceiling": {"contents": "write", "secrets": "write", "issues": "read"},
+            "create_owners": ["jrt"],
         },
         "homelab": {"allowed_groups": ["svc-gitea", "svc-sonarr", "svc-k8s-gitops"]},
         "kubernetes": {

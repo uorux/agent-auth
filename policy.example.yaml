@@ -51,6 +51,12 @@ platforms:
       - secrets
       - administration
       - organization_secrets
+    # Orgs where capability "create" makes a new repo (resource "org/name",
+    # scope {visibility: private|public}). The broker does the create with an
+    # Administration token that never leaves it; public repos always reach a
+    # human. The app needs Administration: write on these installations.
+    # create_owners:
+    #   - "uorux"
   homelab:
     # Only these LLDAP groups are brokered. Authelia rules per group are
     # configured in Authelia itself, not here.

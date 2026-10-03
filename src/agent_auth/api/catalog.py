@@ -62,6 +62,12 @@ async def build_catalog(
                 resource_hint="owner/repo",
                 repo_allowlist=gh.repo_allowlist or ["<any>"],
                 permission_ceiling=gh.permission_ceiling,
+                create_owners=gh.create_owners or None,
+                create_disposition=(
+                    await _disposition(session, engine, agent, Platform.GITHUB, "create")
+                    if gh.create_owners
+                    else None
+                ),
             )
         )
 
