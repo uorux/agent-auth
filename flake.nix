@@ -330,5 +330,165 @@
             };
           };
         };
+
+      # sandboxd, inside an agent VM's guest (docs/sandbox-design.md §6). The
+      # host side (the VM itself) is nixos-dots' modules.agentVm; this module
+      # goes into its guestModules. Pair once:
+      #   broker admin:  agent-auth admin daemon-pair --role sandbox <host>
+      #   in the guest:  agent-auth-sandboxd pair        (prompts for the code)
+      # State (agent keys, conversations) is in /var/lib/sandboxd, projects in
+      # /var/lib/sandbox: both on the guest's persisted /var/lib.
+      nixosModules.sandboxd = { config, lib, pkgs, ... }:
+        let
+          cfg = config.services.agent-auth-sandboxd;
+          pkg = cfg.package;
+          agentEnv = pkgs.buildEnv {
+            name = "agent-sandbox-path";
+            paths = cfg.agentPackages;
+          };
+          settings = {
+            broker_url = cfg.brokerUrl;
+            broker_public_key = cfg.brokerPublicKey;
+            name = cfg.hostName;
+            agent_path = "${agentEnv}/bin:${pkg}/bin";
+            agent_auth_mcp = "${pkg}/bin/agent-auth-mcp";
+            sandbox_mcp = "${pkg}/bin/agent-auth-sandbox-mcp";
+            tmux = "${pkgs.tmux}/bin/tmux";
+            systemd_run = "${config.systemd.package}/bin/systemd-run";
+            systemctl = "${config.systemd.package}/bin/systemctl";
+            setfacl = "${pkgs.acl}/bin/setfacl";
+            orchestrator_runtime = cfg.orchestratorRuntime;
+            runtimes = lib.mapAttrs (name: r: {
+              command = "${r.package}/bin/${r.binary}";
+              model = r.model;
+            }) cfg.runtimes;
+            inherit (cfg) park_grace_secs max_processes unit_memory_max;
+          };
+          configFile = pkgs.writeText "sandboxd.json" (builtins.toJSON settings);
+        in
+        {
+          options.services.agent-auth-sandboxd = {
+            enable = lib.mkEnableOption "agent-auth sandboxd (in an agent VM)";
+
+            package = lib.mkOption {
+              type = lib.types.package;
+              default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+              defaultText = lib.literalExpression "agent-auth.packages.<system>.default";
+            };
+
+            brokerUrl = lib.mkOption {
+              type = lib.types.strMatching
+                "https://[^/].*|http://(localhost|127\\.0\\.0\\.1|\\[::1])(:[0-9]+)?(/.*)?";
+            };
+
+            brokerPublicKey = lib.mkOption {
+              type = lib.types.strMatching "ed25519:[A-Za-z0-9_-]{43}";
+              description = "The broker's public signing key, pinned (as for hostd).";
+            };
+
+            hostName = lib.mkOption {
+              type = lib.types.strMatching "[a-z0-9][a-z0-9-]{0,62}";
+              description = ''
+                The PHYSICAL host this VM runs on: the sandbox daemon's name,
+                and the <host> in its agents' names
+                (<runtime>-<project>-<host>-sandbox).
+              '';
+            };
+
+            runtimes = lib.mkOption {
+              type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
+                options = {
+                  package = lib.mkOption { type = lib.types.package; };
+                  binary = lib.mkOption {
+                    type = lib.types.str;
+                    default = name;
+                    description = "The binary in the package (unwrapped, not a sandbox launcher).";
+                  };
+                  model = lib.mkOption {
+                    type = lib.types.nullOr lib.types.str;
+                    default = null;
+                  };
+                };
+              }));
+              default = { };
+              example = lib.literalExpression
+                ''{ claude.package = pkgs.claude-code; codex.package = pkgs.codex; }'';
+              description = "Agent runtimes: claude and/or codex.";
+            };
+
+            orchestratorRuntime = lib.mkOption {
+              type = lib.types.str;
+              default = "claude";
+              description = "Which runtime the VM's orchestrator runs as.";
+            };
+
+            agentPackages = lib.mkOption {
+              type = lib.types.listOf lib.types.package;
+              default = with pkgs; [
+                bashInteractive coreutils findutils gnugrep gnused gawk diffutils
+                gnutar gzip xz unzip which file less procps
+                git gh openssh curl wget jq ripgrep fd tree
+                config.nix.package python3
+              ];
+              defaultText = lib.literalExpression "[ git gh coreutils nix python3 ripgrep … ]";
+              description = "What agents find on PATH in their units.";
+            };
+
+            park_grace_secs = lib.mkOption {
+              type = lib.types.number;
+              default = 30;
+              description = "Idle seconds after a turn before a conversation's process is parked.";
+            };
+            max_processes = lib.mkOption {
+              type = lib.types.ints.positive;
+              default = 16;
+            };
+            unit_memory_max = lib.mkOption {
+              type = lib.types.str;
+              default = "8G";
+              description = "MemoryMax= of each agent process's unit.";
+            };
+          };
+
+          config = lib.mkIf cfg.enable {
+            environment.etc."agent-auth/sandboxd.json".source = configFile;
+            # Project users are userdb drop-ins sandboxd writes at run time.
+            services.userdbd.enable = lib.mkDefault true;
+            environment.etc.userdb.source = lib.mkDefault "/var/lib/userdb";
+            environment.systemPackages = [ pkg pkgs.tmux pkgs.acl ];
+
+            systemd.tmpfiles.rules = [
+              "d /var/lib/sandbox 0711 root root -"
+              "d /var/lib/sandbox/projects 0711 root root -"
+              "d /var/lib/sandbox/homes 0711 root root -"
+              "d /var/lib/sandbox/tmp 0711 root root -"
+            ];
+
+            systemd.services.agent-auth-sandboxd = {
+              description = "agent-auth sandbox daemon";
+              wantedBy = [ "multi-user.target" ];
+              wants = [ "network-online.target" ];
+              after = [ "network-online.target" "systemd-userdbd.service" ];
+              environment.AGENT_AUTH_SANDBOXD_CONFIG = "/etc/agent-auth/sandboxd.json";
+              path = [ pkgs.util-linux pkgs.acl pkgs.coreutils config.systemd.package pkgs.tmux ];
+              # Running agents live in their own transient units: restarting the
+              # daemon parks them (they resume on their next message).
+              restartIfChanged = true;
+              serviceConfig = {
+                ExecStart = "${pkg}/bin/agent-auth-sandboxd run";
+                Restart = "always";
+                RestartSec = 5;
+                StateDirectory = "sandboxd";
+                StateDirectoryMode = "0700";
+                RuntimeDirectory = [ "sandboxd" "sandboxd-agent" ];
+                RuntimeDirectoryMode = "0755";
+                # The daemon manages users, ACLs and units: it is root, on purpose.
+                # It holds every agent key in the VM; the agents themselves run
+                # unprivileged, each in its own unit.
+                UMask = "0077";
+              };
+            };
+          };
+        };
     };
 }
