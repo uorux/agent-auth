@@ -416,6 +416,36 @@ services.agent-auth-hostd = {
 # mode 0700, user and group agent-auth-hostd
 ```
 
+## Agent VMs (sandboxd)
+
+An agent VM is one per host. It runs orchestrated, headless Claude/Codex
+agents, each project under its own unix user. See
+[docs/sandbox-design.md](docs/sandbox-design.md); nixos-dots'
+`modules.agentVm` builds the VM, and `nixosModules.sandboxd` goes into its
+guest.
+
+- **Identities.** Pairing the VM's daemon (`agent-auth admin daemon-pair
+  --role sandbox <host>`, then `avm pair` on the host) bootstraps
+  `orchestrator-<host>-sandbox`. Its policy may mint
+  `<runtime>-<project>-<host>-sandbox` (platform `agents`, capability `mint`;
+  only a rule naming `mint` clears it). A minted agent's key goes to the
+  VM's daemon alone, never to the agent that asked. Each minted agent has a
+  lease (`platforms.agents.lease`, 30d; minting again renews it), and
+  `admin agent-disable` disables an agent and everything it minted.
+- **Conversations.** An a2a open to a VM agent becomes a conversation: a
+  claude (`-p` stream-json) or codex (app-server) process in a sandboxed
+  systemd unit. It parks when idle and resumes on the next message, with the
+  same transcript and scratchpad. `{"_sandbox": {"conversation": id}}` in an
+  opening payload continues an existing conversation.
+- **Projects.** Each project gets `/var/lib/sandbox/projects/<p>`, a home
+  and a `/tmp` of its own, and a userdb user. Another project's files are a
+  grant (platform `sandbox`, `project.read`, or `project.write`, which is
+  always a human's call), applied by the daemon as ACLs.
+- **Operators.** On the host, `avm`: `avm claude <project>` opens a
+  conversation in the Claude TUI, minting the agent if needed. Other commands
+  are `avm ls`, `attach`, `logs -f`, `send`, `stop`, `close`, `shell`,
+  `project-create`, and `secret-set claude-oauth-token < file`.
+
 ## Deploy (recommended: native NixOS service)
 
 Why not on the k8s cluster: the homelab agent will eventually hold gitops-repo

@@ -22,6 +22,17 @@ against the pinned versions; **[open]** = needs your call (collected in §16).
 
 ---
 
+## Status (2026-10-04)
+
+| phase | state |
+|---|---|
+| 1. Daemon channel + hostd skeleton | built, tested; not deployed |
+| 2. Agent VM (nixos-dots) | built (guest system and units build); not run on hardware |
+| 3. sandboxd | built, tested against a real broker with a fake runtime; not run on hardware |
+| 4–8 | not started |
+
+Where the build departed from this document is noted in place as **[built: …]**.
+
 ## 0. Decisions on record
 
 - One agent VM per physical host, NixOS guest under crosvm.
@@ -443,7 +454,13 @@ Conversation {id, agent, runtime, runtime_session_id, broker_session_id,
      or a matching topic → **triage**: a one-shot cheap-model call
      (`claude -p --model haiku` or the codex equivalent, in a throwaway unit)
      picks `{conversation_id | "new"}`. Any failure → new.
+     **[built: not yet — rules 1, 2 and 4 only]**
   4. Otherwise → a new conversation.
+
+  **[built]** The hint is `{"_sandbox": {"conversation": "<id>"}}` in the
+  opening payload. Building it surfaced a broker bug, now fixed: FastAPI's
+  encoder dropped payload keys starting with `_sa`, as if they were
+  SQLAlchemy state.
 
   The chosen conversation claims the thread by accepting with its own session.
 - **Delivery format**: `[a2a] thread <id> · from <peer> · topic <t> · seq <n>`,
@@ -513,7 +530,9 @@ Prototyped on 2026-10-03 against Claude Code 2.1.280 and codex-cli 0.156.1.
     messages into an active turn, and starts a turn otherwise.
   - Claude: queued stdin lines become the next turns (verified). A
     `PostToolUse` hook doorbell for true mid-turn injection is still
-    **[verify]**.
+    **[verify]** **[built: not yet]**. For an attached TUI, a
+    `UserPromptSubmit` hook (`agent-auth-sandbox-mcp hook`) adds queued
+    messages to your next prompt **[built]**.
 - **Auth: subscription OAuth** **[decided]**
   - Claude: one long-lived `claude setup-token` token, root-only on the VM
     disk, injected as `CLAUDE_CODE_OAUTH_TOKEN`.
@@ -581,6 +600,17 @@ sbx-broker's `grant-net` does. Deferred, along with per-project egress
 
 ### 6.7 Key custody
 
+**[built]**
+- **Orchestrator bootstrap:** pairing a sandbox daemon bootstraps
+  `orchestrator-<host>-sandbox`, and re-pairing rotates its key.
+- **Delivery:** keys are pushed as `key` messages on connect, on every
+  heartbeat, and right after a mint, until acknowledged.
+- **Leases:** the identity lease (`platforms.agents.lease`, 30d) is separate
+  from the mint grant's duration, which recusant's 24h default would cap.
+  Minting again renews the lease. A sweep disables expired agents, and
+  `admin agent-disable` disables an agent and everything it minted.
+- **Explicit rules:** minting is cleared only by a rule that names `mint`.
+
 `agents:mint` provisioning generates the key, stores it Fernet-wrapped in
 `pending_key_deliveries`, and pushes `key.available`. sandboxd fetches it once
 over the daemon channel, and the row is deleted on ack. A lost key → `admin
@@ -596,7 +626,9 @@ leave it to run headless, and take over a headless one, all on the same
 transcript.
 
 **Host CLI `avm`** (on the agent VM's host; `--host <h>` reaches another host
-over tailnet SSH, which `jrt` already has):
+over tailnet SSH, which `jrt` already has). **[built: avm runs
+`agent-auth-sandboxctl` in the guest over vsock SSH; `avm claude|codex
+<project>` stands in for `avm new`; `--host` not yet]**
 
 | command | does |
 |---|---|
@@ -732,7 +764,16 @@ Re-pairing replaces the key; `admin daemons` lists them, and
   - `arm|disarm|arm.state`
   - `control` (sandbox/mount/mcp provision steps, `lockdown`, `unlock`,
     `vm.freeze|thaw|stop`) and `control.ack`
-  - sandboxes only: `a2a.events`, `key.available|fetch`
+  - sandboxes only: `key` (broker → daemon, an agent's key) and `key.ack`,
+    `key.rotate` (daemon → broker), and `project.grant|revoke` answered by
+    `reply` through `DaemonHub.call()`.
+
+  **[built]** a2a doesn't travel over the channel. sandboxd runs one
+  sessionless `/v1/a2a/events` long-poll per agent, which is also what keeps
+  each agent reachable, plus one session-scoped long-poll per open
+  conversation, which keeps its session alive while parked. That's simpler
+  than fanning events out over the channel, and fine at homelab scale; it
+  can move onto the channel later without changing sandboxd's logic.
 
   Daemon-side provisioners wait for an ack. A timeout or nack becomes
   `provision_failed`, and revocations retry until acked.
