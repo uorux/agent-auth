@@ -14,7 +14,46 @@ from mcp.server.fastmcp import FastMCP
 
 from .client import BrokerClient, BrokerError
 
-mcp = FastMCP("agent-auth")
+# Shown to the agent up front. Clients like Claude Code and Codex defer MCP
+# tools (the agent sees their names, not their docs, until it loads one), so
+# this is where an agent learns what the server is for and the workflow.
+INSTRUCTIONS = """\
+agent-auth is this homelab's access broker. You have an agent identity (an API
+key in your environment). Anything beyond your own sandbox — GitHub repos (or
+creating new ones), homelab services behind LLDAP/Authelia, Kubernetes,
+talking to other agents — goes through it, and each grant is approved by
+policy, an LLM reviewer, or a human on Discord. Never ask the user for tokens
+or passwords: request access here.
+
+Getting access:
+1. whoami — your agent name and kind (ephemeral CLI agent or service).
+2. list_capabilities — what exists and what you may ask for (platforms, roles,
+   groups, repos, permissions, orgs you can create repos in, reachable agents),
+   with each one's usual routing (auto-approve / llm review / human review).
+3. list_grants — reuse an active grant before requesting another.
+4. request_access — the narrowest capability that does the job, with a
+   specific justification (what task, why this resource, why this long).
+5. wait_for_decision — follow its `status` and `guidance`.
+6. get_credential(grant_id) — tokens, accounts, a created repo's URL.
+   Re-fetch instead of caching: credentials stop being issued when the grant
+   ends.
+
+Talking to other agents (a2a): conversations are threads. check_a2a or
+list_capabilities show who is reachable; a2a_open needs an a2a "talk" grant
+for that agent and carries your first message; a2a_poll waits for replies. If
+someone opened a thread to you asking for work, answer with
+a2a_send({"type": "result", "status": "done"|"failed"|"declined",
+"summary": "..."}) before a2a_close — initiators look for that message.
+Service agents receive threads by looping on a2a_events.
+
+If several conversations share this MCP server (service runtimes), each calls
+create_session once and passes the returned id as session_key on every a2a_*
+and request_access call. If another agent asked you, in a thread it opened to
+you, for work that needs access, pass on_behalf_of_thread=<that thread> to
+request_access: the grant then ends when the thread does.\
+"""
+
+mcp = FastMCP("agent-auth", instructions=INSTRUCTIONS)
 
 # One client per MCP server process so the a2a session (minted lazily below)
 # sticks for the life of this agent instance — exactly the intended lifetime
@@ -65,6 +104,15 @@ def _safe(fn) -> str:
         return json.dumps(fn(), indent=2, default=str)
     except BrokerError as exc:
         return json.dumps({"error": exc.detail, "status_code": exc.status_code})
+
+
+@mcp.tool()
+def whoami() -> str:
+    """Your agent identity: name, kind ("ephemeral" = a CLI agent like Claude
+    Code or Codex, which can open a2a threads but not receive them; "service" =
+    an always-on agent that can receive them), and your current session if any.
+    Other agents and policy rules know you by this name."""
+    return _safe(lambda: _client().me())
 
 
 @mcp.tool()
@@ -132,13 +180,15 @@ def request_access(
       service yourself — e.g. mint your own Gitea token)
     - kubernetes: capability=<role>, resource=<namespace> — the capability is
       the role you want (view, logs-reader, edit, or a narrow custom role like
-      traefik-patcher; ask the operator which roles exist). Grants a
+      traefik-patcher; list_capabilities lists the roles that exist, with what
+      each grants). resource="*" asks for it cluster-wide (always a human). Grants a
       ServiceAccount bound to that role in the namespace; get_credential returns
       a short-lived bearer token for kubectl (--token) or the API. Request the
       narrowest role that does the job — broad roles (edit/admin) get surfaced
       to a human, narrow ones are often auto-approved.
     - a2a: capability="talk", resource=<agent name>, scope={"topic": "deploy/*"}
-    - google: capability in {calendar.read, calendar.write, gmail.read, drive.read}
+    - google: not functional yet (decisions are recorded, no credential is
+      issued); don't plan on it.
 
     Write a SPECIFIC justification (what task, why this resource, why this
     duration) — vague justifications get denied. duration examples: "30m", "8h", "2d".
@@ -159,12 +209,15 @@ def request_access(
 @mcp.tool()
 def wait_for_decision(request_id: str, timeout_secs: float = 120) -> str:
     """Block until the request is decided (or timeout). Read `status` and `guidance`:
-    - granted: access is live; use get_credential(grant_id) if a token is needed
+    - granted: access is live; get_credential(grant_id) if it carries a credential
     - llm_denied: read decision_reason, then retry_request with a better
-      justification, or escalate to a human
+      justification, or escalate_request to a human
     - awaiting_human: a human was pinged on Discord; keep waiting (this can take
-      a while — poll again rather than giving up immediately)
-    - denied: final; do not resubmit the same request unchanged"""
+      a while — call this again rather than giving up)
+    - pending / llm_evaluating / approved / provisioning: in progress; call again
+    - denied: final; do not resubmit the same request unchanged
+    - provision_failed: approved, but setting it up failed (decision_reason
+      says why); tell the user rather than retrying in a loop"""
     return _safe(lambda: _client().wait(request_id, timeout_secs))
 
 
@@ -196,11 +249,18 @@ def list_grants(status: str = "active") -> str:
 
 @mcp.tool()
 def get_credential(grant_id: str) -> str:
-    """Fetch the live credential for an active grant. GitHub grants return a
-    short-lived installation token — refetch rather than storing it; it stops
-    being issued the moment the grant expires. Homelab grants return your LLDAP
-    service account (kind lldap_account: username + password) when the broker
-    manages it; log in to Authelia-protected services with those."""
+    """Fetch the live credential for an active grant, by `kind`:
+    - github_installation_token (github "repo"): a token for git/the API, valid
+      under an hour — refetch rather than storing it; it stops being issued the
+      moment the grant ends. git: https://x-access-token:<token>@github.com/<repo>
+    - github_repo (github "create"): `value` is the new repo's URL and `note`
+      says whether it was created or already existed. Then request a "repo"
+      grant on it for access.
+    - kubernetes_token: a short-lived bearer token (kubectl --token=…).
+    - lldap_account (homelab): your service account's username + password, for
+      Authelia-protected services. lldap_group: a hand-registered account was
+      added to the group; you already have its password.
+    a2a grants carry no credential."""
     return _safe(lambda: _client().credential(grant_id))
 
 
@@ -284,7 +344,12 @@ def a2a_send(
 ) -> str:
     """Send a message into an open thread you participate in. Replying to a
     pending_open thread you received accepts it implicitly (pass your
-    session_key to bind the thread to this conversation)."""
+    session_key to bind the thread to this conversation).
+
+    Answering a thread someone opened to you: your last message should be the
+    result — {"type": "result", "status": "done"|"failed"|"declined",
+    "summary": "<one paragraph>", "detail": {...}} — sent BEFORE a2a_close
+    (sends on a closed thread fail). Initiators parse that shape."""
     return _safe(lambda: _client_for(session_key).a2a_send(thread_id, payload))
 
 
@@ -334,7 +399,9 @@ def a2a_reject(
 def a2a_close(
     thread_id: str, reason: str | None = None, session_key: str | None = None
 ) -> str:
-    """Close a thread you participate in (hang up). Conversations are
+    """Close a thread you participate in (hang up). If you were asked to do
+    something, a2a_send the {"type": "result", ...} message first. Closing also
+    revokes grants you got on_behalf_of this thread. Conversations are
     session-lived: your threads also close automatically if your session ends."""
     return _safe(lambda: _client_for(session_key).a2a_close(thread_id, reason))
 

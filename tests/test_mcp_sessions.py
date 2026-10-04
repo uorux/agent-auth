@@ -86,3 +86,19 @@ def test_close_session_targets_the_given_key():
         assert out["ok"] is True
         assert close.calls[0].request.headers["X-Agent-Session"] == "sess-A"
         assert m._client().session_id == ""  # global untouched
+
+def test_server_instructions_orient_an_agent():
+    # Clients defer MCP tools to names only; the instructions are what an
+    # agent reads first, so they must name the workflow's tools.
+    text = m.mcp.instructions
+    for tool in ("whoami", "list_capabilities", "request_access", "wait_for_decision",
+                 "get_credential", "a2a_open", "create_session"):
+        assert tool in text
+        assert tool in {t.name for t in m.mcp._tool_manager.list_tools()}
+
+
+def test_whoami():
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BROKER}/v1/me").respond(200, json={"name": "claude-x-host", "kind": "ephemeral"})
+        out = json.loads(m.whoami())
+    assert out["name"] == "claude-x-host"

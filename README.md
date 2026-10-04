@@ -75,7 +75,9 @@ interfaces, all wrapping the same HTTP API:
       "command": "agent-auth-mcp",
       "env": {"AGENT_AUTH_URL": "https://agent-auth.rooty.dev", "AGENT_AUTH_API_KEY": "aa_..."}}}}
   ```
-  Tools: `list_capabilities`, `request_access`, `wait_for_decision`,
+  The server sends orientation instructions on connect (clients that defer
+  MCP tools show agents only tool names until loaded, so the workflow lives
+  there). Tools: `whoami`, `list_capabilities`, `request_access`, `wait_for_decision`,
   `retry_request`, `escalate_request`, `get_credential`, `list_grants`,
   `create_session`, `close_session`, `check_a2a`, `a2a_open`, `a2a_send`,
   `a2a_poll`, `a2a_threads`, `a2a_accept`, `a2a_reject`, `a2a_close`,
