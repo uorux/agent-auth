@@ -350,12 +350,24 @@ as root in the guest. Its state lives in SQLite under `/var/lib/sandboxd`.
 
 ### 6.1 Guest system **[proposed]**
 
-- **Persistent disk**: a virtio-blk image (`/large/agent-vm/disk.img`, sparse,
-  size option) holding `/var/lib/sandbox`, `/var/lib/sandboxd`, `/nix/.rw-store`
-  and `/var/lib/userdb`. The rest of `/` is tmpfs, as in app guests.
-  - Block rather than virtio-fs because the guest has many uids, ACLs and
-    default ACLs. On a block device these are native, with no uidmap ranges,
-    and backups are a file on the host.
+- **Disk** **[decided, built]**: `/` is a tmpfs rebuilt from Nix on every
+  boot, as on the hosts. A **btrfs** data disk is mounted at `/persist`
+  (virtio-blk, formatted on first boot) and holds `/var/lib` (projects, homes,
+  per-project `/tmp`, sandboxd and userdb state), `/nix/var`, `/var/log`, and
+  the store overlay's writable layer, all bound in place in the initrd.
+  - Why tmpfs root: whatever a compromised guest root writes anywhere else is
+    gone at the next boot.
+  - Why btrfs: compression and checksums inside the image, a subvolume per
+    project for cheap snapshots and reflink copies, and `discard=async`, which
+    returns freed blocks to a sparse image.
+  - Why a block device rather than a virtio-fs folder: many guest uids,
+    ACLs, and an overlay writable layer all need a real local filesystem.
+    Mapping guest uid ranges through virtio-fs would mean a root-run,
+    guest-facing parser on the host.
+  - Where the disk lives on the host: a sparse image in `/large`, marked
+    nodatacow (`chattr +C`) before it is created, so btrfs hosts don't
+    fragment it. Or a dedicated block device (`disk.type = "block"`: an LVM
+    thin LV, a partition or a zvol), which is better where one exists.
 - **Nix**: the host's `/nix/store` (a virtio-fs share, as today) is the
   lower layer of an overlayfs `/nix/store`, with the upper layer on the
   disk. A guest `nix-daemon` lets agents `nix develop`/`build`. Substituters:
