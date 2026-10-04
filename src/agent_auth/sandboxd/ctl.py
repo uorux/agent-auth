@@ -79,11 +79,20 @@ def new(
     prompt: str = typer.Option(None, "--prompt"),
     detach: bool = typer.Option(False, "--detach", "-d", help="headless; don't attach"),
 ):
-    """New conversation of <runtime>-<project>-<host>-sandbox, attached in its TUI."""
-    agent = next((a["name"] for a in _call("agents") if a["project"] == project and a["runtime"] == runtime), None)
+    """New conversation of <runtime>-<project>-<host>-sandbox, attached in its
+    TUI. Mints the agent first if it doesn't exist (the broker's policy decides;
+    a human may be asked on Discord)."""
+    def find():
+        return next((a["name"] for a in _call("agents") if a["project"] == project and a["runtime"] == runtime), None)
+
+    agent = find()
     if agent is None:
-        typer.secho(f"no {runtime} agent for {project} yet: run `mint {project} -r {runtime}` first", fg=typer.colors.RED, err=True)
-        sys.exit(1)
+        typer.echo(f"minting {runtime} for {project} (the broker may ask a human)…", err=True)
+        res = _call("mint", runtime=runtime, project=project, why=f"operator opened a {runtime} session on {project}")
+        agent = find()
+        if agent is None:
+            typer.secho(f"not minted: {res.get('status')} {res.get('reason') or ''}", fg=typer.colors.RED, err=True)
+            sys.exit(1)
     res = _call("new", agent=agent, prompt=prompt, attach=not detach)
     if detach:
         _out(res["conversation"])
