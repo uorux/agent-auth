@@ -143,10 +143,31 @@ class KubernetesPlatformConfig(BaseModel):
     sensitive_roles: list[str] = Field(default_factory=lambda: ["edit", "admin"])
 
 
+class AgentsPlatformConfig(BaseModel):
+    # Runtimes an agent VM may mint identities for (capability "mint",
+    # resource "<runtime>-<project>-<host>-sandbox"). Empty = minting disabled.
+    runtimes: list[str] = Field(default_factory=lambda: ["claude", "codex"])
+    # A minted agent's identity lease: minting it again renews it; past it the
+    # agent (and everything it minted) is disabled. Independent of the mint
+    # grant's own duration, which only bounds the request.
+    lease: str | int = "30d"
+
+    @property
+    def lease_secs(self) -> int:
+        return parse_duration(self.lease)
+
+    @field_validator("lease")
+    @classmethod
+    def _valid(cls, v):
+        parse_duration(v)
+        return v
+
+
 class PlatformsConfig(BaseModel):
     github: GithubPlatformConfig = Field(default_factory=GithubPlatformConfig)
     homelab: HomelabPlatformConfig = Field(default_factory=HomelabPlatformConfig)
     kubernetes: KubernetesPlatformConfig = Field(default_factory=KubernetesPlatformConfig)
+    agents: AgentsPlatformConfig = Field(default_factory=AgentsPlatformConfig)
 
 
 class PolicyFile(BaseModel):

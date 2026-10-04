@@ -130,6 +130,23 @@ class Agent(Base, TimestampMixin):
     # so it is stored plaintext (same trust level as the env-var global secret;
     # Fernet-wrapping under encryption_key is a possible future hardening).
     webhook_secret: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Sandbox agents (minted in an agent VM, docs/sandbox-design.md §4): the
+    # agent whose `agents mint` request created this one, the sandbox daemon
+    # that holds its key and dispatches its a2a, and the structured parts of
+    # its name (<runtime>-<project>-<host>-sandbox). The name is never parsed
+    # for security decisions; these columns are. All null for hand-registered
+    # agents.
+    parent_agent_id: Mapped[str | None] = mapped_column(
+        ForeignKey("agents.id"), nullable=True, index=True
+    )
+    sandbox_id: Mapped[str | None] = mapped_column(
+        ForeignKey("daemons.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    runtime: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    project: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # A minted agent's identity lease: past it, the agent is disabled (with
+    # everything it minted). Renewed by minting it again. Null = no lease.
+    lease_expires_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
 
 
 class AgentSession(Base, TimestampMixin):
@@ -394,3 +411,20 @@ class DaemonPairingCode(Base, TimestampMixin):
     failed_attempts: Mapped[int] = mapped_column(Integer, default=0)
 
     __table_args__ = (Index("ix_daemon_pairing_codes_role_name", "role", "name"),)
+
+
+class PendingKeyDelivery(Base, TimestampMixin):
+    """A minted agent's API key, waiting for its sandbox daemon to collect it.
+
+    The broker stores only key hashes otherwise; this row is the one window in
+    which it can still hand the key out — to the sandbox daemon only, over the
+    signed channel, never to the agent that asked for the mint. Deleted when
+    the daemon acknowledges it.
+    """
+
+    __tablename__ = "pending_key_deliveries"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), unique=True)
+    sandbox_id: Mapped[str] = mapped_column(ForeignKey("daemons.id", ondelete="CASCADE"), index=True)
+    key_encrypted: Mapped[str] = mapped_column(Text)

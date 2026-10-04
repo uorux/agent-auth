@@ -43,6 +43,13 @@ def fold(platform: Platform, capability: str, scope: dict[str, Any] | None) -> d
         return dict(scope)
     if platform == Platform.GOOGLE:
         return {"action": capability}
+    if platform == Platform.AGENTS:
+        # The runtime is the privilege's kind; the name (resource) carries the
+        # project and host.
+        return {"action": capability, "runtime": scope.get("runtime")}
+    if platform == Platform.SANDBOX:
+        # capability "project.read" / "project.write" on another project
+        return {"access": capability}
     return {}  # HOMELAB: membership only; the group is the resource
 
 
@@ -58,6 +65,10 @@ def split(platform: Platform, authority: dict[str, Any] | None) -> tuple[str, di
         return authority.get("role", ""), scope
     if platform == Platform.A2A:
         return "talk", dict(authority)
+    if platform == Platform.AGENTS:
+        return authority.get("action", "mint"), {"runtime": authority.get("runtime")}
+    if platform == Platform.SANDBOX:
+        return authority.get("access", ""), {}
     if platform == Platform.GOOGLE:
         return authority.get("action", ""), {}
     return "group", {}  # HOMELAB
@@ -73,6 +84,8 @@ def label(platform: Platform, authority: dict[str, Any] | None) -> str:
     if platform == Platform.KUBERNETES:
         role = (authority or {}).get("role") or "*"
         return f"{role} (cluster-wide)" if (authority or {}).get("cluster") else role
+    if platform == Platform.AGENTS:
+        return f"mint:{(authority or {}).get('runtime') or '?'}"
     return split(platform, authority)[0] or "*"
 
 
@@ -87,6 +100,10 @@ def needs_explicit_rule(platform: Platform, authority: dict[str, Any] | None) ->
         # Creating a repo is a different act from accessing one; a rule
         # written to hand out access must not start minting repos.
         return (authority or {}).get("action") == "create"
+    if platform == Platform.AGENTS:
+        # Minting an identity: never cleared by a rule written for something
+        # else (a null-authority catch-all, the default).
+        return True
     return False
 
 
@@ -105,4 +122,7 @@ def is_sensitive(platform: Platform, authority: dict[str, Any] | None, platforms
         if authority.get("cluster"):
             return True
         return authority.get("role") in set(platforms_cfg.kubernetes.sensitive_roles)
+    if platform == Platform.SANDBOX:
+        # Writing into another project's files: a human's call.
+        return authority.get("access") == "project.write"
     return False

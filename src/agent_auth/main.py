@@ -9,6 +9,7 @@ from .api.app import create_app
 from .config import Settings, get_settings
 from .core.a2a import A2AThreadService
 from .core.daemons import DaemonHub
+from .core.sandboxes import SandboxService
 from .core.events import KeyedEvents
 from .core.scheduler import ExpiryScheduler
 from .core.service import RequestService
@@ -19,6 +20,8 @@ from .policy.engine import PolicyEngine
 from .policy.llm import LLMEvaluator
 from .policy.schema import load_policy
 from .provisioners.a2a import A2AProvisioner
+from .provisioners.agents import AgentsProvisioner
+from .provisioners.sandbox import SandboxProvisioner
 from .provisioners.base import ProvisionerRegistry
 from .provisioners.github import GithubProvisioner
 from .provisioners.google_stub import GoogleStubProvisioner
@@ -119,10 +122,21 @@ async def serve(settings: Settings) -> None:
     service = RequestService(db, PolicyEngine(policy), registry, events, llm=llm)
     a2a = A2AThreadService(db, settings, KeyedEvents())
     daemons = DaemonHub(db, settings)
+    sandboxes = None
     if not daemons.enabled:
         log.info("daemon channel disabled (BROKER_SIGNING_KEY not set)")
+    else:
+        # Agent VMs: minted identities and cross-project access. Keys are
+        # handed to sandboxes Fernet-wrapped in between, so ENCRYPTION_KEY too.
+        sandboxes = SandboxService(
+            db, daemons, SecretBox(settings.encryption_key) if settings.encryption_key else None
+        )
+        if not settings.encryption_key:
+            log.warning("ENCRYPTION_KEY unset: agent VMs can pair but receive no agent keys")
+        registry.register(AgentsProvisioner(policy.platforms.agents, sandboxes))
+        registry.register(SandboxProvisioner(daemons))
     app = create_app(settings, db, service, registry, events, a2a, daemons)
-    scheduler = ExpiryScheduler(service, a2a)
+    scheduler = ExpiryScheduler(service, a2a, sandboxes=sandboxes)
 
     server = uvicorn.Server(
         uvicorn.Config(

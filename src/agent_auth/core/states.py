@@ -9,6 +9,10 @@ class Platform(str, enum.Enum):
     KUBERNETES = "kubernetes"
     A2A = "a2a"
     GOOGLE = "google"
+    # docs/sandbox-design.md §5: identities minted in an agent VM, and access
+    # between projects inside one.
+    AGENTS = "agents"
+    SANDBOX = "sandbox"
 
 
 class RequestStatus(str, enum.Enum):

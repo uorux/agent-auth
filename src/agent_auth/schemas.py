@@ -239,6 +239,12 @@ class AgentOut(BaseModel):
     # always a mis-registered ephemeral one — it will be advertised as a peer
     # and never answer.
     last_seen_at: datetime | None = None
+    # Agents minted in an agent VM (null otherwise).
+    parent: str | None = None
+    sandbox: str | None = None
+    runtime: str | None = None
+    project: str | None = None
+    lease_expires_at: datetime | None = None
     api_key: str | None = None  # only set on create/rotate
     webhook_secret: str | None = None  # only set on create/rotate-webhook-secret
 

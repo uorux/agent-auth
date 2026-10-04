@@ -9,6 +9,7 @@ from sqlalchemy import select
 
 from .. import authority as authority_mod
 from ..core.daemons import DaemonsDisabled
+from ..core.sandboxes import disable_agent_tree
 from ..core.service import HumanDecision, TransitionError
 from ..crypto import generate_api_key
 from ..core.states import GrantStatus, Platform
@@ -42,6 +43,11 @@ def _agent_out(
         lldap_managed=agent.lldap_password_encrypted is not None,
         disabled=agent.disabled,
         last_seen_at=agent.last_seen_at,
+        parent=agent.parent_agent_id,
+        sandbox=agent.sandbox_id,
+        runtime=agent.runtime,
+        project=agent.project,
+        lease_expires_at=agent.lease_expires_at,
         api_key=api_key,
         webhook_secret=webhook_secret,
     )
@@ -362,3 +368,14 @@ async def broker_key(request: Request):
         return {"broker_public_key": request.app.state.daemons.public_key}
     except DaemonsDisabled as exc:
         raise HTTPException(503, str(exc)) from None
+
+
+@router.post("/agents/{agent_id}/disable")
+async def disable_agent(agent_id: str, request: Request):
+    """Disable an agent and every agent it minted (transitively); their active
+    grants end within a scheduler tick, revoked through their provisioners."""
+    async with request.app.state.db.session() as session:
+        if await session.get(Agent, agent_id) is None:
+            raise HTTPException(404, "agent not found")
+        names = await disable_agent_tree(session, agent_id)
+    return {"disabled": names}

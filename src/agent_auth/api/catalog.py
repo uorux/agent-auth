@@ -81,6 +81,27 @@ async def build_catalog(
             )
         )
 
+    # Agent VMs (docs/sandbox-design.md): only agents living in one can mint
+    # or reach other projects, so only they see these.
+    if agent.sandbox_id and registry.enabled(Platform.AGENTS):
+        platforms.append(
+            PlatformCatalog(
+                platform=Platform.AGENTS,
+                capability_hint="mint",
+                resource_hint="<runtime>-<project>-<this host>-sandbox",
+                capabilities=list(policy.platforms.agents.runtimes),
+            )
+        )
+    if agent.sandbox_id and agent.project and registry.enabled(Platform.SANDBOX):
+        platforms.append(
+            PlatformCatalog(
+                platform=Platform.SANDBOX,
+                capability_hint="project.read | project.write (write: always a human)",
+                resource_hint="<another project in this agent VM>",
+                capabilities=["project.read", "project.write"],
+            )
+        )
+
     if registry.enabled(Platform.HOMELAB):
         hl = policy.platforms.homelab
         platforms.append(

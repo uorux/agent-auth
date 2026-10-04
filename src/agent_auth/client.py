@@ -269,6 +269,9 @@ class BrokerClient:
             "POST", "/admin/daemons/pairing-codes", admin=True, json={"role": role, "name": name}
         )
 
+    def admin_disable_agent(self, agent_id: str):
+        return self._request("POST", f"/admin/agents/{agent_id}/disable", admin=True)
+
     def admin_list_daemons(self):
         return self._request("GET", "/admin/daemons", admin=True)
 

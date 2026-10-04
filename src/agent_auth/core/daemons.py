@@ -20,9 +20,10 @@ import json
 import logging
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from sqlalchemy import select, update
 from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -84,6 +85,10 @@ class DaemonsDisabled(Exception):
     """BROKER_SIGNING_KEY is not configured."""
 
 
+class DaemonCallError(Exception):
+    """A call() to a daemon failed: offline, timed out, or the daemon said no."""
+
+
 class PairingError(Exception):
     def __init__(self, status: int, detail: str):
         self.status = status
@@ -134,6 +139,71 @@ class DaemonHub:
         # registers the connection.
         self._generation: dict[tuple[str, str], int] = {}
         self._pending_handshakes = asyncio.Semaphore(MAX_PENDING_HANDSHAKES)
+        # Extension points for role-specific services (core/sandboxes.py):
+        # per-type message handlers, and hooks on pairing / connect /
+        # heartbeat. Handlers and hooks get the connection and must not
+        # raise (errors are logged and swallowed).
+        self._handlers: dict[str, Callable[[LiveConnection, dict], Awaitable[None]]] = {}
+        self._on_paired: list[Callable[[str, str, str], Awaitable[None]]] = []
+        self._on_connect: list[Callable[[LiveConnection], Awaitable[None]]] = []
+        self._on_heartbeat: list[Callable[[LiveConnection], Awaitable[None]]] = []
+        # call(): outstanding requests, keyed by call_id, with the daemon each
+        # was sent to (a reply from any other daemon is ignored).
+        self._calls: dict[str, tuple[tuple[str, str], asyncio.Future]] = {}
+        self._tasks: set[asyncio.Task] = set()
+
+    # --- extension points ------------------------------------------------------
+
+    def handle(self, kind: str, handler: Callable[[LiveConnection, dict], Awaitable[None]]) -> None:
+        if kind in ("heartbeat", "reply") or kind in self._handlers:
+            raise ValueError(f"message type {kind!r} is already handled")
+        self._handlers[kind] = handler
+
+    def on_paired(self, hook: Callable[[str, str, str], Awaitable[None]]) -> None:
+        """hook(role, name, daemon_id), after a successful (re-)pairing."""
+        self._on_paired.append(hook)
+
+    def on_connect(self, hook: Callable[[LiveConnection], Awaitable[None]]) -> None:
+        self._on_connect.append(hook)
+
+    def on_heartbeat(self, hook: Callable[[LiveConnection], Awaitable[None]]) -> None:
+        self._on_heartbeat.append(hook)
+
+    def _spawn(self, coro, what: str) -> None:
+        async def guarded():
+            try:
+                await coro
+            except Exception:
+                log.exception("%s failed", what)
+
+        task = asyncio.create_task(guarded())
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def call(
+        self, role: str, name: str, payload: dict[str, Any], timeout: float = 30
+    ) -> dict[str, Any]:
+        """Send a request and wait for the daemon's {"type": "reply"}. Returns
+        its `data`; raises DaemonCallError if offline, on timeout, or when the
+        daemon answers ok=false."""
+        call_id = uuid.uuid4().hex
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._calls[call_id] = ((role, name), future)
+        try:
+            if not await self.send(role, name, {**payload, "call_id": call_id}, ttl=timeout):
+                raise DaemonCallError(f"{daemon_principal(role, name)} is offline")
+            try:
+                reply = await asyncio.wait_for(future, timeout)
+            except TimeoutError:
+                raise DaemonCallError(
+                    f"{daemon_principal(role, name)} did not answer within {timeout:g}s"
+                ) from None
+        finally:
+            self._calls.pop(call_id, None)
+        if not reply.get("ok"):
+            raise DaemonCallError(str(reply.get("error") or "refused by the daemon")[:500])
+        data = reply.get("data")
+        return data if isinstance(data, dict) else {}
 
     # --- state ---------------------------------------------------------------
 
@@ -275,6 +345,17 @@ class DaemonHub:
         # A connection authenticated with the old key must not outlive it.
         await self._kick(role, name, "re-paired")
         log.info("paired %s (%s)", principal, fingerprint(public_key))
+        async with self.db.session() as session:
+            daemon_id = (
+                await session.execute(
+                    select(Daemon.id).where(Daemon.role == role, Daemon.name == name)
+                )
+            ).scalar_one()
+        for hook in self._on_paired:
+            try:
+                await hook(role, name, daemon_id)
+            except Exception:
+                log.exception("on_paired hook failed for %s", principal)
         broker_key = self.public_key
         return {
             "broker_public_key": broker_key,
@@ -330,6 +411,8 @@ class DaemonHub:
         if replaced is not None:
             await self._close(replaced, CLOSE_REPLACED, "replaced by a newer connection")
         log.info("daemon %s connected", daemon_principal(live.role, live.name))
+        for hook in self._on_connect:
+            self._spawn(hook(live), f"on_connect hook for {daemon_principal(live.role, live.name)}")
         verifier = EnvelopeVerifier(
             live.public_key,
             expected_sender=daemon_principal(live.role, live.name),
@@ -462,6 +545,19 @@ class DaemonHub:
                     del self._live[(live.role, live.name)]
                 await self._close(live, CLOSE_UNAUTHORIZED, "no longer paired with this key")
                 return False
+            for hook in self._on_heartbeat:
+                self._spawn(hook(live), f"on_heartbeat hook for {daemon_principal(live.role, live.name)}")
+        elif kind == "reply":
+            entry = self._calls.get(message.get("call_id") or "")
+            if entry is not None and entry[0] == (live.role, live.name) and not entry[1].done():
+                entry[1].set_result(message)
+        elif kind in self._handlers:
+            try:
+                await self._handlers[kind](live, message)
+            except Exception:
+                log.exception(
+                    "handler for %r from %s failed", kind, daemon_principal(live.role, live.name)
+                )
         else:
             log.debug("ignoring %r from %s", kind, daemon_principal(live.role, live.name))
         return True

@@ -425,6 +425,12 @@ def agents_list():
     _run(lambda: _client().admin_list_agents())
 
 
+@admin.command("agent-disable")
+def agent_disable(agent_id: str):
+    """Disable an agent and everything it minted; their grants end within a tick."""
+    _run(lambda: _client().admin_disable_agent(agent_id))
+
+
 @admin.command("rotate-key")
 def rotate_key(agent_id: str):
     _run(lambda: _client().admin_rotate_key(agent_id))
