@@ -25,6 +25,11 @@ class PolicyDecision:
     # may bypass the sensitive-capability gate — a wildcard (null-authority) rule
     # cannot silently auto-approve a sensitive role/permission.
     pinned_authority: bool = False
+    # True when the matched rule names this request's privilege itself: a DB
+    # rule pinned to the exact authority, or a YAML rule whose match.capability
+    # is literally the request's capability (no glob). Privileges flagged by
+    # `needs_explicit_rule` (github "create") are only cleared by such a rule.
+    explicit: bool = False
 
 
 def _matches(
@@ -93,7 +98,7 @@ class PolicyEngine:
                 delegator_name,
                 grants_access=rule.action in (PolicyAction.APPROVE, PolicyAction.LLM),
             ):
-                return self._from_yaml_rule(rule)
+                return self._from_yaml_rule(rule, explicit=m.capability == request.capability)
 
         defaults = self.policy.defaults
         return PolicyDecision(
@@ -147,10 +152,11 @@ class PolicyEngine:
                 or self.policy.defaults.max_duration_secs,
                 rule_id=rule.id,
                 pinned_authority=rule.authority is not None,
+                explicit=rule.authority is not None,
             )
         return None
 
-    def _from_yaml_rule(self, rule: PolicyRule) -> PolicyDecision:
+    def _from_yaml_rule(self, rule: PolicyRule, explicit: bool = False) -> PolicyDecision:
         c = rule.constraints
         return PolicyDecision(
             action=rule.action,
@@ -161,6 +167,7 @@ class PolicyEngine:
             retry_budget=c.retry_budget
             if c.retry_budget is not None
             else self.policy.llm.retry_budget,
+            explicit=explicit,
         )
 
     def cap_duration(self, requested_secs: int, max_secs: int | None) -> int:
@@ -175,3 +182,8 @@ class PolicyEngine:
         return authority_mod.is_sensitive(
             request.platform, request.authority, self.policy.platforms
         )
+
+    def needs_explicit_rule(self, request: AccessRequest) -> bool:
+        """An authority that only a rule naming it may approve or LLM-route
+        (see PolicyDecision.explicit); anything else surfaces it to a human."""
+        return authority_mod.needs_explicit_rule(request.platform, request.authority)

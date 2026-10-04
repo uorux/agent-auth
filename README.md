@@ -19,7 +19,7 @@ agent ──HTTP/MCP/CLI──▶ broker ──policy──▶ deny | approve | 
 | platform  | capability    | resource            | grant means                                                                 |
 |-----------|---------------|---------------------|-----------------------------------------------------------------------------|
 | `github`  | `repo`        | `owner/repo`        | broker mints GitHub App installation tokens (≤1h, re-minted on demand) scoped to the repo + `scope.permissions` |
-| `github`  | `create`      | `org/name`          | broker **creates** the repo in an org listed in `create_owners` (`scope.visibility`: `private`, or `public` = always human-reviewed), using an Administration token it mints, uses once and revokes — the agent never sees it. Already exists → reported, not an error. Access afterwards is a normal `repo` grant; nothing is deleted at expiry |
+| `github`  | `create`      | `org/name`          | broker **creates** the repo in an org listed in `create_owners` (`scope.visibility`: `private`, or `public` = always human-reviewed), using an Administration token it mints, uses once and revokes — the agent never sees it. Already exists → fails, unless the broker itself created it earlier (a retried create is adopted). Access afterwards is a normal `repo` grant; nothing is deleted at expiry |
 | `homelab` | `group`       | LLDAP group name    | agent's LLDAP service account is added to the group (Authelia rules are per-group); removed at expiry. Agents without a hand-registered account get a broker-managed one (`svc-<name>`, generated password) at their first grant; the credential fetch returns username + password |
 | `kubernetes` | role name (`view`, `edit`, `traefik-patcher`, …) | namespace name (or `*` for cluster-wide) | per-grant ServiceAccount + RoleBinding to the named (Cluster)Role — a ClusterRoleBinding when the namespace is `*`; tokens minted on demand via TokenRequest; SA deleted at expiry → all tokens die instantly. The capability *is* the role, so policy rules auto-approve narrow roles and surface broad ones |
 | `a2a`     | `talk`        | target agent name   | authorizes OPENING conversation threads to that (service) agent — see [a2a threads](#a2a-threads); no credential is minted |
@@ -378,17 +378,25 @@ Hosts run `agent-auth-hostd`, a daemon that dials out to the broker over a
 signed WebSocket (`/v1/daemons/connect`). It is the foundation for running
 approved commands outside agent VMs; see
 [docs/sandbox-design.md](docs/sandbox-design.md). Today (phase 1) it only
-pairs, connects and reports heartbeats. It accepts no work.
+pairs, connects and reports heartbeats. It accepts no work, and the NixOS
+module runs it as the unprivileged `agent-auth-hostd` user until a later phase
+needs root to run jobs.
 
-- **Broker key**: `agent-auth admin gen-signing-key` prints `BROKER_SIGNING_KEY`
-  (put it in the broker's env secret) and the public key. Every daemon
+- **Broker key**: `agent-auth admin gen-signing-key --out FILE` writes
+  `BROKER_SIGNING_KEY` to a new 0600 file (move it into the broker's env
+  secret, never into `settings`) and prints the public key. Without `--out`
+  it prints the seed only to a terminal (or with `--stdout`). Every daemon
   **pins** that public key in its own config, so the broker is verified
   against the host's config, not against whatever answers on the network.
   Without `BROKER_SIGNING_KEY`, the daemon endpoints are disabled (503).
 - **Pairing**: `agent-auth admin daemon-pair <hostname>` issues a one-time
   code (10 min, single use, burned after 5 wrong proofs). On the host, run
-  `sudo agent-auth-hostd pair <code>`. Both sides prove knowledge of the code
-  over the exact keys exchanged, and both print key fingerprints to compare.
+  `sudo agent-auth-hostd pair` and enter the code at the (hidden) prompt, or
+  pipe it to `agent-auth-hostd pair -`, or set
+  `AGENT_AUTH_HOSTD_PAIRING_CODE`. It is never taken as an argument, where it
+  would land in shell history and process listings. Both sides prove
+  knowledge of the code over the exact keys exchanged, and both print key
+  fingerprints to compare.
   Re-pairing replaces the key and drops the old connection.
 - **Connections**: mutual challenge–response on every connect, then every
   message is an ed25519-signed envelope naming its sender and recipient, with
@@ -404,7 +412,8 @@ services.agent-auth-hostd = {
   brokerUrl = "https://agent-auth.recusant.rooty.dev";
   brokerPublicKey = "ed25519:…";   # agent-auth admin broker-key
 };
-# impermanence: persist /var/lib/agent-auth-hostd (the host's identity key)
+# impermanence: persist /var/lib/agent-auth-hostd (the host's identity key),
+# mode 0700, user and group agent-auth-hostd
 ```
 
 ## Deploy (recommended: native NixOS service)

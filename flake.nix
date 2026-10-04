@@ -110,9 +110,13 @@
                 ''[ config.sops.secrets."agent-auth/env".path ]'';
               description = ''
                 EnvironmentFile(s) with secrets (ADMIN_TOKEN, ENCRYPTION_KEY,
-                DISCORD_*, OPENROUTER_API_KEY, GITHUB_*, LLDAP_*, ...).
-                Point at sops-nix (`format = "dotenv"`) or agenix paths — never
-                nix-store files. Root-owned 0400 secrets are fine: systemd reads
+                BROKER_SIGNING_KEY, DISCORD_*, OPENROUTER_API_KEY, GITHUB_*,
+                LLDAP_*, ...). BROKER_SIGNING_KEY is the broker's private
+                ed25519 seed (`agent-auth admin gen-signing-key --out FILE`):
+                it belongs here, never in `settings`, which lands in the
+                world-readable nix store. Point at sops-nix
+                (`format = "dotenv"`) or agenix paths — never nix-store
+                files. Root-owned 0400 secrets are fine: systemd reads
                 EnvironmentFile before dropping to the DynamicUser.
               '';
             };
@@ -198,23 +202,30 @@
       # The per-host daemon. Import on every host; it dials out to the broker
       # (no inbound ports). Pair once per host:
       #   broker admin:  agent-auth admin daemon-pair <hostname>
-      #   on the host:   sudo agent-auth-hostd pair <code>
-      # State (the host's identity key) lives in /var/lib/agent-auth-hostd —
-      # persist it on impermanence hosts, or the host must re-pair after reboot.
+      #   on the host:   sudo agent-auth-hostd pair      (prompts for the code)
+      # State (the host's identity key) lives in /var/lib/agent-auth-hostd,
+      # owned by the agent-auth-hostd user — persist it on impermanence hosts
+      # (owned by that user), or the host must re-pair after reboot.
       nixosModules.hostd = { config, lib, pkgs, ... }:
         let
           cfg = config.services.agent-auth-hostd;
           stateDir = "/var/lib/agent-auth-hostd";
+          user = "agent-auth-hostd";
           env = {
             AGENT_AUTH_HOSTD_BROKER_URL = cfg.brokerUrl;
             AGENT_AUTH_HOSTD_BROKER_KEY = cfg.brokerPublicKey;
             AGENT_AUTH_HOSTD_NAME = cfg.name;
             AGENT_AUTH_HOSTD_STATE_DIR = stateDir;
           };
-          # `agent-auth-hostd pair <code>` on the host picks up the same
-          # broker URL, pinned key and name as the service.
+          # `agent-auth-hostd pair` on the host picks up the same broker URL,
+          # pinned key and name as the service. Run as root it drops to the
+          # service user, so the key it creates is one the service can read;
+          # runuser -u keeps the exported environment.
           cli = pkgs.writeShellScriptBin "agent-auth-hostd" ''
             ${lib.concatStringsSep "\n" (lib.mapAttrsToList (k: v: "export ${k}=${lib.escapeShellArg v}") env)}
+            if [ "$EUID" = 0 ]; then
+              exec ${pkgs.util-linux}/bin/runuser -u ${user} -- ${cfg.package}/bin/agent-auth-hostd "$@"
+            fi
             exec ${cfg.package}/bin/agent-auth-hostd "$@"
           '';
         in
@@ -229,7 +240,9 @@
             };
 
             brokerUrl = lib.mkOption {
-              type = lib.types.str;
+              # https only; plain http just to a loopback broker (development).
+              type = lib.types.strMatching
+                "https://[^/].*|http://(localhost|127\\.0\\.0\\.1|\\[::1])(:[0-9]+)?(/.*)?";
               example = "https://agent-auth.recusant.rooty.dev";
             };
 
@@ -252,6 +265,25 @@
           config = lib.mkIf cfg.enable {
             environment.systemPackages = [ cli ];
 
+            # Static rather than DynamicUser: a later phase moves hostd back to
+            # root (docs/sandbox-design.md §8.2), and root can still read a key
+            # owned by this user.
+            users.users.${user} = {
+              isSystemUser = true;
+              group = user;
+              description = "agent-auth host daemon";
+            };
+            users.groups.${user} = { };
+
+            # `pair` may run before the service ever started, so the state dir
+            # must exist without it. Z hands over a key a root-run hostd
+            # created: StateDirectory's own recursive chown is skipped once the
+            # top-level directory already has the right owner.
+            systemd.tmpfiles.rules = [
+              "d ${stateDir} 0700 ${user} ${user} -"
+              "Z ${stateDir} - ${user} ${user} -"
+            ];
+
             systemd.services.agent-auth-hostd = {
               description = "agent-auth host daemon";
               wantedBy = [ "multi-user.target" ];
@@ -260,14 +292,18 @@
               environment = env;
               serviceConfig = {
                 ExecStart = "${cfg.package}/bin/agent-auth-hostd run";
+                User = user;
+                Group = user;
                 StateDirectory = "agent-auth-hostd";
                 StateDirectoryMode = "0700";
                 Restart = "always";
                 RestartSec = 10;
 
-                # Phase 1 only connects and reports, so it is locked down
-                # hard. Running approved jobs (a later phase) needs systemd-run
-                # and will relax exactly what that requires.
+                # Phase 1 only connects and reports, so it runs unprivileged
+                # and locked down hard: as root, AF_UNIX alone would reach
+                # systemd and the system bus with full authority. Running
+                # approved jobs (a later phase) moves it back to root for
+                # systemd-run and will relax exactly what that requires.
                 NoNewPrivileges = true;
                 ProtectSystem = "strict";
                 ProtectHome = true;
@@ -283,6 +319,8 @@
                 RestrictNamespaces = true;
                 RestrictRealtime = true;
                 RestrictSUIDSGID = true;
+                RemoveIPC = true;
+                ProtectHostname = true;
                 LockPersonality = true;
                 CapabilityBoundingSet = "";
                 SystemCallFilter = [ "@system-service" "~@privileged" ];

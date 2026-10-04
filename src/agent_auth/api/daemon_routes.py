@@ -15,14 +15,15 @@ class PairBody(BaseModel):
     role: str = Field(max_length=16)
     name: str = Field(max_length=128)
     public_key: str = Field(max_length=128)
-    proof: str = Field(max_length=128)
+    selector: str = Field(pattern=r"^[0-9a-f]{32}$")
+    proof: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 @router.post("/pair")
 async def pair(body: PairBody, request: Request):
     try:
         return await request.app.state.daemons.pair(
-            body.role, body.name, body.public_key, body.proof
+            body.role, body.name, body.public_key, body.selector, body.proof
         )
     except DaemonsDisabled as exc:
         raise HTTPException(503, str(exc)) from None

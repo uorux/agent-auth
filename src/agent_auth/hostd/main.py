@@ -17,17 +17,27 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
 import typer
 
 from .. import __version__
-from ..daemon_common.channel import DaemonChannel, DaemonIdentity, PairingFailed, pair as pair_with
+from ..daemon_common.channel import (
+    DaemonChannel,
+    DaemonIdentity,
+    PairingFailed,
+    check_broker_url,
+    pair as pair_with,
+)
 from ..daemon_common.crypto import fingerprint, load_or_create_key, parse_public_key
 
 log = logging.getLogger("agent_auth.hostd")
 
-app = typer.Typer(help="agent-auth host daemon", no_args_is_help=True)
+app = typer.Typer(
+    help="agent-auth host daemon", no_args_is_help=True, pretty_exceptions_show_locals=False
+)
 
 ROLE = "host"
+PAIRING_CODE_ENV = "AGENT_AUTH_HOSTD_PAIRING_CODE"
 
 
 def _default_name() -> str:
@@ -53,6 +63,11 @@ def _identity(broker_url: str, broker_key: str, name: str | None, state_dir: Pat
     except ValueError as exc:
         typer.secho(f"invalid --broker-key: {exc}", fg=typer.colors.RED, err=True)
         sys.exit(2)
+    try:
+        check_broker_url(broker_url)  # https, or plain http to a loopback broker
+    except ValueError as exc:
+        typer.secho(f"invalid --broker-url: {exc}", fg=typer.colors.RED, err=True)
+        sys.exit(2)
     return DaemonIdentity(
         role=ROLE,
         name=name or _default_name(),
@@ -62,20 +77,54 @@ def _identity(broker_url: str, broker_key: str, name: str | None, state_dir: Pat
     )
 
 
+def _read_pairing_code(source: str | None) -> str:
+    """The code never comes from argv, where /proc, sudo's log and shell
+    history would keep it: env, stdin (`-`), or a hidden prompt."""
+    if source not in (None, "-"):
+        typer.secho(
+            "the pairing code is not accepted on the command line (it lands in "
+            "shell history and process listings). Issue a fresh code with "
+            "`agent-auth admin daemon-pair`, then run `agent-auth-hostd pair` "
+            f"and enter it at the prompt (or pipe it to `pair -`, or set {PAIRING_CODE_ENV}).",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        sys.exit(2)
+    if source == "-":
+        code = sys.stdin.readline()
+    else:
+        code = os.environ.get(PAIRING_CODE_ENV) or typer.prompt("pairing code", hide_input=True)
+    code = code.strip()
+    if not code:
+        typer.secho("no pairing code given", fg=typer.colors.RED, err=True)
+        sys.exit(2)
+    return code
+
+
 @app.command()
 def pair(
-    code: str = typer.Argument(help="from `agent-auth admin daemon-pair <name>`"),
+    source: str = typer.Argument(
+        None,
+        metavar="[-]",
+        help=f"`-` reads the code from stdin; otherwise {PAIRING_CODE_ENV} or a prompt",
+        show_default=False,
+    ),
     broker_url: str = BrokerUrl,
     broker_key: str = BrokerKey,
     name: str = Name,
     state_dir: Path = StateDir,
 ):
-    """Pair this host with the broker using a one-time code."""
+    """Pair this host with the broker using a one-time code from
+    `agent-auth admin daemon-pair <name>`."""
     identity = _identity(broker_url, broker_key, name, state_dir)
+    code = _read_pairing_code(source)
     try:
         pair_with(identity, code)
     except PairingFailed as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        sys.exit(1)
+    except httpx.HTTPError as exc:
+        typer.secho(f"could not reach the broker: {exc}", fg=typer.colors.RED, err=True)
         sys.exit(1)
     record = {
         "role": ROLE,
@@ -117,7 +166,7 @@ def run(
     if not (state_dir / "paired.json").exists():
         log.warning(
             "%s has not been paired on this machine; the broker will refuse it until "
-            "`agent-auth-hostd pair <code>` succeeds",
+            "`agent-auth-hostd pair` succeeds",
             identity.principal,
         )
     started_at = datetime.now(timezone.utc).isoformat()

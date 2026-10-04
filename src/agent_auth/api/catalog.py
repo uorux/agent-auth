@@ -3,6 +3,7 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .. import authority as authority_mod
 from ..core.a2a import reachability
 from ..core.states import Platform
 from ..models import AccessRequest, Agent
@@ -37,7 +38,16 @@ async def _disposition(
         justification="",
         requested_duration_secs=0,
     )
+    probe.authority = authority_mod.fold(platform, capability, {})
     decision = await engine.evaluate(session, agent, probe)
+    # Mirror the service's gate: a privilege only an explicit rule may clear
+    # (github "create") goes to a human when a catch-all matched it.
+    if (
+        decision.action in (PolicyAction.APPROVE, PolicyAction.LLM)
+        and not decision.explicit
+        and engine.needs_explicit_rule(probe)
+    ):
+        return _DISPOSITION[PolicyAction.SURFACE]
     return _DISPOSITION.get(decision.action, decision.action.value)
 
 

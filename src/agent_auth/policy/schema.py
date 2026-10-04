@@ -20,6 +20,8 @@ class PolicyAction(str, enum.Enum):
 class Match(BaseModel):
     agent: str = "*"
     platform: Platform | None = None
+    # Glob. "*" (the default) never clears a github "create": that takes a
+    # rule naming it exactly (see authority.needs_explicit_rule).
     capability: str = "*"
     resource: str = "*"
     # Glob on the delegator's name for on-behalf-of requests. Omitted = the
@@ -91,9 +93,13 @@ class GithubPlatformConfig(BaseModel):
     # resource "org/name"). Empty = creation disabled. The new repo must also
     # pass repo_allowlist/repo_denylist. The GitHub App needs Administration:
     # write on these installations; the broker uses it for the create call
-    # alone and never hands that token out. Creating a PUBLIC repo always
-    # reaches a human. Organizations only: an installation token can't create
-    # repos under a personal account.
+    # alone and never hands that token out. Only a rule that names creation
+    # auto-approves or LLM-routes it — a YAML rule with `capability: create`
+    # (exactly), or a saved rule pinned to the create authority; repo-access
+    # rules, null-authority rules and the default surface it instead. Creating
+    # a PUBLIC repo is sensitive on top (only a pinned saved rule clears it).
+    # Organizations only: an installation token can't create repos under a
+    # personal account.
     create_owners: list[str] = Field(default_factory=list)
 
 

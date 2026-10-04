@@ -201,6 +201,21 @@ class RequestService:
                     *request.risk_notes,
                     "sensitive capability — routed to human review",
                 ]
+            # Some privileges (github "create") are a different kind of act from
+            # what catch-all rules were written for, so only a rule that names
+            # them may clear them: a YAML rule with that exact capability, or a
+            # saved rule pinned to the exact authority. An "approve github
+            # org/*" or null-authority rule, or an llm catch-all, surfaces.
+            if (
+                decision.action in (PolicyAction.APPROVE, PolicyAction.LLM)
+                and not decision.explicit
+                and self.engine.needs_explicit_rule(request)
+            ):
+                decision.action = PolicyAction.SURFACE
+                request.risk_notes = [
+                    *request.risk_notes,
+                    f"no rule names {request.capability!r} — routed to human review",
+                ]
 
             # Set after the sensitive gate: a matched rule that got surfaced
             # anyway was not the decider, so it must not be announced as one.

@@ -27,7 +27,8 @@ def _line(d: dict) -> str:
         if d.get("last_seen_at")
         else "never connected"
     )
-    version = f" · v{d['version']}" if d.get("version") else ""
+    # Daemon-supplied: validated at ingest, escaped here as well.
+    version = f" · v{discord.utils.escape_markdown(d['version'])}" if d.get("version") else ""
     return f"{state} **{d['name']}** ({d['role']}){version} · {seen} · `{d['fingerprint'][:19]}`"
 
 

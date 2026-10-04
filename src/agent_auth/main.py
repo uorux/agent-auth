@@ -126,7 +126,13 @@ async def serve(settings: Settings) -> None:
 
     server = uvicorn.Server(
         uvicorn.Config(
-            app, host=settings.listen_host, port=settings.listen_port, log_level="info"
+            app,
+            host=settings.listen_host,
+            port=settings.listen_port,
+            log_level="info",
+            # The only WebSocket is the daemon channel, reachable before
+            # authentication; its messages are small.
+            ws_max_size=1024 * 1024,
         )
     )
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -23,8 +24,12 @@ log = logging.getLogger(__name__)
 _PERM_LEVELS = {"read": 1, "write": 2, "admin": 3}
 # Refresh the cached installation token when less than this much validity remains.
 _MIN_TOKEN_VALIDITY = timedelta(minutes=5)
-# GitHub's repository name charset; "." and ".." are reserved.
-_REPO_NAME = re.compile(r"^[a-z0-9._-]{1,100}$")
+# GitHub's repository name charset (lowercased); always used with fullmatch.
+_REPO_NAME = re.compile(r"[a-z0-9._-]{1,100}")
+# Normalized "owner/repo" for access requests. Lenient on the owner (GHES
+# allows "_"), but nothing that could re-route the API path or slip past an
+# exact denylist entry (whitespace, "%", "?", "#", "..").
+_REPO_PATH = re.compile(r"[a-z0-9_.-]+/[a-z0-9_.-]+")
 _VISIBILITIES = ("private", "public")
 
 
@@ -32,6 +37,18 @@ def _fnmatch_any(name: str, patterns: list[str]) -> bool:
     from fnmatch import fnmatch
 
     return any(fnmatch(name, p) for p in patterns)
+
+
+def _normalize_repo(resource: str) -> str:
+    """Lowercased "owner/repo" with surrounding whitespace and slashes removed.
+
+    Control and non-ASCII characters are refused BEFORE stripping: otherwise
+    "jrt/nixos-dots<LF>/" strips to "jrt/nixos-dots<LF>", which misses an
+    exact denylist entry, and a "$"-anchored regex would still accept it.
+    """
+    if not resource.isascii() or any(c < " " or c == "\x7f" for c in resource):
+        raise SpecValidationError("github resource contains control or non-ASCII characters")
+    return resource.strip().strip("/").strip().lower()
 
 
 class GithubProvisioner:
@@ -56,7 +73,9 @@ class GithubProvisioner:
     "create one repo" (it could delete or reconfigure any repo the
     installation covers), so it never leaves the broker. Access to the new
     repo is an ordinary "repo" grant afterwards. Nothing is undone at expiry:
-    the broker never deletes repos.
+    the broker never deletes repos. A name that is already taken fails, unless
+    the broker itself created that very repo for the same agent earlier (an
+    idempotent retry), which is reported instead.
     """
 
     platform = Platform.GITHUB
@@ -86,9 +105,11 @@ class GithubProvisioner:
             return self._validate_create(spec)
         if spec.capability != "repo":
             raise SpecValidationError("github capability must be 'repo' or 'create'")
-        repo = spec.resource.strip().strip("/").lower()
+        repo = _normalize_repo(spec.resource)
         if repo.count("/") != 1:
             raise SpecValidationError("github resource must be 'owner/repo'")
+        if not _REPO_PATH.fullmatch(repo) or repo.split("/")[1] in (".", ".."):
+            raise SpecValidationError(f"invalid github repository {repo!r}")
         if _fnmatch_any(repo, self.config.repo_denylist):
             raise SpecValidationError(f"repo {repo!r} is never brokered (denylist)")
         if self.config.repo_allowlist and not _fnmatch_any(repo, self.config.repo_allowlist):
@@ -120,7 +141,7 @@ class GithubProvisioner:
         return spec
 
     def _validate_create(self, spec: RequestSpec) -> RequestSpec:
-        repo = spec.resource.strip().strip("/").lower()
+        repo = _normalize_repo(spec.resource)
         if repo.count("/") != 1:
             raise SpecValidationError("github create resource must be 'org/name'")
         owner, name = repo.split("/")
@@ -128,7 +149,18 @@ class GithubProvisioner:
             raise SpecValidationError(
                 f"repos can't be created under {owner!r} (platforms.github.create_owners)"
             )
-        if not _REPO_NAME.match(name) or name in (".", "..") or name.endswith(".git"):
+        if (
+            not _REPO_NAME.fullmatch(name)
+            or name.endswith(".git")
+            # ".github" / ".github-private" are org-wide profile and community
+            # health repos, "<org>.github.io" is the org's Pages site: special
+            # to GitHub, so never created by an agent. Dot-led names in general
+            # (including "." and "..") and punctuation-only names ("...", "-")
+            # go with them.
+            or name.startswith(".")
+            or name.endswith(".github.io")
+            or not any(c.isalnum() for c in name)
+        ):
             raise SpecValidationError(f"invalid repository name {name!r}")
         if _fnmatch_any(repo, self.config.repo_denylist):
             raise SpecValidationError(f"repo {repo!r} is never brokered (denylist)")
@@ -149,7 +181,7 @@ class GithubProvisioner:
 
     async def provision(self, session: AsyncSession, grant: Grant) -> dict:
         if grant.capability == "create":
-            return await self._create(grant)
+            return await self._create(session, grant)
         # Minting a token scoped to the repo proves the installation covers it.
         token, expires_at = await self._mint(grant)
         await self._cache_token(session, grant, token, expires_at)
@@ -283,12 +315,14 @@ class GithubProvisioner:
         self._pinned_account = str(login).lower()
         return self._pinned_account
 
-    async def _create(self, grant: Grant) -> dict:
+    async def _create(self, session: AsyncSession, grant: Grant) -> dict:
         org, name = grant.resource.split("/", 1)
         visibility = grant.scope["visibility"]
         installation_id = await self._org_installation(org)
-        token = await self._admin_token(installation_id, org)
+        # Assigned inside the try so a token, once minted, is always revoked.
+        token: str | None = None
         try:
+            token = await self._admin_token(installation_id, org)
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(
                     f"{self.api_url}/orgs/{org}/repos",
@@ -302,17 +336,15 @@ class GithubProvisioner:
                 if resp.status_code == 201:
                     repo, created = resp.json(), True
                 elif resp.status_code == 422:
-                    # Most likely the name is taken. Idempotent for retries
-                    # (an orchestrator re-running project setup, a re-provision
-                    # after a crash): adopt it if it's visible to the app.
-                    existing = await client.get(
-                        f"{self.api_url}/repos/{org}/{name}",
-                        headers=self._token_headers(token),
+                    # Most likely the name is taken. GitHub's text stays in
+                    # the broker log: it reaches the agent via decision_reason.
+                    log.warning(
+                        "GitHub repo create for %s refused (422): %s",
+                        grant.resource,
+                        resp.text[:300],
                     )
-                    if existing.status_code != 200:
-                        log.error("GitHub repo create for %s failed: %s", grant.resource, resp.text[:300])
-                        raise ProvisionerError(f"GitHub repo create failed (422): {resp.text[:200]}")
-                    repo, created = existing.json(), False
+                    repo = await self._adopt_own(session, client, token, grant)
+                    created = False
                 else:
                     log.error(
                         "GitHub repo create for %s failed (%s): %s",
@@ -322,8 +354,15 @@ class GithubProvisioner:
                     )
                     raise ProvisionerError(f"GitHub repo create failed ({resp.status_code})")
         finally:
-            await self._revoke_token(token)
-        covered = await self._installation_covers(grant.resource)
+            if token is not None:
+                # Shielded: a cancelled provision must not skip the revoke.
+                await asyncio.shield(self._revoke_token(token))
+        try:
+            covered = await self._installation_covers(grant.resource)
+        except Exception:
+            # The repo exists; failing the grant now would misreport that.
+            log.warning("installation lookup for new repo %s failed", grant.resource)
+            covered = False
         if created:
             log.info("created GitHub repo %s (%s)", grant.resource, visibility)
         return {
@@ -335,6 +374,57 @@ class GithubProvisioner:
             "created": created,
             "installation_covers": covered,
         }
+
+    async def _adopt_own(
+        self, session: AsyncSession, client: httpx.AsyncClient, token: str, grant: Grant
+    ) -> dict:
+        """The name is taken: report the existing repo only if this broker
+        created it earlier, for this agent (a retry after the create grant
+        expired, an orchestrator re-running project setup). The admin token
+        sees every repo in the org, so adopting anything else would hand the
+        agent a stranger's repo details. Not covered: a create whose outcome
+        was never recorded (broker died mid-provision) — that fails closed."""
+        own = await self._created_repo_ids(session, grant)
+        if not own:
+            raise ProvisionerError("repository already exists (not created by the broker)")
+        existing = await client.get(
+            f"{self.api_url}/repos/{grant.resource}", headers=self._token_headers(token)
+        )
+        if existing.status_code != 200:
+            raise ProvisionerError("GitHub repo create failed (422)")
+        repo = existing.json()
+        if repo.get("id") not in own:
+            # Same name, different repo: deleted and re-made by someone else.
+            raise ProvisionerError("repository already exists (not created by the broker)")
+        actual = repo.get("visibility") or ("private" if repo.get("private") else "public")
+        wanted = grant.scope["visibility"]
+        if actual != wanted:
+            raise ProvisionerError(
+                f"repository already exists as {actual}, not the requested {wanted}"
+            )
+        return repo
+
+    async def _created_repo_ids(self, session: AsyncSession, grant: Grant) -> set[int]:
+        """GitHub ids of repos earlier create grants of this agent recorded
+        as created by the broker under this same org/name."""
+        rows = await session.execute(
+            select(Grant).where(
+                Grant.platform == Platform.GITHUB,
+                Grant.resource == grant.resource,
+                Grant.agent_id == grant.agent_id,
+                Grant.id != grant.id,
+            )
+        )
+        ids: set[int] = set()
+        for prior in rows.scalars():
+            state = prior.provisioner_state or {}
+            if (
+                prior.capability == "create"
+                and state.get("created") is True
+                and state.get("repo_id") is not None
+            ):
+                ids.add(state["repo_id"])
+        return ids
 
     async def _org_installation(self, org: str) -> str:
         if self.installation_id:
@@ -370,14 +460,21 @@ class GithubProvisioner:
         return resp.json()["token"]
 
     async def _revoke_token(self, token: str) -> None:
+        # Failures are logged, not raised: it expires within the hour regardless.
         try:
             async with httpx.AsyncClient(timeout=15) as client:
-                await client.delete(
+                resp = await client.delete(
                     f"{self.api_url}/installation/token", headers=self._token_headers(token)
                 )
         except Exception:
-            # It expires within the hour regardless.
             log.warning("failed to revoke the Administration token after a repo create")
+            return
+        if resp.status_code != 204:
+            log.warning(
+                "revoking the Administration token after a repo create returned %s; "
+                "it stays valid until it expires (within the hour)",
+                resp.status_code,
+            )
 
     async def _installation_covers(self, repo: str) -> bool:
         async with httpx.AsyncClient(timeout=15) as client:

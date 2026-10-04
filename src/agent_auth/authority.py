@@ -76,6 +76,20 @@ def label(platform: Platform, authority: dict[str, Any] | None) -> str:
     return split(platform, authority)[0] or "*"
 
 
+def needs_explicit_rule(platform: Platform, authority: dict[str, Any] | None) -> bool:
+    """May only a rule that names this authority clear it (approve / route to
+    the LLM)? Stricter than "anything goes" and looser than `is_sensitive`: a
+    YAML rule whose `match.capability` is exactly this capability, or a saved
+    rule pinned to this exact authority, still counts. Catch-alls written for
+    repo access ({platform: github, resource: "org/*"}, a null-authority
+    "approve:platform" rule, the default) never do."""
+    if platform == Platform.GITHUB:
+        # Creating a repo is a different act from accessing one; a rule
+        # written to hand out access must not start minting repos.
+        return (authority or {}).get("action") == "create"
+    return False
+
+
 def is_sensitive(platform: Platform, authority: dict[str, Any] | None, platforms_cfg) -> bool:
     """Does this authority always require a human, regardless of policy routing?"""
     authority = authority or {}

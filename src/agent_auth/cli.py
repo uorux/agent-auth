@@ -1,18 +1,32 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+from pathlib import Path
 
+import httpx
 import typer
 
 from .client import BrokerClient, BrokerError
 
-app = typer.Typer(help="agent-auth broker CLI", no_args_is_help=True)
-admin = typer.Typer(help="Admin operations (AGENT_AUTH_ADMIN_TOKEN)", no_args_is_help=True)
-a2a = typer.Typer(help="Agent-to-agent threads", no_args_is_help=True)
+# pretty_exceptions_show_locals=False: a traceback must never print the
+# tokens and keys held in local variables (older typer showed them by default).
+app = typer.Typer(
+    help="agent-auth broker CLI", no_args_is_help=True, pretty_exceptions_show_locals=False
+)
+admin = typer.Typer(
+    help="Admin operations (AGENT_AUTH_ADMIN_TOKEN)",
+    no_args_is_help=True,
+    pretty_exceptions_show_locals=False,
+)
+a2a = typer.Typer(
+    help="Agent-to-agent threads", no_args_is_help=True, pretty_exceptions_show_locals=False
+)
 session = typer.Typer(
     help="Agent sessions (ephemeral agents need one for a2a; AGENT_AUTH_SESSION)",
     no_args_is_help=True,
+    pretty_exceptions_show_locals=False,
 )
 app.add_typer(admin, name="admin")
 app.add_typer(a2a, name="a2a")
@@ -27,12 +41,19 @@ def _out(data) -> None:
     typer.echo(json.dumps(data, indent=2, default=str))
 
 
-def _run(fn):
+def _call(fn):
     try:
-        _out(fn())
+        return fn()
     except BrokerError as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         sys.exit(1)
+    except httpx.HTTPError as exc:
+        typer.secho(f"could not reach the broker: {exc}", fg=typer.colors.RED, err=True)
+        sys.exit(1)
+
+
+def _run(fn):
+    _out(_call(fn))
 
 
 @app.command()
@@ -130,8 +151,6 @@ def session_create(
     label: str = typer.Option(None, "--label", "-l", help="Defaults to cwd basename"),
 ):
     """Mint a session; export AGENT_AUTH_SESSION=<session_id> to use it."""
-    import os
-
     if label is None:
         label = os.path.basename(os.getcwd()) or "session"
         label = "".join(c for c in label if c.isalnum() or c in "._-")[:64] or "session"
@@ -443,9 +462,19 @@ def revoke(grant_id: str, reason: str = typer.Option("revoked by admin", "--reas
 
 
 @admin.command("gen-signing-key")
-def gen_signing_key():
+def gen_signing_key(
+    out: Path = typer.Option(
+        None,
+        "--out",
+        help="write BROKER_SIGNING_KEY=<seed> to this new file (0600, never overwritten)",
+    ),
+    to_stdout: bool = typer.Option(
+        False, "--stdout", help="print the private seed even when stdout is not a terminal"
+    ),
+):
     """Generate BROKER_SIGNING_KEY (ed25519 seed) and print its public key,
-    which every daemon pins as brokerPublicKey."""
+    which every daemon pins as brokerPublicKey. The seed is a secret: prefer
+    --out and move the file into the broker's env secret."""
     from .daemon_common.crypto import (
         fingerprint,
         generate_private_key,
@@ -453,9 +482,29 @@ def gen_signing_key():
         public_key_text,
     )
 
+    if out is None and not to_stdout and not sys.stdout.isatty():
+        # Piped or captured output (agent transcripts, logs) would keep the seed.
+        typer.secho(
+            "refusing to print the private signing key to a non-terminal stdout. "
+            "Use --out FILE to write it to a new 0600 file, or --stdout to print anyway.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        sys.exit(2)
     key = generate_private_key()
     public = public_key_text(key)
-    typer.echo(f"BROKER_SIGNING_KEY={private_key_to_text(key)}")
+    line = f"BROKER_SIGNING_KEY={private_key_to_text(key)}"
+    if out is not None:
+        try:
+            fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        except OSError as exc:
+            typer.secho(f"cannot create {out}: {exc.strerror}", fg=typer.colors.RED, err=True)
+            sys.exit(1)
+        with os.fdopen(fd, "w") as f:
+            f.write(line + "\n")
+        typer.echo(f"# wrote BROKER_SIGNING_KEY to {out}")
+    else:
+        typer.echo(line)
     typer.echo(f"# public key (pin in daemons): {public}")
     typer.echo(f"# fingerprint: {fingerprint(public)}")
 
@@ -465,17 +514,18 @@ def daemon_pair(
     name: str = typer.Argument(help="the host's name, e.g. excelsior"),
     role: str = typer.Option("host", "--role", help="host (hostd) | sandbox (sandboxd)"),
 ):
-    """Issue a one-time pairing code; run `agent-auth-hostd pair <code>` on the host."""
-    try:
-        res = _client().admin_create_pairing_code(role, name)
-    except BrokerError as exc:
-        typer.secho(str(exc), fg=typer.colors.RED, err=True)
-        sys.exit(1)
+    """Issue a one-time pairing code; on the host, run `sudo agent-auth-hostd
+    pair` and enter it at the prompt (never as an argument)."""
+    res = _call(lambda: _client().admin_create_pairing_code(role, name))
     from .daemon_common.crypto import fingerprint
 
     typer.echo(f"pairing code for {role}:{name}: {res['code']}")
     typer.echo(f"expires: {res['expires_at']}")
     typer.echo(f"broker key fingerprint (the daemon prints it too): {fingerprint(res['broker_public_key'])}")
+    typer.echo(
+        "on the host: `sudo agent-auth-hostd pair`, then enter the code at the prompt "
+        "(not as an argument — it would land in shell history)"
+    )
 
 
 @admin.command("daemons")

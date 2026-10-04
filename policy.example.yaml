@@ -54,7 +54,9 @@ platforms:
     # Orgs where capability "create" makes a new repo (resource "org/name",
     # scope {visibility: private|public}). The broker does the create with an
     # Administration token that never leaves it; public repos always reach a
-    # human. The app needs Administration: write on these installations.
+    # human. Only a rule with `capability: create` (exactly) auto-approves or
+    # LLM-routes a create; repo-access rules and catch-alls surface it. The
+    # app needs Administration: write on these installations.
     # create_owners:
     #   - "uorux"
   homelab:

@@ -684,11 +684,19 @@ in the CLI design blocks this. The operator API is the contract both use.
 
 ```
 admin:   agent-auth admin daemon-pair --role host excelsior   → one-time code (10 min)
-host:    sudo agent-auth-hostd pair 7KQ2-MX9D-3HFA
-           → POST /v1/daemons/pair {role, name, pubkey, proof = HMAC(code, role‖name‖pubkey)}
-broker:  verifies proof, stores pubkey, replies proof' = HMAC(code, pubkey‖broker_pubkey)
+host:    sudo agent-auth-hostd pair            (prompts for the code; never on argv)
+           → POST /v1/daemons/pair {role, name, pubkey,
+                selector = HMAC(code, "pair-selector"), proof = HMAC(code, role‖name‖pubkey)}
+broker:  matches selector, verifies proof, stores pubkey,
+           replies proof' = HMAC(code, role‖name‖pubkey‖broker_pubkey)
 host:    verifies proof' and broker_pubkey == pinned; prints both fingerprints
 ```
+
+The selector lets the broker refuse attempts from anyone without the code
+before they spend one of the code's 5 attempts, so the unauthenticated pair
+endpoint can't be used to burn a pending code (or to learn whether one is
+pending: every refusal reads the same). Attempts are spent atomically before
+the proof is checked. Unpairing also burns any unused code for that daemon.
 
 sandboxd pairs the same way (`--role sandbox`), with the code entered
 through the VM's debug SSH endpoint or passed in by hostd over the relay.
@@ -701,10 +709,20 @@ Re-pairing replaces the key; `admin daemons` lists them, and
   recusant's nginx, tailnet-only. hostd connects over the host's tailnet;
   sandboxd connects via passt (§6.6). There are no inbound ports anywhere.
 - **Handshake**: a mutual challenge in which each side signs
-  `"agent-auth/v1/hello" ‖ role ‖ name ‖ both nonces`.
-- **Envelopes**: `{"p": b64(json), "s": b64(sig over "agent-auth/v1/msg" ‖ p)}`
-  carrying `type`, `id`, `issued_at`, `expires_at` (60s for jobs). Stale
-  messages and replayed ids are rejected.
+  `"agent-auth/v1/hello" ‖ speaker ‖ role ‖ name ‖ both nonces ‖ params`
+  (`params`: the daemon's version, the broker's heartbeat interval). A
+  hello verified against a key that is re-paired or unpaired before the
+  connection registers is refused.
+- **Envelopes**: `{"p": b64(json), "s": b64(sig over "agent-auth/v1/msg" ‖ sid ‖ p)}`
+  carrying `type`, `id`, `seq`, `iat`, `exp` (60s for jobs), where `sid`
+  hashes role, name and both hello nonces. An envelope verifies only on the
+  connection it was sent on; `seq` must strictly increase per direction, so
+  nothing is replayed or reordered; stale messages are rejected. Ids that
+  must survive reconnects (job ids) are deduplicated by the job layer.
+- **Liveness**: the broker drops a connection that sends nothing for three
+  heartbeat intervals.
+- **Confidentiality** is TLS's: envelopes are signed, not encrypted, so
+  daemons refuse a non-https broker URL (plain http only for localhost).
 - **Reliability**: reconnect with backoff; in-flight jobs are reconciled by
   id. nginx `proxy_read_timeout` must exceed the heartbeat interval (it is
   330s today; the heartbeat is 30s).

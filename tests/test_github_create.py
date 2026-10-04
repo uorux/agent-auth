@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 
+import httpx
 import pytest
 import respx
 from sqlalchemy import select
 
 from agent_auth import authority
+from agent_auth.core.service import RequestService
 from agent_auth.core.states import Platform, RequestStatus, RuleAction
-from agent_auth.models import Grant, Rule
+from agent_auth.models import Grant, Rule, utcnow
+from agent_auth.policy.engine import PolicyEngine
+from agent_auth.policy.schema import PolicyRule
 from agent_auth.provisioners.base import RequestSpec, SpecValidationError
 from agent_auth.schemas import RequestCreate
 
-from .conftest import GITHUB_API
+from .conftest import GITHUB_API, make_agent
 
 CREATE_PRIVATE = {"action": "create", "visibility": "private"}
 
@@ -140,23 +146,27 @@ async def test_private_create_end_to_end(db, service, gh, agent):
     assert "ghs_admin" not in (cred.value or "") + (cred.note or "")
 
 
-async def test_existing_repo_is_adopted_not_failed(db, service, gh, agent):
+async def test_own_earlier_create_is_adopted_on_retry(db, service, gh, agent):
     a, _ = agent
     await _approve_rule(db, a)
+    first = await service.create_request(a.id, create_request())
+    assert first.status == RequestStatus.GRANTED
+    # Retry (e.g. the orchestrator re-runs project setup): the name is taken —
+    # by the repo the broker itself created above (same GitHub id).
     gh["create"].respond(422, json={"message": "Repository creation failed.",
                                      "errors": [{"message": "name already exists on this account"}]})
     gh["mock"].get(f"{GITHUB_API}/repos/jrt/newproj").respond(
         200,
-        json={"id": 7, "html_url": "https://github.com/jrt/newproj", "visibility": "private"},
+        json={"id": 4242, "html_url": "https://github.com/jrt/newproj", "visibility": "private"},
     )
     req = await service.create_request(a.id, create_request())
-    assert req.status == RequestStatus.GRANTED
+    assert req.status == RequestStatus.GRANTED, req.decision_reason
     async with db.session() as session:
         grant = (await session.execute(select(Grant).where(Grant.request_id == req.id))).scalar_one()
         assert grant.provisioner_state["created"] is False
         cred = await service.registry.get(Platform.GITHUB).get_credential(session, grant)
     assert cred.note.startswith("already existed")
-    assert gh["revoke"].called
+    assert gh["revoke"].call_count == 2
 
 
 async def test_failed_create_still_revokes_admin_token(db, service, gh, agent):
@@ -201,4 +211,251 @@ async def test_catalog_lists_create_owners(api, agent):
     resp = await api.get("/v1/catalog", headers={"Authorization": f"Bearer {key}"})
     gh = next(p for p in resp.json()["platforms"] if p["platform"] == "github")
     assert gh["create_owners"] == ["jrt"]
-    assert gh["create_disposition"] in ("human review", "llm review", "auto-approve", "denied")
+    # The test policy's github catch-all is "llm", but a create needs a rule
+    # naming it, so the catalog must not advertise llm review.
+    assert gh["create_disposition"] == "human review"
+
+
+# ------------------------------------------------- only rules naming create
+
+def _service_with_rules(db, policy, registry, events, rules):
+    custom = policy.model_copy(update={"rules": [PolicyRule.model_validate(r) for r in rules]})
+    return RequestService(db, PolicyEngine(custom), registry, events, llm=None, notifier=None)
+
+
+async def test_repo_wildcard_yaml_rule_does_not_approve_create(db, policy, registry, events, gh, agent):
+    a, _ = agent
+    svc = _service_with_rules(
+        db, policy, registry, events,
+        [{"match": {"platform": "github", "resource": "jrt/*"}, "action": "approve"}],
+    )
+    req = await svc.create_request(a.id, create_request())
+    assert req.status == RequestStatus.AWAITING_HUMAN
+    assert any("no rule names 'create'" in n for n in req.risk_notes)
+    assert not gh["create"].called
+    # The same rule still approves repo access, which is what it was written for.
+    repo = await svc.create_request(
+        a.id,
+        RequestCreate(
+            platform=Platform.GITHUB,
+            capability="repo",
+            resource="jrt/cactus",
+            scope={"permissions": {"contents": "write"}},
+            justification="push the fix",
+            requested_duration="1h",
+        ),
+    )
+    assert repo.status == RequestStatus.GRANTED, repo.decision_reason
+
+
+async def test_llm_catch_all_does_not_route_create(db, service, gh, agent):
+    a, _ = agent
+    # TEST_POLICY routes {platform: github} to the LLM; a create must not go there.
+    req = await service.create_request(a.id, create_request())
+    assert req.status == RequestStatus.AWAITING_HUMAN
+    assert not gh["create"].called
+
+
+async def test_explicit_yaml_create_rule_approves(db, policy, registry, events, gh, agent):
+    a, _ = agent
+    svc = _service_with_rules(
+        db, policy, registry, events,
+        [{"match": {"platform": "github", "capability": "create", "resource": "jrt/*"},
+          "action": "approve"}],
+    )
+    req = await svc.create_request(a.id, create_request())
+    assert req.status == RequestStatus.GRANTED, req.decision_reason
+    # Still sensitive when public: a YAML rule never clears that.
+    pub = await svc.create_request(a.id, create_request("jrt/site", visibility="public"))
+    assert pub.status == RequestStatus.AWAITING_HUMAN
+
+
+async def test_globbed_capability_is_not_explicit(db, policy, registry, events, gh, agent):
+    a, _ = agent
+    svc = _service_with_rules(
+        db, policy, registry, events,
+        [{"match": {"platform": "github", "capability": "creat*"}, "action": "approve"}],
+    )
+    req = await svc.create_request(a.id, create_request())
+    assert req.status == RequestStatus.AWAITING_HUMAN
+    assert not gh["create"].called
+
+
+async def test_null_authority_db_rule_does_not_approve_private_create(db, service, gh, agent):
+    a, _ = agent
+    await _approve_rule(db, a, auth=None)  # e.g. Discord "approve:platform"
+    req = await service.create_request(a.id, create_request())
+    assert req.status == RequestStatus.AWAITING_HUMAN
+    assert not gh["create"].called
+
+
+async def test_default_approve_does_not_approve_create(db, policy, registry, events, gh, agent):
+    a, _ = agent
+    custom = policy.model_copy(
+        update={"rules": [], "defaults": policy.defaults.model_copy(update={"action": "approve"})}
+    )
+    svc = RequestService(db, PolicyEngine(custom), registry, events, llm=None, notifier=None)
+    req = await svc.create_request(a.id, create_request())
+    assert req.status == RequestStatus.AWAITING_HUMAN
+
+
+# ------------------------------------------------- adopting existing repos
+
+def _name_taken(gh, existing=None):
+    gh["create"].respond(
+        422,
+        json={"message": "Repository creation failed.",
+              "errors": [{"message": "name already exists on this account"}]},
+    )
+    return gh["mock"].get(f"{GITHUB_API}/repos/jrt/newproj").respond(
+        200,
+        json=existing
+        or {"id": 4242, "html_url": "https://github.com/jrt/newproj", "visibility": "private"},
+    )
+
+
+async def test_existing_repo_not_created_by_broker_is_refused(db, service, gh, agent):
+    a, _ = agent
+    await _approve_rule(db, a)
+    lookup = _name_taken(gh)
+    req = await service.create_request(a.id, create_request())
+    assert req.status == RequestStatus.PROVISION_FAILED
+    assert "not created by the broker" in req.decision_reason
+    # Neither GitHub's text nor the existing repo's details reach the agent,
+    # and the admin token is never used to look the stranger's repo up.
+    assert "already exists on this account" not in req.decision_reason
+    assert not lookup.called
+    assert gh["revoke"].called
+
+
+async def test_adoption_requires_the_same_repo(db, service, gh, agent):
+    a, _ = agent
+    await _approve_rule(db, a)
+    assert (await service.create_request(a.id, create_request())).status == RequestStatus.GRANTED
+    # Deleted and re-made by someone else since: same name, different id.
+    _name_taken(gh, {"id": 9999, "html_url": "https://github.com/jrt/newproj",
+                     "visibility": "private"})
+    req = await service.create_request(a.id, create_request())
+    assert req.status == RequestStatus.PROVISION_FAILED
+    assert "not created by the broker" in req.decision_reason
+
+
+async def test_adoption_requires_the_same_visibility(db, service, gh, agent):
+    a, _ = agent
+    await _approve_rule(db, a)
+    assert (await service.create_request(a.id, create_request())).status == RequestStatus.GRANTED
+    _name_taken(gh, {"id": 4242, "html_url": "https://github.com/jrt/newproj",
+                     "visibility": "public"})
+    req = await service.create_request(a.id, create_request())
+    assert req.status == RequestStatus.PROVISION_FAILED
+    assert "exists as public" in req.decision_reason
+
+
+async def test_adoption_requires_the_same_agent(db, service, gh, agent):
+    a, _ = agent
+    b, _ = await make_agent(db, "other-agent")
+    await _approve_rule(db, a)
+    await _approve_rule(db, b)
+    assert (await service.create_request(a.id, create_request())).status == RequestStatus.GRANTED
+    _name_taken(gh)
+    req = await service.create_request(b.id, create_request())
+    assert req.status == RequestStatus.PROVISION_FAILED
+    assert "not created by the broker" in req.decision_reason
+
+
+# ------------------------------------------------------ validator hardening
+
+async def test_control_and_non_ascii_resources_are_refused(db, registry, agent):
+    a, _ = agent
+    gh = registry.get(Platform.GITHUB)
+
+    async def check(capability, resource, scope):
+        async with db.session() as session:
+            return await gh.validate_request(
+                session, RequestSpec(agent=a, capability=capability, resource=resource, scope=scope)
+            )
+
+    repo_scope = {"permissions": {"contents": "read"}}
+    for bad in ("jrt/nixos-dots\n/", "jrt/nixos-dots\n", "jrt/x\t", "jrt/x\x7f", "jrt/nеwproj"):
+        with pytest.raises(SpecValidationError, match="control or non-ASCII"):
+            await check("create", bad, {})
+        with pytest.raises(SpecValidationError, match="control or non-ASCII"):
+            await check("repo", bad, repo_scope)
+    # Whitespace between the name and a trailing slash can't dodge the denylist.
+    with pytest.raises(SpecValidationError, match="never brokered"):
+        await check("repo", "jrt/nixos-dots /", repo_scope)
+    for bad in ("jrt/a b", "jrt/..", "jrt/x%0a", "jrt/x?y"):
+        with pytest.raises(SpecValidationError, match="invalid github repository"):
+            await check("repo", bad, repo_scope)
+
+
+async def test_special_repo_names_are_refused(db, registry, agent):
+    a, _ = agent
+    gh = registry.get(Platform.GITHUB)
+
+    async def check(resource):
+        async with db.session() as session:
+            return await gh.validate_request(
+                session, RequestSpec(agent=a, capability="create", resource=resource, scope={})
+            )
+
+    for bad in (".github", ".github-private", ".hidden", "jrt.github.io", "...", "-", "_", "-._"):
+        with pytest.raises(SpecValidationError, match="invalid repository name"):
+            await check(f"jrt/{bad}")
+    for ok in ("a.b", "x-1", "_x", "github.io-notes"):
+        assert (await check(f"jrt/{ok}")).resource == f"jrt/{ok}"
+
+
+# ------------------------------------------------------ admin token hygiene
+
+async def test_admin_token_revoke_failure_is_logged(db, service, gh, agent, caplog):
+    a, _ = agent
+    await _approve_rule(db, a)
+    gh["revoke"].respond(401)
+    with caplog.at_level(logging.WARNING, logger="agent_auth.provisioners.github"):
+        req = await service.create_request(a.id, create_request())
+    assert req.status == RequestStatus.GRANTED
+    assert any("returned 401" in r.getMessage() for r in caplog.records)
+
+
+async def test_admin_token_revoked_when_create_is_cancelled(db, registry, gh, agent):
+    a, _ = agent
+    in_flight = asyncio.Event()
+
+    async def hang(request):
+        in_flight.set()
+        await asyncio.Event().wait()
+
+    gh["create"].side_effect = hang
+    grant = Grant(
+        agent_id=a.id,
+        platform=Platform.GITHUB,
+        capability="create",
+        scope={"visibility": "private"},
+        resource="jrt/newproj",
+        expires_at=utcnow(),
+    )
+    async with db.session() as session:
+        task = asyncio.create_task(registry.get(Platform.GITHUB).provision(session, grant))
+        await in_flight.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    # The shielded revoke outlives the cancellation.
+    for _ in range(50):
+        if gh["revoke"].called:
+            break
+        await asyncio.sleep(0.01)
+    assert gh["revoke"].called
+
+
+async def test_coverage_lookup_error_does_not_fail_a_create(db, service, gh, agent):
+    a, _ = agent
+    await _approve_rule(db, a)
+    gh["covers"].side_effect = httpx.ConnectError("boom")
+    req = await service.create_request(a.id, create_request())
+    assert req.status == RequestStatus.GRANTED, req.decision_reason
+    async with db.session() as session:
+        grant = (await session.execute(select(Grant).where(Grant.request_id == req.id))).scalar_one()
+    assert grant.provisioner_state["created"] is True
+    assert grant.provisioner_state["installation_covers"] is False
