@@ -27,6 +27,9 @@ agent-auth = "agent_auth.cli:app"
 agent-auth-server = "agent_auth.main:run"
 agent-auth-mcp = "agent_auth.mcp_server:run"
 agent-auth-hostd = "agent_auth.hostd.main:app"
+agent-auth-sandboxd = "agent_auth.sandboxd.main:app"
+agent-auth-sandboxctl = "agent_auth.sandboxd.ctl:app"
+agent-auth-sandbox-mcp = "agent_auth.sandboxd.mcp:run"
 
 [dependency-groups]
 dev = [

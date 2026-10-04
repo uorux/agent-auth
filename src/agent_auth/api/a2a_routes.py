@@ -5,6 +5,7 @@ import logging
 import secrets
 from datetime import datetime, timezone
 
+from fastapi.responses import JSONResponse
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import select
 
@@ -175,6 +176,14 @@ async def send_message(
         _raise(exc)
 
 
+def _payloads(result: dict) -> JSONResponse:
+    """Agents' payloads verbatim. FastAPI's default encoder drops any dict
+    key starting with "_sa" (it takes them for SQLAlchemy instance state), so
+    a payload like {"_sandbox": …} or {"_sample": …} would silently lose
+    them; everything in here is already JSON-ready."""
+    return JSONResponse(result)
+
+
 @router.get("/a2a/threads/{thread_id}/messages")
 async def read_messages(
     thread_id: str,
@@ -195,11 +204,11 @@ async def read_messages(
         _raise(exc)
     start_state = first["thread"]["state"]
     if first["messages"] or wait <= 0 or start_state == "closed":
-        return first
+        return _payloads(first)
     while True:
         remaining = deadline - asyncio.get_event_loop().time()
         if remaining <= 0:
-            return first
+            return _payloads(first)
         await state.a2a_events.wait(wake_key, timeout=min(remaining, 2.0))
         await _touch_caller(state, caller)
         await mark_listening(state, caller)
@@ -210,7 +219,7 @@ async def read_messages(
         except A2AError as exc:
             _raise(exc)
         if result["messages"] or result["thread"]["state"] != start_state:
-            return result
+            return _payloads(result)
         first = result
 
 
