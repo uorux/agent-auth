@@ -473,3 +473,17 @@ async def test_interactive_attach_hands_the_session_to_a_tui(db, live, sbx, fake
     # Detaching for good: back to headless, and the queue is delivered there.
     await daemon.stop_tui(conv)
     assert await wait_for(lambda: any(e.get("turn", "").startswith("[a2a] queued") for e in read_log(fake_log)))
+
+
+async def test_an_open_that_cannot_be_served_is_rejected_not_retried(db, live, sbx, stack):
+    daemon, _ = sbx
+    daemon.runtimes.clear()  # no runtime for the orchestrator any more
+    hermes = await peer(db, live)
+    async with hermes:
+        tid = await open_thread(hermes, "orchestrator-excelsior-sandbox", {"task": "ping"})
+
+        async def closed():
+            t = (await hermes.get(f"/v1/a2a/threads/{tid}")).json()
+            return t["state"] == "closed" and "sandbox:" in (t.get("close_note") or "")
+
+        assert await wait_for(closed)

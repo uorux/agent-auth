@@ -328,7 +328,13 @@ class Sandboxd:
                 snap = await self.broker.events(rec.api_key, wait=EVENTS_WAIT, after=after)
                 after = snap.get("cursor") or after
                 for thread in snap.get("pending_opens", []):
-                    await self.route_open(rec, thread)
+                    try:
+                        await self.route_open(rec, thread)
+                    except (LookupError, RuntimeError, ValueError) as exc:
+                        # Can't be served here (no runtime for this agent, …):
+                        # tell the initiator now rather than retrying forever.
+                        log.warning("refusing thread %s for %s: %s", thread["thread_id"], agent_name, exc)
+                        await self.broker.reject(rec.api_key, thread["thread_id"], f"sandbox: {exc}"[:500])
             except BrokerCallError as exc:
                 if exc.status == 401:
                     await self._key_lost(agent_name)
