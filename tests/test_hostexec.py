@@ -28,6 +28,7 @@ from sqlalchemy import select
 from agent_auth.api.app import create_app
 from agent_auth.config import Settings
 from agent_auth.core.daemons import DaemonHub
+from agent_auth.core.desktop import DesktopService, FanoutNotifier
 from agent_auth.core.events import KeyedEvents
 from agent_auth.core.hostexec import HostExecError, HostExecService
 from agent_auth.core.sandboxes import SandboxService
@@ -39,7 +40,7 @@ from agent_auth.daemon_common import hostexec as hx
 from agent_auth.daemon_common.channel import pair
 from agent_auth.daemon_common.localsock import ApiError
 from agent_auth.daemon_common.totp import STEP_SECS, TotpError, TotpStore, code_at
-from agent_auth.hostd.config import HostConfig, TierConfig, duration_secs, match_argv
+from agent_auth.hostd.config import DesktopConfig, HostConfig, TierConfig, duration_secs, match_argv
 from agent_auth.hostd.daemon import Hostd
 from agent_auth.models import AccessRequest, Grant, HostJob, Rule
 from agent_auth.policy.engine import PolicyEngine
@@ -56,6 +57,8 @@ ADMIN = {"Authorization": "Bearer admin-secret"}
 HOST = "excelsior"
 POLICY = {
     "defaults": {"action": "surface", "max_duration": "24h"},
+    # Desktop prompts: only for agents named desk-* (tests/test_desktop.py).
+    "desktop": {"enabled": True, "agents": ["desk-*"], "timeout": "5s", "queue_timeout": "1s"},
     "platforms": {
         "hostexec": {
             "templates": {"greet": {"tier": "user", "argv": ["echo", "hello", "{name}"], "params": {"name": "[a-z]+"}}}
@@ -235,11 +238,14 @@ def stack(db, a2a_service, broker_key):
     sandboxes = SandboxService(db, hub, SecretBox(settings.encryption_key))
     registry.register(AgentsProvisioner(policy.platforms.agents, sandboxes))
     service = RequestService(db, PolicyEngine(policy), registry, events, notifier=notifier)
+    desktop = DesktopService(db, hub, policy.desktop, service)
+    service.set_notifier(FanoutNotifier(notifier, desktop))
     hostexec = HostExecService(db, hub, events)
     hostexec.bind(service, a2a_service)
     registry.register(HostexecProvisioner(policy.platforms.hostexec, hostexec))
     app = create_app(settings, db, service, registry, events, a2a_service, hub, hostexec)
-    return {"app": app, "service": service, "hub": hub, "hostexec": hostexec, "notifier": notifier}
+    return {"app": app, "service": service, "hub": hub, "hostexec": hostexec, "notifier": notifier,
+            "desktop": desktop}
 
 
 @pytest.fixture
@@ -302,6 +308,11 @@ def host_config(tmp_path, live, broker_key, run_dir) -> HostConfig:
         deny_commands=[["rm", "**"]],
         templates={"greet": {"tier": "user", "argv": ["echo", "hello", "{name}"], "params": {"name": "[a-z]+"}}},
         vm_unit="agent-vm.service",
+        # The "dialog" is tests/test_desktop.py's script.
+        desktop=DesktopConfig(
+            enable=True,
+            prompt_command=[sys.executable, str(tmp_path / "dialog.py"), "{title}", "{text}", "{timeout}"],
+        ),
     )
 
 

@@ -23,6 +23,7 @@ agent ──HTTP/MCP/CLI──▶ broker ──policy──▶ deny | approve | 
 | `homelab` | `group`       | LLDAP group name    | agent's LLDAP service account is added to the group (Authelia rules are per-group); removed at expiry. Agents without a hand-registered account get a broker-managed one (`svc-<name>`, generated password) at their first grant; the credential fetch returns username + password |
 | `kubernetes` | role name (`view`, `edit`, `traefik-patcher`, …) | namespace name (or `*` for cluster-wide) | per-grant ServiceAccount + RoleBinding to the named (Cluster)Role — a ClusterRoleBinding when the namespace is `*`; tokens minted on demand via TokenRequest; SA deleted at expiry → all tokens die instantly. The capability *is* the role, so policy rules auto-approve narrow roles and surface broad ones |
 | `a2a`     | `talk`        | target agent name   | authorizes OPENING conversation threads to that (service) agent — see [a2a threads](#a2a-threads); no credential is minted |
+| `hostexec` | `run`, `tpl.<name>`, `shell` | host name | one command (or a time-boxed shell) **on a host**, run by that host's daemon — see [Commands on hosts](#commands-on-hosts-hostexec). The host decides, with its own TOTP secrets and policy; root and shells always reach a human |
 | `google`  | `calendar.*`… | calendar id / label | stub: decisions recorded, no credential minted (501)                        |
 
 Note the Gitea flow: the broker grants the homelab agent the `svc-gitea` LLDAP
@@ -375,12 +376,11 @@ ServiceAccount itself is deleted.
 ## Paired daemons (hostd)
 
 Hosts run `agent-auth-hostd`, a daemon that dials out to the broker over a
-signed WebSocket (`/v1/daemons/connect`). It is the foundation for running
-approved commands outside agent VMs; see
-[docs/sandbox-design.md](docs/sandbox-design.md). Today (phase 1) it only
-pairs, connects and reports heartbeats. It accepts no work, and the NixOS
-module runs it as the unprivileged `agent-auth-hostd` user until a later phase
-needs root to run jobs.
+signed WebSocket (`/v1/daemons/connect`); see
+[docs/sandbox-design.md](docs/sandbox-design.md). With no tier enabled it only
+pairs, connects and reports heartbeats, as the unprivileged `agent-auth-hostd`
+user. Enabling a tier makes it run approved commands
+([Commands on hosts](#commands-on-hosts-hostexec)), as root.
 
 - **Broker key**: `agent-auth admin gen-signing-key --out FILE` writes
   `BROKER_SIGNING_KEY` to a new 0600 file (move it into the broker's env
@@ -412,9 +412,132 @@ services.agent-auth-hostd = {
   brokerUrl = "https://agent-auth.recusant.rooty.dev";
   brokerPublicKey = "ed25519:…";   # agent-auth admin broker-key
 };
-# impermanence: persist /var/lib/agent-auth-hostd (the host's identity key),
-# mode 0700, user and group agent-auth-hostd
+# impermanence: persist /var/lib/agent-auth-hostd (the host's identity key,
+# its TOTP secrets and lockdown flag), mode 0700. Owner: agent-auth-hostd while
+# no tier is enabled, root once one is (the module's tmpfiles rule moves it).
 ```
+
+## Commands on hosts (hostexec)
+
+An agent can ask to run one exact command on a host, as your user or as root:
+platform `hostexec`, capability `run`, resource = the host,
+`scope {"tier": "user"|"root", "argv": [...], "cwd"?, "env"?, "timeout"?, "stdin"?}`
+(MCP tool `host_run`). The request goes through policy and Discord like any
+other. **Whether it runs is decided on the host**, by hostd, in this order:
+
+1. locked down → no;
+2. tier disabled, a `denyCommands` match, an env var outside `envAllow` → no;
+3. a valid **direct TOTP code** came with the approval → run, armed or not;
+4. an `autoCommands` match (user tier) → run;
+5. the tier is **armed** → run if a human approved it; a rule's, the LLM's or
+   policy's approval only with `acceptMachineApprovals`; an "approve all"
+   window only with `acceptApproveAll`;
+6. otherwise → refused (`not_armed`), and the approval is not accepted: the
+   request stays open on Discord.
+
+```nix
+services.agent-auth-hostd = {
+  enable = true; brokerUrl = "…"; brokerPublicKey = "ed25519:…";
+  user = "jrt";                       # the user tier runs as this account
+  tiers.user = { enable = true; maxArm = "8h"; shell.enable = true; };
+  tiers.root = { enable = true; maxArm = "1h"; };   # no windows, no machine approvals
+  autoCommands = [ [ "systemctl" "--user" "status" "*" ] ];
+  denyCommands = [ ];
+  templates.nixos-rebuild = {
+    tier = "root";
+    argv = [ "nixos-rebuild" "switch" "--flake" "{flake}" ];
+    params.flake = "git\\+https://git\\.example/me/[a-z0-9-]+#[a-z0-9-]+";
+  };
+  vm.unit = "agent-vm.service";       # frozen on lockdown; null without a VM
+};
+users.users.jrt.linger = true;        # headless hosts: the user tier needs the user's manager
+```
+
+- **TOTP.** `sudo agent-auth-hostd totp-enroll` on each host creates four
+  secrets and shows each once as a QR code: `<tier>-arm` and `<tier>-direct`
+  for `user` and `root`. They are generated on the host and never leave it.
+  Codes are single use; five wrong ones lock a secret for five minutes.
+- **Arming.** `/arm host tier duration code` (an arm code), or on the host
+  `agent-auth-hostctl arm 2h` (your user for the user tier; `sudo … --tier
+  root`). Held in memory: a restart disarms. `/disarm` needs no code.
+- **Discord.** Approve (needs the tier armed) · Approve all… (a time-boxed
+  rule for that agent, host and tier; armed, and the host must accept
+  windows) · Approve with TOTP (a direct code, works disarmed) · Deny · Edit.
+  The message gets the exit code, duration and the end of the output; the
+  agent gets all of it (the last 1 MiB) from `host_job`. With
+  `OPENROUTER_API_KEY`, each request carries an advisory risk line from a
+  model (`platforms.hostexec.risk_model`); it decides nothing.
+- **Templates** (`tpl.<name>`): the host expands its own copy, with each
+  parameter checked against its regex and substituted as one whole argument.
+  `platforms.hostexec.templates` in the broker's policy mirrors them so the
+  Discord message can show the expanded command.
+- **Shells** (`shell`, `scope {"tier"}`): a time-boxed window in which the
+  agent runs commands one at a time (`host_shell_exec`; no terminal). Opened
+  with a TOTP code only — arming, windows and rules never open one. The
+  request is loud (optionally in `DISCORD_LOUD_CHANNEL_ID`), every command is
+  posted to a thread on it **before** it is sent to the host (if it can't be
+  posted, it doesn't run), and **End shell** kills it. The host keeps the
+  expiry itself.
+- **Kill switch.** `/lockdown [sandboxes|all|host]` or `agent-auth admin
+  lockdown`: revokes the grants of agent-VM agents (of every agent with
+  `all`), refuses new identities and host commands, and each host disarms,
+  kills its jobs and shells, and freezes its agent VM from outside (`kill_vm`
+  stops it). `/unlock` lifts the broker's side; **each host stays locked**
+  until `/unlock host:<h> code:<root-arm code>` or `sudo agent-auth-hostctl
+  unlock` there.
+- **Audit.** Every decision hostd makes is in its journal
+  (`journalctl -u agent-auth-hostd`), with the evidence it was made on.
+
+What this does **not** protect against: codes pass through Discord and the
+broker, so a compromised broker can attach a direct code you typed to a
+different command (once per code); and while a tier is armed it can run
+anything in that tier. Disarmed and without codes it can run only the
+`autoCommands`. `denyCommands` guards against mistakes, not against `sh -c`.
+
+Not yet run on a real host: the systemd-run paths (the user tier's in
+particular). The tests drive the real daemon with a fake executor.
+
+## Desktop prompts
+
+With `desktop.enabled` in the policy and `services.agent-auth-hostd.desktop.enable`
+on a host, a request that needs you is also shown as a dialog on **every
+desktop you are at**, next to the Discord message; the first answer decides
+and the others are taken down. No answer in 90 s leaves it to Discord.
+
+```yaml
+desktop:
+  enabled: true
+  agents: ["claude-*", "codex-*", "*-sandbox"]   # who may be asked at a desk
+  # platforms: [github, a2a]    # empty = any
+  # sensitive: false            # root commands etc. stay on Discord
+```
+
+- **Present** means: hostd's helper in your session (`agent-auth-hostd user`,
+  a user service) is connected, the session is unlocked and was used within
+  `desktop.maxIdle`, nothing is fullscreen, and do-not-disturb is off. Unknown
+  counts as away. Hyprland keeps no idle or lock hints, so report them:
+
+  ```
+  # hypridle.conf
+  listener { timeout = 300; on-timeout = agent-auth-hostctl presence idle; on-resume = agent-auth-hostctl presence active }
+  # around your lock screen
+  agent-auth-hostctl presence locked; hyprlock; agent-auth-hostctl presence unlocked
+  ```
+- **Buttons**: Allow once · Deny · Mute agent 1h · Send to Discord. The dialog
+  is `desktop.promptCommand` (zenity by default; any command that exits 0 for
+  allow works, including `sbx-prompt`).
+- **Limits**: one dialog per desktop at a time, 2 in a burst and 6 an hour per
+  agent, 20 an hour overall, a 10-minute pause after a Deny (an hour after
+  three), optional `quiet_hours`, `agent-auth-hostctl dnd 2h` / `/dnd`.
+- An answer at a desk counts like a click on Discord: a host command still
+  needs its host armed, and shells are never asked there.
+
+What this does **not** protect against: anything running as you on one of
+those desktops, or a compromised host, can answer its prompts. `desktop.agents`
+and `desktop.platforms` are the limit on what that can approve.
+
+Not yet run on a desktop: the zenity dialog, the Hyprland fullscreen check and
+the user service. The tests drive the real helper with a script as the dialog.
 
 ## Agent VMs (sandboxd)
 

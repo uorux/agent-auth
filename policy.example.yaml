@@ -15,7 +15,31 @@ llm:
   retry_budget: 2          # LLM denials the agent may retry before human escalation
   timeout_secs: 60
 
+# Approval prompts on the desktops you are at, next to Discord (README:
+# "Desktop prompts"). Off unless enabled. Whatever is listed here can be
+# approved by any process running as you on such a desktop.
+#
+# desktop:
+#   enabled: true
+#   agents: ["claude-*", "codex-*", "*-sandbox"]
+#   platforms: []            # empty = any platform
+#   sensitive: false         # root commands, secrets permissions, … stay on Discord
+#   quiet_hours: ["23:00", "08:00"]
+
 platforms:
+  # Commands on hosts (README: "Commands on hosts"). Each host's own config
+  # decides what it runs; nothing here can loosen that.
+  # hostexec:
+  #   # Mirrors of the hosts' templates, to show the expanded command.
+  #   templates:
+  #     nixos-rebuild:
+  #       tier: root
+  #       argv: ["nixos-rebuild", "switch", "--flake", "{flake}"]
+  #       params: {flake: "git\\+https://git\\.example/me/[a-z0-9-]+#[a-z0-9-]+"}
+  #   risk_model: deepseek/deepseek-chat   # the advisory risk line (default: llm.model)
+  #   window_default: 30m                  # "Approve all…"
+  #   window_max: 8h
+
   github:
     # GitHub account owners whose repos are brokered (the app must be
     # installed on each)
@@ -216,6 +240,16 @@ rules:
     constraints: {max_duration: 12h}
   # Unknown pairs: ask once, then use Edit→rule
   - match: {platform: a2a}
+    action: surface
+
+  # Commands on hosts. Root commands and every shell reach a human whatever
+  # is written here; only a rule that names the capability clears a user
+  # command, and the host still wants its tier armed (or the command in its
+  # autoCommands) before it runs anything.
+  #
+  #   - match: {agent: "*-sandbox", platform: hostexec, capability: run}
+  #     action: approve        # then each host's autoCommands / arm state decide
+  - match: {platform: hostexec}
     action: surface
 
   # Google (stub) — always a human decision while unimplemented

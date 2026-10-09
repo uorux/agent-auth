@@ -843,7 +843,12 @@ class Hostd:
                     p.locked = locked if isinstance(locked, bool) else None
                     p.fullscreen = bool(msg.get("fullscreen"))
                     p.reported_at = time.time()
-                    if msg.get("fresh") and p.explicit_idle is None and p.explicit_locked is None:
+                    if (
+                        msg.get("fresh")
+                        and self.config.desktop.idle_source == "hooks"
+                        and p.explicit_idle is None
+                        and p.explicit_locked is None
+                    ):
                         # The helper just started with the session, and no
                         # hook has said otherwise yet: you just logged in.
                         self._presence_event("unlocked")

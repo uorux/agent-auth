@@ -22,14 +22,19 @@ against the pinned versions; **[open]** = needs your call (collected in §16).
 
 ---
 
-## Status (2026-10-04)
+## Status (2026-10-09)
 
 | phase | state |
 |---|---|
-| 1. Daemon channel + hostd skeleton | built, tested; not deployed |
-| 2. Agent VM (nixos-dots) | built (guest system and units build); not run on hardware |
-| 3. sandboxd | built, tested against a real broker with a fake runtime; not run on hardware |
-| 4–8 | not started |
+| 1. Daemon channel + hostd skeleton | built, tested; deployed |
+| 2. Agent VM (nixos-dots) | built; being brought up on excelsior |
+| 3. sandboxd | built, including routing triage and the claude mid-turn doorbell; tested against a real broker with a fake runtime. `avm --host` (nixos-dots) not built |
+| 4. hostexec `run` + kill switch | built, tested against the real hostd with a fake executor; **the systemd-run paths have not run on a host** |
+| 5. Shells | built, same caveat |
+| 6. MCP catalog + proxy | not started |
+| 7. Mounts | not started |
+| 8. Content-bound desktop approval of hostexec | not started |
+| 9. Desktop prompts on every active host | built, tested with the real helper and a script for the dialog; **not run on a desktop** |
 
 Where the build departed from this document is noted in place as **[built: …]**.
 
@@ -145,7 +150,7 @@ built for desktop apps, and most VM-side pieces are build-verified only
 | `lib/vm/vsock-relay.py` | guest unix socket → host service, authenticated by peer CID only | yes, for host↔VM local services |
 | `lib/vm/grants.py` + guest `sbx-grantd` | live folder grants: the allowlist adds a `$HOME` subtree, and the guest bind-mounts it at the same path. No revoke; `ro` is enforced only in the guest | **yes, as the mount mechanism**, extended with revoke and per-project mapping (§11) |
 | `sbx-broker` (user service, `graphical-session.target`) | per-sandbox socket; ops `exec` (user, or root via `run0`), `grant-net`, `grant-path`, `camera`, `fido`, `authenticate`. Prompts with zenity; root is never session-cached; rules per sandbox name | **not** used by the agent VM. It stays the app-sandbox broker. hostd is the agent-side counterpart (§8.1) |
-| `sbx-prompt` (`lib/broker/prompt.nix`) | `sbx-prompt [--timeout N] [--no-session] -- REQUESTER SUMMARY DETAIL` → `once\|session\|deny` | **yes**, as the desktop prompt for hostd (phase 8, §8.6, §8.10) |
+| `sbx-prompt` (`lib/broker/prompt.nix`) | `sbx-prompt [--timeout N] [--no-session] -- REQUESTER SUMMARY DETAIL` → `once\|session\|deny` | **yes**, as the desktop prompt for hostd (phases 8 and 9, §8.6, §8.10) |
 | polkit `authenticate` path (`pkcheck` → hyprpolkitagent) | a password check bound to a fixed action message | **yes**, as the second step of root desktop approval (phase 8, §8.6) |
 | `modules.sandbox.agents` group | ONE persistent VM/container holding claude, codex, gemini, gsd and opencode, all sharing credentials (`agent-peers` collapses the wall on purpose). Projects shared rw at their real paths | kept for interactive desktop use; the agent VM is separate (§3.3) |
 | agent-auth on recusant | broker; Hermes `hermes-homelab-recusant` + its a2a dispatcher (`agent-auth a2a serve`); `agent-auth-client` on every host | yes. Hermes is the first orchestrator client |
@@ -454,7 +459,14 @@ Conversation {id, agent, runtime, runtime_session_id, broker_session_id,
      or a matching topic → **triage**: a one-shot cheap-model call
      (`claude -p --model haiku` or the codex equivalent, in a throwaway unit)
      picks `{conversation_id | "new"}`. Any failure → new.
-     **[built: not yet — rules 1, 2 and 4 only]**
+     **[built]** Candidates are the agent's open conversations that already
+     have a thread with the same peer or the same topic (at most 8). The
+     call has no tools, no MCP and no settings, gets the prompt on stdin,
+     and runs in a throwaway unit as the project's user. Only an answer
+     naming exactly one candidate routes there. The claude call
+     (`--model haiku --tools "" --strict-mcp-config --setting-sources ""`)
+     is checked against the fake runtime only; the codex one (`codex exec -`)
+     is unverified.
   4. Otherwise → a new conversation.
 
   **[built]** The hint is `{"_sandbox": {"conversation": "<id>"}}` in the
@@ -528,11 +540,15 @@ Prototyped on 2026-10-03 against Claude Code 2.1.280 and codex-cli 0.156.1.
   - Codex: `turn/steer` adds input to the running turn, which is better than
     the turn-boundary baseline assumed in revision 2. sandboxd steers a2a
     messages into an active turn, and starts a turn otherwise.
-  - Claude: queued stdin lines become the next turns (verified). A
-    `PostToolUse` hook doorbell for true mid-turn injection is still
-    **[verify]** **[built: not yet]**. For an attached TUI, a
-    `UserPromptSubmit` hook (`agent-auth-sandbox-mcp hook`) adds queued
-    messages to your next prompt **[built]**.
+  - Claude: queued stdin lines become the next turns (verified).
+    **[built]** A `PostToolUse` hook is the doorbell: a message for a busy
+    process waits in the conversation's inbox, the hook
+    (`agent-auth-sandbox-mcp hook`) hands it to the model as added context
+    after its next tool call, and whatever is still queued when the turn
+    ends becomes the next turn. Verified against Claude Code 2.1.292 in `-p`
+    mode: the hook's `additionalContext` reaches the model. For an attached
+    TUI, the same hook on `UserPromptSubmit` adds queued messages to your
+    next prompt.
 - **Auth: subscription OAuth** **[decided]**
   - Claude: one long-lived `claude setup-token` token, root-only on the VM
     disk, injected as `CLAUDE_CODE_OAUTH_TOKEN`.
@@ -814,6 +830,14 @@ broker.
 - **hostd-user** (user service, desktop hosts) is a prompt helper that talks
   to hostd-root over a root-owned unix socket.
 
+**[built]** One root daemon, `agent-auth-hostd run`, started as root only
+when a tier or `vm.unit` is configured (otherwise it stays the unprivileged
+connect-only service). User jobs do not use `--machine=jrt@.host`: that
+transport can't carry the job's stdio. hostd drops to the user (`setpriv`)
+and runs `systemd-run --user` against `/run/user/<uid>/bus`. hostd-user is
+`agent-auth-hostd user`, a user service; it is used for desktop prompts
+(phase 9) and holds nothing.
+
 Why the user instance doesn't pair or verify on its own: an approved user
 command runs as `jrt`. If the user-tier daemon also ran as `jrt`, that command
 could read its TOTP secrets, ptrace it, or arm it, so one approval would mean
@@ -897,6 +921,21 @@ hostd checks it in this order:
 Shells accept only step 3. Every decision goes to the journal with its
 evidence, as a local audit log the broker can't edit.
 
+**[built]** Three messages instead of one offer, so a refusal can leave the
+request open on Discord instead of failing it:
+
+- `hostexec.precheck {spec, source, window}`: would this be admitted now?
+  Consumes nothing. Asked before a human approval is recorded.
+- `hostexec.authorize {job_id, digest, tier, totp}`: verify and spend a
+  direct TOTP code for one request. The digest is over the whole spec
+  (host, tier, argv or template+params, cwd, env, timeout, stdin), and the
+  job that follows must have that digest.
+- `job.start {job_id, spec, evidence}`: run it, if an authorization with
+  that digest is waiting, or the steps above admit it.
+
+Codes also lock: five wrong ones lock a secret for five minutes, so whoever
+relays codes can't search them.
+
 **Residual risk** (accepted): TOTP codes pass through Discord and the broker.
 A compromised broker can't *produce* codes, but it could hold back your
 request and attach your code to its own command, once per code. Only an
@@ -918,7 +957,7 @@ content.
     column on `rules`).
   - It also approves matching pending requests.
   - It never matches `shell`.
-- **Arming**
+- **Arming** **[built]**
   - Discord: `/arm host:<h> tier:<user|root> duration:<d> code:<arm TOTP>`,
     and `/disarm`.
   - Locally: `agent-auth-hostctl arm 2h` (user tier: local presence; root:
@@ -933,9 +972,13 @@ content.
 - **Output**: the approval message is edited with the exit code, duration,
   and last ~30 lines. Full output (≤1 MiB) is attached and returned to the
   agent with a sha256, and `job.done` is signed by hostd.
-- **Desktop approval of hostexec on the same host** (phase 8). This is the
-  only approval path where the UI is rendered from what hostd itself
-  received, so it binds the approval to the content.
+- **[built]** The output is sent after the job ends, in chunks, and the
+  host keeps it until the broker acknowledges it (resent after a reconnect).
+  It is the *last* 1 MiB. There is no separate signature on `job.done`: it
+  travels in the channel's signed envelopes like everything else.
+- **Desktop approval of hostexec on the same host** (phase 8, not built).
+  This is the only approval path where the UI is rendered from what hostd
+  itself received, so it binds the approval to the content.
   - **User tier**: hostd-user runs `sbx-prompt` with the command *as hostd
     received it*. `once` = a direct approval; `session` = arm the user tier
     for `maxArm`.
@@ -953,7 +996,7 @@ content.
        capture the password, which is the standard Linux-desktop weakness
        and is accepted. Zenity alone is never accepted for root.
 
-### 8.7 Shells **[decided]**
+### 8.7 Shells **[decided, built]**
 
 - **Open**: `hostexec shell` with `{tier}`, a duration ≤ `shell.maxDuration`,
   and a justification. Approval is TOTP only. hostd records `shell_id →
@@ -963,6 +1006,12 @@ content.
 - **Mirror**: a Discord thread on the approval message gets every command
   **before** dispatch, then its output. **End shell** revokes the grant, and
   hostd drops the `shell_id` and kills any running job.
+- **[built]** If the command can't be posted, it is not sent to the host. A
+  shell is never decided by a rule or the LLM (`authority.human_only`), and
+  hostd opens one only on an authorization from a direct TOTP code. A hostd
+  restart ends its shells. The agent's calls are
+  `POST /v1/hostexec/shells/{grant}/exec|close` (`host_shell_exec`,
+  `host_shell_close`).
 
 ### 8.8 Risk summary **[decided]**
 
@@ -979,6 +1028,28 @@ never approves anything.
 - Default timeout is 10m, capped by local policy.
 
 ### 8.10 Direct desktop prompts **[decided: allowed, with anti-spam policy]**
+
+**[built, as phase 9]** with these differences from the text below:
+
+- **Every present desktop is asked, not one "active desk".** The first
+  answer decides and the other dialogs are taken down.
+- **Presence** comes from hooks, because Hyprland keeps no logind hints:
+  `agent-auth-hostctl presence idle|active|locked|unlocked`, called from
+  hypridle and around the lock screen (or `idleSource = "logind"` where a
+  desktop maintains them). Unknown counts as away. hostd-user adds the
+  fullscreen check (`hyprctl activewindow`).
+- **Eligibility** is `desktop.agents` / `desktop.platforms` globs in the
+  policy, not a per-rule `channels:` list. Sensitive requests stay on
+  Discord unless `desktop.sensitive`; shells never reach a desktop.
+- A hostexec request is offered only while its target tier is armed, since a
+  desktop answer carries no TOTP code. The **same-host content-bound path**
+  (and the polkit step for root) is still phase 8.
+- Not built: coalescing ("3 requests from …"), the "Allow 30 min" button,
+  and local overrides of the limits in hostd-user.
+- Trust: an answer is accepted only for a prompt the broker sent to that
+  host and that is still open. That still means any process running as you
+  on such a desktop, and any compromised host, can approve whatever the
+  policy allows on desktops.
 
 Agents can get a human decision at your desktop without going through Discord.
 This applies to any broker request (a GitHub grant, an MCP grant, a hostexec),
@@ -1045,7 +1116,13 @@ local overrides in hostd-user):
 
 ---
 
-## 9. Kill switch **[decided]**
+## 9. Kill switch **[decided, built]**
+
+**[built]** `scope: host <h>` covers that host's hostd and the agents of its
+agent VM. A daemon that was offline is locked when it reconnects. sandboxd
+freezes its units and queues incoming work until unlocked. The broker also
+refuses `hostexec` requests while locked. "Kill" is a button on the lockdown
+message and `kill_vm` on the command.
 
 `/lockdown [scope: all | sandboxes | host <h>]` (owner only), or `agent-auth
 admin lockdown`:
@@ -1079,6 +1156,9 @@ unlock`, so a compromised broker can't undo a lockdown.
   - `agent-auth admin daemons` and Discord `/hosts`;
   - `GET /v1/catalog` `hosts` (online, tiers enabled, armed);
   - a Discord alert after 3 missed heartbeats.
+- **[built]** hostd's status (tiers, armed-until, jobs, shells, lockdown, VM
+  state, desktop presence) is in `/hosts`, `admin hosts` and the catalog.
+  The missed-heartbeat alert is not built.
 
 ---
 
@@ -1259,11 +1339,17 @@ in-process WS, a fake runtime adapter).
 5. **Shells**: TOTP-only, loud embeds, mirror threads.
 6. **MCP catalog + broker proxy** (none/header first, then OAuth).
 7. **Mounts** (local host): allowlist revoke, idmapped binds.
-8. **Desktop prompts**:
-   - hostd-user presence;
-   - the desktop notifier with the anti-spam policy (§8.10);
-   - content-bound hostexec approval: `sbx-prompt` for the user tier,
-     `sbx-prompt` then polkit `auth_admin` for root.
+8. **Content-bound desktop approval of hostexec** (§8.6): on the host a
+   command targets, `sbx-prompt` for the user tier, and `sbx-prompt` then
+   polkit `auth_admin` for root, counted by that hostd as local evidence.
+   Builds on phase 9's helper.
+9. **Desktop prompts on every active host** (§8.10) **[built]**:
+   - hostd-user and presence (hooks, or logind);
+   - the broker's desktop notifier: every present desktop is asked, the
+     first answer decides;
+   - the anti-spam policy.
+
+   Built before 6–8 because it only needed the channel and hostd.
 
 Later: the web UI (§6.8), remote-host mounts, per-project egress, and a `net`
 grant platform for other tailnet services.

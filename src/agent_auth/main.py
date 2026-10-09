@@ -9,6 +9,7 @@ from .api.app import create_app
 from .config import Settings, get_settings
 from .core.a2a import A2AThreadService
 from .core.daemons import DaemonHub
+from .core.desktop import DesktopService, FanoutNotifier
 from .core.hostexec import HostExecService
 from .core.sandboxes import SandboxService
 from .core.events import KeyedEvents
@@ -168,16 +169,24 @@ async def serve(settings: Settings) -> None:
         asyncio.create_task(scheduler.run(), name="scheduler"),
     ]
 
+    # Approval prompts on the desktops you are at, next to Discord.
+    desktop = None
+    if daemons.enabled and policy.desktop.enabled:
+        desktop = DesktopService(db, daemons, policy.desktop, service)
+        log.info("desktop prompts enabled for agents %s", ", ".join(policy.desktop.agents) or "(none listed)")
+
     bot: AgentAuthBot | None = None
+    notifier = service.notifier
     if settings.discord_token:
-        bot = AgentAuthBot(settings, db, service, daemons, hostexec)
-        service.set_notifier(DiscordNotifier(bot, db, settings))
+        bot = AgentAuthBot(settings, db, service, daemons, hostexec, desktop)
+        notifier = DiscordNotifier(bot, db, settings)
         tasks.append(asyncio.create_task(bot.start(settings.discord_token), name="discord"))
     else:
         log.warning(
             "DISCORD_TOKEN not set — running headless; surfaced requests are only "
             "visible via the admin API"
         )
+    service.set_notifier(FanoutNotifier(notifier, desktop) if desktop is not None else notifier)
 
     try:
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
