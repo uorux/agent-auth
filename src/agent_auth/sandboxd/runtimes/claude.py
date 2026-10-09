@@ -94,9 +94,19 @@ class ClaudeRun:
         await asyncio.gather(self._reader, return_exceptions=True)
 
 
+def hook_settings(ctx: SpawnContext) -> dict:
+    return {
+        "hooks": {
+            event: [{"hooks": [{"type": "command", "command": command}]}]
+            for event, command in ctx.hooks.items()
+        }
+    }
+
+
 class ClaudeRuntime:
     name = "claude"
     shares_live_process = False
+    doorbell = True
 
     def __init__(self, command: str, model: str | None = None):
         self.command = command
@@ -111,6 +121,8 @@ class ClaudeRuntime:
         model = ctx.model or self.model
         if model:
             argv += ["--model", model]
+        if ctx.hooks:
+            argv += ["--settings", json.dumps(hook_settings(ctx))]
         return argv
 
     async def start(self, host: Host, ctx: SpawnContext) -> ClaudeRun:
@@ -132,3 +144,24 @@ class ClaudeRuntime:
         if ctx.runtime_session_id:
             argv += ["--resume", ctx.runtime_session_id]
         return argv
+
+    def triage_argv(self, model: str | None) -> list[str]:
+        # No tools, no MCP, no project or user settings, nothing saved: the
+        # prompt (on stdin) carries untrusted text and only its one-line
+        # answer is used.
+        return [
+            self.command, "-p",
+            "--model", model or "haiku",
+            "--output-format", "json",
+            "--tools", "",
+            "--strict-mcp-config",
+            "--setting-sources", "",
+            "--no-session-persistence",
+        ]
+
+    def triage_answer(self, stdout: str) -> str:
+        try:
+            result = json.loads(stdout).get("result")
+        except (ValueError, AttributeError):
+            return ""
+        return result if isinstance(result, str) else ""

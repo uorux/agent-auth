@@ -100,15 +100,23 @@ def agent_spawn(agent: str, prompt: str) -> str:
 
 
 def hook() -> None:
-    """claude UserPromptSubmit hook: hand queued a2a messages to the next
-    prompt of an attached TUI."""
+    """claude hook (PostToolUse, UserPromptSubmit): hand the a2a messages that
+    arrived for this conversation to the model as added context — after a
+    tool call in the middle of a turn, or with the next prompt of an attached
+    TUI. The event's name comes on stdin; the reply names the same event."""
+    try:
+        event = json.load(sys.stdin).get("hook_event_name")
+    except (ValueError, AttributeError):
+        event = None
+    if event not in ("PostToolUse", "UserPromptSubmit"):
+        event = "UserPromptSubmit"
     try:
         queued = agent_call("inbox", {"drain": True}) or []
     except Exception:
         queued = []
     if queued:
         context = "Messages that arrived for this conversation while you were working:\n\n" + "\n\n".join(queued)
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}}))
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": context}}))
 
 
 def run() -> None:

@@ -40,6 +40,13 @@ class Config:
     uid_base: int = 40000
     uid_max: int = 49999
     park_grace_secs: float = 30
+    # Routing triage (docs/sandbox-design.md §6.3 rule 3): when a new thread
+    # could continue one of the agent's conversations, a one-shot cheap-model
+    # call decides. Off = always a new conversation unless the opener hints.
+    triage: bool = True
+    triage_runtime: str | None = None  # default: the orchestrator's runtime
+    triage_model: str | None = None  # default: the runtime's cheap model
+    triage_timeout_secs: float = 60
     interactive_idle_secs: float = 1800
     max_processes: int = 16
     max_processes_per_project: int = 4

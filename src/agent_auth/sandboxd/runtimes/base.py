@@ -32,6 +32,8 @@ class SpawnContext:
     mcp_servers: dict[str, dict[str, Any]]  # name -> {"command", "args", "env_vars"}
     read_write: list[Path] = field(default_factory=list)
     model: str | None = None
+    # Hook commands by event name (claude: PostToolUse, UserPromptSubmit).
+    hooks: dict[str, str] = field(default_factory=dict)
 
     def unit_spec(self, argv: list[str], description: str) -> UnitSpec:
         return UnitSpec(
@@ -64,6 +66,14 @@ class Runtime(Protocol):
     # Whether an interactive TUI can join the live process (codex app-server)
     # or must take the session over (claude: stop, then resume in the TUI).
     shares_live_process: bool
+    # Whether a message for a busy process should wait in the inbox for the
+    # runtime's own hook to pick up mid-turn (claude's PostToolUse), instead
+    # of being written to the process (codex steers the running turn itself).
+    doorbell: bool
 
     async def start(self, host: Host, ctx: SpawnContext) -> Run: ...
     def tui_argv(self, ctx: SpawnContext, run: Run | None) -> list[str]: ...
+    # One-shot, tool-less call for routing triage: the prompt goes to stdin,
+    # triage_answer() extracts the model's reply from stdout.
+    def triage_argv(self, model: str | None) -> list[str]: ...
+    def triage_answer(self, stdout: str) -> str: ...

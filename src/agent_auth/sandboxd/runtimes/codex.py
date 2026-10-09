@@ -148,6 +148,7 @@ class CodexRun:
 class CodexRuntime:
     name = "codex"
     shares_live_process = True
+    doorbell = False  # turn/steer delivers into a running turn
 
     def __init__(self, command: str, model: str | None = None):
         self.command = command
@@ -182,3 +183,15 @@ class CodexRuntime:
         if ctx.runtime_session_id:
             argv.append(ctx.runtime_session_id)
         return argv
+
+    def triage_argv(self, model: str | None) -> list[str]:
+        # NOT verified against a live codex: `exec -` reads the prompt from
+        # stdin and prints the final message on stdout (progress on stderr).
+        argv = [self.command, "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only"]
+        if model or self.model:
+            argv += ["-m", model or self.model]
+        return argv + ["-"]
+
+    def triage_answer(self, stdout: str) -> str:
+        lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+        return lines[-1] if lines else ""
