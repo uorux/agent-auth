@@ -50,6 +50,27 @@ def fold(platform: Platform, capability: str, scope: dict[str, Any] | None) -> d
     if platform == Platform.SANDBOX:
         # capability "project.read" / "project.write" on another project
         return {"access": capability}
+    if platform == Platform.HOSTEXEC:
+        # The whole command is the privilege: a rule pinned to one argv never
+        # approves another. The host is the resource.
+        tier = scope.get("tier")
+        if capability == "shell":
+            return {"action": "shell", "tier": tier}
+        common = {
+            "tier": tier,
+            "cwd": scope.get("cwd"),
+            "env": dict(scope.get("env") or {}),
+            "timeout": scope.get("timeout"),
+            "stdin": scope.get("stdin"),
+        }
+        if capability.startswith("tpl."):
+            return {
+                "action": "tpl",
+                "template": capability[len("tpl."):],
+                "params": dict(scope.get("params") or {}),
+                **common,
+            }
+        return {"action": "run", "argv": list(scope.get("argv") or []), **common}
     return {}  # HOMELAB: membership only; the group is the resource
 
 
@@ -71,6 +92,18 @@ def split(platform: Platform, authority: dict[str, Any] | None) -> tuple[str, di
         return authority.get("access", ""), {}
     if platform == Platform.GOOGLE:
         return authority.get("action", ""), {}
+    if platform == Platform.HOSTEXEC:
+        action = authority.get("action")
+        if action in ("shell", "window"):
+            return ("shell" if action == "shell" else "run"), {"tier": authority.get("tier")}
+        scope = {
+            key: authority[key]
+            for key in ("tier", "cwd", "env", "timeout", "stdin")
+            if authority.get(key) not in (None, {}, "")
+        }
+        if action == "tpl":
+            return f"tpl.{authority.get('template')}", {**scope, "params": dict(authority.get("params") or {})}
+        return "run", {**scope, "argv": list(authority.get("argv") or [])}
     return "group", {}  # HOMELAB
 
 
@@ -86,6 +119,13 @@ def label(platform: Platform, authority: dict[str, Any] | None) -> str:
         return f"{role} (cluster-wide)" if (authority or {}).get("cluster") else role
     if platform == Platform.AGENTS:
         return f"mint:{(authority or {}).get('runtime') or '?'}"
+    if platform == Platform.HOSTEXEC:
+        a = authority or {}
+        if a.get("action") == "window":
+            return f"approve-all:{a.get('tier')}"
+        if a.get("action") == "tpl":
+            return f"tpl.{a.get('template')}:{a.get('tier')}"
+        return f"{a.get('action') or '*'}:{a.get('tier')}"
     return split(platform, authority)[0] or "*"
 
 
@@ -104,6 +144,29 @@ def needs_explicit_rule(platform: Platform, authority: dict[str, Any] | None) ->
         # Minting an identity: never cleared by a rule written for something
         # else (a null-authority catch-all, the default).
         return True
+    if platform == Platform.HOSTEXEC:
+        # Running a command on a host: only a rule about hostexec itself.
+        return True
+    return False
+
+
+def human_only(platform: Platform, authority: dict[str, Any] | None) -> bool:
+    """Is this never decided by a rule or the LLM, whoever wrote the rule?
+    A shell on a host: every one is opened by a human, with a TOTP code."""
+    return platform == Platform.HOSTEXEC and (authority or {}).get("action") == "shell"
+
+
+def rule_covers(
+    platform: Platform, rule_authority: dict[str, Any] | None, authority: dict[str, Any] | None
+) -> bool:
+    """Does a saved rule's pinned authority cover this request's? Equality,
+    with one exception: a hostexec "approve all" window ({"action": "window",
+    "tier": t}) covers any command or template of its tier — never a shell."""
+    if rule_authority is None or rule_authority == authority:
+        return True
+    if platform == Platform.HOSTEXEC and rule_authority.get("action") == "window":
+        a = authority or {}
+        return a.get("action") in ("run", "tpl") and a.get("tier") == rule_authority.get("tier")
     return False
 
 
@@ -125,4 +188,7 @@ def is_sensitive(platform: Platform, authority: dict[str, Any] | None, platforms
     if platform == Platform.SANDBOX:
         # Writing into another project's files: a human's call.
         return authority.get("access") == "project.write"
+    if platform == Platform.HOSTEXEC:
+        # Anything as root, and every shell.
+        return authority.get("tier") == "root" or authority.get("action") == "shell"
     return False

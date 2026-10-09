@@ -29,7 +29,36 @@ def _line(d: dict) -> str:
     )
     # Daemon-supplied: validated at ingest, escaped here as well.
     version = f" · v{discord.utils.escape_markdown(d['version'])}" if d.get("version") else ""
-    return f"{state} **{d['name']}** ({d['role']}){version} · {seen} · `{d['fingerprint'][:19]}`"
+    return (
+        f"{state} **{d['name']}** ({d['role']}){version} · {seen} · `{d['fingerprint'][:19]}`"
+        f"{_host_state(d.get('status'))}"
+    )
+
+
+def _host_state(status) -> str:
+    """What a hostd reported about itself. Daemon-supplied: only fixed words,
+    numbers and timestamps are taken from it."""
+    if not isinstance(status, dict) or status.get("role") != "host":
+        return ""
+    parts = []
+    if status.get("lockdown") is True:
+        parts.append("⛔ locked down")
+    tiers = status.get("tiers") if isinstance(status.get("tiers"), dict) else {}
+    for name in ("user", "root"):
+        tier = tiers.get(name)
+        if not isinstance(tier, dict) or tier.get("enabled") is not True:
+            continue
+        until = tier.get("armed_until")
+        parts.append(
+            f"{name} 🔓 until <t:{int(until)}:t>" if isinstance(until, (int, float)) else f"{name} 🔒"
+        )
+    for key, label in (("jobs", "job"), ("shells", "shell")):
+        if isinstance(status.get(key), int) and status[key] > 0:
+            parts.append(f"{status[key]} {label}(s)")
+    desktop = status.get("desktop") if isinstance(status.get("desktop"), dict) else {}
+    if desktop.get("present") is True:
+        parts.append("🧑‍💻 at the desk")
+    return ("\n　" + " · ".join(parts)) if parts else ""
 
 
 def build_hosts_embed(daemons: list[dict]) -> discord.Embed:

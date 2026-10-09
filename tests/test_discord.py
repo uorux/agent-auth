@@ -202,3 +202,78 @@ def test_edit_modal_respects_discord_field_limits():
         assert len(item.placeholder or "") <= 100, item.label
         if item.default and item.max_length:
             assert len(item.default) <= item.max_length, item.label
+
+
+# --- commands on hosts ---------------------------------------------------------
+
+
+def _hostexec_request(capability="run", tier="user", **scope):
+    from agent_auth.discord_bot import hostexec as hx_views  # noqa: F401
+
+    scope = {"tier": tier, **scope}
+    if capability == "run":
+        scope.setdefault("argv", ["nixos-rebuild", "switch", "--flake", ".#excelsior"])
+    return _request(
+        platform=Platform.HOSTEXEC,
+        capability=capability,
+        resource="excelsior",
+        scope=scope,
+        justification="apply the config change",
+        risk_notes=["risk (some/model, advisory): MEDIUM — rebuilds the system"],
+    )
+
+
+def test_hostexec_embeds_say_what_runs_where_and_whether_approve_works():
+    from agent_auth.discord_bot import hostexec as hx_views
+
+    agent = Agent(id="a", name="claude-larder-excelsior-sandbox", key_id="k", api_key_hash="h", project="larder")
+    armed = {"online": True, "lockdown": False,
+             "tiers": {"user": {"enabled": True, "armed_until": 1_800_000_000, "shell": True},
+                       "root": {"enabled": True, "armed_until": None, "shell": False}}}
+    run = hx_views.build_embed(_hostexec_request(cwd="/home/jrt/dots", env={"LANG": "C"}), agent, None, None, armed)
+    fields = {f.name: f.value for f in run.fields}
+    assert "your user" in run.title and "nixos-rebuild switch --flake" in fields["Command"]
+    assert fields["Project"] == "larder" and "LANG" in fields["env"] and "armed until" in fields["Host"]
+    assert "MEDIUM" in fields["⚠️ Risk context"]
+
+    root = hx_views.build_embed(_hostexec_request(tier="root"), agent, None, None, armed)
+    assert "ROOT" in root.title and "not armed" in {f.name: f.value for f in root.fields}["Host"]
+    shell = hx_views.build_embed(_hostexec_request("shell", tier="root"), agent, None, None, armed)
+    assert shell.title.startswith("🚨 ROOT SHELL") and shell.color.value == hx_views.COLOR_SHELL
+    assert "not enabled" in {f.name: f.value for f in shell.fields}["Host"]
+    offline = hx_views.build_embed(_hostexec_request(), agent, None, None, None)
+    assert "offline" in {f.name: f.value for f in offline.fields}["Host"]
+    # A command can't break out of its code block.
+    sneaky = hx_views.build_embed(_hostexec_request(argv=["echo", "```\n**APPROVED**"]), agent, None, None, armed)
+    assert "```\n**APPROVED**" not in {f.name: f.value for f in sneaky.fields}["Command"][4:-4]
+
+
+def test_hostexec_buttons():
+    from agent_auth.discord_bot import hostexec as hx_views
+
+    rid = "0" * 8 + "-0000-0000-0000-" + "0" * 12
+    run = hx_views.pending_view(_hostexec_request(id=rid))
+    assert [c.item.label for c in run.children] == ["Approve", "Approve all…", "Approve with TOTP", "Deny", "Edit"]
+    # A shell: a TOTP code or nothing.
+    shell = hx_views.pending_view(_hostexec_request("shell", id=rid))
+    assert [c.item.label for c in shell.children] == ["Approve with TOTP", "Deny"]
+    for item in (*run.children, *hx_views.shell_view(rid).children):
+        assert len(item.item.custom_id) <= 100
+    for cls in hx_views.DYNAMIC_ITEMS:
+        assert re.fullmatch(cls.__discord_ui_compiled_template__, cls(rid).item.custom_id)
+    modal = hx_views.TotpModal(_hostexec_request("shell", id=rid))
+    assert len(modal.children) == 3 and all(len(c.label) <= 45 for c in modal.children)
+    assert len(hx_views.TotpModal(_hostexec_request(id=rid)).children) == 2
+
+
+def test_hostexec_result_field():
+    from agent_auth.discord_bot import hostexec as hx_views
+    from agent_auth.models import HostJob
+
+    job = HostJob(id="j" * 36, host="excelsior", tier="user", status="done", exit_code=0, duration_ms=1234,
+                  output="line\n" * 500, spec={}, truncated=False)
+    text = hx_views.result_field(job)
+    assert text.startswith("✅ exit 0 in 1.2s") and len(text) <= 1024
+    assert hx_views.output_file(job) is not None
+    refused = HostJob(id="j" * 36, host="excelsior", tier="root", status="refused", error="not_armed", spec={})
+    assert "refused by excelsior" in hx_views.result_field(refused) and hx_views.output_file(refused) is None

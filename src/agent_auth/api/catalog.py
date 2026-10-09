@@ -57,6 +57,7 @@ async def build_catalog(
     registry: ProvisionerRegistry,
     engine: PolicyEngine,
     listen_threshold_secs: int = 300,
+    hosts: list[dict] | None = None,
 ) -> CatalogOut:
     """What this agent may request, per enabled platform — the menu it needs
     before composing a request."""
@@ -99,6 +100,17 @@ async def build_catalog(
                 capability_hint="project.read | project.write (write: always a human)",
                 resource_hint="<another project in this agent VM>",
                 capabilities=["project.read", "project.write"],
+            )
+        )
+
+    if registry.enabled(Platform.HOSTEXEC) and hosts:
+        platforms.append(
+            PlatformCatalog(
+                platform=Platform.HOSTEXEC,
+                capability_hint='run | tpl.<template> | shell (root and every shell: always a human)',
+                resource_hint="<host>",
+                capabilities=["run", "shell", *[f"tpl.{name}" for name in policy.platforms.hostexec.templates]],
+                hosts=hosts,
             )
         )
 

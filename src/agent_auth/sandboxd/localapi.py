@@ -14,74 +14,13 @@ Reply:   {"ok": true, "result": ...} | {"ok": false, "error": "..."}
 
 from __future__ import annotations
 
-import asyncio
-import json
-import logging
-import os
-import socket
-import struct
 from dataclasses import asdict
-from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
+from ..daemon_common.localsock import ApiError, peer_uid, serve_unix
 from .daemon import Sandboxd
 
-log = logging.getLogger(__name__)
-
-MAX_LINE = 1024 * 1024
-
-
-class ApiError(Exception):
-    pass
-
-
-def peer_uid(writer: asyncio.StreamWriter) -> int:
-    sock = writer.get_extra_info("socket")
-    creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
-    return struct.unpack("3i", creds)[1]
-
-
-async def _serve_conn(
-    reader: asyncio.StreamReader,
-    writer: asyncio.StreamWriter,
-    handler: Callable[[str, dict, str | None, int], Awaitable[Any]],
-) -> None:
-    try:
-        uid = peer_uid(writer)
-        while True:
-            line = await reader.readline()
-            if not line:
-                break
-            try:
-                req = json.loads(line)
-                if not isinstance(req, dict) or not isinstance(req.get("method"), str):
-                    raise ApiError("bad request")
-                params = req.get("params") or {}
-                if not isinstance(params, dict):
-                    raise ApiError("params must be an object")
-                result = await handler(req["method"], params, req.get("token"), uid)
-                reply = {"ok": True, "result": result}
-            except (ApiError, LookupError, ValueError, RuntimeError) as exc:
-                reply = {"ok": False, "error": str(exc)}
-            except Exception as exc:
-                log.exception("local API %r failed", line[:200])
-                reply = {"ok": False, "error": f"internal error: {exc}"}
-            writer.write(json.dumps(reply, default=str).encode() + b"\n")
-            await writer.drain()
-    except (ConnectionError, asyncio.IncompleteReadError):
-        pass
-    finally:
-        writer.close()
-
-
-async def serve_unix(path: Path, mode: int, handler) -> asyncio.base_events.Server:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.unlink(missing_ok=True)
-    server = await asyncio.start_unix_server(
-        lambda r, w: _serve_conn(r, w, handler), path=str(path), limit=MAX_LINE
-    )
-    os.chmod(path, mode)
-    return server
+__all__ = ["AgentApi", "ApiError", "OperatorApi", "peer_uid", "serve_unix"]
 
 
 def _conv(conv) -> dict[str, Any]:

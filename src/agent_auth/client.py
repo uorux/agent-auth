@@ -249,12 +249,13 @@ class BrokerClient:
         approve: bool,
         reason: str = "",
         duration: str | None = None,
+        totp: str | None = None,
     ):
         return self._request(
             "POST",
             f"/admin/requests/{request_id}/decide",
             admin=True,
-            json={"approve": approve, "reason": reason, "duration": duration},
+            json={"approve": approve, "reason": reason, "duration": duration, "totp": totp},
         )
 
     def admin_revoke_grant(self, grant_id: str, reason: str):
@@ -280,3 +281,42 @@ class BrokerClient:
 
     def admin_broker_key(self):
         return self._request("GET", "/admin/broker-key", admin=True)
+
+    def admin_hosts(self):
+        return self._request("GET", "/admin/hosts", admin=True)
+
+    def admin_arm(self, host: str, tier: str, duration: str, totp: str):
+        return self._request(
+            "POST", f"/admin/hosts/{host}/arm", admin=True,
+            json={"tier": tier, "duration": duration, "totp": totp},
+        )
+
+    def admin_disarm(self, host: str, tier: str | None = None):
+        return self._request(
+            "POST", f"/admin/hosts/{host}/disarm", admin=True, params={"tier": tier} if tier else None
+        )
+
+    def admin_lockdown(self, scope: str, host: str | None, kill_vm: bool):
+        return self._request(
+            "POST", "/admin/lockdown", admin=True, json={"scope": scope, "host": host, "kill_vm": kill_vm}
+        )
+
+    def admin_unlock(self, host: str | None, totp: str | None):
+        return self._request("POST", "/admin/unlock", admin=True, json={"host": host, "totp": totp})
+
+    # --- commands on hosts ------------------------------------------------------
+
+    def host_job(self, job_id: str, wait: float = 0):
+        return self._request(
+            "GET", f"/v1/hostexec/jobs/{job_id}", params={"wait": wait}, timeout=wait + 15
+        )
+
+    def host_shell_exec(self, grant_id: str, argv: list[str], cwd: str | None = None,
+                        stdin: str | None = None, timeout: int | None = None, wait: float = 60):
+        return self._request(
+            "POST", f"/v1/hostexec/shells/{grant_id}/exec", timeout=wait + 30,
+            json={"argv": argv, "cwd": cwd, "stdin": stdin, "timeout": timeout, "wait": wait},
+        )
+
+    def host_shell_close(self, grant_id: str):
+        return self._request("POST", f"/v1/hostexec/shells/{grant_id}/close")

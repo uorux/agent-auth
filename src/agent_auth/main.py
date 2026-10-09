@@ -9,6 +9,7 @@ from .api.app import create_app
 from .config import Settings, get_settings
 from .core.a2a import A2AThreadService
 from .core.daemons import DaemonHub
+from .core.hostexec import HostExecService
 from .core.sandboxes import SandboxService
 from .core.events import KeyedEvents
 from .core.scheduler import ExpiryScheduler
@@ -18,12 +19,14 @@ from .db import Database
 from .discord_bot.bot import AgentAuthBot, DiscordNotifier
 from .policy.engine import PolicyEngine
 from .policy.llm import LLMEvaluator
+from .policy.risk import RiskSummarizer
 from .policy.schema import load_policy
 from .provisioners.a2a import A2AProvisioner
 from .provisioners.agents import AgentsProvisioner
 from .provisioners.sandbox import SandboxProvisioner
 from .provisioners.base import ProvisionerRegistry
 from .provisioners.github import GithubProvisioner
+from .provisioners.hostexec import HostexecProvisioner
 from .provisioners.google_stub import GoogleStubProvisioner
 from .provisioners.kubernetes import KubernetesProvisioner
 from .provisioners.lldap import LldapProvisioner
@@ -122,7 +125,7 @@ async def serve(settings: Settings) -> None:
     service = RequestService(db, PolicyEngine(policy), registry, events, llm=llm)
     a2a = A2AThreadService(db, settings, KeyedEvents())
     daemons = DaemonHub(db, settings)
-    sandboxes = None
+    sandboxes = hostexec = None
     if not daemons.enabled:
         log.info("daemon channel disabled (BROKER_SIGNING_KEY not set)")
     else:
@@ -135,7 +138,17 @@ async def serve(settings: Settings) -> None:
             log.warning("ENCRYPTION_KEY unset: agent VMs can pair but receive no agent keys")
         registry.register(AgentsProvisioner(policy.platforms.agents, sandboxes))
         registry.register(SandboxProvisioner(daemons))
-    app = create_app(settings, db, service, registry, events, a2a, daemons)
+        # Commands on hosts: each host's hostd decides what it runs.
+        hostexec = HostExecService(db, daemons, events)
+        hostexec.bind(service, a2a)
+        registry.register(HostexecProvisioner(policy.platforms.hostexec, hostexec))
+        if settings.openrouter_api_key and policy.platforms.hostexec.risk_summary:
+            service.risk = RiskSummarizer(
+                settings.openrouter_api_key,
+                settings.openrouter_base_url,
+                policy.platforms.hostexec.risk_model or policy.llm.model,
+            )
+    app = create_app(settings, db, service, registry, events, a2a, daemons, hostexec)
     scheduler = ExpiryScheduler(service, a2a, sandboxes=sandboxes)
 
     server = uvicorn.Server(
@@ -157,7 +170,7 @@ async def serve(settings: Settings) -> None:
 
     bot: AgentAuthBot | None = None
     if settings.discord_token:
-        bot = AgentAuthBot(settings, db, service, daemons)
+        bot = AgentAuthBot(settings, db, service, daemons, hostexec)
         service.set_notifier(DiscordNotifier(bot, db, settings))
         tasks.append(asyncio.create_task(bot.start(settings.discord_token), name="discord"))
     else:

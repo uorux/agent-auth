@@ -231,6 +231,7 @@ class Sandboxd:
             "agents": len(self.state.agents()),
             "projects": len(self.state.projects()),
             "conversations": counts,
+            "lockdown": self.locked,
             "processes": sum(1 for lv in self.live.values() if lv.run is not None),
         }
 
@@ -262,6 +263,48 @@ class Sandboxd:
                 reply = {"ok": False, "error": str(exc)}
             if self.channel:
                 await self.channel.send({"type": "reply", "call_id": msg.get("call_id"), **reply})
+        elif kind in ("lockdown", "unlock"):
+            if kind == "lockdown":
+                await self.lockdown()
+            else:
+                await self.unlock()
+            if self.channel and msg.get("call_id"):
+                await self.channel.send({"type": "reply", "call_id": msg["call_id"], "ok": True})
+
+    # --- lockdown (docs/sandbox-design.md §9) ------------------------------------------
+
+    @property
+    def locked(self) -> bool:
+        return bool(self.state.get("locked", False))
+
+    async def lockdown(self) -> None:
+        """Freeze every agent process where it stands and start nothing new.
+        The host freezes the whole VM from outside as well; this is for when
+        only the VM heard about it."""
+        self.state.set("locked", True)
+        log.warning("LOCKDOWN: freezing every agent unit")
+        for conv_id, lv in list(self.live.items()):
+            if lv.run is not None:
+                await self.host.freeze_unit(self._unit(conv_id), True)
+            if lv.tui:
+                await self.host.freeze_unit(self._tui_unit(conv_id), True)
+
+    async def unlock(self) -> None:
+        if not self.locked:
+            return
+        self.state.set("locked", False)
+        log.warning("lockdown lifted: thawing agent units")
+        for conv_id, lv in list(self.live.items()):
+            if lv.run is not None:
+                await self.host.freeze_unit(self._unit(conv_id), False)
+            if lv.tui:
+                await self.host.freeze_unit(self._tui_unit(conv_id), False)
+        # What arrived meanwhile.
+        for conv in self.state.conversations():
+            if not self._live(conv.id).tui:
+                queued = self.state.drain(conv.id)
+                if queued:
+                    await self.deliver(conv.id, "\n\n".join(queued))
 
     async def _key_lost(self, agent: str) -> None:
         log.warning("the broker no longer accepts the key of %s; asking for a new one", agent)
@@ -688,6 +731,9 @@ class Sandboxd:
         lv = self._live(conv_id)
         self._log(conv_id, "in", text)
         self.state.touch(conv_id)
+        if self.locked:
+            self.state.queue(conv_id, text)  # delivered when the lockdown is lifted
+            return
         if lv.tui and not self.runtimes[conv.runtime].shares_live_process:
             # Claude's TUI holds the session: queue; its prompt hook (or the
             # next headless start) picks these up.
@@ -816,6 +862,8 @@ class Sandboxd:
         conv = self.state.conversation(conv_id)
         if conv is None or conv.state == "closed":
             raise LookupError(f"no open conversation {conv_id}")
+        if self.locked:
+            raise RuntimeError("locked down")
         lv = self._live(conv_id)
         runtime = self.runtimes[conv.runtime]
         host_sock, _ = self.tui_socket(conv_id)
@@ -950,6 +998,8 @@ class Sandboxd:
         orch = self.state.agent(self.orchestrator)
         if orch is None:
             raise RuntimeError("this VM has no orchestrator key yet (is it paired?)")
+        if self.locked:
+            raise RuntimeError("locked down")
         if self.state.project(project) is None:
             raise LookupError(f"create project {project!r} first")
         name = f"{runtime}-{project}-{self.config.name}-sandbox"

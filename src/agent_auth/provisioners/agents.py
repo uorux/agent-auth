@@ -36,6 +36,10 @@ class AgentsProvisioner:
         daemon = await session.get(Daemon, spec.agent.sandbox_id) if spec.agent.sandbox_id else None
         if daemon is None or daemon.role != SANDBOX_ROLE:
             raise SpecValidationError("only agents running in an agent VM can mint identities")
+        from ..core.hostexec import HostExecService
+
+        if await HostExecService.locked(session, daemon.name):
+            raise SpecValidationError("locked down: no identities are minted until it is lifted")
         name = spec.resource.strip().lower()
         suffix = f"-{daemon.name}-sandbox"
         runtime = next(

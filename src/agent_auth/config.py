@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     discord_token: str = ""
     discord_channel_id: int = 0
     discord_owner_id: int = 0
+    # Where shell requests (hostexec "shell") are posted, if not the approvals
+    # channel: somewhere that notifies loudly. 0 = the approvals channel.
+    discord_loud_channel_id: int = 0
 
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"

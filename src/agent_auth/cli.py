@@ -457,9 +457,13 @@ def decide(
     approve: bool = typer.Option(..., "--approve/--deny"),
     reason: str = typer.Option("", "--reason"),
     duration: str = typer.Option(None, "--duration", "-d"),
+    totp: bool = typer.Option(
+        False, "--totp", help="hostexec: prompt for the host's direct TOTP code (required for shells)"
+    ),
 ):
     """Decide a surfaced request via API (fallback when Discord is unavailable)."""
-    _run(lambda: _client().admin_decide(request_id, approve, reason, duration))
+    code = typer.prompt("TOTP code", hide_input=True) if totp and approve else None
+    _run(lambda: _client().admin_decide(request_id, approve, reason, duration, code))
 
 
 @admin.command("revoke")
@@ -550,6 +554,51 @@ def daemon_unpair(daemon_id: str):
 def broker_key():
     """The broker's public signing key (what daemons pin)."""
     _run(lambda: _client().admin_broker_key())
+
+
+@admin.command("hosts")
+def hosts_list():
+    """Hosts with a hostd: tiers, arm state, lockdown, VM, desktop presence."""
+    _run(lambda: _client().admin_hosts())
+
+
+@admin.command("arm")
+def arm(
+    host: str,
+    tier: str = typer.Option("user", "--tier", help="user | root"),
+    duration: str = typer.Option("1h", "--duration", "-d", help="capped by the host's own policy"),
+):
+    """Arm a tier on a host: approvals made on Discord then count there.
+    Prompts for a code from that host's <tier>-arm TOTP secret."""
+    code = typer.prompt(f"{host} {tier}-arm code", hide_input=True)
+    _run(lambda: _client().admin_arm(host, tier, duration, code))
+
+
+@admin.command("disarm")
+def disarm(host: str, tier: str = typer.Option(None, "--tier", help="default: both")):
+    _run(lambda: _client().admin_disarm(host, tier))
+
+
+@admin.command("lockdown")
+def lockdown(
+    scope: str = typer.Option("sandboxes", "--scope", help="sandboxes | all | host"),
+    host: str = typer.Option(None, "--host", help="with --scope host"),
+    kill_vm: bool = typer.Option(False, "--kill-vm", help="stop agent VMs instead of freezing them"),
+):
+    """The kill switch: revoke the grants of agent-VM agents (every agent with
+    --scope all), refuse new identities and host commands, disarm hosts, kill
+    their jobs and shells, and freeze their agent VMs from outside."""
+    if host and scope == "sandboxes":
+        scope = "host"
+    _run(lambda: _client().admin_lockdown(scope, host, kill_vm))
+
+
+@admin.command("unlock")
+def unlock(host: str = typer.Option(None, "--host", help="also unlock this host's hostd (asks for its root arm code)")):
+    """Lift a lockdown on the broker. Each host stays locked until it gets its
+    own root arm code (--host), or `sudo agent-auth-hostctl unlock` there."""
+    code = typer.prompt(f"{host} root-arm code", hide_input=True) if host else None
+    _run(lambda: _client().admin_unlock(host, code))
 
 
 if __name__ == "__main__":

@@ -275,6 +275,10 @@ class PlatformCatalog(BaseModel):
     groups: list[CatalogEntry] | None = None
     capabilities: list[str] | None = None
     peers: list[PeerEntry] | None = None
+    # hostexec: hosts with a hostd, whether each is online, and per tier
+    # whether it is enabled and armed (a human's approval only counts on an
+    # armed tier, or with a TOTP code).
+    hosts: list[dict[str, Any]] | None = None
 
 
 class CatalogOut(BaseModel):

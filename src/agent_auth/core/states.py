@@ -13,6 +13,8 @@ class Platform(str, enum.Enum):
     # between projects inside one.
     AGENTS = "agents"
     SANDBOX = "sandbox"
+    # §8: commands (and time-boxed shells) on a host, outside the agent VM.
+    HOSTEXEC = "hostexec"
 
 
 class RequestStatus(str, enum.Enum):

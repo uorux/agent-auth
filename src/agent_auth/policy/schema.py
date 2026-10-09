@@ -163,17 +163,95 @@ class AgentsPlatformConfig(BaseModel):
         return v
 
 
+class HostexecTemplate(BaseModel):
+    tier: str = Field(pattern=r"^(user|root)$")
+    argv: list[str] = Field(min_length=1)
+    # parameter name -> regex its value must match in full
+    params: dict[str, str] = Field(default_factory=dict)
+    description: str = ""
+
+
+class HostexecPlatformConfig(BaseModel):
+    # Commands on hosts, run by each host's hostd (capability "run" |
+    # "tpl.<name>" | "shell", resource = the host). Each host's own config
+    # decides what it accepts; nothing here can loosen that.
+    #
+    # Templates mirrored from the hosts' configs, so the broker can check
+    # parameters early and show the expanded command. The host expands its
+    # own copy and that is what runs.
+    templates: dict[str, HostexecTemplate] = Field(default_factory=dict)
+    # One advisory line + low|medium|high on each request shown to a human,
+    # from an OpenRouter model. Never approves or denies anything.
+    risk_summary: bool = True
+    risk_model: str | None = None  # default: llm.model
+    # "Approve all" windows: default and longest duration.
+    window_default: str | int = "30m"
+    window_max: str | int = "8h"
+
+    @field_validator("window_default", "window_max")
+    @classmethod
+    def _valid(cls, v):
+        parse_duration(v)
+        return v
+
+
+class DesktopConfig(BaseModel):
+    """Approval prompts on the desktops you are at (hostd-user), next to
+    Discord. Off unless enabled; see docs/sandbox-design.md §8.10."""
+
+    enabled: bool = False
+    # Which requests may be asked on a desktop: globs on the requesting
+    # agent's name, and platforms (empty = every platform).
+    agents: list[str] = Field(default_factory=list)
+    platforms: list[Platform] = Field(default_factory=list)
+    # Sensitive requests (root commands, write access to another project,
+    # secrets permissions, …) stay on Discord unless this is set. Shells
+    # never reach a desktop.
+    sensitive: bool = False
+    # How long a dialog stays up before the request is left to Discord.
+    timeout: str | int = "90s"
+    # A request waits at most this long for a desktop's previous dialog.
+    queue_timeout: str | int = "30s"
+    # Rate limits; beyond them requests go to Discord only.
+    per_agent_burst: int = 2
+    per_agent_per_hour: int = 6
+    per_hour: int = 20
+    # After a Deny, that agent's desktop prompts pause; three in an hour mute it.
+    deny_cooldown: str | int = "10m"
+    mute: str | int = "1h"
+    # Optional daily window with no desktop prompts, e.g. ["23:00", "08:00"]
+    # (the broker's local time).
+    quiet_hours: list[str] = Field(default_factory=list)
+
+    @field_validator("timeout", "queue_timeout", "deny_cooldown", "mute")
+    @classmethod
+    def _valid(cls, v):
+        parse_duration(v)
+        return v
+
+    @field_validator("quiet_hours")
+    @classmethod
+    def _hours(cls, v):
+        import re
+
+        if v and (len(v) != 2 or not all(re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", h) for h in v)):
+            raise ValueError('quiet_hours is ["HH:MM", "HH:MM"]')
+        return v
+
+
 class PlatformsConfig(BaseModel):
     github: GithubPlatformConfig = Field(default_factory=GithubPlatformConfig)
     homelab: HomelabPlatformConfig = Field(default_factory=HomelabPlatformConfig)
     kubernetes: KubernetesPlatformConfig = Field(default_factory=KubernetesPlatformConfig)
     agents: AgentsPlatformConfig = Field(default_factory=AgentsPlatformConfig)
+    hostexec: HostexecPlatformConfig = Field(default_factory=HostexecPlatformConfig)
 
 
 class PolicyFile(BaseModel):
     defaults: Defaults = Field(default_factory=Defaults)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     platforms: PlatformsConfig = Field(default_factory=PlatformsConfig)
+    desktop: DesktopConfig = Field(default_factory=DesktopConfig)
     rules: list[PolicyRule] = Field(default_factory=list)
 
 

@@ -286,6 +286,9 @@ class DecideBody(BaseModel):
     duration: str | int | None = None
     resource_override: str | None = None
     scope_override: dict | None = None
+    # hostexec: a code for the host's direct TOTP secret (approves while the
+    # host is not armed; the only way to approve a shell).
+    totp: str | None = None
 
 
 @router.post("/requests/{request_id}/decide", response_model=RequestOut)
@@ -307,6 +310,7 @@ async def decide_request(request_id: str, body: DecideBody, request: Request):
                 duration_secs=duration_secs,
                 resource_override=body.resource_override,
                 scope_override=body.scope_override,
+                totp=body.totp,
             ),
         )
     except TransitionError as exc:
@@ -379,3 +383,81 @@ async def disable_agent(agent_id: str, request: Request):
             raise HTTPException(404, "agent not found")
         names = await disable_agent_tree(session, agent_id)
     return {"disabled": names}
+
+
+# --- hosts: arming and the kill switch ------------------------------------------
+
+
+def _hostexec(request: Request):
+    hostexec = request.app.state.hostexec
+    if hostexec is None:
+        raise HTTPException(503, "the daemon channel is disabled (BROKER_SIGNING_KEY)")
+    return hostexec
+
+
+@router.get("/hosts")
+async def list_hosts(request: Request):
+    """Paired hosts: tiers, arm state, lockdown, VM, desktop presence."""
+    hostexec = _hostexec(request)
+    return {"lockdown": await hostexec.lockdown_state(), "hosts": await hostexec.hosts()}
+
+
+class ArmBody(BaseModel):
+    tier: str = "user"
+    duration: str | int = "1h"
+    totp: str
+
+
+@router.post("/hosts/{name}/arm")
+async def arm_host(name: str, body: ArmBody, request: Request):
+    """Arm a tier: the host then believes the broker's approvals for it. The
+    code is for the host's <tier>-arm secret; the host checks it."""
+    from ..core.hostexec import HostExecError
+
+    try:
+        return await _hostexec(request).arm(name, body.tier, body.duration, body.totp)
+    except HostExecError as exc:
+        raise HTTPException(409, str(exc)) from None
+
+
+@router.post("/hosts/{name}/disarm")
+async def disarm_host(name: str, request: Request, tier: str | None = None):
+    from ..core.hostexec import HostExecError
+
+    try:
+        return await _hostexec(request).disarm(name, tier)
+    except HostExecError as exc:
+        raise HTTPException(409, str(exc)) from None
+
+
+class LockdownBody(BaseModel):
+    scope: str = "sandboxes"
+    host: str | None = None
+    kill_vm: bool = False
+
+
+@router.post("/lockdown")
+async def lockdown(body: LockdownBody, request: Request):
+    """The kill switch: revoke grants, disarm hosts, kill jobs and shells,
+    freeze (or stop) agent VMs. scope: sandboxes | all | host."""
+    try:
+        return await _hostexec(request).lockdown(body.scope, body.host, body.kill_vm, by="admin-api")
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+
+
+class UnlockBody(BaseModel):
+    host: str | None = None
+    totp: str | None = None
+
+
+@router.post("/unlock")
+async def unlock(body: UnlockBody, request: Request):
+    """Lift the broker's side of a lockdown. A host's own lock needs its root
+    arm code here (host + totp), or `agent-auth-hostctl unlock` on the host."""
+    from ..core.hostexec import HostExecError
+
+    try:
+        return await _hostexec(request).unlock(body.host, body.totp, by="admin-api")
+    except HostExecError as exc:
+        raise HTTPException(409, str(exc)) from None

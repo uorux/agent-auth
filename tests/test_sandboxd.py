@@ -115,6 +115,7 @@ class FakeHost:
         self.acls: list[tuple] = []
         self.chowns: list[tuple] = []
         self.procs: dict[str, asyncio.subprocess.Process] = {}
+        self.frozen: list[tuple[str, bool]] = []
 
     def ensure_user(self, name, uid, home):
         self.users[name] = uid
@@ -171,6 +172,9 @@ class FakeHost:
     async def unit_active(self, name):
         proc = self.procs.get(name)
         return proc is not None and proc.returncode is None
+
+    async def freeze_unit(self, name, frozen):
+        self.frozen.append((name, frozen))
 
     async def run_as(self, uid, argv):
         proc = await asyncio.create_subprocess_exec(
@@ -589,3 +593,26 @@ def test_hook_answers_for_the_event_it_was_called_for(monkeypatch, capsys):
     monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
     sandbox_mcp.hook()
     assert capsys.readouterr().out == ""
+
+
+async def test_lockdown_freezes_agent_units_and_holds_work_until_it_is_lifted(db, live, sbx, fake_log, stack):
+    daemon, host = sbx
+    conv = await daemon.new_conversation("orchestrator-excelsior-sandbox", created_by="test")
+    await daemon.deliver(conv.id, "first")
+    assert await wait_for(lambda: any(e.get("turn") == "first" for e in read_log(fake_log)))
+
+    # Ordered by the broker over the channel.
+    await stack["hub"].call("sandbox", "excelsior", {"type": "lockdown"})
+    assert daemon.locked and (daemon._unit(conv.id), True) in host.frozen
+    await daemon.deliver(conv.id, "while locked")
+    assert daemon.state.peek(conv.id) == ["while locked"]
+    daemon.create_project("larder")
+    with pytest.raises(RuntimeError, match="locked down"):
+        await daemon.mint("claude", "larder", "test")
+    with pytest.raises(RuntimeError, match="locked down"):
+        await daemon.attach(conv.id)
+
+    await stack["hub"].send("sandbox", "excelsior", {"type": "unlock"})
+    assert await wait_for(lambda: not daemon.locked)
+    assert (daemon._unit(conv.id), False) in host.frozen
+    assert await wait_for(lambda: any(e.get("turn") == "while locked" for e in read_log(fake_log)))

@@ -1,8 +1,8 @@
-"""agent-auth-hostd CLI.
+"""agent-auth-hostd CLI: pair the host, enroll its TOTP secrets, run the
+daemon (hostd/daemon.py), and the desktop helper (hostd/user.py).
 
-Phase 1 is the skeleton: pairing, the signed connection, and heartbeats. It
-accepts no work yet — the broker can see the host but can't make it do
-anything.
+Without a config file (AGENT_AUTH_HOSTD_CONFIG) the daemon only connects and
+reports: no tier is enabled, so it runs nothing for anyone.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import logging
 import os
 import signal
 import socket
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,15 +21,15 @@ from pathlib import Path
 import httpx
 import typer
 
-from .. import __version__
 from ..daemon_common.channel import (
-    DaemonChannel,
     DaemonIdentity,
     PairingFailed,
     check_broker_url,
     pair as pair_with,
 )
 from ..daemon_common.crypto import fingerprint, load_or_create_key, parse_public_key
+from ..daemon_common.totp import SECRET_NAMES, TotpError, TotpStore, otpauth_uri
+from .config import CONFIG_ENV, HostConfig
 
 log = logging.getLogger("agent_auth.hostd")
 
@@ -44,9 +45,12 @@ def _default_name() -> str:
     return socket.gethostname().split(".")[0].lower()
 
 
-BrokerUrl = typer.Option(..., "--broker-url", envvar="AGENT_AUTH_HOSTD_BROKER_URL")
+BrokerUrl = typer.Option(None, "--broker-url", envvar="AGENT_AUTH_HOSTD_BROKER_URL")
+ConfigFile = typer.Option(
+    None, "--config", envvar=CONFIG_ENV, help="hostd's config and local policy (JSON, from the NixOS module)"
+)
 BrokerKey = typer.Option(
-    ...,
+    None,
     "--broker-key",
     envvar="AGENT_AUTH_HOSTD_BROKER_KEY",
     help="the broker's pinned public key (ed25519:…)",
@@ -55,6 +59,25 @@ Name = typer.Option(None, "--name", envvar="AGENT_AUTH_HOSTD_NAME", help="defaul
 StateDir = typer.Option(
     Path("/var/lib/agent-auth-hostd"), "--state-dir", envvar="AGENT_AUTH_HOSTD_STATE_DIR"
 )
+
+
+def _load_config(
+    config: Path | None, broker_url: str | None, broker_key: str | None, name: str | None, state_dir: Path
+) -> HostConfig:
+    """The config file if there is one; else a connect-only config from the
+    options (no tiers: nothing can be run)."""
+    if config is not None:
+        try:
+            return HostConfig.load(config)
+        except (OSError, ValueError, KeyError) as exc:
+            typer.secho(f"invalid config {config}: {exc}", fg=typer.colors.RED, err=True)
+            sys.exit(2)
+    if not broker_url or not broker_key:
+        typer.secho("need --config, or --broker-url and --broker-key", fg=typer.colors.RED, err=True)
+        sys.exit(2)
+    return HostConfig(
+        broker_url=broker_url, broker_public_key=broker_key, name=name or _default_name(), state_dir=state_dir
+    )
 
 
 def _identity(broker_url: str, broker_key: str, name: str | None, state_dir: Path) -> DaemonIdentity:
@@ -113,10 +136,13 @@ def pair(
     broker_key: str = BrokerKey,
     name: str = Name,
     state_dir: Path = StateDir,
+    config: Path = ConfigFile,
 ):
     """Pair this host with the broker using a one-time code from
     `agent-auth admin daemon-pair <name>`."""
-    identity = _identity(broker_url, broker_key, name, state_dir)
+    cfg = _load_config(config, broker_url, broker_key, name, state_dir)
+    broker_url, broker_key, state_dir = cfg.broker_url, cfg.broker_public_key, cfg.state_dir
+    identity = _identity(broker_url, broker_key, cfg.name, state_dir)
     code = _read_pairing_code(source)
     try:
         pair_with(identity, code)
@@ -150,36 +176,97 @@ def key(state_dir: Path = StateDir):
     typer.echo(fingerprint(public))
 
 
+@app.command("totp-enroll")
+def totp_enroll(
+    rotate: str = typer.Option(None, "--rotate", help=f"replace one secret: {', '.join(SECRET_NAMES)}"),
+    state_dir: Path = StateDir,
+    config: Path = ConfigFile,
+    qrencode: str = typer.Option(None, "--qrencode", help="qrencode binary (default: from the config, or PATH)"),
+):
+    """Create this host's TOTP secrets and show each one ONCE, as a QR code,
+    for your authenticator. They are generated here and never leave the host.
+
+    \b
+    <tier>-arm     opens an arming window (/arm on Discord)
+    <tier>-direct  approves one request ("Approve with TOTP"), armed or not
+    """
+    cfg = HostConfig.load(config) if config is not None else None
+    if cfg is not None:
+        state_dir = cfg.state_dir
+    if os.geteuid() != 0:
+        typer.secho("run as root: the secrets are root-only", fg=typer.colors.RED, err=True)
+        sys.exit(1)
+    host = cfg.name if cfg else _default_name()
+    store = TotpStore(state_dir / "totp")
+    names = [rotate] if rotate else [n for n in SECRET_NAMES if not store.enrolled(n)]
+    if not names:
+        typer.echo("all four secrets are enrolled; use --rotate <name> to replace one")
+        return
+    qr = qrencode or (cfg.qrencode if cfg else "qrencode")
+    for secret_name in names:
+        try:
+            secret = store.enroll(secret_name, replace=bool(rotate))
+        except TotpError as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            sys.exit(1)
+        uri = otpauth_uri(secret, host, secret_name)
+        typer.secho(f"\n== {host} {secret_name} ==", bold=True)
+        try:
+            subprocess.run([qr, "-t", "ANSIUTF8", uri], check=True)
+        except (OSError, subprocess.CalledProcessError):
+            typer.echo("(no qrencode: add it by hand)")
+        typer.echo(f"secret: {secret}")
+        typer.echo(uri)
+    typer.echo("\nScan them now: they are not shown again. Restart is not needed.")
+
+
 @app.command()
 def run(
     broker_url: str = BrokerUrl,
     broker_key: str = BrokerKey,
     name: str = Name,
     state_dir: Path = StateDir,
+    config: Path = ConfigFile,
 ):
-    """Hold the connection to the broker (the systemd service's entry point)."""
+    """The daemon (the systemd service's entry point)."""
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(levelname)s %(name)s: %(message)s",
     )
-    identity = _identity(broker_url, broker_key, name, state_dir)
-    if not (state_dir / "paired.json").exists():
+    from .daemon import Hostd
+    from .executor import LinuxExecutor
+
+    cfg = _load_config(config, broker_url, broker_key, name, state_dir)
+    _identity(cfg.broker_url, cfg.broker_public_key, cfg.name, cfg.state_dir)  # validates; creates the key
+    if not (cfg.state_dir / "paired.json").exists():
         log.warning(
-            "%s has not been paired on this machine; the broker will refuse it until "
+            "host:%s has not been paired on this machine; the broker will refuse it until "
             "`agent-auth-hostd pair` succeeds",
-            identity.principal,
+            cfg.name,
         )
-    started_at = datetime.now(timezone.utc).isoformat()
-
-    def status() -> dict:
-        return {"version": __version__, "started_at": started_at, "role": ROLE}
-
-    channel = DaemonChannel(identity, version=__version__, status=status)
-    asyncio.run(_run_until_signalled(channel))
+    if cfg.privileged and os.geteuid() != 0:
+        log.error("tiers or a VM are configured but hostd is not root: jobs will fail to start")
+    asyncio.run(_run_until_signalled(Hostd(cfg, LinuxExecutor(cfg))))
 
 
-async def _run_until_signalled(channel: DaemonChannel) -> None:
-    task = asyncio.create_task(channel.run())
+@app.command()
+def user(config: Path = ConfigFile):
+    """The desktop helper (a user service): reports whether you are at this
+    desktop and shows approval prompts there."""
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+    from .user import run_user
+
+    if config is None:
+        typer.secho(f"need --config (or {CONFIG_ENV})", fg=typer.colors.RED, err=True)
+        sys.exit(2)
+    asyncio.run(run_user(HostConfig.load(config)))
+
+
+async def _run_until_signalled(daemon) -> None:
+    task = asyncio.create_task(daemon.run())
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, task.cancel)

@@ -63,6 +63,7 @@ class Host(Protocol):
     async def start_detached(self, spec: UnitSpec) -> None: ...
     async def stop_unit(self, name: str) -> None: ...
     async def unit_active(self, name: str) -> bool: ...
+    async def freeze_unit(self, name: str, frozen: bool) -> None: ...
     async def run_as(self, uid: int, argv: list[str]) -> tuple[int, str]: ...
 
 
@@ -220,6 +221,11 @@ class LinuxHost:
     async def unit_active(self, name: str) -> bool:
         code, _ = await self._run(self.config.systemctl, "is-active", "--quiet", f"{name}.service")
         return code == 0
+
+    async def freeze_unit(self, name: str, frozen: bool) -> None:
+        # The cgroup freezer: every process of the unit stops where it is,
+        # and can be inspected.
+        await self._run(self.config.systemctl, "freeze" if frozen else "thaw", f"{name}.service")
 
     async def run_as(self, uid: int, argv: list[str]) -> tuple[int, str]:
         return await self._run("setpriv", f"--reuid={uid}", f"--regid={uid}", "--clear-groups", "--", *argv)

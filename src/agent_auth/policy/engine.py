@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import authority as authority_mod
 from ..core.states import Platform, RuleAction
-from ..models import AccessRequest, Agent, Rule
+from ..models import AccessRequest, Agent, Rule, utcnow
 from .schema import PolicyAction, PolicyFile, PolicyRule
 
 
@@ -30,6 +30,9 @@ class PolicyDecision:
     # is literally the request's capability (no glob). Privileges flagged by
     # `needs_explicit_rule` (github "create") are only cleared by such a rule.
     explicit: bool = False
+    # True when the rule is a time-boxed "approve all" window (hostexec): the
+    # host is told so, and decides for itself whether it honours windows.
+    window: bool = False
 
 
 def _matches(
@@ -122,7 +125,10 @@ class PolicyEngine:
             .where(Rule.enabled.is_(True), Rule.platform == request.platform)
             .order_by(Rule.created_at.desc())
         )
+        now = utcnow()
         for rule in rows.scalars():
+            if rule.expires_at is not None and rule.expires_at <= now:
+                continue
             if not fnmatch(agent.name, rule.agent_pattern):
                 continue
             if not fnmatch(request.resource, rule.resource_pattern):
@@ -137,7 +143,7 @@ class PolicyEngine:
             # privilege, so an "approve contents:write" rule never rubber-stamps
             # a later secrets:write, and an "approve view" rule never clears an
             # edit. null authority = any privilege (but see pinned_authority).
-            if rule.authority is not None and rule.authority != request.authority:
+            if not authority_mod.rule_covers(request.platform, rule.authority, request.authority):
                 continue
             action = (
                 PolicyAction.APPROVE
@@ -153,6 +159,7 @@ class PolicyEngine:
                 rule_id=rule.id,
                 pinned_authority=rule.authority is not None,
                 explicit=rule.authority is not None,
+                window=(rule.authority or {}).get("action") == "window",
             )
         return None
 

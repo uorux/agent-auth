@@ -49,6 +49,22 @@ async def catalog(request: Request, agent: Agent = Depends(get_agent)):
     """What this agent may request: enabled platforms and the roles/groups/repos
     (with descriptions and typical routing) available to it."""
     state = request.app.state
+    hosts = None
+    if getattr(state, "hostexec", None) is not None:
+        hosts = [
+            {
+                "name": h["name"],
+                "online": h["online"],
+                "lockdown": h["lockdown"],
+                "tiers": {
+                    name: {"armed": bool(t.get("armed_until")), "shell": bool(t.get("shell"))}
+                    for name, t in h["tiers"].items()
+                    if t.get("enabled")
+                },
+                "templates": h["templates"],
+            }
+            for h in await state.hostexec.hosts()
+        ]
     async with state.db.session() as session:
         return await build_catalog(
             session,
@@ -56,6 +72,7 @@ async def catalog(request: Request, agent: Agent = Depends(get_agent)):
             state.registry,
             state.service.engine,
             state.settings.a2a_listen_threshold_secs,
+            hosts,
         )
 
 

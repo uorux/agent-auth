@@ -253,6 +253,8 @@ class AccessRequest(AuthoritySugar, Base, TimestampMixin):
     decided_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     discord_channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     discord_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # hostexec shells: the Discord thread that mirrors every command.
+    discord_thread_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         TZDateTime(), default=utcnow, onupdate=utcnow
     )
@@ -335,6 +337,9 @@ class Rule(Base, TimestampMixin):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_by: Mapped[str] = mapped_column(String(128), default="")
     notes: Mapped[str] = mapped_column(Text, default="")
+    # Null = until deleted. Set for "approve all" windows: past it the rule
+    # no longer matches anything.
+    expires_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
 
 
 class Credential(Base, TimestampMixin):
@@ -428,3 +433,43 @@ class PendingKeyDelivery(Base, TimestampMixin):
     agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), unique=True)
     sandbox_id: Mapped[str] = mapped_column(ForeignKey("daemons.id", ondelete="CASCADE"), index=True)
     key_encrypted: Mapped[str] = mapped_column(Text)
+
+
+class HostJob(Base, TimestampMixin):
+    """One command run (or to be run) on a host by its hostd: a `run`/`tpl`
+    grant's single execution (id = the request's id), or one command of a
+    shell. The output is what hostd reported, capped there at 1 MiB."""
+
+    __tablename__ = "host_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    grant_id: Mapped[str | None] = mapped_column(ForeignKey("grants.id"), nullable=True, index=True)
+    request_id: Mapped[str] = mapped_column(ForeignKey("access_requests.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), index=True)
+    host: Mapped[str] = mapped_column(String(128))
+    tier: Mapped[str] = mapped_column(String(8))
+    # The grant's id when this is a command of a shell; null for run/tpl.
+    shell_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    spec: Mapped[dict] = mapped_column(JSON, default=dict)
+    # starting | running | done | refused | lost
+    status: Mapped[str] = mapped_column(String(16), default="starting", index=True)
+    # What hostd admitted it on (totp, auto, armed+human, …).
+    via: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    output: Mapped[str | None] = mapped_column(Text, nullable=True)
+    output_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    truncated: Mapped[bool] = mapped_column(Boolean, default=False)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+
+
+class BrokerFlag(Base):
+    """Small durable switches of the broker itself (the lockdown)."""
+
+    __tablename__ = "broker_flags"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow, onupdate=utcnow)
