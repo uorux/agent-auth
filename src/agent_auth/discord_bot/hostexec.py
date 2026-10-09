@@ -457,6 +457,8 @@ def register(bot) -> None:
             return
         done = ", ".join(f"`{k}`" for k in out["daemons"]) or "the broker only"
         note = "" if (host and code) else " Hosts stay locked until they get their own code."
+        if out["broker_locked"]:
+            note += " The broker is still locked (`/unlock` without a host lifts that)."
         await interaction.followup.send(f"Unlocked: {done}.{note}", ephemeral=True)
 
     @bot.tree.command(name="dnd", description="No approval prompts on your desktops for a while")

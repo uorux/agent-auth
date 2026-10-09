@@ -192,7 +192,11 @@ class HostExecService:
             raise TransitionError("a shell is approved with a TOTP code only (Approve with TOTP)")
         try:
             if shell:
-                await self.call(host, {"type": "hostexec.precheck", "kind": "shell", "tier": spec["tier"]})
+                # Everything the host would refuse, before a code is spent on it.
+                await self.call(
+                    host,
+                    {"type": "hostexec.precheck", "kind": "shell", "tier": spec["tier"], "duration": spec["duration"]},
+                )
             else:
                 await self.call(
                     host,
@@ -571,7 +575,9 @@ class HostExecService:
                 if await self.hub.send(daemon.role, daemon.name, {"type": "unlock"}):
                     reports[f"sandbox:{daemon.name}"] = "unlocked"
         log.warning("UNLOCK (%s) by %s", host or "broker", by)
-        return {"host": host, "daemons": reports}
+        async with self.db.session() as session:
+            still = await session.get(BrokerFlag, LOCKDOWN_FLAG)
+        return {"host": host, "daemons": reports, "broker_locked": sorted((still.value.get("hosts") or [])) if still else []}
 
     async def _on_connect(self, live: LiveConnection) -> None:
         """A daemon that was offline when it mattered is told now."""

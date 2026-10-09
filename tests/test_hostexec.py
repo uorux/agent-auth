@@ -282,13 +282,16 @@ class Host:
 
     def __init__(self, daemon: Hostd, executor: FakeExecutor, secrets: dict[str, str]):
         self.daemon, self.executor, self.secrets = daemon, executor, secrets
-        self._step = int(time.time() // STEP_SECS) - 1
+        self._steps: dict[str, int] = {}
 
     def code(self, name: str) -> str:
-        """A fresh, never-used code (the store accepts the next step too)."""
+        """A fresh, never-used code for one secret. The store accepts the
+        previous, current and next step, so a test gets three per secret."""
         now = int(time.time() // STEP_SECS)
-        self._step = min(max(self._step + 1, now - 1), now + 1)
-        return code_at(self.secrets[name], self._step)
+        step = max(self._steps.get(name, now - 2) + 1, now - 1)
+        assert step <= now + 1, f"more than three {name} codes in one test"
+        self._steps[name] = step
+        return code_at(self.secrets[name], step)
 
 
 def host_config(tmp_path, live, broker_key, run_dir) -> HostConfig:
@@ -671,8 +674,14 @@ async def test_a_shell_takes_a_totp_code_and_shows_every_command_first(db, stack
 
 
 async def test_the_host_bounds_shells_itself(db, stack, host):
-    # Longer than the host allows; a tier whose shells are off; an expired one.
+    # Longer than the host allows: said before the code is spent…
     _, long = await ask(stack, db, shell_request(duration="2h"))
+    code = host.code("user-direct")
+    with pytest.raises(TransitionError, match="at most 600s"):
+        await approve(stack, long.id, totp=code)
+    _, short = await ask(stack, db, shell_request(duration="1m"))
+    assert (await approve(stack, short.id, totp=code)).status == RequestStatus.GRANTED
+    # …and enforced when it is opened, whatever the broker checked.
     with pytest.raises(HostExecError, match="at most 600s"):
         await stack["hostexec"].call(
             HOST, {"type": "hostexec.authorize", "job_id": long.id, "tier": "user",
@@ -723,8 +732,8 @@ async def test_lockdown_stops_the_host_and_only_the_host_can_be_unlocked_with_it
     assert host.daemon.locked_down
     with pytest.raises(HostExecError, match="wrong code"):
         await stack["hostexec"].unlock(HOST, "000000", by="jrt")
-    await stack["hostexec"].unlock(HOST, host.code("root-arm"), by="jrt")
-    assert not host.daemon.locked_down and ("thaw", "agent-vm.service") in host.executor.units
+    out = await stack["hostexec"].unlock(HOST, host.code("root-arm"), by="jrt")
+    assert out["broker_locked"] == [] and not host.daemon.locked_down and ("thaw", "agent-vm.service") in host.executor.units
     # Unlocked is not armed.
     _, req = await ask(stack, db, run_request(["echo", "back"]))
     with pytest.raises(TransitionError, match="not_armed"):

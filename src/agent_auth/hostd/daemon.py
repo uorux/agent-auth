@@ -355,10 +355,16 @@ class Hostd:
         the broker tell a human "arm first" before they approve."""
         if msg.get("kind") == "shell":
             tier = self._tier(msg.get("tier"))
-            if not self.config.tiers[tier].shell_enable:
+            cfg = self.config.tiers[tier]
+            if not cfg.shell_enable:
                 raise Refused(f"{tier} shells are not enabled on {self.config.name}")
             if self.locked_down:
                 raise Refused(f"{self.config.name} is locked down")
+            duration = msg.get("duration")
+            if isinstance(duration, int) and duration > cfg.shell_max_duration_secs:
+                raise Refused(
+                    f"a {tier} shell on {self.config.name} lasts at most {cfg.shell_max_duration_secs}s"
+                )
             return {"needs": "totp"}
         raw = msg.get("spec")
         spec = self._normalize(raw)
