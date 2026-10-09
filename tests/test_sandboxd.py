@@ -487,3 +487,16 @@ async def test_an_open_that_cannot_be_served_is_rejected_not_retried(db, live, s
             return t["state"] == "closed" and "sandbox:" in (t.get("close_note") or "")
 
         assert await wait_for(closed)
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="needs tmux")
+async def test_a_tui_that_fails_reports_its_output_instead_of_a_dead_session(db, live, sbx, tmp_path):
+    daemon, host = sbx
+    broken = tmp_path / "broken-claude"
+    broken.write_text("#!/bin/sh\necho 'boom: bad flag'\nexit 3\n")
+    broken.chmod(0o755)
+    daemon.runtimes["claude"].command = str(broken)
+    conv = await daemon.new_conversation("orchestrator-excelsior-sandbox", created_by="test")
+    with pytest.raises(RuntimeError, match="boom: bad flag"):
+        await daemon.attach(conv.id)
+    assert not await host.unit_active(daemon._tui_unit(conv.id))

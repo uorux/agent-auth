@@ -45,6 +45,8 @@ ROLE = "sandbox"
 PROJECT_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?")
 EVENTS_WAIT = 60
 RETRY_SECS = 5
+TUI_SETTLE_SECS = 1.5
+TUI_FAILED = "[the TUI exited with status"
 
 
 def orchestrator_name(host: str) -> str:
@@ -745,15 +747,35 @@ class Sandboxd:
                 break
             await asyncio.sleep(0.1)
         # The session runs inside the server, so inside the unit's sandbox;
-        # when the TUI exits the server goes too and the unit ends.
-        command = f"{shlex.join(tui)}; {shlex.quote(tmux)} -S {shlex.quote(str(unit_sock))} kill-server"
+        # when the TUI exits the server goes too and the unit ends. A TUI that
+        # fails keeps its pane (and its error) up instead of vanishing.
+        command = (
+            f"t0=$(date +%s); {shlex.join(tui)}; rc=$?; "
+            # Failed, or gone within seconds (a TUI doesn't end that fast on purpose).
+            'if [ "$rc" -ne 0 ] || [ $(( $(date +%s) - t0 )) -lt 5 ]; then '
+            f"printf '\\n{TUI_FAILED} %s]\\n' \"$rc\"; sleep 600; fi; "
+            f"{shlex.quote(tmux)} -S {shlex.quote(str(unit_sock))} kill-server"
+        )
+        client = [tmux, "-S", str(host_sock)]
         code, out = await self.host.run_as(
             ctx.uid,
-            [tmux, "-S", str(host_sock), "new-session", "-d", "-s", "conv", "-c", str(ctx.workdir), "sh", "-c", command],
+            [*client, "new-session", "-d", "-s", "conv", "-c", str(ctx.workdir), "/bin/sh", "-c", command],
         )
         if code != 0:
             await self.host.stop_unit(self._tui_unit(conv_id))
             raise RuntimeError(f"tmux new-session failed: {out.strip()[:300]}")
+        # Don't hand the operator a dead session: give the TUI a moment, then
+        # report what it printed if it already failed.
+        await asyncio.sleep(TUI_SETTLE_SECS)
+        alive, _ = await self.host.run_as(ctx.uid, [*client, "has-session", "-t", "conv"])
+        _, pane = await self.host.run_as(ctx.uid, [*client, "capture-pane", "-p", "-t", "conv"])
+        if alive != 0 or TUI_FAILED in pane:
+            await self.host.stop_unit(self._tui_unit(conv_id))
+            shown = "\n".join(line for line in pane.splitlines() if line.strip())[-1500:]
+            raise RuntimeError(
+                "the TUI exited as soon as it started"
+                + (f":\n{shown}" if alive == 0 and shown else f" (see journalctl -u {self._tui_unit(conv_id)})")
+            )
 
     def _attach_info(self, conv_id: str, host_sock: Path) -> dict[str, Any]:
         conv = self.state.conversation(conv_id)
