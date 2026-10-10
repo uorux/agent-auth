@@ -184,3 +184,29 @@ def test_get_credential_to_file_keeps_the_token_out_of_the_reply(tmp_path, monke
         # nothing secret about a created repo's URL: it stays in the reply
         assert json.loads(m.get_credential("g-2", to_file=True))["value"].endswith("/o/r")
         assert json.loads(m.get_credential("g-1"))["value"] == "ghs_secret"
+
+
+def test_a_long_wait_is_several_short_requests(monkeypatch):
+    """A proxy in front of the broker cuts a request at 100s; no single
+    long-poll may be longer than a slice."""
+    import agent_auth.client as c
+
+    clock = [0.0]
+    monkeypatch.setattr(c.time, "monotonic", lambda: clock[0])
+    asked: list[float] = []
+
+    def answer(request):
+        import httpx
+
+        wait = float(request.url.params["timeout"])
+        asked.append(wait)
+        clock[0] += wait
+        status = "granted" if clock[0] >= 200 else "awaiting_human"
+        return httpx.Response(200, json={"id": "r-1", "status": status})
+
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(f"{BROKER}/v1/requests/r-1/wait").mock(side_effect=answer)
+        assert json.loads(m.wait_for_decision("r-1", timeout_secs=150))["status"] == "awaiting_human"
+        assert asked == [60, 60, 30]
+        assert json.loads(m.wait_for_decision("r-1", timeout_secs=240))["status"] == "granted"
+        assert asked == [60, 60, 30, 60]
