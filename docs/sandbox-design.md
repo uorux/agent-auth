@@ -31,7 +31,7 @@ against the pinned versions; **[open]** = needs your call (collected in §16).
 | 3. sandboxd | built; claude and codex conversations, their TUIs and a2a from Hermes work on excelsior |
 | 4. hostexec `run` + kill switch | built; lockdown used on excelsior |
 | 5. Shells | built; a root shell on recusant was opened and used from Hermes |
-| 6. MCP servers (§12) | built, tested against its own verifier; **not run against ToolHive** |
+| 6. MCP servers (§12) | built; live on recusant and the cluster: a token for two Playwright tools was accepted by ToolHive, those tools drove the Steel browser, a third was refused |
 | 7. Mounts | deferred (§11) |
 | 8. Approval at the target host's own desk, `notify_operator` | built, tested with a fake polkit; **not run on a desktop** |
 | 9. Desktop prompts on every active host | built; a request was approved from excelsior's desktop |
@@ -39,15 +39,18 @@ against the pinned versions; **[open]** = needs your call (collected in §16).
 Used for real, so considered working. **Not confirmed on hardware** (covered
 by the tests only, or not at all), left that way on purpose for now:
 
-- hostexec: a `run` as the user (the `User=` unit; it failed twice in earlier
-  forms and was not retried after the last change), a root `run` outside a
-  shell, the refusal while disarmed, "Approve all" windows, templates, the
-  immediate denial of a tier the host has switched off, End shell.
+- hostexec: the refusal while disarmed, templates, the immediate denial of a
+  tier the host has switched off, End shell. (A `run` as the user on both
+  hosts, a root `run` outside a shell and an "Approve all" window have since
+  been used: recusant was rebuilt through them.)
 - Kill switch: `/unlock` (per host with the code, then the broker's), the
   sandbox-first ordering, lockdown on recusant with its VM.
-- MCP (phase 6): ToolHive accepting the tokens and applying the tools
-  policy; Traefik forward-auth against `verify`; the bridge against a real
-  server (tested against a scripted one).
+- MCP (phase 6): Traefik forward-auth against `verify`; a wrong-audience or
+  expired token (there is one server, and no way to mint either by hand);
+  the bridge as sandboxd starts it in the VM (its code was run against the
+  live server with the broker stubbed). ToolHive 0.50.0 answers 400 to a
+  client's JSON-RPC *response* (the reply to a server ping), which the
+  Python MCP SDK client treats as fatal; the bridge logs it and carries on.
 - The watcher against the real model.
 - Desk approval (phase 8): all of it, in particular `pkcheck` showing
   hostd's message and sbx-prompt as the dialog; `notify_operator`.
