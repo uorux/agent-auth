@@ -22,19 +22,38 @@ against the pinned versions; **[open]** = needs your call (collected in §16).
 
 ---
 
-## Status (2026-10-09)
+## Status (2026-10-10)
 
 | phase | state |
 |---|---|
 | 1. Daemon channel + hostd skeleton | built, tested; deployed |
-| 2. Agent VM (nixos-dots) | built; being brought up on excelsior |
-| 3. sandboxd | built, including routing triage and the claude mid-turn doorbell; tested against a real broker with a fake runtime. `avm --host` is in nixos-dots (not run) |
-| 4. hostexec `run` + kill switch | built, tested against the real hostd with a fake executor; **the systemd-run paths have not run on a host** |
-| 5. Shells | built, same caveat |
+| 2. Agent VM (nixos-dots) | built; running on excelsior, enabled on recusant |
+| 3. sandboxd | built; claude and codex conversations, their TUIs and a2a from Hermes work on excelsior |
+| 4. hostexec `run` + kill switch | built; lockdown used on excelsior |
+| 5. Shells | built; a root shell on recusant was opened and used from Hermes |
 | 6. MCP catalog + proxy | not started |
 | 7. Mounts | not started |
 | 8. Content-bound desktop approval of hostexec | not started |
-| 9. Desktop prompts on every active host | built, tested with the real helper and a script for the dialog; **not run on a desktop** |
+| 9. Desktop prompts on every active host | built; a request was approved from excelsior's desktop |
+
+Used for real, so considered working. **Not confirmed on hardware** (covered
+by the tests only, or not at all), left that way on purpose for now:
+
+- hostexec: a `run` as the user (the `User=` unit; it failed twice in earlier
+  forms and was not retried after the last change), a root `run` outside a
+  shell, the refusal while disarmed, "Approve all" windows, templates, the
+  immediate denial of a tier the host has switched off, End shell.
+- Kill switch: `/unlock` (per host with the code, then the broker's), the
+  sandbox-first ordering, lockdown on recusant with its VM.
+- Desktop prompts: no dialog while a window is fullscreen, while locked or
+  under do-not-disturb; the away reason in `agent-auth-hostctl status`; the
+  rate limits and the Deny cooldown.
+- sandboxd: the mid-turn doorbell and routing triage against a live model,
+  the orchestrator setting up a project, project isolation and
+  `project.read` grants, `avm --host`.
+- recusant: its agent VM (boot, pairing, an agent in it).
+- Earlier phases: GitHub repo creation, hostd's pairing negative checks
+  (old code, reconnect, reboot).
 
 Where the build departed from this document is noted in place as **[built: …]**.
 
