@@ -6,7 +6,9 @@ JSON-RPC over WebSocket on the socket; several clients can share one server
 (after thread/resume each gets the thread's events), which is how an
 operator's TUI (`codex --remote unix://… resume <thread>`) joins a live
 conversation. turn/steer adds input to a running turn. The rollout (what
-thread/resume needs) is written at the first turn.
+thread/resume needs) is written at the first turn, or when the thread is
+named (thread/name/set; 0.161.0), which is what makes a new conversation
+attachable at once.
 """
 
 from __future__ import annotations
@@ -108,6 +110,17 @@ class CodexRun:
         else:
             result = await self._call("thread/start", base)
         self.runtime_session_id = result["thread"]["id"]
+        if not self.ctx.runtime_session_id:
+            # A thread has no rollout until its first turn, and without one
+            # no second client (the operator's TUI) can resume it. Naming it
+            # writes the rollout, and adds nothing to what the model sees.
+            try:
+                await self._call(
+                    "thread/name/set",
+                    {"threadId": self.runtime_session_id, "name": f"conversation {self.ctx.conversation_id}"},
+                )
+            except RuntimeError as exc:
+                log.warning("codex: could not name the new thread (the TUI may not attach before a turn): %s", exc)
 
     async def _call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         self._next_id += 1
