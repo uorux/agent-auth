@@ -124,8 +124,9 @@ def _broker_with_idle_sweep(mock):
         return httpx.Response(200, json=[])
 
     mock.post(f"{BROKER}/v1/sessions").mock(side_effect=mint)
-    mock.get(f"{BROKER}/v1/me").mock(side_effect=answer)
+    me = mock.get(f"{BROKER}/v1/me").mock(side_effect=answer)
     threads = mock.get(f"{BROKER}/v1/a2a/threads").mock(side_effect=answer)
+    threads.me = me
     return closed, minted, threads
 
 
@@ -210,3 +211,33 @@ def test_a_long_wait_is_several_short_requests(monkeypatch):
         assert asked == [60, 60, 30]
         assert json.loads(m.wait_for_decision("r-1", timeout_secs=240))["status"] == "granted"
         assert asked == [60, 60, 30, 60]
+
+
+def test_a_minted_session_is_kept_in_use_while_the_agent_is_quiet(monkeypatch):
+    import time
+
+    monkeypatch.setattr(m, "KEEPALIVE_SECS", 0.02)
+    m._KIND = "ephemeral"
+    with respx.mock(assert_all_called=False) as mock:
+        closed, minted, threads = _broker_with_idle_sweep(mock)
+        me = threads.me
+
+        assert json.loads(m.a2a_threads()) == []
+        time.sleep(0.2)  # the agent does nothing for a while
+        touched = [c.request.headers.get("X-Agent-Session") for c in me.calls]
+        assert len(touched) >= 3 and set(touched) == {"sess-1"}
+
+        # Closed all the same (the broker restarted, say): forgotten, and the
+        # next call gets a new one, which is kept in use in its turn.
+        closed.add("sess-1")
+        time.sleep(0.1)
+        assert m._client().session_id == ""
+        before = len(me.calls)
+        time.sleep(0.1)
+        assert len(me.calls) == before  # the old session's thread has stopped
+        assert json.loads(m.a2a_threads()) == []
+        assert minted == ["sess-1", "sess-2"]
+        time.sleep(0.1)
+        assert me.calls[-1].request.headers["X-Agent-Session"] == "sess-2"
+        m._client().session_id = ""  # stop the thread before the mock goes away
+        time.sleep(0.05)

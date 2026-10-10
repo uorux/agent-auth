@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -91,10 +92,14 @@ mcp = FastMCP("agent-auth", instructions=INSTRUCTIONS)
 # of an ephemeral agent's session.
 _CLIENT: BrokerClient | None = None
 _KIND: str | None = None
-# The broker closes a session nobody has used for a while (a long wait for a
-# human will do it). One this process minted itself is replaced then.
+# The broker closes a session nobody has used for a while, and with it the
+# threads the session opened. A session this process minted lives as long as
+# the process: it is kept in use while the agent is quiet (waiting on a
+# human, working on something else), and replaced if it was closed anyway.
 _MINTED = False
 STALE_SESSION = "unknown or closed session"
+# Well inside the broker's idle timeout (15 minutes by default).
+KEEPALIVE_SECS = 240.0
 
 
 def _client() -> BrokerClient:
@@ -118,7 +123,27 @@ def _session_client() -> BrokerClient:
         label = "".join(c for c in label if c.isalnum() or c in "._-")[:64] or "session"
         client.create_session(label)
         _MINTED = True
+        threading.Thread(
+            target=_keep_alive, args=(client, client.session_id), name="session-keepalive", daemon=True
+        ).start()
     return client
+
+
+def _keep_alive(client: BrokerClient, session_id: str) -> None:
+    """Touch the session until the process ends or the session is replaced."""
+    stop = threading.Event()
+    while not stop.wait(KEEPALIVE_SECS):
+        if client.session_id != session_id:
+            return
+        try:
+            client.me()
+        except BrokerError as exc:
+            if exc.status_code == 401 and exc.detail == STALE_SESSION:
+                if client.session_id == session_id:
+                    client.session_id = ""  # the next call mints another
+                return
+        except Exception:  # the broker is away for a moment: try again later
+            pass
 
 
 def _minted_session_gone() -> bool:
