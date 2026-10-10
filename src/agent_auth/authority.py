@@ -71,6 +71,11 @@ def fold(platform: Platform, capability: str, scope: dict[str, Any] | None) -> d
                 **common,
             }
         return {"action": "run", "argv": list(scope.get("argv") or []), **common}
+    if platform == Platform.MCP:
+        # Which of the server's tools: the server is the resource. Sorted, so
+        # the same set is the same authority; "*" alone means all of them.
+        tools = sorted({str(t) for t in scope.get("tools") or ["*"]})
+        return {"tools": ["*"] if "*" in tools else tools}
     return {}  # HOMELAB: membership only; the group is the resource
 
 
@@ -104,6 +109,8 @@ def split(platform: Platform, authority: dict[str, Any] | None) -> tuple[str, di
         if action == "tpl":
             return f"tpl.{authority.get('template')}", {**scope, "params": dict(authority.get("params") or {})}
         return "run", {**scope, "argv": list(authority.get("argv") or [])}
+    if platform == Platform.MCP:
+        return "use", {"tools": list(authority.get("tools") or ["*"])}
     return "group", {}  # HOMELAB
 
 
@@ -119,6 +126,9 @@ def label(platform: Platform, authority: dict[str, Any] | None) -> str:
         return f"{role} (cluster-wide)" if (authority or {}).get("cluster") else role
     if platform == Platform.AGENTS:
         return f"mint:{(authority or {}).get('runtime') or '?'}"
+    if platform == Platform.MCP:
+        tools = (authority or {}).get("tools") or ["*"]
+        return "all tools" if "*" in tools else ",".join(tools)
     if platform == Platform.HOSTEXEC:
         a = authority or {}
         if a.get("action") == "window":
@@ -147,6 +157,9 @@ def needs_explicit_rule(platform: Platform, authority: dict[str, Any] | None) ->
     if platform == Platform.HOSTEXEC:
         # Running a command on a host: only a rule about hostexec itself.
         return True
+    if platform == Platform.MCP:
+        # Tools on a server: only a rule about mcp itself.
+        return True
     return False
 
 
@@ -167,6 +180,10 @@ def rule_covers(
     if platform == Platform.HOSTEXEC and rule_authority.get("action") == "window":
         a = authority or {}
         return a.get("action") in ("run", "tpl") and a.get("tier") == rule_authority.get("tier")
+    if platform == Platform.MCP:
+        # A rule for some of a server's tools covers a request for fewer.
+        allowed, wanted = set(rule_authority.get("tools") or []), set((authority or {}).get("tools") or ["*"])
+        return "*" in allowed or ("*" not in wanted and wanted <= allowed)
     return False
 
 

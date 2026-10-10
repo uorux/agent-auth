@@ -667,6 +667,7 @@
             agent_path = "${agentEnv}/bin:${pkg}/bin";
             agent_auth_mcp = "${pkg}/bin/agent-auth-mcp";
             sandbox_mcp = "${pkg}/bin/agent-auth-sandbox-mcp";
+            mcp_bridge = "${pkg}/bin/agent-auth-mcp-bridge";
             tmux = "${pkgs.tmux}/bin/tmux";
             systemd_run = "${config.systemd.package}/bin/systemd-run";
             systemctl = "${config.systemd.package}/bin/systemctl";

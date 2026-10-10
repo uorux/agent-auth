@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import enum
+import re
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ..core.states import Platform
 from ..schemas import parse_duration
@@ -199,6 +200,49 @@ class HostexecPlatformConfig(BaseModel):
         return v
 
 
+class McpServer(BaseModel):
+    # Where agents connect (an MCP endpoint, or any HTTP tool behind a proxy
+    # that checks agent-auth's tokens).
+    url: str
+    description: str = ""
+    # The tools it offers, if you want requests checked against them and the
+    # catalog to list them. Empty: any tool name is accepted in a request.
+    tools: list[str] = Field(default_factory=list)
+    # The `aud` of tokens for this server; what its proxy is configured to
+    # require. Default: the url.
+    audience: str | None = None
+
+
+class McpPlatformConfig(BaseModel):
+    """MCP servers (and other HTTP tools) that take agent-auth's own tokens.
+    A grant is for one server and a set of its tools; its credential is a
+    short-lived signed token (ES256, keys at <issuer>/.well-known/jwks.json)
+    that the server's proxy validates, or a reverse proxy checks at
+    /v1/tokens/verify. agent-auth is never in the data path."""
+
+    # The `iss` of tokens: the broker's own public URL, where the proxies
+    # fetch its keys. Required once servers are listed.
+    issuer: str = ""
+    # A token's lifetime (never past its grant's). Agents re-fetch.
+    token_ttl: str | int = "1h"
+    servers: dict[str, McpServer] = Field(default_factory=dict)
+
+    @field_validator("token_ttl")
+    @classmethod
+    def _valid(cls, v):
+        parse_duration(v)
+        return v
+
+    @model_validator(mode="after")
+    def _issuer(self):
+        if self.servers and not self.issuer.startswith("https://"):
+            raise ValueError("platforms.mcp.issuer (the broker's https URL) is required when servers are listed")
+        for name in self.servers:
+            if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", name):
+                raise ValueError(f"mcp server name {name!r}: lowercase letters, digits and dashes")
+        return self
+
+
 class DesktopConfig(BaseModel):
     """Approval prompts and notifications on the desktops you are at
     (hostd-user), next to Discord. Off unless enabled; see
@@ -236,6 +280,7 @@ class PlatformsConfig(BaseModel):
     kubernetes: KubernetesPlatformConfig = Field(default_factory=KubernetesPlatformConfig)
     agents: AgentsPlatformConfig = Field(default_factory=AgentsPlatformConfig)
     hostexec: HostexecPlatformConfig = Field(default_factory=HostexecPlatformConfig)
+    mcp: McpPlatformConfig = Field(default_factory=McpPlatformConfig)
 
 
 class PolicyFile(BaseModel):

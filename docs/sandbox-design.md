@@ -31,7 +31,7 @@ against the pinned versions; **[open]** = needs your call (collected in §16).
 | 3. sandboxd | built; claude and codex conversations, their TUIs and a2a from Hermes work on excelsior |
 | 4. hostexec `run` + kill switch | built; lockdown used on excelsior |
 | 5. Shells | built; a root shell on recusant was opened and used from Hermes |
-| 6. MCP catalog + proxy | not started |
+| 6. MCP servers (§12) | built, tested against its own verifier; **not run against ToolHive** |
 | 7. Mounts | deferred (§11) |
 | 8. Approval at the target host's own desk, `notify_operator` | built, tested with a fake polkit; **not run on a desktop** |
 | 9. Desktop prompts on every active host | built; a request was approved from excelsior's desktop |
@@ -45,6 +45,10 @@ by the tests only, or not at all), left that way on purpose for now:
   immediate denial of a tier the host has switched off, End shell.
 - Kill switch: `/unlock` (per host with the code, then the broker's), the
   sandbox-first ordering, lockdown on recusant with its VM.
+- MCP (phase 6): ToolHive accepting the tokens and applying the tools
+  policy; Traefik forward-auth against `verify`; the bridge against a real
+  server (tested against a scripted one).
+- The watcher against the real model.
 - Desk approval (phase 8): all of it, in particular `pkcheck` showing
   hostd's message and sbx-prompt as the dialog; `notify_operator`.
 - Desktop prompts: no dialog while a window is fullscreen, while locked or
@@ -1205,40 +1209,65 @@ Remote-host mounts (a path on a different host than the VM) are deferred
 
 ---
 
-## 12. MCP catalog **[decided: catalog + broker proxy]**
+## 12. MCP servers **[built: tokens, not a proxy]**
+
+Co-designed with the homelab repo's `docs/agent-infra/` (ToolHive on the
+cluster, one pod per MCP server, a proxy in front of each that validates
+bearer tokens and applies a Cedar policy). The original plan here, a proxy
+inside the broker, is dropped: MCP servers are third-party code driven by
+model output, and the broker's host holds its long-lived credentials.
+agent-auth is the authority; it is never in the data path.
 
 ```yaml
 platforms:
   mcp:
-    catalog:
-      linear:
-        url: https://mcp.linear.app/mcp
-        auth: oauth            # broker-held refresh token (admin mcp-login)
-        tools: ["*"]
-        description: "Linear issues/projects"
-      context7:
-        url: https://mcp.context7.com/mcp
-        auth: none
+    issuer: https://agent-auth.rooty.dev     # the broker's public URL
+    token_ttl: 1h
+    servers:
+      playwright:
+        url: https://mcp-playwright.rooty.dev/mcp
+        description: "A browser (Playwright on the shared Steel instance)"
+        tools: [browser_navigate, browser_snapshot]   # optional
 ```
 
-`/v1/mcp/<server>` is a streamable-HTTP proxy:
-- Agents authenticate with their own key.
-- The broker checks for an active `mcp` grant, filters
-  `tools/list`/`tools/call` to the granted tools, injects the upstream
-  credential, and logs every call.
+- **Grant**: platform `mcp`, capability `use`, resource = the server, scope
+  `{"tools": [...]}` (or none: every tool). Only a rule that names `mcp`
+  clears one; a saved rule for some tools covers a request for fewer.
+- **Credential**: a JWT signed by the broker (ES256, because ToolHive takes
+  RSA and ECDSA only). `iss` = the issuer, `aud` = the server's audience
+  (its URL by default), `sub` = `agent:<name>`, `tools` = the granted tools
+  (`["*"]` for all), `grant`, `server`, `agent`; it lives `token_ttl` at
+  most, never past the grant. `get_credential` issues a new one each call
+  while the grant is active.
+- **Key**: derived from `BROKER_SIGNING_KEY` (HKDF, its own label), so there
+  is no second secret; published at `/.well-known/jwks.json` (and a minimal
+  `/.well-known/openid-configuration`). Rotating the broker key rotates it.
+- **The server's side** (homelab `apps/infra/toolhive/auth.yaml`):
+  `MCPOIDCConfig` type `inline` with the issuer and JWKS URL, the server's
+  `audience`, and a Cedar policy that permits `call_tool` only when
+  `principal.claim_tools` contains `"*"` or the tool's name.
+- **`GET /v1/tokens/verify?server=<name>`** for a reverse proxy
+  (Traefik `forwardAuth`): 200 if the bearer token is valid for that server
+  **and its grant is still active**, with `X-Agent-Auth-Agent` /
+  `X-Agent-Auth-Tools`; 401 otherwise. This is how plain HTTP tools (SearXNG,
+  Steel) are put behind grants: list them as servers.
+- **Clients**: `agent-auth-mcp-bridge <server>` is a stdio MCP server that
+  relays to the server's URL with the agent's current token and fetches a new
+  one when it runs out. sandboxd adds one for each server the agent holds a
+  grant for when it starts a conversation's process (a server granted later
+  appears at the next start). An agent can also send the token itself.
 
-Agents never see upstream tokens, and revocation is instant.
+**Revocation**: no new tokens once a grant ends. A proxy that validates
+signatures only (ToolHive) keeps accepting an issued token until it expires,
+an hour at most by default; one that calls `verify` stops at once.
 
-Upstream auth is `none`, `header` (a secret file), or `oauth`. For `oauth`,
-`admin mcp-login <server>` runs PKCE with the link posted to Discord, and
-the refresh token is stored Fernet-wrapped.
+**What this does not protect against**: the token is a bearer token, so the
+server's proxy (and anything that reads the request) could replay it against
+that same server until it expires. It is useless elsewhere: the audience is
+one server, and it is not a Kubernetes or any other credential.
 
-sandboxd writes each conversation's MCP config pointing at the proxy:
-- Claude: `--mcp-config`.
-- Codex: `-c mcp_servers.<n>.url=…` with a bearer env var. **[verify]**
-
-New grants appear on the next resume, or sandboxd restarts and resumes
-immediately. Local stdio MCPs (rare) run inside the project unit.
+**Not built**: upstream credentials for third-party servers (an OAuth'd
+Linear, say). That belongs in the gateway (`MCPRemoteProxy`), not here.
 
 ---
 
@@ -1350,7 +1379,8 @@ in-process WS, a fake runtime adapter).
    (approve-all, TOTP), output, risk summary, templates. The **kill
    switch**, including the host-side VM freeze, lands here, before shells.
 5. **Shells**: TOTP-only, loud embeds, mirror threads.
-6. **MCP catalog + broker proxy** (none/header first, then OAuth).
+6. **MCP servers** (§12) **[built]**: the `mcp` platform, tokens and
+   their keys, `verify`, the stdio bridge.
 7. **Mounts**: deferred (§11).
 8. **Approval at the target host's own desk** (§8.10) **[built]**: the
    dialog from what hostd would run; Allow is the host's own approval of

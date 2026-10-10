@@ -31,6 +31,7 @@ class Config:
     agent_path: str = "/run/current-system/sw/bin"
     agent_auth_mcp: str = "agent-auth-mcp"
     sandbox_mcp: str = "agent-auth-sandbox-mcp"
+    mcp_bridge: str = "agent-auth-mcp-bridge"
     tmux: str = "tmux"
     systemd_run: str = "systemd-run"
     systemctl: str = "systemctl"

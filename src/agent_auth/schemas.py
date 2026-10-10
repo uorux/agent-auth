@@ -279,6 +279,9 @@ class PlatformCatalog(BaseModel):
     # whether it is enabled and armed (a human's approval only counts on an
     # armed tier, or with a TOTP code).
     hosts: list[dict[str, Any]] | None = None
+    # mcp: the servers that take this broker's tokens (name, url, what it is
+    # for, its tools if listed).
+    servers: list[dict[str, Any]] | None = None
 
 
 class CatalogOut(BaseModel):

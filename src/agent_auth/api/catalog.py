@@ -114,6 +114,20 @@ async def build_catalog(
             )
         )
 
+    if registry.enabled(Platform.MCP):
+        platforms.append(
+            PlatformCatalog(
+                platform=Platform.MCP,
+                capability_hint='use (scope {"tools": [...]}; omit for every tool)',
+                resource_hint="<server>",
+                capabilities=["use"],
+                servers=[
+                    {"name": name, "url": s.url, "description": s.description, "tools": s.tools or None}
+                    for name, s in sorted(policy.platforms.mcp.servers.items())
+                ],
+            )
+        )
+
     if registry.enabled(Platform.HOMELAB):
         hl = policy.platforms.homelab
         platforms.append(

@@ -21,7 +21,10 @@ from .db import Database
 from .discord_bot.bot import AgentAuthBot, DiscordNotifier
 from .policy.engine import PolicyEngine
 from .policy.llm import LLMEvaluator
+from .core.tokens import TokenIssuer
+from .daemon_common.crypto import private_key_from_text
 from .policy.risk import RiskSummarizer, Watcher
+from .provisioners.mcp import McpProvisioner
 from .policy.schema import load_policy
 from .provisioners.a2a import A2AProvisioner
 from .provisioners.agents import AgentsProvisioner
@@ -157,6 +160,17 @@ async def serve(settings: Settings) -> None:
                 policy.platforms.hostexec.risk_model or policy.llm.model,
             )
     app = create_app(settings, db, service, registry, events, a2a, daemons, hostexec)
+    # MCP servers that take the broker's own tokens (signed with a key derived
+    # from the broker's signing key).
+    if policy.platforms.mcp.servers:
+        if settings.broker_signing_key:
+            tokens = TokenIssuer(private_key_from_text(settings.broker_signing_key), policy.platforms.mcp.issuer)
+            registry.register(McpProvisioner(policy.platforms.mcp, tokens))
+            app.state.tokens = tokens
+            log.info("mcp: %d server(s), tokens issued as %s (kid %s)", len(policy.platforms.mcp.servers),
+                     tokens.issuer, tokens.kid)
+        else:
+            log.warning("platforms.mcp lists servers but BROKER_SIGNING_KEY is not set: mcp is disabled")
     scheduler = ExpiryScheduler(service, a2a, sandboxes=sandboxes)
 
     server = uvicorn.Server(

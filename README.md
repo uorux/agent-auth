@@ -496,6 +496,51 @@ anything in that tier. Disarmed and without codes it can run only the
 Not yet run on a real host: the systemd-run paths (the user tier's in
 particular). The tests drive the real daemon with a fake executor.
 
+## MCP servers
+
+agent-auth can hand out access to MCP servers (and other HTTP tools) without
+being in their data path. A grant's credential is a short-lived token the
+broker signs; the server's own proxy verifies it against the broker's public
+keys. Designed for [ToolHive](https://github.com/stacklok/toolhive): one pod
+per server, a token-validating proxy in front.
+
+```yaml
+platforms:
+  mcp:
+    issuer: https://agent-auth.example.org      # this broker's public URL
+    token_ttl: 1h
+    servers:
+      playwright:
+        url: https://mcp-playwright.example.org/mcp
+        description: "A browser"
+        tools: [browser_navigate, browser_snapshot]   # optional: checked, and listed for agents
+rules:
+  - match: {agent: "hermes-*", platform: mcp, capability: use, resource: playwright}
+    action: approve
+```
+
+- **Agents** ask for `platform: mcp, capability: use, resource: <server>`,
+  with `scope: {tools: [...]}` for some of its tools. `get_credential` returns
+  a bearer token for the server's URL.
+- **The token** is an ES256 JWT: `iss` the issuer, `aud` the server's
+  `audience` (its URL by default), `tools` the granted tool names (`["*"]`
+  for all), plus `agent`, `server`, `grant`. Keys: `/.well-known/jwks.json`.
+  They derive from `BROKER_SIGNING_KEY`, which must be set.
+- **ToolHive**: an `MCPOIDCConfig` of type `inline` (`issuer`, `jwksUrl`), the
+  audience on the `MCPServer`, and a Cedar policy such as
+  `permit(principal, action == Action::"call_tool", resource) when { principal.claim_tools.contains("*") || principal.claim_tools.contains(resource.name) };`
+- **Any reverse proxy**: `GET /v1/tokens/verify?server=<name>` with the
+  request's `Authorization` header answers 200 or 401, and also checks that
+  the grant is still active (Traefik `forwardAuth`, nginx `auth_request`).
+- **Clients that can't refresh a header**: `agent-auth-mcp-bridge <server>`
+  is a stdio MCP server that relays to the real one with a current token
+  (`claude mcp add playwright -- agent-auth-mcp-bridge playwright`). Agents in
+  an agent VM get one per granted server automatically.
+
+Ending a grant stops new tokens. A proxy that only checks signatures accepts
+an already issued token until it expires (`token_ttl`); one that calls
+`verify` stops at once.
+
 ## Desktop prompts
 
 With `desktop.enabled` in the policy and `services.agent-auth-hostd.desktop.enable`

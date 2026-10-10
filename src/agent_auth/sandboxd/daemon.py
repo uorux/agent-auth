@@ -42,6 +42,7 @@ log = logging.getLogger(__name__)
 
 ROLE = "sandbox"
 PROJECT_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?")
+NAME_OK = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 EVENTS_WAIT = 60
 RETRY_SECS = 5
 TUI_SETTLE_SECS = 1.5
@@ -692,6 +693,24 @@ class Sandboxd:
             },
         )
 
+    async def _add_mcp_servers(self, ctx: SpawnContext, rec: AgentRecord) -> None:
+        """The catalogued MCP servers this agent holds a grant for, as local
+        stdio servers (agent-auth-mcp-bridge keeps their tokens fresh). Read
+        when a process starts: a server granted later appears at the next
+        start, after the conversation has parked."""
+        try:
+            grants = await self.broker.call(rec.api_key, "GET", "/v1/grants", params={"status": "active"})
+        except Exception as exc:
+            log.warning("mcp servers for %s: %s", rec.name, exc)
+            return
+        for name in sorted({g["resource"] for g in grants if g.get("platform") == "mcp"}):
+            if name not in ctx.mcp_servers and NAME_OK.fullmatch(name):
+                ctx.mcp_servers[name] = {
+                    "command": self.config.mcp_bridge,
+                    "args": [name],
+                    "env_vars": ["AGENT_AUTH_URL", "AGENT_AUTH_API_KEY", "AGENT_AUTH_SESSION"],
+                }
+
     async def _sync_codex_auth(self, home: Path, uid: int, into_project: bool) -> None:
         """One subscription login shared by every project: copy the newest
         auth.json each way around a codex process (refresh rotates tokens).
@@ -724,6 +743,7 @@ class Sandboxd:
             await self.seal_project(rec.project)
         async with self._spawn_slots:
             ctx = self._context(conv, lv)
+            await self._add_mcp_servers(ctx, rec)
             if conv.runtime == "codex":
                 await self._sync_codex_auth(ctx.home, ctx.uid, into_project=True)
             run = await self.runtimes[conv.runtime].start(self.host, ctx)
@@ -897,6 +917,7 @@ class Sandboxd:
                     lv.run = None
                 run = None
             ctx = self._context(self.state.conversation(conv_id), lv, tui=True)
+            await self._add_mcp_servers(ctx, self.state.agent(conv.agent))
             if conv.runtime == "claude" and not ctx.runtime_session_id:
                 import uuid
 

@@ -42,6 +42,16 @@ platforms:
   #   window_default: 30m                  # "Approve all…"
   #   window_max: 8h
 
+  # MCP servers that take this broker's own tokens (README: "MCP servers").
+  # mcp:
+  #   issuer: https://agent-auth.example.org   # this broker's public URL
+  #   token_ttl: 1h
+  #   servers:
+  #     playwright:
+  #       url: https://mcp-playwright.example.org/mcp
+  #       description: "A browser"
+  #       tools: [browser_navigate, browser_snapshot]
+
   github:
     # GitHub account owners whose repos are brokered (the app must be
     # installed on each)

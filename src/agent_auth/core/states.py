@@ -15,6 +15,7 @@ class Platform(str, enum.Enum):
     SANDBOX = "sandbox"
     # §8: commands (and time-boxed shells) on a host, outside the agent VM.
     HOSTEXEC = "hostexec"
+    MCP = "mcp"
 
 
 class RequestStatus(str, enum.Enum):

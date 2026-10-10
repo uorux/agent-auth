@@ -26,6 +26,7 @@ dependencies = [
 agent-auth = "agent_auth.cli:app"
 agent-auth-server = "agent_auth.main:run"
 agent-auth-mcp = "agent_auth.mcp_server:run"
+agent-auth-mcp-bridge = "agent_auth.mcp_bridge:run"
 agent-auth-hostd = "agent_auth.hostd.main:app"
 agent-auth-hostctl = "agent_auth.hostd.ctl:app"
 agent-auth-sandboxd = "agent_auth.sandboxd.main:app"

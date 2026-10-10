@@ -62,6 +62,12 @@ capability="shell", resource=<host>, scope={"tier": "user"|"root"}), then
 host_shell_exec(grant_id, argv) per command. Every command is shown to the
 operator before it runs, and there is no terminal: each is run on its own.
 
+MCP servers (a browser, search, ...): list_capabilities shows the ones this
+broker fronts. Ask for the tools you need with request_access(platform="mcp",
+capability="use", resource=<server>, scope={"tools": [...]}); get_credential
+then returns a short-lived token to send to the server's URL as
+`Authorization: Bearer`. The server checks the token itself.
+
 Blocked on your operator (a decision only they can make, something they
 asked to be told)? notify_operator(message) reaches them on Discord and at
 their desk. Not for progress updates, and not for requests: those reach
@@ -214,6 +220,11 @@ def request_access(
     - hostexec: a command on a host — use host_run rather than this directly.
       A shell: capability="shell", resource=<host>, scope={"tier": "user"}.
       A host template: capability="tpl.<name>", scope={"tier": ..., "params": {...}}.
+    - mcp: tools on an MCP server from the catalog (list_capabilities shows
+      them): capability="use", resource=<server>, scope={"tools": [...]} for
+      the ones you need, or no scope for all. get_credential gives a
+      short-lived bearer token for that server's URL; fetch a new one when it
+      runs out.
     - google: not functional yet (decisions are recorded, no credential is
       issued); don't plan on it.
 
