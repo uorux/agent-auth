@@ -24,7 +24,6 @@ import logging
 import re
 import secrets
 import shlex
-import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -693,17 +692,28 @@ class Sandboxd:
             },
         )
 
-    def _sync_codex_auth(self, home: Path, into_project: bool) -> None:
+    async def _sync_codex_auth(self, home: Path, uid: int, into_project: bool) -> None:
         """One subscription login shared by every project: copy the newest
-        auth.json each way around a codex process (refresh rotates tokens)."""
+        auth.json each way around a codex process (refresh rotates tokens).
+        ~/.codex and the copy in it are the project user's (codex writes
+        there); the home is the project's to arrange, so nothing in it is
+        followed if it is a symlink."""
         shared = self.config.secrets_dir / "codex-auth.json"
-        local = home / ".codex" / "auth.json"
-        src, dst = (shared, local) if into_project else (local, shared)
+        codex_home = home / ".codex"
+        local = codex_home / "auth.json"
         try:
-            if src.exists() and (not dst.exists() or src.stat().st_mtime > dst.stat().st_mtime):
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dst)
-        except OSError as exc:
+            if codex_home.is_symlink() or local.is_symlink():
+                log.warning("codex auth sync: %s is a symlink; skipped", codex_home)
+                return
+            if into_project:
+                codex_home.mkdir(mode=0o700, exist_ok=True)
+                if shared.exists() and (not local.exists() or shared.stat().st_mtime > local.stat().st_mtime):
+                    self.host.write_file(local, shared.read_text(), uid, 0o600)
+                # Also what an earlier version left there as root.
+                await self.host.chown_tree(codex_home, uid)
+            elif local.is_file() and (not shared.exists() or local.stat().st_mtime > shared.stat().st_mtime):
+                self.host.write_file(shared, local.read_text(), None, 0o600)
+        except (OSError, RuntimeError, UnicodeDecodeError) as exc:
             log.warning("codex auth sync: %s", exc)
 
     async def _ensure_running(self, conv: Conversation, lv: Live) -> Run:
@@ -715,7 +725,7 @@ class Sandboxd:
         async with self._spawn_slots:
             ctx = self._context(conv, lv)
             if conv.runtime == "codex":
-                self._sync_codex_auth(ctx.home, into_project=True)
+                await self._sync_codex_auth(ctx.home, ctx.uid, into_project=True)
             run = await self.runtimes[conv.runtime].start(self.host, ctx)
         lv.run, lv.ctx = run, ctx
         if run.runtime_session_id and run.runtime_session_id != conv.runtime_session_id:
@@ -814,7 +824,7 @@ class Sandboxd:
             await run.stop()
             conv = self.state.conversation(conv_id)
             if conv and conv.runtime == "codex" and lv.ctx:
-                self._sync_codex_auth(lv.ctx.home, into_project=False)
+                await self._sync_codex_auth(lv.ctx.home, lv.ctx.uid, into_project=False)
             if conv and conv.state != "closed":
                 self.state.update_conversation(conv_id, state="parked")
         log.info("parked conversation %s", conv_id)

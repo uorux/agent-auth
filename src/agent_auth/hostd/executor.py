@@ -6,15 +6,17 @@ children of hostd, so a job doesn't inherit hostd's sandbox, environment or
 file descriptors, a runaway one is killed as a whole cgroup, and the journal
 has it under its own unit name (aa-job-<id>).
 
-- root tier: a system unit, started by PID 1.
-- user tier: a unit of the user's own systemd manager (so it sees the user's
-  session bus and environment). hostd drops to the user to ask for it:
-  systemd-run talks to /run/user/<uid>/bus directly, which carries the job's
-  stdio as file descriptors. Needs the user's manager running (logged in, or
-  lingering).
+Both tiers are system units, started by PID 1 on hostd's request (hostd is
+root; it needs no capability for that):
+- root tier: as root.
+- user tier: with User=<the configured user>, their groups, and their
+  session's runtime dir and bus in the environment, so `systemctl --user` and
+  desktop tools work while they are logged in. It is not a unit of the user's
+  own manager: hostd would have to become the user to ask for one, and
+  changing uid inside the service failed on the first real run (EPERM from
+  setpriv and from setuid in a child, cause not found).
 
-The drop happens in the child, between fork and exec (not through setpriv,
-which failed under the service's capability set on the first real run).
+Run on a real host so far: nothing of this version.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import os
 import pwd
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Awaitable, Callable, Protocol
 
 from .config import HostConfig
 
@@ -66,31 +68,20 @@ class LinuxExecutor:
             raise RuntimeError("no user configured for the user tier")
         return pwd.getpwnam(self.config.user)
 
-    def _as_user(self) -> tuple[dict[str, Any], dict[str, str]]:
-        """How to act as the configured user against their systemd manager:
-        subprocess arguments (the child drops to the user before exec) and
-        the environment."""
+    def _as_user(self) -> tuple[list[str], dict[str, str]]:
+        """systemd-run properties and the job's environment for the user tier."""
         pw = self._user()
         runtime = f"/run/user/{pw.pw_uid}"
-        if not os.path.exists(f"{runtime}/bus"):
-            raise RuntimeError(
-                f"{pw.pw_name}'s systemd manager isn't running (not logged in, and lingering is off)"
-            )
-        drop: dict[str, Any] = {}
-        if os.geteuid() != pw.pw_uid:
-            drop = {
-                "user": pw.pw_uid,
-                "group": pw.pw_gid,
-                "extra_groups": os.getgrouplist(pw.pw_name, pw.pw_gid),
-            }
         env = {
-            "XDG_RUNTIME_DIR": runtime,
-            "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime}/bus",
             "HOME": pw.pw_dir,
             "USER": pw.pw_name,
             "LOGNAME": pw.pw_name,
+            "SHELL": pw.pw_shell,
+            # Only there while the user is logged in (or lingering).
+            "XDG_RUNTIME_DIR": runtime,
+            "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime}/bus",
         }
-        return drop, env
+        return ["-p", f"User={pw.pw_name}"], env
 
     def _path(self, tier: str) -> str:
         if tier == "user" and self.config.user:
@@ -101,13 +92,11 @@ class LinuxExecutor:
         c = self.config
         path = self._path(tier)
         command = [c.systemd_run]
-        proc_env = {"PATH": path, "LANG": "C.UTF-8"}
-        drop: dict[str, Any] = {}
         if tier == "user":
-            drop, user_env = self._as_user()
-            command.append("--user")
-            proc_env.update(user_env)
+            props, user_env = self._as_user()
+            command += props
             cwd = cwd or user_env["HOME"]
+            env = {**user_env, **env}
         command += [
             f"--unit={unit_name(job_id)}",
             "--collect",
@@ -128,8 +117,97 @@ class LinuxExecutor:
             stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            env=proc_env,
-            **drop,
+            env={"PATH": path, "LANG": "C.UTF-8"},
+        )
+        if stdin is not None:
+            assert proc.stdin is not None
+            proc.stdin.write(stdin)
+            try:
+                await proc.stdin.drain()
+            except ConnectionError:
+                pass
+            proc.stdin.close()
+        assert proc.stdout is not None
+        while True:
+            chunk = await proc.stdout.read(READ_CHUNK)
+            if not chunk:
+                break
+            await on_output(chunk)
+        return await proc.wait()
+
+    async def _systemctl(self, *args: str) -> tuple[int, str]:
+        proc = await asyncio.create_subprocess_exec(
+            self.config.systemctl, *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env={"PATH": self.config.job_path},
+        )
+        out, _ = await proc.communicate()
+        return proc.returncode or 0, out.decode(errors="replace").strip()
+
+    async def kill(self, job_id: str, tier: str) -> None: ...
+    async def unit_action(self, action: str, unit: str) -> tuple[int, str]:
+        """systemctl freeze | thaw | stop | is-active a system unit."""
+        ...
+
+
+class LinuxExecutor:
+    def __init__(self, config: HostConfig):
+        self.config = config
+
+    def _user(self) -> pwd.struct_passwd:
+        if not self.config.user:
+            raise RuntimeError("no user configured for the user tier")
+        return pwd.getpwnam(self.config.user)
+
+    def _as_user(self) -> tuple[list[str], dict[str, str]]:
+        """systemd-run properties and the job's environment for the user tier."""
+        pw = self._user()
+        runtime = f"/run/user/{pw.pw_uid}"
+        env = {
+            "HOME": pw.pw_dir,
+            "USER": pw.pw_name,
+            "LOGNAME": pw.pw_name,
+            "SHELL": pw.pw_shell,
+            # Only there while the user is logged in (or lingering).
+            "XDG_RUNTIME_DIR": runtime,
+            "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime}/bus",
+        }
+        return ["-p", f"User={pw.pw_name}"], env
+
+    def _path(self, tier: str) -> str:
+        if tier == "user" and self.config.user:
+            return f"{self.config.job_path}:/etc/profiles/per-user/{self.config.user}/bin"
+        return self.config.job_path
+
+    async def run(self, job_id, tier, argv, cwd, env, timeout, stdin, on_output) -> int:
+        c = self.config
+        path = self._path(tier)
+        command = [c.systemd_run]
+        if tier == "user":
+            props, user_env = self._as_user()
+            command += props
+            cwd = cwd or user_env["HOME"]
+            env = {**user_env, **env}
+        command += [
+            f"--unit={unit_name(job_id)}",
+            "--collect",
+            "--quiet",
+            "--pipe",
+            "--wait",
+            "-p", f"RuntimeMaxSec={timeout}",
+            "-p", "KillMode=control-group",
+            "-p", f"Description=agent-auth job {job_id}",
+            f"--working-directory={cwd or '/'}",
+            f"--setenv=PATH={path}",
+        ]
+        command += [f"--setenv={key}={value}" for key, value in env.items()]
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            "--",
+            *argv,
+            stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env={"PATH": path, "LANG": "C.UTF-8"},
         )
         if stdin is not None:
             assert proc.stdin is not None
@@ -161,11 +239,11 @@ class LinuxExecutor:
 
     async def kill(self, job_id: str, tier: str) -> None:
         try:
-            await self._systemctl(tier, "stop", f"{unit_name(job_id)}.service")
+            await self._systemctl("stop", f"{unit_name(job_id)}.service")
         except (OSError, RuntimeError, KeyError):
             pass
 
     async def unit_action(self, action: str, unit: str) -> tuple[int, str]:
         if action not in ("freeze", "thaw", "stop", "is-active"):
             raise ValueError(action)
-        return await self._systemctl("root", action, unit)
+        return await self._systemctl(action, unit)

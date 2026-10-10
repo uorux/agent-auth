@@ -832,9 +832,11 @@ broker.
 
 **[built]** One root daemon, `agent-auth-hostd run`, started as root only
 when a tier or `vm.unit` is configured (otherwise it stays the unprivileged
-connect-only service). User jobs do not use `--machine=jrt@.host`: that
-transport can't carry the job's stdio. hostd drops to the user (in the child, before exec)
-and runs `systemd-run --user` against `/run/user/<uid>/bus`. hostd-user is
+connect-only service). User jobs are system units with `User=<user>` and the
+user's session bus in their environment, not units of the user's own manager:
+`--machine=jrt@.host` can't carry the job's stdio, and changing uid inside the
+service (to ask the user's manager directly) failed on the first real run. So
+hostd keeps no capability; polkit authorizes its requests as uid 0. hostd-user is
 `agent-auth-hostd user`, a user service; it is used for desktop prompts
 (phase 9) and holds nothing.
 

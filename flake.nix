@@ -340,9 +340,9 @@
               default = null;
               example = "jrt";
               description = ''
-                The account the user tier runs commands as, and whose desktop
-                is asked. Its systemd manager must be running for user-tier
-                commands (logged in, or `users.users.<name>.linger = true`).
+                The account the user tier runs commands as (system units with
+                User=; their session's bus is in the environment while they
+                are logged in), and whose desktop is asked.
               '';
             };
 
@@ -487,6 +487,10 @@
               }
             ];
 
+            # A root without capabilities is authorized by polkit when it
+            # asks systemd for a unit.
+            security.polkit.enable = lib.mkIf privileged true;
+
             environment.systemPackages = [ cli hostctl ];
             environment.etc."agent-auth/hostd.json".source = configFile;
 
@@ -541,14 +545,13 @@
                 SystemCallArchitectures = "native";
                 UMask = "0077";
               } // (if privileged then {
-                # Root, to ask systemd for units (system ones directly; the
-                # user's by dropping to that user). The jobs themselves are
-                # started by systemd, outside this sandbox. /run/user stays
-                # reachable (no ProtectHome); CAP_SETUID/SETGID are for the
-                # drop, CAP_DAC_READ_SEARCH to look into /run/user/<uid>, and
-                # nothing else of root's is kept.
+                # Root, to ask PID 1 for units over the system bus: the jobs
+                # (as root, or with User= for the user tier) and the VM's
+                # freeze. systemd starts them, outside this sandbox. That
+                # takes root's uid and no capability (polkit vouches for uid
+                # 0), so none is kept.
                 User = "root";
-                CapabilityBoundingSet = [ "CAP_SETUID" "CAP_SETGID" "CAP_DAC_READ_SEARCH" ];
+                CapabilityBoundingSet = "";
               } else {
                 # Connect-and-report only: unprivileged and locked down hard.
                 User = serviceUser;

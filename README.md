@@ -450,7 +450,6 @@ services.agent-auth-hostd = {
   };
   vm.unit = "agent-vm.service";       # frozen on lockdown; null without a VM
 };
-users.users.jrt.linger = true;        # headless hosts: the user tier needs the user's manager
 ```
 
 - **TOTP.** `sudo agent-auth-hostd totp-enroll` on each host creates four

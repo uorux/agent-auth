@@ -909,33 +909,37 @@ async def test_the_risk_line_is_on_the_request_the_human_sees(db, stack, host):
 
 
 def test_linux_executor_user_tier_command(tmp_path, monkeypatch):
-    """The real executor, with a script for systemd-run: the user tier asks
-    the user's manager (--user, its bus in the environment), in a unit named
-    after the job, and relays output and exit status."""
+    """The real executor, with a script for systemd-run: the user tier is a
+    system unit with User=, the user's session in the job's environment, in a
+    unit named after the job; output and exit status are relayed."""
     from agent_auth.hostd import executor
     from agent_auth.hostd.config import HostConfig, TierConfig
 
     fake = tmp_path / "systemd-run"
-    fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\necho "bus=$DBUS_SESSION_BUS_ADDRESS"\nexit 3\n')
+    fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\nexit 3\n')
     fake.chmod(0o755)
     config = HostConfig(
         broker_url="http://127.0.0.1:1", broker_public_key="ed25519:" + "A" * 43, name="h",
         user="me", tiers={"user": TierConfig(enable=True), "root": TierConfig()},
         systemd_run=str(fake),
     )
-    monkeypatch.setattr(executor.os.path, "exists", lambda path: True)
-    me = executor.pwd.struct_passwd(("me", "x", os.getuid(), os.getgid(), "", str(tmp_path), "/bin/sh"))
-    monkeypatch.setattr(executor.pwd, "getpwnam", lambda name: me)  # the test user may not be in passwd
+    me = executor.pwd.struct_passwd(("me", "x", 4242, 4242, "", "/home/me", "/bin/sh"))
+    monkeypatch.setattr(executor.pwd, "getpwnam", lambda name: me)
     chunks: list[bytes] = []
 
     async def on_output(chunk: bytes) -> None:
         chunks.append(chunk)
 
-    rc = asyncio.run(
-        executor.LinuxExecutor(config).run("j1", "user", ["echo", "hi"], None, {"TZ": "UTC"}, 60, None, on_output)
-    )
+    ex = executor.LinuxExecutor(config)
+    rc = asyncio.run(ex.run("j1", "user", ["echo", "hi"], None, {"TZ": "UTC"}, 60, None, on_output))
     out = b"".join(chunks).decode().splitlines()
     assert rc == 3
-    assert out[0] == "--user" and "--unit=aa-job-j1" in out and "--setenv=TZ=UTC" in out
-    assert out[-4:-1] == ["--", "echo", "hi"]
-    assert out[-1] == f"bus=unix:path=/run/user/{os.getuid()}/bus"
+    assert out[:2] == ["-p", "User=me"] and "--user" not in out
+    assert "--unit=aa-job-j1" in out and "--working-directory=/home/me" in out
+    assert "--setenv=TZ=UTC" in out and "--setenv=XDG_RUNTIME_DIR=/run/user/4242" in out
+    assert out[-3:] == ["--", "echo", "hi"]
+
+    chunks.clear()
+    asyncio.run(ex.run("j2", "root", ["id"], None, {}, 60, None, on_output))
+    out = b"".join(chunks).decode().splitlines()
+    assert "User=me" not in out and "--working-directory=/" in out
