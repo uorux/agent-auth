@@ -110,7 +110,6 @@ class HostConfig:
     max_timeout_secs: int = 3600
     systemd_run: str = "systemd-run"
     systemctl: str = "systemctl"
-    setpriv: str = "setpriv"
     qrencode: str = "qrencode"
     desktop: DesktopConfig = field(default_factory=DesktopConfig)
 
@@ -147,7 +146,7 @@ class HostConfig:
                 kwargs[key] = Path(raw[key])
         for key in (
             "user", "auto_commands", "deny_commands", "templates", "env_allow", "vm_unit", "job_path",
-            "systemd_run", "systemctl", "setpriv", "qrencode",
+            "systemd_run", "systemctl", "qrencode",
         ):
             if raw.get(key) is not None:
                 kwargs[key] = raw[key]

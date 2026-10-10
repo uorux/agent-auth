@@ -245,7 +245,6 @@
             max_timeout = cfg.maxTimeout;
             systemd_run = "${config.systemd.package}/bin/systemd-run";
             systemctl = "${config.systemd.package}/bin/systemctl";
-            setpriv = "${pkgs.util-linux}/bin/setpriv";
             qrencode = "${pkgs.qrencode}/bin/qrencode";
             desktop = {
               inherit (cfg.desktop) enable;

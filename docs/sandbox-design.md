@@ -833,7 +833,7 @@ broker.
 **[built]** One root daemon, `agent-auth-hostd run`, started as root only
 when a tier or `vm.unit` is configured (otherwise it stays the unprivileged
 connect-only service). User jobs do not use `--machine=jrt@.host`: that
-transport can't carry the job's stdio. hostd drops to the user (`setpriv`)
+transport can't carry the job's stdio. hostd drops to the user (in the child, before exec)
 and runs `systemd-run --user` against `/run/user/<uid>/bus`. hostd-user is
 `agent-auth-hostd user`, a user service; it is used for desktop prompts
 (phase 9) and holds nothing.

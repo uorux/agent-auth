@@ -13,8 +13,8 @@ has it under its own unit name (aa-job-<id>).
   stdio as file descriptors. Needs the user's manager running (logged in, or
   lingering).
 
-NOT yet run on a real host: the user-tier path in particular depends on the
-service's sandboxing leaving /run/user reachable.
+The drop happens in the child, between fork and exec (not through setpriv,
+which failed under the service's capability set on the first real run).
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import os
 import pwd
-from typing import Awaitable, Callable, Protocol
+from typing import Any, Awaitable, Callable, Protocol
 
 from .config import HostConfig
 
@@ -66,22 +66,23 @@ class LinuxExecutor:
             raise RuntimeError("no user configured for the user tier")
         return pwd.getpwnam(self.config.user)
 
-    def _as_user(self) -> tuple[list[str], dict[str, str]]:
-        """argv prefix and environment for acting as the configured user
-        against their systemd manager."""
+    def _as_user(self) -> tuple[dict[str, Any], dict[str, str]]:
+        """How to act as the configured user against their systemd manager:
+        subprocess arguments (the child drops to the user before exec) and
+        the environment."""
         pw = self._user()
         runtime = f"/run/user/{pw.pw_uid}"
         if not os.path.exists(f"{runtime}/bus"):
             raise RuntimeError(
                 f"{pw.pw_name}'s systemd manager isn't running (not logged in, and lingering is off)"
             )
-        prefix = [
-            self.config.setpriv,
-            f"--reuid={pw.pw_uid}",
-            f"--regid={pw.pw_gid}",
-            "--init-groups",
-            "--",
-        ]
+        drop: dict[str, Any] = {}
+        if os.geteuid() != pw.pw_uid:
+            drop = {
+                "user": pw.pw_uid,
+                "group": pw.pw_gid,
+                "extra_groups": os.getgrouplist(pw.pw_name, pw.pw_gid),
+            }
         env = {
             "XDG_RUNTIME_DIR": runtime,
             "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime}/bus",
@@ -89,7 +90,7 @@ class LinuxExecutor:
             "USER": pw.pw_name,
             "LOGNAME": pw.pw_name,
         }
-        return prefix, env
+        return drop, env
 
     def _path(self, tier: str) -> str:
         if tier == "user" and self.config.user:
@@ -101,9 +102,10 @@ class LinuxExecutor:
         path = self._path(tier)
         command = [c.systemd_run]
         proc_env = {"PATH": path, "LANG": "C.UTF-8"}
+        drop: dict[str, Any] = {}
         if tier == "user":
-            prefix, user_env = self._as_user()
-            command = [*prefix, c.systemd_run, "--user"]
+            drop, user_env = self._as_user()
+            command.append("--user")
             proc_env.update(user_env)
             cwd = cwd or user_env["HOME"]
         command += [
@@ -127,6 +129,7 @@ class LinuxExecutor:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env=proc_env,
+            **drop,
         )
         if stdin is not None:
             assert proc.stdin is not None
@@ -145,13 +148,13 @@ class LinuxExecutor:
         return await proc.wait()
 
     async def _systemctl(self, tier: str, *args: str) -> tuple[int, str]:
-        command, env = [self.config.systemctl], None
+        command, env, drop = [self.config.systemctl], {}, {}
         if tier == "user":
-            prefix, env = self._as_user()
-            command = [*prefix, self.config.systemctl, "--user"]
+            drop, env = self._as_user()
+            command.append("--user")
         proc = await asyncio.create_subprocess_exec(
             *command, *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-            env={"PATH": self.config.job_path, **(env or {})},
+            env={"PATH": self.config.job_path, **env}, **drop,
         )
         out, _ = await proc.communicate()
         return proc.returncode or 0, out.decode(errors="replace").strip()

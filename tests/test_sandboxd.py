@@ -616,3 +616,18 @@ async def test_lockdown_freezes_agent_units_and_holds_work_until_it_is_lifted(db
     assert await wait_for(lambda: not daemon.locked)
     assert (daemon._unit(conv.id), False) in host.frozen
     assert await wait_for(lambda: any(e.get("turn") == "while locked" for e in read_log(fake_log)))
+
+
+def test_codex_socket_behind_its_symlink(tmp_path):
+    """codex leaves a symlink to /tmp/codex-daemon-<uid>/<hash> at the socket
+    path: /tmp is the unit's, so outside it the target is under its tmp dir."""
+    from agent_auth.sandboxd.runtimes.codex import socket_on_host
+
+    path = tmp_path / "codex-abc.sock"
+    assert socket_on_host(path, tmp_path) == path  # nothing there yet
+    path.symlink_to("/tmp/codex-daemon-40001/c376b6")
+    assert socket_on_host(path, tmp_path) == tmp_path / "codex-daemon-40001" / "c376b6"
+    for elsewhere in ("/run/sandboxd/ctl.sock", "/tmp/../run/x", "relative"):
+        path.unlink()
+        path.symlink_to(elsewhere)
+        assert socket_on_host(path, tmp_path) == path

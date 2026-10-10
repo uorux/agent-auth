@@ -1,6 +1,7 @@
 """Codex headless: `codex app-server` on a unix socket, driven as a client.
 
-Verified (2026-10-03, codex-cli 0.156.1; docs/sandbox-design.md §6.4):
+Verified (2026-10-03, codex-cli 0.156.1; the socket and the handshake again
+on 0.161.0, 2026-10-10; docs/sandbox-design.md §6.4):
 JSON-RPC over WebSocket on the socket; several clients can share one server
 (after thread/resume each gets the thread's events), which is how an
 operator's TUI (`codex --remote unix://… resume <thread>`) joins a live
@@ -13,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+from pathlib import Path
 from typing import Any
 
 import websockets
@@ -28,6 +31,19 @@ SOCKET_WAIT_SECS = 30
 
 def _toml_str(s: str) -> str:
     return json.dumps(s)  # a JSON string is a valid TOML basic string
+
+
+def socket_on_host(path: Path, tmp: Path) -> Path:
+    """Where the app-server's socket is, seen from outside its unit. codex
+    (0.161) leaves a symlink at the path it was given, to the real socket
+    under /tmp/codex-daemon-<uid>/: the unit's /tmp, which is `tmp` here."""
+    try:
+        target = Path(os.readlink(path))
+    except OSError:
+        return path
+    if target.is_absolute() and target.parts[1:2] == ("tmp",) and ".." not in target.parts:
+        return tmp.joinpath(*target.parts[2:])
+    return path
 
 
 class CodexRun:
@@ -49,10 +65,16 @@ class CodexRun:
 
     async def connect(self) -> None:
         for _ in range(SOCKET_WAIT_SECS * 10):
-            if self.socket_host_path.exists():
+            if (sock := socket_on_host(self.socket_host_path, self.ctx.tmp)).is_socket():
                 break
             await asyncio.sleep(0.1)
-        self._ws = await unix_connect(str(self.socket_host_path), uri="ws://localhost/")
+        else:
+            await self.host.stop_unit(self.ctx.unit)
+            raise RuntimeError(
+                f"codex app-server did not open its socket within {SOCKET_WAIT_SECS} s"
+                f" (in the VM: journalctl -u {self.ctx.unit})"
+            )
+        self._ws = await unix_connect(str(sock), uri="ws://localhost/")
         self._reader = asyncio.create_task(self._read())
         await self._call("initialize", {"clientInfo": {"name": "sandboxd", "version": "1"}})
         base = {
@@ -155,8 +177,6 @@ class CodexRuntime:
         self.model = model
 
     def socket_name(self, ctx: SpawnContext) -> str:
-        # Short on purpose: long unix socket paths make codex symlink them
-        # under /tmp/codex-daemon-<uid>, which the host side can't follow.
         return f"codex-{ctx.conversation_id}.sock"
 
     async def start(self, host: Host, ctx: SpawnContext) -> CodexRun:
