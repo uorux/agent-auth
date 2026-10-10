@@ -17,6 +17,7 @@ with it.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import logging
@@ -39,6 +40,8 @@ log = logging.getLogger(__name__)
 
 HOST_ROLE = "host"
 SANDBOX_ROLE = "sandbox"
+# A sandbox gets this long to lock itself before its host freezes the VM.
+SANDBOX_LOCKDOWN_TIMEOUT = 5.0
 LOCKDOWN_FLAG = "lockdown"
 CALL_TIMEOUT = 20
 # Output arrives in chunks; a job's buffer is dropped past this.
@@ -512,16 +515,32 @@ class HostExecService:
             affected = agents
         else:
             affected = [a for a in agents if a.sandbox_id in sandbox_ids]
-        # Hosts first: stop what is running before tidying up the records.
+        # Stop what is running before tidying up the records. Sandboxes
+        # first, briefly: once its host has frozen the VM a sandbox can't
+        # answer any more. Then the hosts, which don't depend on them.
         reports: dict[str, str] = {}
-        for daemon in targets:
-            payload = {"type": "lockdown", "kill_vm": kill_vm}
+        payload = {"type": "lockdown", "kill_vm": kill_vm}
+
+        async def tell(daemon: Daemon, timeout: float) -> tuple[Daemon, dict[str, Any] | None, str]:
             try:
-                data = await self.hub.call(daemon.role, daemon.name, payload, timeout=CALL_TIMEOUT)
-                reports[f"{daemon.role}:{daemon.name}"] = "locked" + (f" · vm {data['vm']}" if data.get("vm") else "")
+                return daemon, await self.hub.call(daemon.role, daemon.name, payload, timeout=timeout), ""
             except DaemonCallError as exc:
+                return daemon, None, str(exc)
+
+        sandboxes = [d for d in targets if d.role == SANDBOX_ROLE]
+        others = [d for d in targets if d.role != SANDBOX_ROLE]
+        answers = list(await asyncio.gather(*(tell(d, SANDBOX_LOCKDOWN_TIMEOUT) for d in sandboxes)))
+        answers += await asyncio.gather(*(tell(d, CALL_TIMEOUT) for d in others))
+        frozen = {d.name for d, data, _ in answers if d.role != SANDBOX_ROLE and data and data.get("vm")}
+        for daemon, data, error in answers:
+            key = f"{daemon.role}:{daemon.name}"
+            if data is not None:
+                reports[key] = "locked" + (f" · vm {data['vm']}" if data.get("vm") else "")
+            elif daemon.role == SANDBOX_ROLE and daemon.name in frozen:
                 # Told again when it connects (_on_connect).
-                reports[f"{daemon.role}:{daemon.name}"] = f"NOT reached ({exc}); it is locked when it reconnects"
+                reports[key] = "did not answer; its VM is stopped by its host, and it is locked when it reconnects"
+            else:
+                reports[key] = f"NOT reached ({error}); it is locked when it reconnects"
         revoked = 0
         agent_ids = [a.id for a in affected]
         async with self.db.session() as session:
