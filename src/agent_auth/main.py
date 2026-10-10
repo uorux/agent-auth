@@ -21,7 +21,7 @@ from .db import Database
 from .discord_bot.bot import AgentAuthBot, DiscordNotifier
 from .policy.engine import PolicyEngine
 from .policy.llm import LLMEvaluator
-from .policy.risk import RiskSummarizer
+from .policy.risk import RiskSummarizer, Watcher
 from .policy.schema import load_policy
 from .provisioners.a2a import A2AProvisioner
 from .provisioners.agents import AgentsProvisioner
@@ -146,6 +146,12 @@ async def serve(settings: Settings) -> None:
         registry.register(HostexecProvisioner(policy.platforms.hostexec, hostexec))
         if settings.openrouter_api_key and policy.platforms.hostexec.risk_summary:
             service.risk = RiskSummarizer(
+                settings.openrouter_api_key,
+                settings.openrouter_base_url,
+                policy.platforms.hostexec.risk_model or policy.llm.model,
+            )
+        if settings.openrouter_api_key and policy.platforms.hostexec.watch:
+            hostexec.watcher = Watcher(
                 settings.openrouter_api_key,
                 settings.openrouter_base_url,
                 policy.platforms.hostexec.risk_model or policy.llm.model,

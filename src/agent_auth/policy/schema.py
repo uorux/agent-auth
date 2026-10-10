@@ -184,6 +184,10 @@ class HostexecPlatformConfig(BaseModel):
     # from an OpenRouter model. Never approves or denies anything.
     risk_summary: bool = True
     risk_model: str | None = None  # default: llm.model
+    # The same model looks at each shell command, and each command no human
+    # saw individually (a rule, a window, the reviewer), as it runs, and has
+    # the operator pinged about one it finds alarming. It stops nothing.
+    watch: bool = True
     # "Approve all" windows: default and longest duration.
     window_default: str | int = "30m"
     window_max: str | int = "8h"

@@ -360,6 +360,17 @@ class DesktopService:
                 pass
         return shown
 
+    async def alert(self, title: str, text: str) -> None:
+        """Something the operator should see now, from the broker itself: on
+        every desk they are at, whatever the agent-eligibility rules say."""
+        for host in await self.present_hosts():
+            try:
+                await self.hub.call(
+                    HOST_ROLE, host, {"type": "notify", "title": title, "text": text, "urgency": "critical"}, timeout=10
+                )
+            except DaemonCallError:
+                pass
+
     def cancel(self, request_id: str) -> None:
         """The request was decided some other way: take the dialogs down."""
         offer = self._offers.get(request_id)
@@ -383,6 +394,14 @@ class FanoutNotifier:
     async def update_outcome(self, request: AccessRequest, grant) -> None:
         self.desktop.cancel(request.id)
         await self.primary.update_outcome(request, grant)
+
+    async def watch_alert(self, request: AccessRequest, job, text: str) -> None:
+        await self.primary.watch_alert(request, job, text)
+        import shlex
+
+        await self.desktop.alert(
+            f"agent-auth: look at {job.host}", f"{shlex.join(job.spec.get('argv') or [])[:200]} — {text}"
+        )
 
     def __getattr__(self, name: str):
         return getattr(self.primary, name)

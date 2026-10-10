@@ -66,6 +66,8 @@ class Notifier(Protocol):
     # means it could not be shown to a human, and it then does not run.
     async def job_finished(self, request: AccessRequest, job) -> None: ...
     async def shell_command(self, request: AccessRequest, job) -> bool: ...
+    # The watcher found a running command alarming (advisory; nothing stops).
+    async def watch_alert(self, request: AccessRequest, job, text: str) -> None: ...
     # An agent wants the operator's attention (core/attention.py); `desks`
     # are the hosts whose desktops already showed it.
     async def attention(self, agent: Agent, text: str, urgency: str, desks: list[str]) -> None: ...
@@ -98,6 +100,9 @@ class NullNotifier:
 
     async def shell_command(self, request: AccessRequest, job) -> bool:
         return True  # headless broker: the journal on the host is the record
+
+    async def watch_alert(self, request: AccessRequest, job, text: str) -> None:
+        log.warning("%s: job %s on %s", text, job.id, job.host)
 
     async def attention(self, agent: Agent, text: str, urgency: str, desks: list[str]) -> None:
         log.info("attention (%s) from %s: %s", urgency, agent.name, text)

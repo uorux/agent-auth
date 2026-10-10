@@ -37,6 +37,8 @@ platforms:
   #       argv: ["nixos-rebuild", "switch", "--flake", "{flake}"]
   #       params: {flake: "git\\+https://git\\.example/me/[a-z0-9-]+#[a-z0-9-]+"}
   #   risk_model: deepseek/deepseek-chat   # the advisory risk line (default: llm.model)
+  #   watch: true    # that model also watches shell commands, and commands no human saw
+  #                  # one by one, as they run, and pings you about an alarming one
   #   window_default: 30m                  # "Approve all…"
   #   window_max: 8h
 

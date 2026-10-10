@@ -199,6 +199,7 @@ class RecordingNotifier:
         self.mirrored: list[list[str]] = []
         self.mirror_ok = True
         self.attentions: list[tuple] = []
+        self.alerts: list[tuple] = []
 
     async def surface(self, request, agent):
         self.surfaced.append(request.id)
@@ -214,6 +215,9 @@ class RecordingNotifier:
 
     async def job_finished(self, request, job):
         self.finished.append(job)
+
+    async def watch_alert(self, request, job, text):
+        self.alerts.append((job.spec["argv"], text))
 
     async def attention(self, agent, text, urgency, desks):
         self.attentions.append((agent.name, text, urgency, desks))
@@ -957,3 +961,41 @@ def test_linux_executor_user_tier_command(tmp_path, monkeypatch):
     asyncio.run(ex.run("j2", "root", ["id"], None, {}, 60, None, on_output))
     out = b"".join(chunks).decode().splitlines()
     assert "User=me" not in out and "--working-directory=/" in out
+
+
+async def test_the_watcher_pings_about_an_alarming_command_and_stops_nothing(db, stack, host):
+    """A model looks at shell commands as they run. It only ever tells the
+    operator; the command has already been sent."""
+    seen = []
+
+    class FakeWatcher:
+        model = "test-model"
+
+        async def assess(self, agent, host_name, tier, purpose, earlier, argv):
+            seen.append((purpose, earlier, argv))
+            if argv[-1] == "boom":
+                raise RuntimeError("the model is down")
+            return ("alarming", "reads the ssh private key") if "id_ed25519" in argv[-1] else ("fine", "prints text")
+
+    stack["hostexec"].watcher = FakeWatcher()
+    agent, req = await ask(stack, db, shell_request())
+    await approve(stack, req.id, totp=host.code("user-direct"))
+    async with db.session() as session:
+        grant = (await session.execute(select(Grant).where(Grant.request_id == req.id))).scalar_one()
+    notifier = stack["notifier"]
+    for argv in (["echo", "hello"], ["echo", "/home/me/.ssh/id_ed25519"], ["echo", "boom"]):
+        job = await stack["hostexec"].shell_exec(grant.id, agent.id, {"argv": argv})
+        assert (await stack["hostexec"].get_job(job.id, agent.id, 10)).exit_code == 0  # all three ran
+    assert await wait_for(lambda: len(seen) == 3)
+    await asyncio.sleep(0.2)
+    assert notifier.alerts == [(["echo", "/home/me/.ssh/id_ed25519"], "watch (test-model, advisory): reads the ssh private key")]
+    # It is told what the shell is for and what came before.
+    assert seen[1][0] == "debug the failing unit" and seen[1][1] == [["echo", "hello"]]
+
+    # A command a human approved one by one is not watched; one a window let through is.
+    seen.clear()
+    await stack["hostexec"].arm(HOST, "user", "10m", host.code("user-arm"))
+    _, req = await ask(stack, db, run_request(["echo", "seen by a human"]), name="builder")
+    await approve(stack, req.id)
+    await asyncio.sleep(0.3)
+    assert seen == []

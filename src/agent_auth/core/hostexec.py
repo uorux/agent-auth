@@ -34,7 +34,7 @@ from ..models import AccessRequest, Agent, BrokerFlag, Daemon, Grant, HostJob, R
 from ..provisioners.base import RequestSpec, SpecValidationError
 from .daemons import DaemonCallError, DaemonHub, LiveConnection
 from .events import KeyedEvents
-from .states import GrantStatus, Platform, RuleAction
+from .states import DecisionSource, GrantStatus, Platform, RuleAction
 
 log = logging.getLogger(__name__)
 
@@ -110,6 +110,10 @@ class HostExecService:
         self.events = events
         self.service = None  # RequestService, via bind()
         self.a2a = None
+        # policy/risk.Watcher: looks at shell commands, and commands no human
+        # saw individually, as they run. None = nobody is watching.
+        self.watcher = None
+        self._watch_tasks: set[asyncio.Task] = set()
         self._buffers: dict[tuple[str, str], list[bytes]] = {}
         hub.handle("job.output", self._on_output)
         hub.handle("job.done", self._on_done)
@@ -274,7 +278,49 @@ class HostExecService:
             await self._set_status(request.id, "refused", error=str(exc))
             raise
         await self._set_status(request.id, "running", via=data.get("via"))
+        if request.decision_source != DecisionSource.HUMAN or self.evidence(request)["window"]:
+            # Nobody looked at this one command: a rule, a window or the
+            # reviewer let it through.
+            async with self.db.session() as session:
+                job = await session.get(HostJob, request.id)
+            self._watch(request, job)
         return {"job_id": request.id, "host": host}
+
+    def _watch(self, request: AccessRequest, job: HostJob) -> None:
+        """Have the watcher look at a command that is now running. Never in
+        its way: a task of its own, and only ever a message to the operator."""
+        if self.watcher is None or job is None:
+            return
+        task = asyncio.create_task(self._watched(request, job))
+        self._watch_tasks.add(task)
+        task.add_done_callback(self._watch_tasks.discard)
+
+    async def _watched(self, request: AccessRequest, job: HostJob) -> None:
+        try:
+            async with self.db.session() as session:
+                agent = await session.get(Agent, job.agent_id)
+                earlier = []
+                if job.shell_id:
+                    rows = (
+                        await session.execute(
+                            select(HostJob.spec)
+                            .where(HostJob.shell_id == job.shell_id, HostJob.id != job.id)
+                            .order_by(HostJob.created_at)
+                        )
+                    ).scalars().all()
+                    earlier = [list((spec or {}).get("argv") or []) for spec in rows]
+            verdict = await self.watcher.assess(
+                agent.name if agent else "?", job.host, job.tier, request.justification, earlier,
+                list(job.spec.get("argv") or []),
+            )
+            if verdict is None or verdict[0] != "alarming":
+                return
+            log.warning("watch: %s on %s (%s): %s", job.id, job.host, job.tier, verdict[1])
+            await self.service.notifier.watch_alert(
+                request, job, f"watch ({self.watcher.model}, advisory): {verdict[1]}"
+            )
+        except Exception:
+            log.exception("watching job %s failed", job.id)
 
     async def _set_status(self, job_id: str, status: str, **fields: Any) -> None:
         async with self.db.session() as session:
@@ -422,6 +468,7 @@ class HostExecService:
             await self.service.notifier.job_finished(request, refused)
             raise
         await self._set_status(job.id, "running")
+        self._watch(request, job)
         return job
 
     async def close_shell(self, grant: Grant) -> None:

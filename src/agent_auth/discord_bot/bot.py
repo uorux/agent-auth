@@ -138,6 +138,29 @@ class DiscordNotifier:
         except Exception:
             log.exception("failed to update outcome for request %s", request.id)
 
+    async def watch_alert(self, request: AccessRequest, job, text: str) -> None:
+        """The watcher found a running command alarming: a ping, in the
+        shell's thread if it has one. The model's text is escaped."""
+        try:
+            import shlex
+
+            owner = self.settings.discord_owner_id
+            where = await self._shell_thread(request, create=False) if job.shell_id else None
+            if where is None:
+                where = self.bot.get_channel(
+                    self.settings.discord_channel_id
+                ) or await self.bot.fetch_channel(self.settings.discord_channel_id)
+            command = hx_views._code(shlex.join(job.spec.get("argv") or []))
+            said = discord.utils.escape_mentions(discord.utils.escape_markdown(text))
+            await where.send(
+                f"{f'<@{owner}> ' if owner else ''}🚨 **Look at this** — `{job.host}` ({job.tier}), "
+                f"request `{request.id[:8]}`: {command}\n> {said}\nNothing was stopped."[:2000],
+                allowed_mentions=discord.AllowedMentions(users=[discord.Object(owner)] if owner else False,
+                                                         everyone=False, roles=False),
+            )
+        except Exception:
+            log.exception("could not post a watch alert")
+
     async def attention(self, agent: Agent, text: str, urgency: str, desks: list[str]) -> None:
         """An agent asks for the operator's attention. A ping when it is
         urgent or no desk showed it; the text is the agent's, escaped."""

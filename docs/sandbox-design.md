@@ -1028,6 +1028,15 @@ default, e.g. the `deepseek-v4-flash` judge already in policy) for one line
 plus `low|medium|high` per run/tpl/shell request. It is advisory only and
 never approves anything.
 
+**[built] Watching.** The same model also looks at commands as they run:
+every shell command (with the shell's stated purpose and its earlier
+commands), and every `run` no human saw individually (a rule, a window, the
+reviewer). One it finds alarming gets the operator pinged on Discord (in the
+shell's thread) and notified at their desks. It stops nothing and is not in
+the command's path; if the model can't be asked, nothing happens. It reads
+agent-written text, so it can be talked out of an alarm: a convenience, not a
+control.
+
 ### 8.9 Execution details
 
 - Jobs run under `systemd-run --unit=aa-job-<id> --collect --pipe --wait -p
