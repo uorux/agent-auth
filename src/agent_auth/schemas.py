@@ -230,6 +230,19 @@ class AgentAttributesBody(BaseModel):
     host: str | None = Field(default=None, max_length=64, pattern=ATTR_OR_EMPTY)
 
 
+class AgentRenameBody(BaseModel):
+    name: str = Field(min_length=1, max_length=128, pattern=r"^[a-zA-Z0-9._-]+$")
+
+
+class AgentRenamed(BaseModel):
+    agent: "AgentOut"
+    previous_name: str
+    # Saved rules and active a2a grants that named the agent and now carry
+    # the new name.
+    rules: int
+    grants: int
+
+
 class SetKindBody(BaseModel):
     kind: str = Field(pattern=r"^(service|ephemeral)$")
 

@@ -401,6 +401,18 @@ def agent_set(
     _run(lambda: _client().admin_set_attributes(agent, **fields))
 
 
+@admin.command("agent-rename")
+def agent_rename(
+    agent: str = typer.Argument(..., help="Agent name or id"),
+    name: str = typer.Argument(..., help="The new name"),
+):
+    """Rename an agent. Its key, requests and grants are unaffected; saved
+    rules written for exactly this agent and active a2a grants to it are
+    carried over (the counts are reported). Rules that match it by a glob and
+    the policy file are not touched. Agents minted in a VM cannot be renamed."""
+    _run(lambda: _client().admin_rename_agent(agent, name))
+
+
 @admin.command("rotate-lldap-password")
 def rotate_lldap_password(agent_id: str):
     """Rotate a broker-managed LLDAP account's password (delivered to the agent

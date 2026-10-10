@@ -175,3 +175,69 @@ def test_a_pattern_reads_back_the_way_it_was_written():
     assert ", ".join(pattern_text(p) for p in policy.desktop.agents) == (
         "{placement: sandbox}, {runtime: claude|codex}, hermes-*"
     )
+
+
+async def test_a_rename_carries_what_named_the_agent(api, db):
+    from datetime import timedelta
+
+    from sqlalchemy import select
+
+    from agent_auth.models import Grant, Rule, utcnow
+
+    made = (await api.post("/admin/agents", headers=ADMIN, json={"name": "claude-larder-galxy"})).json()
+    await api.post("/admin/agents", headers=ADMIN, json={"name": "claude-other"})
+    caller, _ = await make_agent(db, "caller")
+    async with db.session() as session:
+        session.add_all([
+            Rule(action="auto_approve", platform="github", agent_pattern="claude-larder-galxy"),
+            Rule(action="auto_approve", platform="github", agent_pattern="claude-larder-*"),
+            Rule(action="auto_approve", platform="a2a", agent_pattern="caller", resource_pattern="claude-larder-galxy"),
+            Rule(action="auto_approve", platform="github", agent_pattern="caller", delegator_pattern="claude-larder-galxy"),
+        ])
+        for status in ("active", "revoked"):
+            req = AccessRequest(
+                agent_id=caller.id, platform="a2a", capability="talk", resource="claude-larder-galxy",
+                justification="talk", requested_duration_secs=3600,
+            )
+            session.add(req)
+            await session.flush()
+            session.add(Grant(
+                request_id=req.id, agent_id=caller.id, platform="a2a", capability="talk",
+                resource="claude-larder-galxy", expires_at=utcnow() + timedelta(hours=1), status=status,
+            ))
+
+    path = "/admin/agents/claude-larder-galxy/rename"
+    assert (await api.post(path, headers=auth(made["api_key"]), json={"name": "x"})).status_code == 401
+    assert (await api.post(path, headers=ADMIN, json={"name": "claude-other"})).status_code == 409
+    assert (await api.post(path, headers=ADMIN, json={"name": "not a name"})).status_code == 422
+    assert (await api.post("/admin/agents/nobody/rename", headers=ADMIN, json={"name": "x"})).status_code == 404
+
+    done = (await api.post(path, headers=ADMIN, json={"name": "claude-larder-galaxy"})).json()
+    assert done["agent"]["name"] == "claude-larder-galaxy" and done["agent"]["id"] == made["id"]
+    assert (done["previous_name"], done["rules"], done["grants"]) == ("claude-larder-galxy", 3, 1)
+
+    # The same key is the same agent under its new name.
+    assert (await api.get("/v1/me", headers=auth(made["api_key"]))).json()["name"] == "claude-larder-galaxy"
+    async with db.session() as session:
+        rules = (await session.execute(select(Rule))).scalars().all()
+        assert sorted(r.agent_pattern for r in rules) == ["caller", "caller", "claude-larder-*", "claude-larder-galaxy"]
+        assert {r.resource_pattern for r in rules if r.platform == Platform.A2A} == {"claude-larder-galaxy"}
+        assert [r.delegator_pattern for r in rules if r.delegator_pattern] == ["claude-larder-galaxy"]
+        grants = (await session.execute(select(Grant))).scalars().all()
+        # A grant that is over keeps the name it was made under.
+        assert {(g.status.value, g.resource) for g in grants} == {
+            ("active", "claude-larder-galaxy"), ("revoked", "claude-larder-galxy"),
+        }
+
+
+async def test_an_agent_minted_in_a_vm_keeps_its_name(api, db):
+    from agent_auth.models import Daemon
+
+    async with db.session() as session:
+        sandbox = Daemon(role="sandbox", name="excelsior", public_key="ed25519:" + "A" * 43)
+        session.add(sandbox)
+        await session.flush()
+        sandbox_id = sandbox.id
+    minted, _ = await make_agent(db, "claude-x-excelsior-sandbox", sandbox_id=sandbox_id)
+    resp = await api.post(f"/admin/agents/{minted.id}/rename", headers=ADMIN, json={"name": "other"})
+    assert resp.status_code == 409

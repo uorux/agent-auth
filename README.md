@@ -302,6 +302,12 @@ An agent cannot change them. Agents that existed before the fields did got
 theirs from their names (`<runtime>-<project>-<host>`), which is a guess:
 check the listing once.
 
+A name can be changed too: `agent-auth admin agent-rename <agent> <new-name>`.
+The agent's key, requests and grants are unaffected. Saved rules written for
+exactly that agent, and active a2a grants to it, are carried over to the new
+name; rules that reach it by a glob and the policy file are not touched.
+Agents minted in a VM keep the name the broker gave them.
+
 LLM review calls OpenRouter with a structured verdict schema; the model is set
 per-rule (`constraints.llm_model`) or globally (`llm.model`). Evaluator errors
 always escalate to a human — never auto-approve. **Sensitive scopes always reach a

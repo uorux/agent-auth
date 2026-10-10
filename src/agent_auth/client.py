@@ -217,6 +217,9 @@ class BrokerClient:
     def admin_set_attributes(self, agent: str, **fields: str):
         return self._request("PATCH", f"/admin/agents/{agent}/attributes", admin=True, json=fields)
 
+    def admin_rename_agent(self, agent: str, name: str):
+        return self._request("POST", f"/admin/agents/{agent}/rename", admin=True, json={"name": name})
+
     def admin_create_agent(
         self,
         name: str,

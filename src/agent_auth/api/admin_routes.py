@@ -5,7 +5,7 @@ import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from .. import authority as authority_mod
 from ..core.daemons import DaemonsDisabled
@@ -18,6 +18,8 @@ from ..schemas import (
     AgentAttributesBody,
     AgentCreate,
     AgentOut,
+    AgentRenameBody,
+    AgentRenamed,
     RequestOut,
     RuleOut,
     SetKindBody,
@@ -104,6 +106,53 @@ async def set_attributes(agent_id: str, body: AgentAttributesBody, request: Requ
         for field in body.model_fields_set:
             setattr(agent, field, getattr(body, field) or None)
         return _agent_out(agent)
+
+
+@router.post("/agents/{agent_id}/rename", response_model=AgentRenamed)
+async def rename_agent(agent_id: str, body: AgentRenameBody, request: Request):
+    """Give an agent another name. Its key, requests and grants follow its id;
+    what holds the name as text is carried over here: saved rules written for
+    exactly this agent, and active a2a grants to it. Rules that reach it by a
+    glob, and the policy file, are left as they are. Not for agents minted in
+    a VM: the broker finds those by the name it gave them."""
+    async with request.app.state.db.session() as session:
+        agent = await session.get(Agent, agent_id)
+        if agent is None:
+            agent = (
+                await session.execute(select(Agent).where(Agent.name == agent_id))
+            ).scalar_one_or_none()
+        if agent is None:
+            raise HTTPException(404, "unknown agent")
+        if agent.sandbox_id is not None:
+            raise HTTPException(409, f"{agent.name} was minted in an agent VM; its name is the broker's")
+        old, new = agent.name, body.name
+        if new == old:
+            return AgentRenamed(agent=_agent_out(agent), previous_name=old, rules=0, grants=0)
+        taken = (await session.execute(select(Agent.id).where(Agent.name == new))).scalar_one_or_none()
+        if taken is not None:
+            raise HTTPException(409, f"agent {new!r} already exists")
+        agent.name = new
+        rules = 0
+        for column in (Rule.agent_pattern, Rule.delegator_pattern):
+            done = await session.execute(update(Rule).where(column == old).values({column.key: new}))
+            rules += done.rowcount
+        done = await session.execute(
+            update(Rule)
+            .where(Rule.platform == Platform.A2A, Rule.resource_pattern == old)
+            .values(resource_pattern=new)
+        )
+        rules += done.rowcount
+        done = await session.execute(
+            update(Grant)
+            .where(
+                Grant.platform == Platform.A2A,
+                Grant.resource == old,
+                Grant.status == GrantStatus.ACTIVE,
+            )
+            .values(resource=new)
+        )
+        log.info("agent %s renamed to %s (%d rules, %d grants)", old, new, rules, done.rowcount)
+        return AgentRenamed(agent=_agent_out(agent), previous_name=old, rules=rules, grants=done.rowcount)
 
 
 @router.get("/agents", response_model=list[AgentOut])
