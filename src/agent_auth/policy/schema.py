@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ..core.states import Platform
 from ..schemas import parse_duration
+from .agents import AgentMatch, AgentPattern, Project, check_resource, valid_attr
 
 
 class PolicyAction(str, enum.Enum):
@@ -19,16 +20,22 @@ class PolicyAction(str, enum.Enum):
 
 
 class Match(BaseModel):
-    agent: str = "*"
+    # Which agents: fields ({runtime: claude, placement: sandbox}), or a glob
+    # on the name (the older form).
+    agent: AgentPattern = "*"
     platform: Platform | None = None
     # Glob. "*" (the default) never clears a github "create": that takes a
     # rule naming it exactly (see authority.needs_explicit_rule).
     capability: str = "*"
+    # Glob. May use the requesting agent's own fields: {agent.project},
+    # {agent.host}, {agent.runtime}, and {agent.repos} (each repo of its
+    # project, from `projects:`). An agent without the field is not matched.
     resource: str = "*"
-    # Glob on the delegator's name for on-behalf-of requests. Omitted = the
+    # Which delegator, for on-behalf-of requests: fields or a name glob, as
+    # for `agent`. Omitted = the
     # rule was written without delegation in mind: deny/surface still apply to
     # delegated requests (fail-safe), approve/llm never do.
-    delegator: str | None = None
+    delegator: AgentPattern | None = None
 
 
 class Constraints(BaseModel):
@@ -251,7 +258,7 @@ class DesktopConfig(BaseModel):
     enabled: bool = False
     # Which requests may be asked on a desktop: globs on the requesting
     # agent's name, and platforms (empty = every platform).
-    agents: list[str] = Field(default_factory=list)
+    agents: list[AgentPattern] = Field(default_factory=list)
     platforms: list[Platform] = Field(default_factory=list)
     # Sensitive requests (write access to another project, secrets
     # permissions, …) stay on Discord unless this is set. A command on a host
@@ -288,7 +295,30 @@ class PolicyFile(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     platforms: PlatformsConfig = Field(default_factory=PlatformsConfig)
     desktop: DesktopConfig = Field(default_factory=DesktopConfig)
+    # The projects agents work on. A rule may only name a project listed
+    # here, so a mistyped one is an error at load and not a rule that never
+    # matches.
+    projects: dict[str, Project] = Field(default_factory=dict)
     rules: list[PolicyRule] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _references(self):
+        for name in self.projects:
+            valid_attr(name)
+        patterns = [(f"rules[{i}]", r.match.agent) for i, r in enumerate(self.rules)]
+        patterns += [(f"rules[{i}] delegator", r.match.delegator) for i, r in enumerate(self.rules)]
+        patterns += [(f"desktop.agents[{i}]", p) for i, p in enumerate(self.desktop.agents)]
+        for where, pattern in patterns:
+            if isinstance(pattern, AgentMatch):
+                for project in pattern.project or []:
+                    if project not in self.projects:
+                        raise ValueError(f"{where}: project {project!r} is not listed under `projects`")
+        for i, rule in enumerate(self.rules):
+            try:
+                check_resource(rule.match.resource)
+            except ValueError as exc:
+                raise ValueError(f"rules[{i}]: {exc}") from None
+        return self
 
 
 def load_policy(path: str | Path) -> PolicyFile:

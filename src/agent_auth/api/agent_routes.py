@@ -6,6 +6,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from ..policy.agents import attributes
 from ..core.service import TransitionError
 from ..core.states import GrantStatus, RequestStatus, WAITING_STATUSES
 from ..models import AccessRequest, Agent, Grant
@@ -39,6 +40,8 @@ async def me(caller: Caller = Depends(get_caller)):
         "kind": agent.kind,
         "webhook_url": agent.webhook_url,
         "lldap_username": agent.lldap_username,
+        # What policy knows this agent as.
+        **attributes(agent),
     }
     if caller.session is not None:
         out["session"] = {"id": caller.session.id, "name": caller.session.name}

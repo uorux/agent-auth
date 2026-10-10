@@ -204,14 +204,30 @@ def validate_webhook_url(v: str | None) -> str | None:
     return v
 
 
+ATTR_PATTERN = r"^[a-z0-9][a-z0-9._-]*$"
+ATTR_OR_EMPTY = r"^([a-z0-9][a-z0-9._-]*)?$"
+
+
 class AgentCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128, pattern=r"^[a-zA-Z0-9._-]+$")
     description: str = Field(default="", max_length=2000)
     kind: str = Field(default="service", pattern=r"^(service|ephemeral)$")
     webhook_url: str | None = Field(default=None, max_length=512)
     lldap_username: str | None = Field(default=None, max_length=128)
+    # What the agent is (agent_auth.policy.agents); policy matches on these.
+    runtime: str | None = Field(default=None, max_length=16, pattern=ATTR_PATTERN)
+    project: str | None = Field(default=None, max_length=64, pattern=ATTR_PATTERN)
+    host: str | None = Field(default=None, max_length=64, pattern=ATTR_PATTERN)
 
     _valid_webhook = field_validator("webhook_url")(validate_webhook_url)
+
+
+class AgentAttributesBody(BaseModel):
+    """The fields to change; one left out stays, an empty string clears it."""
+
+    runtime: str | None = Field(default=None, max_length=16, pattern=ATTR_OR_EMPTY)
+    project: str | None = Field(default=None, max_length=64, pattern=ATTR_OR_EMPTY)
+    host: str | None = Field(default=None, max_length=64, pattern=ATTR_OR_EMPTY)
 
 
 class SetKindBody(BaseModel):
@@ -244,6 +260,8 @@ class AgentOut(BaseModel):
     sandbox: str | None = None
     runtime: str | None = None
     project: str | None = None
+    host: str | None = None
+    placement: str = "host"
     lease_expires_at: datetime | None = None
     api_key: str | None = None  # only set on create/rotate
     webhook_secret: str | None = None  # only set on create/rotate-webhook-secret

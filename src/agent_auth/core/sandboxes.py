@@ -214,6 +214,8 @@ class SandboxService:
                     api_key_hash=key_hash,
                     sandbox_id=daemon_id,
                     runtime=ORCHESTRATOR_RUNTIME,
+                    host=name,
+                    placement="sandbox",
                     last_seen_at=utcnow(),
                 )
                 session.add(agent)
@@ -227,6 +229,7 @@ class SandboxService:
                 )
                 return
             agent.sandbox_id = daemon_id
+            agent.host, agent.placement = name, "sandbox"
             agent.disabled = False
             await self._queue_key(session, agent)
         log.info("sandbox %s: orchestrator %s ready, key queued", name, orch_name)
@@ -267,6 +270,11 @@ class SandboxService:
             sandbox_id=daemon.id,
             runtime=runtime,
             project=project,
+            # Where it runs is the sandbox the request came through, whatever
+            # the parent asked for: a VM cannot mint an agent of another host,
+            # or one outside a VM.
+            host=daemon.name,
+            placement="sandbox",
             lease_expires_at=lease,
             last_seen_at=utcnow(),
         )

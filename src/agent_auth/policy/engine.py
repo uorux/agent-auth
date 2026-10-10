@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .. import authority as authority_mod
 from ..core.states import Platform, RuleAction
 from ..models import AccessRequest, Agent, Rule, utcnow
+from .agents import AgentPattern, Project, agent_matches, resources_for
 from .schema import PolicyAction, PolicyFile, PolicyRule
 
 
@@ -36,24 +37,28 @@ class PolicyDecision:
 
 
 def _matches(
-    agent_pattern: str,
+    agent_pattern: AgentPattern,
     platform: Platform | None,
     capability_pattern: str,
     resource_pattern: str,
-    agent_name: str,
+    agent: Agent,
     request: AccessRequest,
+    projects: dict[str, Project],
 ) -> bool:
     if platform is not None and platform != request.platform:
         return False
     return (
-        fnmatch(agent_name, agent_pattern)
+        agent_matches(agent_pattern, agent)
         and fnmatch(request.capability, capability_pattern)
-        and fnmatch(request.resource, resource_pattern)
+        and any(
+            fnmatch(request.resource, resource)
+            for resource in resources_for(resource_pattern, agent, projects)
+        )
     )
 
 
 def _delegator_matches(
-    pattern: str | None, delegator_name: str | None, grants_access: bool
+    pattern: AgentPattern | None, delegator: Agent | None, grants_access: bool
 ) -> bool:
     """Delegation axis of rule matching.
 
@@ -64,10 +69,14 @@ def _delegator_matches(
     thing that auto-approves or LLM-clears one.
     """
     if pattern is not None:
-        return delegator_name is not None and fnmatch(delegator_name, pattern)
-    if delegator_name is None:
+        return delegator is not None and agent_matches(pattern, delegator)
+    if delegator is None:
         return True
     return not grants_access
+
+
+# Stands in for a delegator whose agent no longer exists.
+_GONE = Agent(name="?", placement="host")
 
 
 class PolicyEngine:
@@ -83,22 +92,23 @@ class PolicyEngine:
     async def evaluate(
         self, session: AsyncSession, agent: Agent, request: AccessRequest
     ) -> PolicyDecision:
-        delegator_name = None
+        delegator = None
         if request.delegator_agent_id is not None:
-            delegator = await session.get(Agent, request.delegator_agent_id)
-            delegator_name = delegator.name if delegator else "?"
+            # A delegator that is gone matches no rule that names one, and
+            # still keeps rules written without delegation from approving.
+            delegator = await session.get(Agent, request.delegator_agent_id) or _GONE
 
-        db_decision = await self._match_db_rules(session, agent, request, delegator_name)
+        db_decision = await self._match_db_rules(session, agent, request, delegator)
         if db_decision is not None:
             return db_decision
 
         for rule in self.policy.rules:
             m = rule.match
             if _matches(
-                m.agent, m.platform, m.capability, m.resource, agent.name, request
+                m.agent, m.platform, m.capability, m.resource, agent, request, self.policy.projects
             ) and _delegator_matches(
                 m.delegator,
-                delegator_name,
+                delegator,
                 grants_access=rule.action in (PolicyAction.APPROVE, PolicyAction.LLM),
             ):
                 return self._from_yaml_rule(rule, explicit=m.capability == request.capability)
@@ -118,7 +128,7 @@ class PolicyEngine:
         session: AsyncSession,
         agent: Agent,
         request: AccessRequest,
-        delegator_name: str | None,
+        delegator: Agent | None,
     ) -> PolicyDecision | None:
         rows = await session.execute(
             select(Rule)
@@ -135,7 +145,7 @@ class PolicyEngine:
                 continue
             if not _delegator_matches(
                 rule.delegator_pattern,
-                delegator_name,
+                delegator,
                 grants_access=rule.action == RuleAction.AUTO_APPROVE,
             ):
                 continue

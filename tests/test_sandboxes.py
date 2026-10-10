@@ -247,6 +247,9 @@ async def test_mint_creates_a_child_whose_key_only_the_sandbox_gets(db, sandbox,
         cred = await stack["service"].registry.get(Platform.AGENTS).get_credential(session, grant)
     assert (child.parent_agent_id, child.sandbox_id) == (orch.id, orch.sandbox_id)
     assert (child.runtime, child.project, child.kind) == ("claude", "larder", "service")
+    # Where it runs is the sandbox it was minted through, not anything asked for.
+    assert (child.host, child.placement) == ("excelsior", "sandbox")
+    assert (orch.host, orch.placement) == ("excelsior", "sandbox")
     assert child.lease_expires_at - utcnow() > timedelta(days=29)
     # The orchestrator's credential names the agent; the key is not in it.
     assert cred.kind == "agent_identity" and cred.value == child.name

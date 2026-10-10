@@ -35,7 +35,6 @@ import time
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from fnmatch import fnmatch
 from typing import Any
 
 from sqlalchemy import select
@@ -43,6 +42,7 @@ from sqlalchemy import select
 from .. import authority as authority_mod
 from ..db import Database
 from ..models import AccessRequest, Agent, Daemon
+from ..policy.agents import agent_matches
 from ..policy.schema import DesktopConfig
 from ..schemas import format_duration, parse_duration
 from .daemons import DaemonCallError, DaemonHub, LiveConnection
@@ -153,7 +153,7 @@ class DesktopService:
         c, now = self.config, time.time()
         if not c.enabled:
             return "desktop prompts are off"
-        if not any(fnmatch(agent.name, glob) for glob in c.agents):
+        if not any(agent_matches(pattern, agent) for pattern in c.agents):
             return "agent not listed under desktop.agents"
         if c.platforms and request.platform not in c.platforms:
             return "platform not listed under desktop.platforms"
@@ -340,7 +340,7 @@ class DesktopService:
         c, now = self.config, time.time()
         if (
             not c.enabled
-            or not any(fnmatch(agent.name, glob) for glob in c.agents)
+            or not any(agent_matches(pattern, agent) for pattern in c.agents)
             or self.dnd_until > now
             or self._paused_until.get(agent.name, 0) > now
         ):

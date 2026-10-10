@@ -21,7 +21,7 @@ llm:
 #
 # desktop:
 #   enabled: true
-#   agents: ["claude-*", "codex-*", "*-sandbox"]
+#   agents: [{runtime: [claude, codex]}, {placement: sandbox}]   # or globs on names
 #   platforms: []            # empty = any platform
 #   sensitive: false         # secrets permissions, another project's files, … stay on Discord
 #   per_agent_per_hour: 6
@@ -220,14 +220,24 @@ rules:
   # (or add an explicit rule for them if that changes).
 
   # CLI agents (Claude Code / Codex): register one agent PER FOLDER with its
-  # key in that folder's env, named <agent-type>-<folder>-<host> to match the
-  # rest of the fleet (hermes-homelab-recusant, claude-nixos-dots-uorux, ...).
-  # The key is the permission boundary, so folder-level rules are just agent
-  # name matches — e.g. only the homelab folder's claude may touch kubernetes:
+  # key in that folder's env, and say what it is:
+  #   agent-auth admin agent-create claude-homelab-excelsior --kind ephemeral \
+  #     --runtime claude --project homelab --host excelsior
+  # The key is the permission boundary and the fields are what rules match
+  # (README: "What an agent is"); the name is a label. E.g. only the homelab
+  # project's agents may look at kubernetes, and a claude agent gets its own
+  # project's repos reviewed by the LLM rather than by you:
   #
-  #   - match: {agent: "claude-homelab-*", platform: kubernetes, capability: view}
+  #   - match: {agent: {project: homelab}, platform: kubernetes, capability: view}
   #     action: approve
   #     constraints: {max_duration: 8h}
+  #   - match: {agent: {runtime: claude}, platform: github, resource: "{agent.repos}"}
+  #     action: llm
+  #
+  # Projects named in a rule must be listed (top level of this file):
+  #
+  #   projects:
+  #     homelab: {repos: [uorux/homelab]}
   #
   # a2a grants are agent-level (all sessions of a folder share them); the grant
   # only lets them OPEN threads to service agents — the responder can still

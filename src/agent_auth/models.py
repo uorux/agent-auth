@@ -133,17 +133,21 @@ class Agent(Base, TimestampMixin):
     # Sandbox agents (minted in an agent VM, docs/sandbox-design.md §4): the
     # agent whose `agents mint` request created this one, the sandbox daemon
     # that holds its key and dispatches its a2a, and the structured parts of
-    # its name (<runtime>-<project>-<host>-sandbox). The name is never parsed
-    # for security decisions; these columns are. All null for hand-registered
-    # agents.
+    # its a2a. All null for hand-registered agents.
     parent_agent_id: Mapped[str | None] = mapped_column(
         ForeignKey("agents.id"), nullable=True, index=True
     )
     sandbox_id: Mapped[str | None] = mapped_column(
         ForeignKey("daemons.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # What the agent is (agent_auth.policy.agents): policy matches on these,
+    # never on the name. Set by the operator at registration, or by the
+    # broker for an agent minted in a VM; an agent cannot change its own.
     runtime: Mapped[str | None] = mapped_column(String(16), nullable=True)
     project: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    host: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # "sandbox" = runs in an agent VM; "host" = on the machine itself.
+    placement: Mapped[str] = mapped_column(String(16), default="host", server_default="host")
     # A minted agent's identity lease: past it, the agent is disabled (with
     # everything it minted). Renewed by minting it again. Null = no lease.
     lease_expires_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)

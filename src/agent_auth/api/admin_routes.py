@@ -15,6 +15,7 @@ from ..crypto import generate_api_key
 from ..core.states import GrantStatus, Platform
 from ..models import AccessRequest, Agent, Grant, Rule
 from ..schemas import (
+    AgentAttributesBody,
     AgentCreate,
     AgentOut,
     RequestOut,
@@ -47,6 +48,8 @@ def _agent_out(
         sandbox=agent.sandbox_id,
         runtime=agent.runtime,
         project=agent.project,
+        host=agent.host,
+        placement=agent.placement,
         lease_expires_at=agent.lease_expires_at,
         api_key=api_key,
         webhook_secret=webhook_secret,
@@ -73,10 +76,34 @@ async def create_agent(body: AgentCreate, request: Request):
             webhook_url=body.webhook_url,
             webhook_secret=webhook_secret,
             lldap_username=body.lldap_username,
+            runtime=body.runtime,
+            project=body.project,
+            host=body.host,
+            # Only the broker places an agent in a VM, when it mints one.
+            placement="host",
         )
         session.add(agent)
         await session.flush()
         return _agent_out(agent, api_key=full_key, webhook_secret=webhook_secret)
+
+
+@router.patch("/agents/{agent_id}/attributes", response_model=AgentOut)
+async def set_attributes(agent_id: str, body: AgentAttributesBody, request: Request):
+    """Correct what an agent is. Not for agents minted in a VM: the broker
+    recorded those from the sandbox they came through."""
+    async with request.app.state.db.session() as session:
+        agent = await session.get(Agent, agent_id)
+        if agent is None:
+            agent = (
+                await session.execute(select(Agent).where(Agent.name == agent_id))
+            ).scalar_one_or_none()
+        if agent is None:
+            raise HTTPException(404, "unknown agent")
+        if agent.sandbox_id is not None:
+            raise HTTPException(409, f"{agent.name} was minted in an agent VM; its fields are the broker's")
+        for field in body.model_fields_set:
+            setattr(agent, field, getattr(body, field) or None)
+        return _agent_out(agent)
 
 
 @router.get("/agents", response_model=list[AgentOut])

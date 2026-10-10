@@ -257,6 +257,51 @@ ceiling, or namespace/role allowlist. Auto-approve rules are **scope-pinned**: a
 rule created for `contents:write` won't rubber-stamp a later `secrets:write` on the
 same repo. Manage saved rules with `agent-auth admin rules` / `rule-delete`.
 
+### What an agent is
+
+Rules say which agents they are about by what the broker has on record for
+each one, not by how it is named:
+
+| Field | Meaning | Set by |
+|---|---|---|
+| `runtime` | what runs it: `claude`, `codex`, `hermes`, `orchestrator` | the operator at registration; the broker for an agent minted in a VM |
+| `project` | what it works on | same |
+| `host` | the machine it runs on | same; a minted agent gets its sandbox's host |
+| `placement` | `host`, or `sandbox` for an agent in a VM | only the broker, when it mints one |
+| `kind` | `service` or `ephemeral` | the operator |
+
+```yaml
+projects:
+  agent-auth: {repos: [uorux/agent-auth]}
+  homelab: {repos: [uorux/homelab]}
+
+rules:
+  # an agent in a VM may use the browser
+  - match: {agent: {placement: sandbox}, platform: mcp, capability: use, resource: playwright}
+    action: approve
+  # a claude agent on its own project's repos
+  - match: {agent: {runtime: claude}, platform: github, resource: "{agent.repos}"}
+    action: llm
+```
+
+Every field given must hold; a field takes one value or a list, compared
+exactly. A `resource` may use the agent's own `{agent.project}`,
+`{agent.host}`, `{agent.runtime}` and `{agent.repos}` (each repo of its
+project). An agent without the field is not matched: "your project's repo"
+says nothing to an agent with no project.
+
+A mistake is an error when the policy loads: an unknown field, a project
+not listed under `projects`, a placeholder that doesn't exist. `agent` may
+still be a glob on the name (`agent: "deploy-*"`), for the agents no field
+tells apart; saved rules from Discord stay pinned to the one agent's name.
+
+Set the fields with `agent-auth admin agent-create … --runtime --project
+--host`, correct them with `agent-auth admin agent-set <agent> …`, and see
+them with `agent-auth admin agents` (the agent sees its own in `whoami`).
+An agent cannot change them. Agents that existed before the fields did got
+theirs from their names (`<runtime>-<project>-<host>`), which is a guess:
+check the listing once.
+
 LLM review calls OpenRouter with a structured verdict schema; the model is set
 per-rule (`constraints.llm_model`) or globally (`llm.model`). Evaluator errors
 always escalate to a human — never auto-approve. **Sensitive scopes always reach a

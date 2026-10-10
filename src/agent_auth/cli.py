@@ -358,8 +358,15 @@ def agent_create(
         help="Pre-existing LLDAP account to use as-is. Omit to let the broker "
         "create a managed account (svc-<name>) at the agent's first homelab grant.",
     ),
+    runtime: str = typer.Option(None, "--runtime", help="What runs it: claude, codex, hermes, …"),
+    project: str = typer.Option(None, "--project", help="What it works on (a project of the policy)"),
+    host: str = typer.Option(None, "--host", help="The machine it runs on"),
 ):
-    """Register an agent; prints its API key (and webhook secret) ONCE."""
+    """Register an agent; prints its API key (and webhook secret) ONCE.
+
+    --runtime, --project and --host are what policy rules match on (the name
+    is a label). An agent registered without them is matched only by rules
+    about every agent, or about its name."""
     if kind == "service" and not webhook_url:
         # The common misregistration: a CLI agent left on the default kind gets
         # advertised as a peer and other agents open threads it never reads.
@@ -372,9 +379,26 @@ def agent_create(
         )
     _run(
         lambda: _client().admin_create_agent(
-            name, description, webhook_url, lldap_username, kind=kind
+            name, description, webhook_url, lldap_username, kind=kind,
+            runtime=runtime, project=project, host=host,
         )
     )
+
+
+@admin.command("agent-set")
+def agent_set(
+    agent: str = typer.Argument(..., help="Agent name or id"),
+    runtime: str = typer.Option(None, "--runtime"),
+    project: str = typer.Option(None, "--project"),
+    host: str = typer.Option(None, "--host"),
+):
+    """Correct what an agent is (the fields policy matches on). An option left
+    out keeps its value; "" clears it. Agents minted in a VM are the broker's
+    own record and cannot be changed here."""
+    fields = {k: v for k, v in (("runtime", runtime), ("project", project), ("host", host)) if v is not None}
+    if not fields:
+        raise typer.BadParameter("nothing to set: pass --runtime, --project or --host")
+    _run(lambda: _client().admin_set_attributes(agent, **fields))
 
 
 @admin.command("rotate-lldap-password")

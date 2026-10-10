@@ -214,6 +214,9 @@ class BrokerClient:
         )
 
     # admin operations
+    def admin_set_attributes(self, agent: str, **fields: str):
+        return self._request("PATCH", f"/admin/agents/{agent}/attributes", admin=True, json=fields)
+
     def admin_create_agent(
         self,
         name: str,
@@ -221,6 +224,9 @@ class BrokerClient:
         webhook_url: str | None = None,
         lldap_username: str | None = None,
         kind: str = "service",
+        runtime: str | None = None,
+        project: str | None = None,
+        host: str | None = None,
     ):
         return self._request(
             "POST",
@@ -230,6 +236,9 @@ class BrokerClient:
                 "name": name,
                 "description": description,
                 "kind": kind,
+                "runtime": runtime,
+                "project": project,
+                "host": host,
                 "webhook_url": webhook_url,
                 "lldap_username": lldap_username,
             },

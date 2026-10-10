@@ -4,6 +4,7 @@ import json
 
 import discord
 
+from ..policy.agents import describe
 from ..core.states import RequestStatus
 from ..models import AccessRequest, Agent, A2AThread, Grant, Rule
 from ..schemas import format_duration
@@ -32,7 +33,8 @@ def build_request_embed(
         description=_trim(request.justification),
         color=COLOR_PENDING,
     )
-    embed.add_field(name="Agent", value=agent.name, inline=True)
+    what = describe(agent)
+    embed.add_field(name="Agent", value=f"{agent.name}\n{what}" if what else agent.name, inline=True)
     if delegator is not None:
         topic = delegation_thread.topic if delegation_thread else None
         embed.add_field(
