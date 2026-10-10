@@ -14,6 +14,7 @@ satisfies a host's own TOTP/arming check.
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -41,6 +42,11 @@ STDOUT_ANSWERS = {
     "deny": "deny",
 }
 ZENITY_TIMEOUT = 5
+
+
+def _fill(template: list[str], fields: dict[str, str]) -> list[str]:
+    """Placeholders are whole arguments: nothing here is parsed by a shell."""
+    return [fields.get(arg[1:-1], arg) if arg.startswith("{") and arg.endswith("}") else arg for arg in template]
 
 
 def parse_answer(returncode: int, stdout: str) -> str:
@@ -118,6 +124,7 @@ class UserHelper:
         self._dialog_lock = asyncio.Lock()
         self._current: tuple[str, asyncio.subprocess.Process] | None = None
         self._cancelled: set[str] = set()
+        self._background: set[asyncio.Task] = set()
 
     async def presence(self) -> dict[str, Any]:
         idle, locked = (None, None)
@@ -142,14 +149,20 @@ class UserHelper:
             if prompt_id in self._cancelled:
                 self._cancelled.discard(prompt_id)
                 return "timeout"
+            who, what, detail = (str(prompt.get(k) or "") for k in ("who", "what", "detail"))
             fields = {
-                "title": str(prompt.get("title", "agent-auth")),
-                "text": str(prompt.get("text", "")),
+                # {who} {what} {detail} are one line each (sbx-prompt's
+                # arguments); {title} {text} are the same, laid out.
+                "who": who,
+                "what": what,
+                "detail": detail,
+                "title": f"agent-auth: {who}"[:120],
+                "text": f"{who} asks to:\n    {what}" + (f"\n\n{detail}" if detail else ""),
                 "timeout": str(int(prompt.get("timeout", 90))),
             }
             template = self.config.desktop.prompt_command or DEFAULT_PROMPT
-            # Substituted per argument: the text is never parsed by a shell.
-            argv = [fields.get(arg[1:-1], arg) if arg.startswith("{") and arg.endswith("}") else arg for arg in template]
+            argv = _fill(template, fields)
+            self.attention()
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
@@ -169,6 +182,37 @@ class UserHelper:
                 self._cancelled.discard(prompt_id)
                 return "timeout"
             return parse_answer(proc.returncode or 0, out.decode(errors="replace"))
+
+    def attention(self) -> None:
+        """desktop.attention_command (a sound), not waited for."""
+        if argv := self.config.desktop.attention_command:
+            self._spawn(argv)
+
+    def notify(self, msg: dict[str, Any]) -> None:
+        """A notification, and the attention sound. The text may be an
+        agent's: markup is escaped (notification daemons render it)."""
+        self.attention()
+        if template := self.config.desktop.notify_command:
+            urgency = msg.get("urgency") if msg.get("urgency") in ("low", "normal", "critical") else "normal"
+            self._spawn(_fill(template, {
+                "title": html.escape(str(msg.get("title") or "agent-auth")),
+                "text": html.escape(str(msg.get("text") or "")),
+                "urgency": urgency,
+            }))
+
+    def _spawn(self, argv: list[str]) -> None:
+        async def run() -> None:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *argv, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+                )
+                await asyncio.wait_for(proc.wait(), 30)
+            except (OSError, TimeoutError) as exc:
+                log.warning("%s: %s", argv[0], exc)
+
+        task = asyncio.create_task(run())
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
 
     def cancel(self, prompt_id: str) -> None:
         self._cancelled.add(prompt_id)
@@ -204,6 +248,8 @@ class UserHelper:
                     task.add_done_callback(tasks.discard)
                 elif msg.get("type") == "cancel" and isinstance(msg.get("id"), str):
                     self.cancel(msg["id"])
+                elif msg.get("type") == "notify":
+                    self.notify(msg)
         finally:
             for task in tasks:
                 task.cancel()

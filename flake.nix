@@ -246,6 +246,7 @@
             systemd_run = "${config.systemd.package}/bin/systemd-run";
             systemctl = "${config.systemd.package}/bin/systemctl";
             qrencode = "${pkgs.qrencode}/bin/qrencode";
+            pkcheck = "${pkgs.polkit}/bin/pkcheck";
             desktop = {
               inherit (cfg.desktop) enable;
               max_idle = cfg.desktop.maxIdle;
@@ -253,9 +254,32 @@
               prompt_command = cfg.desktop.promptCommand;
               prompt_timeout = cfg.desktop.promptTimeout;
               busy_command = cfg.desktop.busyCommand;
+              approve = { inherit (cfg.desktop.approve) user root; };
+              attention_command = cfg.desktop.attentionCommand;
+              notify_command = cfg.desktop.notifyCommand;
             };
           };
           configFile = pkgs.writeText "hostd.json" (builtins.toJSON settings);
+          # What hostd asks polkit for before a root command approved at this
+          # host's desk: the user's password, in their own session only.
+          # (hostd is root, so the dialog shows its own description of the
+          # command instead of the message here.)
+          polkitAction = pkgs.writeTextDir "share/polkit-1/actions/dev.agent-auth.hostd.policy" ''
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+              "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+            <policyconfig>
+              <action id="dev.agent-auth.hostd.run-as-root">
+                <description>Approve a command an agent asked to run as root</description>
+                <message>Authentication is required to let an agent run a command as root</message>
+                <defaults>
+                  <allow_any>no</allow_any>
+                  <allow_inactive>no</allow_inactive>
+                  <allow_active>auth_admin</allow_active>
+                </defaults>
+              </action>
+            </policyconfig>
+          '';
           # `agent-auth-hostd pair|totp-enroll|key` on the host use the same
           # config as the service. While the service is unprivileged, root
           # drops to its user so the key it creates is one the service reads.
@@ -443,6 +467,40 @@
                   IdleHint/LockedHint.
                 '';
               };
+              approve = {
+                user = lib.mkEnableOption ''
+                  Allow at this desk as this host's own approval of a
+                  user-tier command on this host: the dialog shows what the
+                  host would run, and no arming or TOTP code is needed.
+                  Anything running as the user can answer that dialog, and
+                  could run the command itself anyway
+                '';
+                root = lib.mkEnableOption ''
+                  the same for root commands, after polkit has also asked
+                  for the user's password (they must be allowed to
+                  authenticate as an administrator, and a polkit agent must
+                  run in their session)
+                '';
+              };
+              attentionCommand = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+                example = lib.literalExpression ''[ "''${pkgs.pipewire}/bin/pw-play" "/path/to/sound.oga" ]'';
+                description = "Run when a prompt or a notification arrives at this desk (a sound).";
+              };
+              notifyCommand = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [
+                  "${pkgs.libnotify}/bin/notify-send" "--app-name" "agent-auth"
+                  "--urgency" "{urgency}" "{title}" "{text}"
+                ];
+                defaultText = lib.literalExpression ''[ "''${pkgs.libnotify}/bin/notify-send" … ]'';
+                description = ''
+                  Shows a notification an agent asked for. {title}, {text}
+                  (markup escaped) and {urgency} (low, normal or critical)
+                  are replaced, each as one argument.
+                '';
+              };
               promptCommand = lib.mkOption {
                 type = lib.types.listOf lib.types.str;
                 default = [
@@ -453,9 +511,11 @@
                 ];
                 defaultText = lib.literalExpression ''[ "''${pkgs.zenity}/bin/zenity" "--question" … ]'';
                 description = ''
-                  The dialog. {title}, {text} and {timeout} are replaced, each
-                  as one argument. Exit 0 = allow, 5 = timed out, anything
-                  else = deny; it may print "mute", "discord", or sbx-prompt's
+                  The dialog. Placeholders are replaced, each as one
+                  argument: {who} (the agent), {what} and {detail} (one line
+                  each), or the same laid out as {title} and {text}; and
+                  {timeout}. Exit 0 = allow, 5 = timed out, anything else =
+                  deny; it may print "mute", "discord", or sbx-prompt's
                   once|session|deny on stdout.
                 '';
               };
@@ -482,6 +542,10 @@
                 message = "services.agent-auth-hostd: the user tier needs `user`.";
               }
               {
+                assertion = !(cfg.desktop.approve.user || cfg.desktop.approve.root) || cfg.desktop.enable;
+                message = "services.agent-auth-hostd.desktop.approve needs desktop.enable.";
+              }
+              {
                 assertion = !cfg.desktop.enable || cfg.user != null;
                 message = "services.agent-auth-hostd: desktop prompts need `user`.";
               }
@@ -489,9 +553,9 @@
 
             # A root without capabilities is authorized by polkit when it
             # asks systemd for a unit.
-            security.polkit.enable = lib.mkIf privileged true;
+            security.polkit.enable = lib.mkIf (privileged || cfg.desktop.approve.root) true;
 
-            environment.systemPackages = [ cli hostctl ];
+            environment.systemPackages = [ cli hostctl ] ++ lib.optional cfg.desktop.approve.root polkitAction;
             environment.etc."agent-auth/hostd.json".source = configFile;
 
             users.users.${serviceUser} = {

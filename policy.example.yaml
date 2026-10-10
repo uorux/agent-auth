@@ -23,8 +23,8 @@ llm:
 #   enabled: true
 #   agents: ["claude-*", "codex-*", "*-sandbox"]
 #   platforms: []            # empty = any platform
-#   sensitive: false         # root commands, secrets permissions, … stay on Discord
-#   quiet_hours: ["23:00", "08:00"]
+#   sensitive: false         # secrets permissions, another project's files, … stay on Discord
+#   per_agent_per_hour: 6
 
 platforms:
   # Commands on hosts (README: "Commands on hosts"). Each host's own config

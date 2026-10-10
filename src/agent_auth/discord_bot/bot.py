@@ -138,6 +138,25 @@ class DiscordNotifier:
         except Exception:
             log.exception("failed to update outcome for request %s", request.id)
 
+    async def attention(self, agent: Agent, text: str, urgency: str, desks: list[str]) -> None:
+        """An agent asks for the operator's attention. A ping when it is
+        urgent or no desk showed it; the text is the agent's, escaped."""
+        try:
+            channel = self.bot.get_channel(
+                self.settings.discord_channel_id
+            ) or await self.bot.fetch_channel(self.settings.discord_channel_id)
+            owner = self.settings.discord_owner_id
+            ping = bool(owner) and (urgency == "high" or not desks)
+            said = discord.utils.escape_mentions(discord.utils.escape_markdown(text))
+            where = f" (shown on {', '.join(desks)})" if desks else ""
+            await channel.send(
+                f"{f'<@{owner}> ' if ping else ''}🔔 **{agent.name}** wants your attention{where}:\n> {said}"[:2000],
+                allowed_mentions=discord.AllowedMentions(users=[discord.Object(owner)] if ping else False,
+                                                         everyone=False, roles=False),
+            )
+        except Exception:
+            log.exception("could not post an attention message")
+
     async def job_finished(self, request: AccessRequest, job) -> None:
         """A host command's result: on the approval message for a run, in the
         shell's thread for a shell command."""

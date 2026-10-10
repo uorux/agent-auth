@@ -4,6 +4,7 @@ import asyncio
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
 
 from ..core.service import TransitionError
 from ..core.states import GrantStatus, RequestStatus, WAITING_STATUSES
@@ -42,6 +43,28 @@ async def me(caller: Caller = Depends(get_caller)):
     if caller.session is not None:
         out["session"] = {"id": caller.session.id, "name": caller.session.name}
     return out
+
+
+class AttentionBody(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)
+    urgency: str = "normal"
+
+
+@router.post("/attention")
+async def attention(body: AttentionBody, request: Request, agent: Agent = Depends(get_agent)):
+    """Ask the operator for their attention: Discord, and a notification on
+    the desks they are at. Grants nothing; rate-limited per agent."""
+    from ..core.attention import AttentionLimit
+
+    service = getattr(request.app.state, "attention", None)
+    if service is None:
+        raise HTTPException(501, "not available on this broker")
+    try:
+        return await service.notify(agent, body.text, body.urgency)
+    except AttentionLimit as exc:
+        raise HTTPException(429, str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
 
 
 @router.get("/catalog", response_model=CatalogOut, response_model_exclude_none=True)

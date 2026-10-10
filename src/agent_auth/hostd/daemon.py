@@ -31,6 +31,7 @@ import json
 import logging
 import pwd
 import re
+import shlex
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,7 +41,7 @@ from .. import __version__
 from ..daemon_common import hostexec as hx
 from ..daemon_common.channel import DaemonChannel, DaemonIdentity
 from ..daemon_common.crypto import load_or_create_key
-from ..daemon_common.localsock import ApiError, peer_uid, serve_unix
+from ..daemon_common.localsock import ApiError, peer_pid, peer_uid, serve_unix
 from ..daemon_common.totp import TotpError, TotpStore
 from .config import HostConfig, duration_secs, match_argv
 from .executor import Executor
@@ -51,6 +52,9 @@ audit = logging.getLogger("agent_auth.hostd.audit")
 ROLE = "host"
 ID_RE = re.compile(r"[0-9a-f-]{8,64}")
 AUTHZ_TTL_SECS = 300
+PROMPT_WHAT_MAX = 600
+PROMPT_DETAIL_MAX = 800
+POLKIT_MESSAGE_MAX = 700
 SOURCES = ("human", "rule", "llm", "policy")
 # How long a finished job's result is kept for a broker that hasn't
 # acknowledged it.
@@ -64,8 +68,23 @@ class Refused(Exception):
 
 @dataclass
 class Authorization:
+    """This host's own approval of one job: a TOTP code, or Allow at its
+    desk (with the user's password, for root)."""
+
     digest: str
     expires_at: float
+    via: str = "totp"
+
+
+@dataclass
+class DeskPrompt:
+    """A prompt at this desk about a command on this host: Allow authorizes
+    exactly this digest."""
+
+    job_id: str
+    digest: str
+    tier: str
+    message: str
 
 
 @dataclass
@@ -115,6 +134,8 @@ class Hostd:
         self.started_at = time.time()
         self.vm_state: str | None = None
         self._user_writer: asyncio.StreamWriter | None = None
+        self._user_pid = 0
+        self._desk_prompts: dict[str, DeskPrompt] = {}
         self._load_presence()
         self._tasks: set[asyncio.Task] = set()
 
@@ -257,6 +278,7 @@ class Hostd:
             "dnd": self._dnd_remote,
             "prompt": self._prompt,
             "prompt.cancel": self._prompt_cancel,
+            "notify": self._notify,
         }.get(kind)
         if handler is None:
             log.debug("ignoring %r from the broker", kind)
@@ -329,18 +351,28 @@ class Hostd:
                 raise Refused("that command is denied by this host's policy")
         return spec
 
-    def _take_authorization(self, job_id: str, digest: str) -> bool:
-        authz = self.authorizations.pop(job_id, None)
-        return authz is not None and authz.expires_at > time.time() and authz.digest == digest
+    def _authorization(self, job_id: str, digest: str, *, take: bool) -> str | None:
+        """How this host itself approved that exact job ("totp" | "desk"),
+        if it did. `take` spends it."""
+        authz = self.authorizations.pop(job_id, None) if take else self.authorizations.get(job_id)
+        if authz is not None and authz.expires_at > time.time() and authz.digest == digest:
+            return authz.via
+        return None
+
+    def _authorize_job(self, job_id: str, digest: str, via: str) -> None:
+        now = time.time()
+        self.authorizations = {k: v for k, v in self.authorizations.items() if v.expires_at > now}
+        self.authorizations[job_id] = Authorization(digest, now + AUTHZ_TTL_SECS, via)
 
     def _admit(self, job_id: str, raw: dict[str, Any], spec: dict[str, Any], evidence: dict[str, Any]) -> str:
         """§8.5, in order. Returns what the job is admitted on; raises Refused."""
         if self.locked_down:
             raise Refused(f"{self.config.name} is locked down")
         tier = spec["tier"]
-        # The TOTP code was given for the request as the broker described it.
-        if self._take_authorization(job_id, hx.digest(raw)):
-            return "totp"
+        # A TOTP code, or Allow at this desk, was given for the request as
+        # the broker described it.
+        if via := self._authorization(job_id, hx.digest(raw), take=True):
+            return via
         if spec["kind"] == "run" and tier == "user" and any(
             match_argv(p, spec["argv"]) for p in self.config.auto_commands
         ):
@@ -388,7 +420,11 @@ class Hostd:
             if self.locked_down:
                 raise Refused(f"{self.config.name} is locked down")
             return {"via": "totp"}
-        # A stand-in id: there is no authorization to consume in a precheck.
+        job_id = msg.get("job_id")
+        if isinstance(job_id, str) and not self.locked_down:
+            if via := self._authorization(job_id, hx.digest(raw), take=False):
+                return {"via": via}
+        # A stand-in id: a precheck consumes no authorization.
         return {"via": self._admit("precheck", raw, spec, evidence)}
 
     async def _authorize(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -406,9 +442,7 @@ class Hostd:
         except TotpError as exc:
             self._audit("totp.refused", job=job_id, tier=tier, why=str(exc))
             raise
-        now = time.time()
-        self.authorizations = {k: v for k, v in self.authorizations.items() if v.expires_at > now}
-        self.authorizations[job_id] = Authorization(digest, now + AUTHZ_TTL_SECS)
+        self._authorize_job(job_id, digest, "totp")
         self._audit("totp.accepted", job=job_id, tier=tier, digest=digest)
         return {"authorized": True}
 
@@ -602,7 +636,7 @@ class Hostd:
                 )
             # Nothing but a direct TOTP code for this exact shell opens one:
             # arming, windows and rules never do.
-            if not self._take_authorization(shell_id, hx.digest(spec)):
+            if self._authorization(shell_id, hx.digest(spec), take=True) != "totp":
                 raise Refused("a shell is opened with a TOTP code only")
         except Refused as exc:
             self._audit("shell.refused", shell=shell_id, tier=tier, why=str(exc))
@@ -693,6 +727,7 @@ class Hostd:
         self.lockdown_file.write_text(json.dumps({"at": time.time(), "via": via}))
         self.disarm(None, f"lockdown ({via})")
         self.authorizations.clear()
+        self._desk_prompts.clear()
         for shell_id in list(self.shells):
             await self._end_shell(shell_id, "lockdown")
         for job_id in list(self.jobs):
@@ -846,6 +881,7 @@ class Hostd:
                 writer.close()
                 return
             previous, self._user_writer = self._user_writer, writer
+            self._user_pid = peer_pid(writer)
             if previous is not None:
                 previous.close()
             self.presence.connected = True
@@ -879,11 +915,8 @@ class Hostd:
                     answer = msg.get("answer")
                     if answer not in ("allow", "deny", "mute", "discord", "timeout"):
                         answer = "timeout"
-                    self._audit("prompt.answer", prompt=msg["id"], answer=answer)
-                    if self.channel:
-                        await self.channel.send(
-                            {"type": "prompt.answer", "prompt_id": msg["id"], "answer": answer}
-                        )
+                    # Not inline: for root this waits for a password.
+                    self._task(self._answered(msg["id"], answer, writer), f"answer:{msg['id']}")
         except (ConnectionError, asyncio.IncompleteReadError):
             pass
         finally:
@@ -904,27 +937,110 @@ class Hostd:
             return False
         return True
 
+    async def _answered(self, prompt_id: str, answer: str, writer: asyncio.StreamWriter) -> None:
+        """The desk answered. For a command on this host, Allow is this
+        host's own approval of exactly what it showed."""
+        desk = self._desk_prompts.pop(prompt_id, None)
+        authorized = False
+        if desk is not None and answer == "allow":
+            ok = not self.locked_down and self._user_writer is writer
+            if ok and desk.tier == "root":
+                ok = await self.executor.polkit_auth(
+                    self._user_pid, self._user_uid(), desk.message, self.config.desktop.prompt_timeout_secs
+                )
+            if ok:
+                self._authorize_job(desk.job_id, desk.digest, "desk")
+                authorized = True
+                self._audit("desk.accepted", job=desk.job_id, tier=desk.tier, digest=desk.digest)
+            else:
+                # No password, or things changed meanwhile: not a denial,
+                # the request stays where it was (Discord).
+                answer = "discord"
+                self._audit("desk.refused", job=desk.job_id, tier=desk.tier)
+        self._audit("prompt.answer", prompt=prompt_id, answer=answer)
+        if self.channel:
+            await self.channel.send(
+                {"type": "prompt.answer", "prompt_id": prompt_id, "answer": answer, "authorized": authorized}
+            )
+
+    def _desk_job(self, prompt_id: str, job: Any, who: str) -> tuple[str, str]:
+        """A prompt about a command on this host: (what, extra detail), from
+        what this host itself would run. Refused unless Allow here may
+        stand for this host's approval, or the tier is armed anyway."""
+        if not isinstance(job, dict):
+            raise Refused("malformed job")
+        job_id, raw = self._job_id(job.get("job_id")), job.get("spec")
+        spec = self._normalize(raw)
+        if self.locked_down:
+            raise Refused(f"{self.config.name} is locked down")
+        tier, d = spec["tier"], self.config.desktop
+        as_whom = "ROOT" if tier == "root" else (self.config.user or "your user")
+        what = f"run on {self.config.name} as {as_whom}: {shlex.join(spec['argv'])}"
+        extras = []
+        if spec.get("cwd"):
+            extras.append(f"in {spec['cwd']}")
+        if spec.get("env"):
+            extras.append("env " + " ".join(f"{k}={v}" for k, v in sorted(spec["env"].items())))
+        if spec.get("stdin") is not None:
+            extras.append(f"with {len(spec['stdin'])} chars on stdin")
+        if d.approve_root if tier == "root" else d.approve_user:
+            self._desk_prompts[prompt_id] = DeskPrompt(
+                job_id, hx.digest(raw), tier, f"{who} asks to {what}"[:POLKIT_MESSAGE_MAX]
+            )
+        elif not self.armed(tier):
+            raise Refused(f"the {tier} tier is not armed, and this desk doesn't approve {tier} commands")
+        return what, " · ".join(extras)
+
     async def _prompt(self, msg: dict[str, Any]) -> dict[str, Any]:
         prompt_id = self._job_id(msg.get("prompt_id"))
         if not self.present():
             raise Refused("nobody is at this desktop")
+        who = _line(msg.get("who") or "an agent", 120)
+        what, detail = _line(msg.get("what"), PROMPT_WHAT_MAX), _line(msg.get("detail"), PROMPT_DETAIL_MAX)
+        if msg.get("job") is not None:
+            # What will run comes from this host, not from the broker's text.
+            what, extra = self._desk_job(prompt_id, msg["job"], who)
+            what, detail = _line(what, PROMPT_WHAT_MAX), _line(" · ".join(x for x in (extra, detail) if x), PROMPT_DETAIL_MAX)
         shown = await self._to_user(
             {
                 "type": "prompt",
                 "id": prompt_id,
-                "title": str(msg.get("title") or "agent-auth")[:200],
-                "text": str(msg.get("text") or "")[:4000],
+                "who": who,
+                "what": what,
+                "detail": detail,
                 "timeout": min(int(msg.get("timeout") or 90), self.config.desktop.prompt_timeout_secs),
             }
         )
         if not shown:
+            self._desk_prompts.pop(prompt_id, None)
             raise Refused("nobody is at this desktop")
         self._audit("prompt.shown", prompt=prompt_id, request=msg.get("request_id"))
-        return {"shown": True}
+        return {"shown": True, "approves": prompt_id in self._desk_prompts}
 
     async def _prompt_cancel(self, msg: dict[str, Any]) -> dict[str, Any]:
-        await self._to_user({"type": "cancel", "id": self._job_id(msg.get("prompt_id"))})
+        prompt_id = self._job_id(msg.get("prompt_id"))
+        self._desk_prompts.pop(prompt_id, None)
+        await self._to_user({"type": "cancel", "id": prompt_id})
         return {}
+
+    async def _notify(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Something wants the user's attention: a notification (and the
+        attention sound) at this desk, if they are there."""
+        if not self.present():
+            raise Refused("nobody is at this desktop")
+        urgency = msg.get("urgency") if msg.get("urgency") in ("low", "normal", "critical") else "normal"
+        shown = await self._to_user(
+            {"type": "notify", "title": _line(msg.get("title") or "agent-auth", 120),
+             "text": _line(msg.get("text"), 600), "urgency": urgency}
+        )
+        if not shown:
+            raise Refused("nobody is at this desktop")
+        return {"shown": True}
+
+
+def _line(value: Any, limit: int) -> str:
+    """One bounded line: a dialog field can't pose as a line of its own."""
+    return " ".join(str(value or "").split())[:limit]
 
 
 def _loggable(spec: Any) -> Any:

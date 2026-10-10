@@ -499,45 +499,58 @@ particular). The tests drive the real daemon with a fake executor.
 ## Desktop prompts
 
 With `desktop.enabled` in the policy and `services.agent-auth-hostd.desktop.enable`
-on a host, a request that needs you is also shown as a dialog on **every
-desktop you are at**, next to the Discord message; the first answer decides
-and the others are taken down. No answer in 90 s leaves it to Discord.
+on a host, a request that needs you is also shown as a dialog at the desks
+you are at, next to the Discord message; the first answer decides and the
+others are taken down. No answer in 90 s leaves it to Discord.
 
 ```yaml
 desktop:
   enabled: true
   agents: ["claude-*", "codex-*", "*-sandbox"]   # who may be asked at a desk
   # platforms: [github, a2a]    # empty = any
-  # sensitive: false            # root commands etc. stay on Discord
+  # sensitive: false            # sensitive requests stay on Discord
 ```
 
 - **Present** means: hostd's helper in your session (`agent-auth-hostd user`,
   a user service) is connected, the session is unlocked and was used within
   `desktop.maxIdle`, nothing is fullscreen (or `desktop.busyCommand` says not
-  now), and do-not-disturb is off. Unknown counts as away. Hyprland keeps no idle or lock hints, so report them:
+  now), and do-not-disturb is off. Unknown counts as away, and
+  `agent-auth-hostctl status` says why. Hyprland keeps no idle or lock hints,
+  so report them:
 
   ```
   # hypridle.conf
-  listener { timeout = 300; on-timeout = agent-auth-hostctl presence idle; on-resume = agent-auth-hostctl presence active }
+  listener { timeout = 60; on-timeout = agent-auth-hostctl presence idle; on-resume = agent-auth-hostctl presence active }
   # around your lock screen
   agent-auth-hostctl presence locked; hyprlock; agent-auth-hostctl presence unlocked
   ```
-- **Buttons**: Allow once · Deny · Mute agent 1h · Send to Discord. Deny is the
-  default, so a stray Enter denies. The dialog
-  is `desktop.promptCommand` (zenity by default; any command that exits 0 for
-  allow works, including `sbx-prompt`).
-- **Limits**: one dialog per desktop at a time, 2 in a burst and 6 an hour per
+- **A command on the host you are sitting at** is asked at that desk only.
+  hostd builds the dialog from what it would actually run, and with
+  `desktop.approve.user` Allow is that host's own approval of exactly that
+  command: no arming, no TOTP code. With `desktop.approve.root`, a root
+  command then also takes your password (polkit, whose dialog shows the
+  command). Without those, and for commands on other hosts, an answer at a
+  desk is a click like on Discord and the host must be armed. Shells are
+  never asked at a desk.
+- **The dialog** is `desktop.promptCommand`: zenity by default (Allow once ·
+  Deny · Mute agent 1h · Send to Discord; Deny is the default, so a stray
+  Enter denies), or `sbx-prompt` (`{who}` `{what}` `{detail}`).
+- **Limits**: one dialog per desk at a time, 2 in a burst and 6 an hour per
   agent, 20 an hour overall, a 10-minute pause after a Deny (an hour after
-  three), optional `quiet_hours`, `agent-auth-hostctl dnd 2h` / `/dnd`.
-- An answer at a desk counts like a click on Discord: a host command still
-  needs its host armed, and shells are never asked there.
+  three), `agent-auth-hostctl dnd 2h` / `/dnd`.
+- **Attention**: agents can call `notify_operator` when they are blocked on
+  you: a Discord message (a ping if urgent or you are at no desk) and a
+  notification on your desks, with `desktop.attentionCommand` as its sound
+  (also played for prompts). Six an hour per agent.
 
 What this does **not** protect against: anything running as you on one of
-those desktops, or a compromised host, can answer its prompts. `desktop.agents`
-and `desktop.platforms` are the limit on what that can approve.
+those desktops, or a compromised host, can answer its prompts (not type your
+password). `desktop.agents` and `desktop.platforms` are the limit on what a
+click there can approve; `desktop.approve.user` adds only what such a process
+could do itself.
 
-Not yet run on a desktop: the zenity dialog, the Hyprland fullscreen check and
-the user service. The tests drive the real helper with a script as the dialog.
+Not yet run on a desktop: approval at the host's own desk (`pkcheck` in
+particular), sbx-prompt as the dialog, and notifications.
 
 ## Agent VMs (sandboxd)
 

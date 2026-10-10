@@ -32,8 +32,8 @@ against the pinned versions; **[open]** = needs your call (collected in §16).
 | 4. hostexec `run` + kill switch | built; lockdown used on excelsior |
 | 5. Shells | built; a root shell on recusant was opened and used from Hermes |
 | 6. MCP catalog + proxy | not started |
-| 7. Mounts | not started |
-| 8. Content-bound desktop approval of hostexec | not started |
+| 7. Mounts | deferred (§11) |
+| 8. Approval at the target host's own desk, `notify_operator` | built, tested with a fake polkit; **not run on a desktop** |
 | 9. Desktop prompts on every active host | built; a request was approved from excelsior's desktop |
 
 Used for real, so considered working. **Not confirmed on hardware** (covered
@@ -45,6 +45,8 @@ by the tests only, or not at all), left that way on purpose for now:
   immediate denial of a tier the host has switched off, End shell.
 - Kill switch: `/unlock` (per host with the code, then the broker's), the
   sandbox-first ordering, lockdown on recusant with its VM.
+- Desk approval (phase 8): all of it, in particular `pkcheck` showing
+  hostd's message and sbx-prompt as the dialog; `notify_operator`.
 - Desktop prompts: no dialog while a window is fullscreen, while locked or
   under do-not-disturb; the away reason in `agent-auth-hostctl status`; the
   rate limits and the Deny cooldown.
@@ -997,25 +999,10 @@ content.
   host keeps it until the broker acknowledges it (resent after a reconnect).
   It is the *last* 1 MiB. There is no separate signature on `job.done`: it
   travels in the channel's signed envelopes like everything else.
-- **Desktop approval of hostexec on the same host** (phase 8, not built).
-  This is the only approval path where the UI is rendered from what hostd
-  itself received, so it binds the approval to the content.
-  - **User tier**: hostd-user runs `sbx-prompt` with the command *as hostd
-    received it*. `once` = a direct approval; `session` = arm the user tier
-    for `maxArm`.
-  - **Root tier** **[decided: zenity, then password]**:
-    1. hostd-user shows `sbx-prompt --no-session` with the full command,
-       cwd, agent, risk summary and the agent's justification (labelled
-       unverified). This is the readable context.
-    2. On Allow, hostd-root asks polkitd itself (`CheckAuthorization`,
-       subject = hostd-user's process, `auth_admin` action
-       `com.otisroot.agent-auth.hostexec-root`, fixed message "Approve the
-       root command shown in the agent-auth dialog"). hyprpolkitagent then
-       asks for **your password**.
-    3. Only polkitd's answer counts. A `jrt` process could fake step 1 but
-       can't fake step 2's result. It could spoof the polkit agent and
-       capture the password, which is the standard Linux-desktop weakness
-       and is accepted. Zenity alone is never accepted for root.
+- **Approval at the target host's own desk** **[built, phase 8]**: see
+  §8.10. This is the only approval whose dialog is rendered from what hostd
+  itself would run, so it is bound to the content; hostd counts it as its
+  own evidence, like a direct TOTP code for that one command.
 
 ### 8.7 Shells **[decided, built]**
 
@@ -1048,92 +1035,84 @@ never approves anything.
 - env is allowlisted by key; stdin is optional and capped.
 - Default timeout is 10m, capped by local policy.
 
-### 8.10 Direct desktop prompts **[decided: allowed, with anti-spam policy]**
+### 8.10 Desk prompts, desk approval, attention **[built: phases 8 and 9]**
 
-**[built, as phase 9]** with these differences from the text below:
+One helper in the user's graphical session (`agent-auth-hostd user`, a user
+service) does three things, all through hostd over a socket only that user
+may use. It holds no secrets and decides nothing.
 
-- **Every present desktop is asked, not one "active desk".** The first
-  answer decides and the other dialogs are taken down.
-- **Presence** comes from hooks, because Hyprland keeps no logind hints:
-  `agent-auth-hostctl presence idle|active|locked|unlocked`, called from
-  hypridle and around the lock screen (or `idleSource = "logind"` where a
-  desktop maintains them). Unknown counts as away. hostd-user adds the
-  fullscreen check (`hyprctl activewindow`).
-- **Eligibility** is `desktop.agents` / `desktop.platforms` globs in the
-  policy, not a per-rule `channels:` list. Sensitive requests stay on
-  Discord unless `desktop.sensitive`; shells never reach a desktop.
-- A hostexec request is offered only while its target tier is armed, since a
-  desktop answer carries no TOTP code. The **same-host content-bound path**
-  (and the polkit step for root) is still phase 8.
-- Not built: coalescing ("3 requests from …"), the "Allow 30 min" button,
-  and local overrides of the limits in hostd-user.
-- Trust: an answer is accepted only for a prompt the broker sent to that
-  host and that is still open. That still means any process running as you
-  on such a desktop, and any compromised host, can approve whatever the
-  policy allows on desktops.
+**1. Presence.** hostd reports whether the user is at this desk: the helper
+is connected, the session is unlocked and was used recently, the host's
+"busy" check doesn't say not now (a fullscreen window), and do-not-disturb
+is off. Idle and lock come from hooks (`agent-auth-hostctl presence
+idle|active|locked|unlocked`, called from hypridle and around the lock
+screen), because Hyprland keeps no logind hints. Unknown counts as away;
+`agent-auth-hostctl status` says why.
 
-Agents can get a human decision at your desktop without going through Discord.
-This applies to any broker request (a GitHub grant, an MCP grant, a hostexec),
-not only hostexec on the local host.
+**2. Prompts.** A request that reaches a human is posted to Discord as
+always, and also asked at a desk:
 
-**Routing: where a prompt goes**
-
-- Each hostd-user reports **presence** in its heartbeat:
-  - idle seconds, via `ext-idle-notify` on Hyprland;
-  - locked or unlocked;
-  - a fullscreen window (games) or Do Not Disturb.
-- When a request reaches `surface`, the broker picks the **active desk**: the
-  desktop host whose hostd-user is unlocked and idle < 5 min, most recent
-  input first.
-- Policy chooses the channels per rule:
-  `channels: [desktop, discord]` (default: desktop when present, else
-  Discord), `[discord]`, or `[desktop]`.
-- The Discord message is still posted as the record. When the desk answers,
-  it is edited to "answered on excelsior's desktop".
-- A desktop prompt unanswered within 90s falls back to Discord.
-- When the desk is the **same host** as a hostexec target, the prompt is the
-  §8.6 content-bound path, and its answer counts as local evidence.
-- Elsewhere, hostd-user's answer travels back to the broker signed by that
-  host's hostd-root, as `source=human, via=desktop:<host>`.
-  - A desktop answer from host A **does not** satisfy host B's hostd for a
-    hostexec on B. B still requires its own arming or TOTP, because B can't
-    verify A's dialog.
-  - The B prompt therefore shows "Approve (B is armed)" or offers a TOTP
-    field, the same as Discord.
-
-**What the dialog looks like**
-
-- `sbx-prompt`-style: the requester label comes from the broker or hostd,
-  never from agent text. It shows the platform, resource, authority, duration,
-  delegator and risk summary, and the justification labelled "the agent says
-  (unverified)".
-- Buttons: **Allow once** · **Allow 30 min** (an approve-all window, only
-  where §8.6 allows windows) · **Deny** · **Mute this agent 1h** ·
-  **Send to Discord**.
-
-**Anti-spam policy** (defaults; configured under `desktop:` in policy, with
-local overrides in hostd-user):
-
-| rule | default | effect |
+| request | asked where | what Allow there is |
 |---|---|---|
-| eligibility | `desktop: allow` must match the agent in policy | agents not listed never reach the desktop |
-| one at a time | 1 dialog on screen | others queue for at most 30s, then go to Discord |
-| coalescing | same agent + platform + resource pending | one dialog says "3 requests from claude-larder…", with Allow all / Deny all / Review on Discord |
-| per-agent rate | burst 2, 6/hour | excess goes to Discord with "desktop rate-limited" |
-| global rate | 20/hour | same |
-| deny cooldown | after a Deny, that agent's desktop prompts pause 10 min; 3 denies in an hour mute it for 1h | stops retry loops |
-| presence | not shown while locked, idle > 5 min, fullscreen, or DND | goes to Discord instead |
-| quiet hours | **off** by default; optional window, e.g. 23:00–08:00 | Discord only |
-| DND toggle | `agent-auth-hostctl dnd 2h`, a Hyprland keybind, `/dnd` on Discord | |
+| a command on a host, at that host's own desk | that desk only | **the host's own approval of exactly that command** (below) |
+| a command on another host | every desk the user is at, only while the target's tier is armed and the request is not sensitive | a click, like on Discord |
+| anything else | every desk the user is at (sensitive requests only with `desktop.sensitive`) | a click, like on Discord |
+| a shell | never | |
 
-**Spoofing**:
-- Agents run in the VM, which has no display access, so they can't draw
-  look-alike dialogs.
-- Sandboxed desktop apps reach the compositor only through
-  `wp_security_context_v1`. They can't read or click the dialog, but they
-  could draw a look-alike.
-- The existing `sbx-prompt` limits apply: no secure-attention mechanism, and
-  input synthesized by a compromised session is out of scope.
+The first answer decides and the other dialogs are taken down. No answer in
+`desktop.timeout` leaves the request to Discord. Deny is the dialog's
+default button.
+
+*Approval at the target's own desk.* The broker sends the job with the
+prompt. hostd validates it as it would at start, expands a template from its
+own copy, and builds the dialog's "what" line from that; the broker's text
+is not used for it. On Allow:
+
+- **user tier** (`desktop.approve.user`): hostd records an authorization for
+  that job id and digest, exactly as a direct TOTP code would. No arming.
+  Anything running as the user can answer the dialog; it could also run the
+  command itself, so nothing is lost.
+- **root tier** (`desktop.approve.root`): hostd then has polkit authenticate
+  the helper's process as an administrator (`pkcheck`, action
+  `dev.agent-auth.hostd.run-as-root`, `auth_admin`). hostd is root, so the
+  password dialog shows hostd's own description of the command. Only
+  polkit's answer counts; a process of the user's can raise that dialog but
+  not answer it. (It could imitate a polkit agent to capture the password:
+  the usual desktop weakness, accepted.)
+- Allow without the password, or a host that doesn't approve that tier at
+  its desk and isn't armed: nothing is decided, the request stays on Discord.
+
+The authorization is spent by the job it was given for and by nothing else:
+another command under the same id, or an edit on Discord, has another
+digest. Whether a desk may approve is the host's nix config, never the
+broker's.
+
+**3. Attention.** `notify_operator(message, urgency)` (MCP; `POST
+/v1/attention`): a message on Discord and, on each desk the user is at, a
+notification and the host's attention sound (`desktop.attentionCommand`,
+also played when a prompt appears). `high` pings on Discord, as does a
+message no desk showed. It grants nothing, has no reply channel, and is
+limited to 6 an hour per agent.
+
+**The dialog** is `desktop.promptCommand`: `{who}` (the agent, from the
+broker's records), `{what}` and `{detail}` (one bounded line each; the
+justification is in `{detail}`, labelled unverified), or the same laid out as
+`{title}` and `{text}`. That is `sbx-prompt`'s interface, and zenity's.
+
+**Anti-spam** (policy `desktop:`): `agents` / `platforms` eligibility; one
+dialog per desk at a time (a request waits 30 s for it); 2 in a burst and
+`per_agent_per_hour` (6) per agent, `per_hour` (20) overall; after a Deny
+that agent pauses for `deny_cooldown` (10 min), after three for `mute` (1 h);
+`agent-auth-hostctl dnd 2h` and `/dnd`.
+
+**Not built**: coalescing several requests into one dialog, an "Allow 30
+min" button, "session" in sbx-prompt arming the tier.
+
+**What this does not protect against**: a process running as the user on a
+desk, or a compromised host, can answer that desk's prompts (not type the
+password). `desktop.agents` and `desktop.platforms` bound what a click there
+can approve; `desktop.approve.user` adds only what that process could do
+anyway.
 
 ---
 
@@ -1183,7 +1162,11 @@ unlock`, so a compromised broker can't undo a lockdown.
 
 ---
 
-## 11. Mounts **[decided: as grants; local host first, remote later]**
+## 11. Mounts **[deferred]**
+
+Dropped from the plan for now (2026-10-10): a granted path can't be taken
+back without restarting the VM, and agents working inside the VM is the
+common case anyway. What follows is the design as it stood.
 
 Built on the existing folder-grant machinery (crosvm fs allowlist + guest
 grant daemon), driven by hostd and sandboxd instead of sbx-broker and the
@@ -1359,11 +1342,11 @@ in-process WS, a fake runtime adapter).
    switch**, including the host-side VM freeze, lands here, before shells.
 5. **Shells**: TOTP-only, loud embeds, mirror threads.
 6. **MCP catalog + broker proxy** (none/header first, then OAuth).
-7. **Mounts** (local host): allowlist revoke, idmapped binds.
-8. **Content-bound desktop approval of hostexec** (§8.6): on the host a
-   command targets, `sbx-prompt` for the user tier, and `sbx-prompt` then
-   polkit `auth_admin` for root, counted by that hostd as local evidence.
-   Builds on phase 9's helper.
+7. **Mounts**: deferred (§11).
+8. **Approval at the target host's own desk** (§8.10) **[built]**: the
+   dialog from what hostd would run; Allow is the host's own approval of
+   that command, with polkit's password check for root. Plus
+   `notify_operator`.
 9. **Desktop prompts on every active host** (§8.10) **[built]**:
    - hostd-user and presence (hooks, or logind);
    - the broker's desktop notifier: every present desktop is asked, the

@@ -29,6 +29,8 @@ from typing import Awaitable, Callable, Protocol
 from .config import HostConfig
 
 UNIT_PREFIX = "aa-job-"
+# Installed by the NixOS module (auth_admin for the active local session).
+POLKIT_ACTION = "dev.agent-auth.hostd.run-as-root"
 READ_CHUNK = 64 * 1024
 
 
@@ -54,6 +56,12 @@ class Executor(Protocol):
         ...
 
     async def kill(self, job_id: str, tier: str) -> None: ...
+    async def polkit_auth(self, pid: int, uid: int, message: str, timeout: int) -> bool:
+        """Have polkit authenticate the user of that process as an
+        administrator (their password, in their session's agent), showing
+        `message`. True only if they did."""
+        ...
+
     async def unit_action(self, action: str, unit: str) -> tuple[int, str]:
         """systemctl freeze | thaw | stop | is-active a system unit."""
         ...
@@ -236,6 +244,30 @@ class LinuxExecutor:
         )
         out, _ = await proc.communicate()
         return proc.returncode or 0, out.decode(errors="replace").strip()
+
+    async def polkit_auth(self, pid: int, uid: int, message: str, timeout: int) -> bool:
+        # The subject is the session helper's process, pinned by its start
+        # time. polkit.message is honoured because hostd is root: the
+        # password dialog itself says what is being approved.
+        try:
+            stat = open(f"/proc/{pid}/stat").read()
+            start_time = stat.rsplit(")", 1)[1].split()[19]
+            proc = await asyncio.create_subprocess_exec(
+                self.config.pkcheck,
+                "--action-id", POLKIT_ACTION,
+                "--process", f"{pid},{start_time},{uid}",
+                "--allow-user-interaction",
+                "--detail", "polkit.message", message,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                env={"PATH": self.config.job_path},
+            )
+        except (OSError, IndexError):
+            return False
+        try:
+            return await asyncio.wait_for(proc.wait(), timeout) == 0
+        except TimeoutError:
+            proc.kill()
+            return False
 
     async def kill(self, job_id: str, tier: str) -> None:
         try:

@@ -1,27 +1,30 @@
-"""Approval prompts on the desktops you are at (docs/sandbox-design.md §8.10,
-phase 9).
+"""Approval prompts, and notifications, on the desktops you are at
+(docs/sandbox-design.md §8.6, §8.10).
 
-When a request reaches a human, Discord gets it as always. In addition, every
-host whose hostd reports you present (session unlocked, recently used, not
-fullscreen, no do-not-disturb) shows a dialog — all of them at once; the
-first answer decides and the other dialogs are taken down. No answer within
-the timeout leaves the request to Discord.
+When a request reaches a human, Discord gets it as always. In addition:
 
-An answer from a desktop counts exactly like a click on Discord, no more:
-- it is accepted only for a prompt this broker sent to that host and that is
-  still open;
-- a command on a host still needs that host armed (the answer carries no
-  TOTP code), and a shell is never asked on a desktop;
-- sensitive requests are asked on a desktop only if policy says so.
+- A command on a host is asked at THAT host's desk, if you are there. hostd
+  builds the dialog from what it would actually run, and Allow there is that
+  host's own approval of exactly that command (for root, with your password
+  through polkit): no arming, no TOTP code. Whether a desk may do that is the
+  host's setting, not the broker's.
+- Anything else is asked on every desk you are at, all at once; the first
+  answer decides and the other dialogs are taken down. That answer counts
+  like a click on Discord, no more: a command on another host still needs
+  that host armed, and sensitive requests are asked only if policy says so.
+- A shell is never asked on a desktop.
+
+No answer within the timeout leaves the request to Discord.
 
 What this does NOT protect against: anything running as you on one of these
-desktops, or a compromised host, can answer its prompts. `desktop:` in the
-policy decides which agents and platforms may be asked there at all; keep it
-to what you would let any process of yours approve.
+desktops, or a compromised host, can answer its prompts (not type your
+password). `desktop:` in the policy decides which agents and platforms may be
+asked there at all; keep it to what you would let any process of yours
+approve.
 
-Anti-spam (policy `desktop:`): eligibility by agent and platform, one dialog
-per host at a time, per-agent and global rates, a cooldown after a Deny (and
-a mute after three), an optional quiet window, and do-not-disturb.
+Anti-spam: eligibility by agent and platform, one dialog per host at a time,
+per-agent and global rates, a pause after a Deny (longer after three), and
+do-not-disturb.
 """
 
 from __future__ import annotations
@@ -32,7 +35,6 @@ import time
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from datetime import datetime
 from fnmatch import fnmatch
 from typing import Any
 
@@ -50,7 +52,10 @@ from .states import Platform, RequestStatus
 log = logging.getLogger(__name__)
 
 HOST_ROLE = "host"
-BURST_WINDOW_SECS = 120
+# At most this many prompts per agent in a burst; a request waits this long
+# for a desk that is showing another dialog.
+BURST, BURST_WINDOW_SECS = 2, 120
+QUEUE_SECS = 30
 DENIES_TO_MUTE = 3
 
 
@@ -64,40 +69,38 @@ class Offer:
     answer: asyncio.Future | None = None
 
 
-def prompt_text(request: AccessRequest, agent: Agent, delegator: Agent | None) -> tuple[str, str]:
-    """(title, text). Who is asking comes from the broker's records; only the
-    quoted justification is the agent's own words."""
+def prompt_fields(request: AccessRequest, agent: Agent, delegator: Agent | None) -> tuple[str, str, str]:
+    """(who, what, detail), one line each. Who is asking comes from the
+    broker's records; only the quoted justification is the agent's own
+    words. (For a command at its own host's desk, hostd replaces `what`
+    with what it would run.)"""
     import shlex
 
-    lines = [f"{agent.name} asks for:"]
+    who = agent.name + (f" (for {delegator.name})" if delegator is not None else "")
     if request.platform == Platform.HOSTEXEC:
         tier = "ROOT" if request.scope.get("tier") == "root" else "your user"
         if request.capability.startswith("tpl."):
-            what = f"template {request.capability[4:]} {request.scope.get('params') or {}}"
+            command = f"template {request.capability[4:]} {request.scope.get('params') or {}}"
         else:
-            what = shlex.join(request.scope.get("argv") or [])
-        lines.append(f"run on {request.resource} as {tier}:\n    {what[:600]}")
-        if request.scope.get("cwd"):
-            lines.append(f"in {request.scope['cwd']}")
+            command = shlex.join(request.scope.get("argv") or [])
+        what = f"run on {request.resource} as {tier}: {command}"
     else:
-        lines.append(f"{request.platform.value} / {request.capability} on {request.resource}")
+        what = f"{request.platform.value} / {request.capability} on {request.resource}"
         if request.scope:
-            lines.append(f"scope: {str(request.scope)[:300]}")
-        lines.append(f"for {format_duration(request.requested_duration_secs)}")
-    if delegator is not None:
-        lines.append(f"on behalf of {delegator.name}")
-    for note in (request.risk_notes or [])[:4]:
-        lines.append(f"• {str(note)[:300]}")
-    lines.append(f"\nThe agent says (unverified):\n{request.justification[:600]}")
-    return f"agent-auth: {agent.name}"[:120], "\n".join(lines)
+            what += f" {str(request.scope)[:200]}"
+        what += f", for {format_duration(request.requested_duration_secs)}"
+    detail = [str(note)[:200] for note in (request.risk_notes or [])[:2]]
+    detail.append(f"The agent says (unverified): {request.justification[:400]}")
+    return who, what, " · ".join(detail)
 
 
 class DesktopService:
-    def __init__(self, db: Database, hub: DaemonHub, config: DesktopConfig, service):
+    def __init__(self, db: Database, hub: DaemonHub, config: DesktopConfig, service, hostexec=None):
         self.db = db
         self.hub = hub
         self.config = config
         self.service = service
+        self.hostexec = hostexec  # HostExecService, for a command's final spec
         self.dnd_until = 0.0
         # What hosts said since their last heartbeat was stored.
         self._presence: dict[str, tuple[bool, float]] = {}
@@ -145,13 +148,6 @@ class DesktopService:
 
     # --- who may be asked, and how often ------------------------------------------------
 
-    def _quiet_now(self) -> bool:
-        if not self.config.quiet_hours:
-            return False
-        start, end = self.config.quiet_hours
-        now = datetime.now().strftime("%H:%M")
-        return (start <= now < end) if start <= end else (now >= start or now < end)
-
     def refusal(self, request: AccessRequest, agent: Agent) -> str | None:
         """Why this request is not asked on a desktop (None = it may be)."""
         c, now = self.config, time.time()
@@ -163,12 +159,12 @@ class DesktopService:
             return "platform not listed under desktop.platforms"
         if authority_mod.human_only(request.platform, request.authority):
             return "never asked on a desktop"
-        if not c.sensitive and self.service.engine.is_sensitive(request):
+        # A command is asked at its own host's desk, where the host itself
+        # decides what an answer is worth (_ask); the rest by sensitivity.
+        if request.platform != Platform.HOSTEXEC and self._too_sensitive(request):
             return "sensitive (desktop.sensitive is off)"
         if self.dnd_until > now:
             return "do-not-disturb"
-        if self._quiet_now():
-            return "quiet hours"
         if self._paused_until.get(agent.name, 0) > now:
             return "this agent's desktop prompts are paused"
         hour = now - 3600
@@ -176,11 +172,14 @@ class DesktopService:
             while times and times[0] < hour:
                 times.popleft()
         mine = self._asked[agent.name]
-        if len(mine) >= c.per_agent_per_hour or sum(1 for t in mine if t > now - BURST_WINDOW_SECS) >= c.per_agent_burst:
+        if len(mine) >= c.per_agent_per_hour or sum(1 for t in mine if t > now - BURST_WINDOW_SECS) >= BURST:
             return "desktop rate-limited (agent)"
         if len(self._asked_all) >= c.per_hour:
             return "desktop rate-limited"
         return None
+
+    def _too_sensitive(self, request: AccessRequest) -> bool:
+        return not self.config.sensitive and self.service.engine.is_sensitive(request)
 
     def _note_deny(self, agent: str) -> None:
         now = time.time()
@@ -223,25 +222,41 @@ class DesktopService:
                         select(Daemon).where(Daemon.role == HOST_ROLE, Daemon.name == request.resource)
                     )
                 ).scalar_one_or_none()
-        if request.platform == Platform.HOSTEXEC:
-            # A desktop answer carries no TOTP code: only worth asking while
-            # the target's tier is armed.
-            tier = ((target.last_status or {}).get("tiers") or {}).get(request.scope.get("tier")) if target else None
-            if not (tier or {}).get("armed_until"):
-                return
         hosts = await self.present_hosts()
+        job = None
+        if request.platform == Platform.HOSTEXEC:
+            if request.resource in hosts and self.hostexec is not None:
+                # At its own host's desk: that hostd says what will run, and
+                # whether Allow there is enough.
+                try:
+                    spec = await self.hostexec.final_spec(
+                        request, agent, HumanDecision(approve=True, decided_by="desktop")
+                    )
+                except Exception as exc:
+                    log.info("desktop prompt for %s: %s", request_id, exc)
+                    return
+                hosts, job = [request.resource], {"job_id": request.id, "spec": spec}
+            else:
+                # Elsewhere an answer is only a click: worth asking while the
+                # target's tier is armed, and not for what stays on Discord.
+                tier = ((target.last_status or {}).get("tiers") or {}).get(request.scope.get("tier")) if target else None
+                if not (tier or {}).get("armed_until") or self._too_sensitive(request):
+                    return
         if not hosts:
             return
-        title, text = prompt_text(request, agent, delegator)
+        who, what, detail = prompt_fields(request, agent, delegator)
         timeout = parse_duration(self.config.timeout)
         now = time.time()
         self._asked[agent.name].append(now)
         self._asked_all.append(now)
         offer = Offer(request_id=request_id, agent=agent.name, answer=asyncio.get_running_loop().create_future())
         self._offers[request_id] = offer
-        shows = [asyncio.create_task(self._show(offer, host, title, text, timeout)) for host in hosts]
+        payload = {"request_id": request_id, "who": who, "what": what, "detail": detail, "timeout": timeout}
+        if job is not None:
+            payload["job"] = job
+        shows = [asyncio.create_task(self._show(offer, host, payload)) for host in hosts]
         try:
-            host, answer = await asyncio.wait_for(asyncio.shield(offer.answer), timeout + parse_duration(self.config.queue_timeout))
+            host, answer = await asyncio.wait_for(asyncio.shield(offer.answer), timeout + QUEUE_SECS)
         except TimeoutError:
             host, answer = None, "timeout"
         finally:
@@ -251,12 +266,12 @@ class DesktopService:
             await self._close(offer)
         await self._apply(offer, host, answer)
 
-    async def _show(self, offer: Offer, host: str, title: str, text: str, timeout: int) -> None:
+    async def _show(self, offer: Offer, host: str, payload: dict[str, Any]) -> None:
         """One dialog on one host; a host shows one at a time. Holds the
         host's slot until the offer ends (this task is cancelled then)."""
         lock = self._host_locks[host]
         try:
-            await asyncio.wait_for(lock.acquire(), parse_duration(self.config.queue_timeout))
+            await asyncio.wait_for(lock.acquire(), QUEUE_SECS)
         except TimeoutError:
             return  # that desktop is busy with another dialog: Discord has it
         try:
@@ -264,14 +279,9 @@ class DesktopService:
             offer.prompts[prompt_id] = host
             self._prompts[prompt_id] = offer
             try:
-                await self.hub.call(
-                    HOST_ROLE,
-                    host,
-                    {"type": "prompt", "prompt_id": prompt_id, "request_id": offer.request_id,
-                     "title": title, "text": text, "timeout": timeout},
-                    timeout=10,
-                )
+                await self.hub.call(HOST_ROLE, host, {"type": "prompt", "prompt_id": prompt_id, **payload}, timeout=10)
             except DaemonCallError:
+                # Nobody there after all, or that host won't ask this.
                 self._prompts.pop(prompt_id, None)
                 offer.prompts.pop(prompt_id, None)
                 return
@@ -321,6 +331,34 @@ class DesktopService:
             # Decided elsewhere meanwhile, or the platform's gate said no
             # (a host that isn't armed): Discord still has the request.
             log.info("desktop answer for %s from %s not applied: %s", offer.request_id, host, exc)
+
+    # --- attention -------------------------------------------------------------------------
+
+    async def notify(self, agent: Agent, text: str, urgency: str = "normal") -> list[str]:
+        """A notification (and a sound) on every desk the operator is at.
+        Returns the hosts that showed it."""
+        c, now = self.config, time.time()
+        if (
+            not c.enabled
+            or not any(fnmatch(agent.name, glob) for glob in c.agents)
+            or self.dnd_until > now
+            or self._paused_until.get(agent.name, 0) > now
+        ):
+            return []
+        shown = []
+        for host in await self.present_hosts():
+            try:
+                await self.hub.call(
+                    HOST_ROLE,
+                    host,
+                    {"type": "notify", "title": f"agent-auth: {agent.name}", "text": text,
+                     "urgency": "critical" if urgency == "high" else "normal"},
+                    timeout=10,
+                )
+                shown.append(host)
+            except DaemonCallError:
+                pass
+        return shown
 
     def cancel(self, request_id: str) -> None:
         """The request was decided some other way: take the dialogs down."""

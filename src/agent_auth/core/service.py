@@ -66,6 +66,9 @@ class Notifier(Protocol):
     # means it could not be shown to a human, and it then does not run.
     async def job_finished(self, request: AccessRequest, job) -> None: ...
     async def shell_command(self, request: AccessRequest, job) -> bool: ...
+    # An agent wants the operator's attention (core/attention.py); `desks`
+    # are the hosts whose desktops already showed it.
+    async def attention(self, agent: Agent, text: str, urgency: str, desks: list[str]) -> None: ...
 
 
 # Runs before a human approval takes effect, outside any transaction, and
@@ -95,6 +98,9 @@ class NullNotifier:
 
     async def shell_command(self, request: AccessRequest, job) -> bool:
         return True  # headless broker: the journal on the host is the record
+
+    async def attention(self, agent: Agent, text: str, urgency: str, desks: list[str]) -> None:
+        log.info("attention (%s) from %s: %s", urgency, agent.name, text)
 
 
 class TransitionError(Exception):

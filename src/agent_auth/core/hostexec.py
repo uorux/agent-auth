@@ -205,6 +205,7 @@ class HostExecService:
                     host,
                     {
                         "type": "hostexec.precheck",
+                        "job_id": request.id,  # it may already be approved at that host's desk
                         "spec": spec,
                         "source": "human",
                         "totp": bool(decision.totp),

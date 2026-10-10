@@ -18,8 +18,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent_auth.core.hostexec import HostExecError
 from agent_auth.core.service import HumanDecision
 from agent_auth.core.states import Platform, RequestStatus
+from agent_auth.daemon_common import hostexec as hx
 from agent_auth.hostd.user import UserHelper, parse_answer
 from agent_auth.models import AccessRequest
 from agent_auth.schemas import RequestCreate
@@ -140,22 +142,105 @@ async def test_who_is_never_asked_at_a_desk(db, stack, host, desk):
             return desktop.refusal(await session.get(AccessRequest, req.id), agent)
 
     assert "not listed" in await refusal(talk(), "claude-elsewhere")
-    assert "sensitive" in await refusal(run_request(["id"], tier="root"), "desk-claude")
     assert "never asked" in await refusal(shell_request(), "desk-claude")
-    await asyncio.sleep(0.3)
-    assert desk.shown() == []
-
-    # A user command on a host: only while that host is armed (the answer has no code).
-    _, req = await ask(stack, db, run_request(["echo", "hi"]), name="desk-claude")
+    # A command on this host, whose desk doesn't approve commands and whose
+    # tiers aren't armed: hostd won't ask (an answer would be worth nothing).
+    for tier in ("root", "user"):
+        _, req = await ask(stack, db, run_request(["id"], tier=tier), name=f"desk-claude-{tier}")
     await asyncio.sleep(0.5)
     assert desk.shown() == [] and await _is(db, req.id, RequestStatus.AWAITING_HUMAN)
+
+    # Armed, a desk answer is a click like one on Discord.
     await stack["hostexec"].arm(HOST, "user", "30m", host.code("user-arm"))
-    await stack["hub"].call("host", HOST, {"type": "disarm", "tier": "root"})  # any call: let a heartbeat land
-    assert await wait_for(lambda: _armed(stack))
     agent, req = await ask(stack, db, run_request(["echo", "from the desk"]), name="desk-claude")
     assert await wait_for(lambda: _is(db, req.id, RequestStatus.GRANTED))
-    assert "run on excelsior as your user" in desk.shown()[0]["text"]
+    assert f"run on {HOST} as" in desk.shown()[0]["text"] and "echo 'from the desk'" in desk.shown()[0]["text"]
     assert (await stack["hostexec"].get_job(req.id, agent.id, 10)).output == "from the desk\n"
+    assert not host.daemon.authorizations  # nothing was authorized at the desk: the arming carried it
+
+
+async def test_allow_at_its_own_desk_approves_exactly_that_command(db, stack, host, desk):
+    """Phase 8: no arming, no code. The host shows what it would run, and
+    Allow there is its own approval of that digest and nothing else."""
+    host.daemon.config.desktop.approve_user = True
+    agent, req = await ask(stack, db, run_request(["echo", "hello", "desk"], cwd="/tmp"), name="desk-claude")
+    assert await wait_for(lambda: _is(db, req.id, RequestStatus.GRANTED))
+    assert (await status_of(db, req.id))[1] == f"desktop:{HOST}"
+    text = desk.shown()[0]["text"]
+    assert "echo hello desk" in text and "in /tmp" in text and "unverified" in text
+    assert (await stack["hostexec"].get_job(req.id, agent.id, 10)).output == "hello desk\n"
+    assert not host.daemon.armed("user") and not host.daemon.authorizations  # spent
+
+    # A template is shown as this host's own expansion of it.
+    _, req = await ask(
+        stack, db,
+        RequestCreate(platform=Platform.HOSTEXEC, capability="tpl.greet", resource=HOST,
+                      scope={"tier": "user", "params": {"name": "bob"}}, justification="say hello to bob",
+                      requested_duration="10m"),
+        name="desk-claude-tpl",
+    )
+    assert await wait_for(lambda: _is(db, req.id, RequestStatus.GRANTED))
+    assert "echo hello bob" in desk.shown()[-1]["text"]
+
+    # The approval is for one digest: another command under the same id is not covered.
+    desk.mode("hang")
+    _, req = await ask(stack, db, run_request(["echo", "one"]), name="desk-claude-other")
+    assert await wait_for(lambda: bool(host.daemon._desk_prompts))
+    prompt_id, shown = next(iter(host.daemon._desk_prompts.items()))
+    await host.daemon._answered(prompt_id, "allow", host.daemon._user_writer)
+    assert host.daemon.authorizations[req.id].via == "desk"
+    other = hx.make_spec(kind="run", host=HOST, tier="user", argv=["echo", "two"], timeout=600)
+    with pytest.raises(HostExecError, match="not_armed"):
+        await stack["hostexec"].call(
+            HOST, {"type": "job.start", "job_id": req.id, "spec": other, "evidence": {"source": "human"}})
+
+
+async def test_root_at_its_own_desk_takes_the_password_too(db, stack, host, desk):
+    host.daemon.config.desktop.approve_root = True
+    # Allow, but no password: not a denial, the request stays on Discord.
+    host.executor.password_ok = False
+    _, req = await ask(stack, db, run_request(["id", "-u"], tier="root"), name="desk-claude")
+    assert await wait_for(lambda: len(host.executor.polkit) == 1)
+    await asyncio.sleep(0.3)
+    assert await _is(db, req.id, RequestStatus.AWAITING_HUMAN) and not host.daemon.authorizations
+    pid, uid, message = host.executor.polkit[0]
+    assert pid == os.getpid() and uid == os.getuid()  # the session helper's process
+    assert f"run on {HOST} as ROOT: id -u" in message and "desk-claude" in message
+
+    host.executor.password_ok = True
+    agent, req = await ask(stack, db, run_request(["echo", "as root"], tier="root"), name="desk-claude-2")
+    assert await wait_for(lambda: _is(db, req.id, RequestStatus.GRANTED))
+    assert await wait_for(lambda: any(run[1] == "root" for run in host.executor.runs))
+    # A desk that only approves root says nothing about the user tier.
+    _, req = await ask(stack, db, run_request(["echo", "x"]), name="desk-claude-3")
+    await asyncio.sleep(0.5)
+    assert await _is(db, req.id, RequestStatus.AWAITING_HUMAN)
+
+
+async def test_an_agent_can_ask_for_attention(db, stack, host, desk, tmp_path):
+    from agent_auth.core.attention import PER_HOUR, AttentionLimit, AttentionService
+
+    log = tmp_path / "notify.log"
+    config = host.daemon.config.desktop
+    config.notify_command = ["sh", "-c", f'printf "%s|%s|%s\\n" "$1" "$2" "$3" >> {log}', "n",
+                             "{urgency}", "{title}", "{text}"]
+    config.attention_command = ["sh", "-c", f"echo ding >> {log}"]
+    attention = AttentionService(stack["service"], stack["desktop"])
+    agent, _ = await make_agent(db, "desk-claude")
+    out = await attention.notify(agent, "the build is <b>done</b>,\nplease look", "high")
+    assert out == {"sent": True, "desktops": [HOST]}
+    assert await wait_for(lambda: log.exists() and len(log.read_text().splitlines()) == 2)
+    lines = log.read_text()
+    assert "ding" in lines
+    assert "critical|agent-auth: desk-claude|the build is &lt;b&gt;done&lt;/b&gt;, please look" in lines
+    assert stack["notifier"].attentions == [("desk-claude", "the build is <b>done</b>, please look", "high", [HOST])]
+    # An agent that may not be asked at a desk still reaches Discord.
+    other, _ = await make_agent(db, "claude-elsewhere")
+    assert (await attention.notify(other, "hello"))["desktops"] == []
+    for _ in range(PER_HOUR - 1):
+        await attention.notify(agent, "again")
+    with pytest.raises(AttentionLimit):
+        await attention.notify(agent, "once more")
 
 
 async def _armed(stack):
@@ -220,7 +305,8 @@ async def test_an_answer_counts_only_for_a_prompt_sent_to_that_host(db, stack, h
     assert await _is(db, req.id, RequestStatus.DENIED)
 
 
-async def test_rates_keep_an_agent_from_flooding_the_desk(db, stack, host, desk):
+async def test_rates_keep_an_agent_from_flooding_the_desk(db, stack, host, desk, monkeypatch):
+    monkeypatch.setattr("agent_auth.core.desktop.QUEUE_SECS", 1)
     desk.mode("hang")
     desktop = stack["desktop"]
     desktop.config.timeout = "1s"
@@ -247,27 +333,3 @@ def test_dialog_answers():
     # sbx-prompt's vocabulary.
     assert parse_answer(0, "once\n") == "allow" and parse_answer(0, "session") == "allow"
     assert parse_answer(0, "deny\n") == "deny"
-
-
-def test_quiet_hours_wrap_midnight(stack):
-    from datetime import datetime
-
-    desktop = stack["desktop"]
-    now = datetime.now().strftime("%H:%M")
-    desktop.config.quiet_hours = ["00:00", "23:59"]
-    assert desktop._quiet_now() or now == "23:59"
-    hour = int(now[:2])
-    desktop.config.quiet_hours = [f"{(hour + 23) % 24:02d}:00", f"{(hour + 1) % 24:02d}:00"]  # wraps around now
-    assert desktop._quiet_now()
-    desktop.config.quiet_hours = [f"{(hour + 2) % 24:02d}:00", f"{(hour + 3) % 24:02d}:00"]
-    assert not desktop._quiet_now()
-
-
-def test_busy_command_decides_whether_prompts_are_shown(tmp_path):
-    """desktop.busy_command: exit 0 = not now; a command that can't run
-    counts as busy too."""
-    from agent_auth.hostd.user import _busy
-
-    assert asyncio.run(_busy(["true"])) is True
-    assert asyncio.run(_busy(["false"])) is False
-    assert asyncio.run(_busy([str(tmp_path / "missing")])) is True

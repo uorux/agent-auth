@@ -73,6 +73,17 @@ class DesktopConfig:
     # (a fullscreen window, a presentation, …). Empty: the built-in check
     # (Hyprland's focused window is fullscreen).
     busy_command: list[str] = field(default_factory=list)
+    # A command on THIS host, shown at this desk with what will actually run:
+    # does Allow there count as this host's own approval, like a TOTP code
+    # for that one command? For root, polkit then asks for the user's
+    # password as well. Off: a desk answer is a click, and the tier must be
+    # armed.
+    approve_user: bool = False
+    approve_root: bool = False
+    # argv run when a prompt or a notification arrives (a sound), and to show
+    # a notification ({title} {text} {urgency}: low | normal | critical).
+    attention_command: list[str] = field(default_factory=list)
+    notify_command: list[str] = field(default_factory=list)
     # Where "idle" and "locked" come from. "hooks": only what
     # `agent-auth-hostctl presence …` reports (hypridle, the lock screen).
     # "logind": the session's IdleHint/LockedHint, where the desktop keeps
@@ -87,6 +98,10 @@ class DesktopConfig:
             prompt_command=list(raw.get("prompt_command") or []),
             prompt_timeout_secs=duration_secs(raw.get("prompt_timeout", 90)),
             busy_command=list(raw.get("busy_command") or []),
+            approve_user=bool((raw.get("approve") or {}).get("user", False)),
+            approve_root=bool((raw.get("approve") or {}).get("root", False)),
+            attention_command=list(raw.get("attention_command") or []),
+            notify_command=list(raw.get("notify_command") or []),
             idle_source="logind" if raw.get("idle_source") == "logind" else "hooks",
         )
 
@@ -116,6 +131,7 @@ class HostConfig:
     systemd_run: str = "systemd-run"
     systemctl: str = "systemctl"
     qrencode: str = "qrencode"
+    pkcheck: str = "pkcheck"
     desktop: DesktopConfig = field(default_factory=DesktopConfig)
 
     @property
@@ -151,7 +167,7 @@ class HostConfig:
                 kwargs[key] = Path(raw[key])
         for key in (
             "user", "auto_commands", "deny_commands", "templates", "env_allow", "vm_unit", "job_path",
-            "systemd_run", "systemctl", "qrencode",
+            "systemd_run", "systemctl", "qrencode", "pkcheck",
         ):
             if raw.get(key) is not None:
                 kwargs[key] = raw[key]

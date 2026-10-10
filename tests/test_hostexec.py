@@ -58,7 +58,7 @@ HOST = "excelsior"
 POLICY = {
     "defaults": {"action": "surface", "max_duration": "24h"},
     # Desktop prompts: only for agents named desk-* (tests/test_desktop.py).
-    "desktop": {"enabled": True, "agents": ["desk-*"], "timeout": "5s", "queue_timeout": "1s"},
+    "desktop": {"enabled": True, "agents": ["desk-*"], "timeout": "5s"},
     "platforms": {
         "hostexec": {
             "templates": {"greet": {"tier": "user", "argv": ["echo", "hello", "{name}"], "params": {"name": "[a-z]+"}}}
@@ -156,6 +156,8 @@ class FakeExecutor:
         self.runs: list[tuple[str, str, list[str]]] = []
         self.units: list[tuple[str, str]] = []
         self.procs: dict[str, asyncio.subprocess.Process] = {}
+        self.password_ok = True  # does the user type their password when polkit asks?
+        self.polkit: list[tuple[int, int, str]] = []
 
     async def run(self, job_id, tier, argv, cwd, env, timeout, stdin, on_output) -> int:
         self.runs.append((job_id, tier, argv))
@@ -180,6 +182,10 @@ class FakeExecutor:
         if proc and proc.returncode is None:
             proc.kill()
 
+    async def polkit_auth(self, pid, uid, message, timeout) -> bool:
+        self.polkit.append((pid, uid, message))
+        return self.password_ok
+
     async def unit_action(self, action, unit):
         self.units.append((action, unit))
         return 0, "active"
@@ -192,6 +198,7 @@ class RecordingNotifier:
         self.finished: list[HostJob] = []
         self.mirrored: list[list[str]] = []
         self.mirror_ok = True
+        self.attentions: list[tuple] = []
 
     async def surface(self, request, agent):
         self.surfaced.append(request.id)
@@ -207,6 +214,9 @@ class RecordingNotifier:
 
     async def job_finished(self, request, job):
         self.finished.append(job)
+
+    async def attention(self, agent, text, urgency, desks):
+        self.attentions.append((agent.name, text, urgency, desks))
 
     async def shell_command(self, request, job):
         if self.mirror_ok:
@@ -242,6 +252,7 @@ def stack(db, a2a_service, broker_key):
     service.set_notifier(FanoutNotifier(notifier, desktop))
     hostexec = HostExecService(db, hub, events)
     hostexec.bind(service, a2a_service)
+    desktop.hostexec = hostexec
     registry.register(HostexecProvisioner(policy.platforms.hostexec, hostexec))
     app = create_app(settings, db, service, registry, events, a2a_service, hub, hostexec)
     return {"app": app, "service": service, "hub": hub, "hostexec": hostexec, "notifier": notifier,

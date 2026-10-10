@@ -9,6 +9,7 @@ from .api.app import create_app
 from .config import Settings, get_settings
 from .core.a2a import A2AThreadService
 from .core.daemons import DaemonHub
+from .core.attention import AttentionService
 from .core.desktop import DesktopService, FanoutNotifier
 from .core.hostexec import HostExecService
 from .core.sandboxes import SandboxService
@@ -172,7 +173,7 @@ async def serve(settings: Settings) -> None:
     # Approval prompts on the desktops you are at, next to Discord.
     desktop = None
     if daemons.enabled and policy.desktop.enabled:
-        desktop = DesktopService(db, daemons, policy.desktop, service)
+        desktop = DesktopService(db, daemons, policy.desktop, service, hostexec)
         log.info("desktop prompts enabled for agents %s", ", ".join(policy.desktop.agents) or "(none listed)")
 
     bot: AgentAuthBot | None = None
@@ -187,6 +188,7 @@ async def serve(settings: Settings) -> None:
             "visible via the admin API"
         )
     service.set_notifier(FanoutNotifier(notifier, desktop) if desktop is not None else notifier)
+    app.state.attention = AttentionService(service, desktop)
 
     try:
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

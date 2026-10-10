@@ -35,6 +35,12 @@ def peer_uid(writer: asyncio.StreamWriter) -> int:
     return struct.unpack("3i", creds)[1]
 
 
+def peer_pid(writer: asyncio.StreamWriter) -> int:
+    sock = writer.get_extra_info("socket")
+    creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+    return struct.unpack("3i", creds)[0]
+
+
 async def _serve_conn(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,

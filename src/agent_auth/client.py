@@ -64,6 +64,9 @@ class BrokerClient:
     def me(self):
         return self._request("GET", "/v1/me")
 
+    def attention(self, text: str, urgency: str = "normal"):
+        return self._request("POST", "/v1/attention", json={"text": text, "urgency": urgency})
+
     def catalog(self):
         return self._request("GET", "/v1/catalog")
 

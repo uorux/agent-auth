@@ -196,46 +196,33 @@ class HostexecPlatformConfig(BaseModel):
 
 
 class DesktopConfig(BaseModel):
-    """Approval prompts on the desktops you are at (hostd-user), next to
-    Discord. Off unless enabled; see docs/sandbox-design.md §8.10."""
+    """Approval prompts and notifications on the desktops you are at
+    (hostd-user), next to Discord. Off unless enabled; see
+    docs/sandbox-design.md §8.10."""
 
     enabled: bool = False
     # Which requests may be asked on a desktop: globs on the requesting
     # agent's name, and platforms (empty = every platform).
     agents: list[str] = Field(default_factory=list)
     platforms: list[Platform] = Field(default_factory=list)
-    # Sensitive requests (root commands, write access to another project,
-    # secrets permissions, …) stay on Discord unless this is set. Shells
+    # Sensitive requests (write access to another project, secrets
+    # permissions, …) stay on Discord unless this is set. A command on a host
+    # is the exception: at that host's own desk the host decides. Shells
     # never reach a desktop.
     sensitive: bool = False
     # How long a dialog stays up before the request is left to Discord.
     timeout: str | int = "90s"
-    # A request waits at most this long for a desktop's previous dialog.
-    queue_timeout: str | int = "30s"
     # Rate limits; beyond them requests go to Discord only.
-    per_agent_burst: int = 2
     per_agent_per_hour: int = 6
     per_hour: int = 20
     # After a Deny, that agent's desktop prompts pause; three in an hour mute it.
     deny_cooldown: str | int = "10m"
     mute: str | int = "1h"
-    # Optional daily window with no desktop prompts, e.g. ["23:00", "08:00"]
-    # (the broker's local time).
-    quiet_hours: list[str] = Field(default_factory=list)
 
-    @field_validator("timeout", "queue_timeout", "deny_cooldown", "mute")
+    @field_validator("timeout", "deny_cooldown", "mute")
     @classmethod
     def _valid(cls, v):
         parse_duration(v)
-        return v
-
-    @field_validator("quiet_hours")
-    @classmethod
-    def _hours(cls, v):
-        import re
-
-        if v and (len(v) != 2 or not all(re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", h) for h in v)):
-            raise ValueError('quiet_hours is ["HH:MM", "HH:MM"]')
         return v
 
 
