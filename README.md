@@ -103,6 +103,10 @@ interfaces, all wrapping the same HTTP API:
    justification (limited attempts), or `escalate_request` to a human.
 4. On `granted`: `get_credential(grant_id)` when a token is needed (GitHub);
    re-fetch rather than caching — minting stops the moment the grant ends.
+   `get_credential(grant_id, to_file=True)` writes the token to a file only
+   the agent's user can read and returns its path (and, for GitHub, a git
+   `credential.helper` that reads it), so the token is neither in the
+   conversation nor on a command line.
 
 ## a2a threads
 

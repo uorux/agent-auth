@@ -23,9 +23,11 @@ def _mcp_env(monkeypatch):
     # Fresh module globals; _KIND="service" skips the /v1/me kind probe.
     m._CLIENT = None
     m._KIND = "service"
+    m._MINTED = False
     yield
     m._CLIENT = None
     m._KIND = None
+    m._MINTED = False
 
 
 def test_create_session_returns_id_without_touching_global():
@@ -102,3 +104,83 @@ def test_whoami():
         mock.get(f"{BROKER}/v1/me").respond(200, json={"name": "claude-x-host", "kind": "ephemeral"})
         out = json.loads(m.whoami())
     assert out["name"] == "claude-x-host"
+
+
+def _broker_with_idle_sweep(mock):
+    """Sessions sess-1, sess-2, ... are minted in turn; those in `closed` are
+    refused the way the broker refuses an idled-out session."""
+    import httpx
+
+    closed: set[str] = set()
+    minted: list[str] = []
+
+    def mint(request):
+        minted.append(f"sess-{len(minted) + 1}")
+        return httpx.Response(200, json={"session_id": minted[-1]})
+
+    def answer(request):
+        if request.headers.get("X-Agent-Session") in closed:
+            return httpx.Response(401, json={"detail": "unknown or closed session"})
+        return httpx.Response(200, json=[])
+
+    mock.post(f"{BROKER}/v1/sessions").mock(side_effect=mint)
+    mock.get(f"{BROKER}/v1/me").mock(side_effect=answer)
+    threads = mock.get(f"{BROKER}/v1/a2a/threads").mock(side_effect=answer)
+    return closed, minted, threads
+
+
+def test_a_minted_session_the_broker_closed_is_replaced():
+    m._KIND = "ephemeral"
+    with respx.mock(assert_all_called=False) as mock:
+        closed, minted, threads = _broker_with_idle_sweep(mock)
+
+        assert json.loads(m.a2a_threads()) == []
+        closed.add("sess-1")  # a long wait for a human: the broker idles it out
+        assert json.loads(m.a2a_threads()) == []
+        assert json.loads(m.a2a_threads()) == []
+
+        assert minted == ["sess-1", "sess-2"]
+        assert [c.request.headers["X-Agent-Session"] for c in threads.calls] == [
+            "sess-1",
+            "sess-1",
+            "sess-2",
+            "sess-2",
+        ]
+
+
+def test_a_session_the_caller_named_is_not_replaced():
+    m._KIND = "ephemeral"
+    with respx.mock(assert_all_called=False) as mock:
+        closed, minted, _ = _broker_with_idle_sweep(mock)
+        closed.add("sess-theirs")
+
+        assert json.loads(m.a2a_threads())  == []  # mints sess-1, which stays live
+        out = json.loads(m.a2a_threads(session_key="sess-theirs"))
+
+        assert out == {"error": "unknown or closed session", "status_code": 401}
+        assert minted == ["sess-1"]
+        assert m._client().session_id == "sess-1"
+
+
+def test_get_credential_to_file_keeps_the_token_out_of_the_reply(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(f"{BROKER}/v1/grants/g-1/credential").respond(
+            200, json={"kind": "github_installation_token", "value": "ghs_secret"}
+        )
+        mock.get(f"{BROKER}/v1/grants/g-2/credential").respond(
+            200, json={"kind": "github_repo", "value": "https://github.com/o/r"}
+        )
+
+        raw = m.get_credential("g-1", to_file=True)
+        out = json.loads(raw)
+        path = tmp_path / "agent-auth" / "credentials" / "g-1"
+
+        assert "ghs_secret" not in raw and out["value"] is None
+        assert out["file"] == str(path) and path.read_text() == "ghs_secret"
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert path.parent.stat().st_mode & 0o777 == 0o700
+        assert str(path) in out["git_helper"]
+        # nothing secret about a created repo's URL: it stays in the reply
+        assert json.loads(m.get_credential("g-2", to_file=True))["value"].endswith("/o/r")
+        assert json.loads(m.get_credential("g-1"))["value"] == "ghs_secret"

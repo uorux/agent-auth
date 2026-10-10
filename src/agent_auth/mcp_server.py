@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -34,7 +35,8 @@ Getting access:
 4. request_access — the narrowest capability that does the job, with a
    specific justification (what task, why this resource, why this long).
 5. wait_for_decision — follow its `status` and `guidance`.
-6. get_credential(grant_id) — tokens, accounts, a created repo's URL.
+6. get_credential(grant_id) — tokens, accounts, a created repo's URL. With
+   to_file=True a token goes to a file instead of into this conversation.
    Re-fetch instead of caching: credentials stop being issued when the grant
    ends.
 
@@ -89,6 +91,10 @@ mcp = FastMCP("agent-auth", instructions=INSTRUCTIONS)
 # of an ephemeral agent's session.
 _CLIENT: BrokerClient | None = None
 _KIND: str | None = None
+# The broker closes a session nobody has used for a while (a long wait for a
+# human will do it). One this process minted itself is replaced then.
+_MINTED = False
+STALE_SESSION = "unknown or closed session"
 
 
 def _client() -> BrokerClient:
@@ -101,7 +107,7 @@ def _client() -> BrokerClient:
 def _session_client() -> BrokerClient:
     """Client for a2a calls: ephemeral agents get a session auto-created on
     first use (label = cwd basename); service agents skip session machinery."""
-    global _KIND
+    global _KIND, _MINTED
     client = _client()
     if client.session_id:
         return client
@@ -111,7 +117,23 @@ def _session_client() -> BrokerClient:
         label = os.path.basename(os.getcwd()) or "session"
         label = "".join(c for c in label if c.isalnum() or c in "._-")[:64] or "session"
         client.create_session(label)
+        _MINTED = True
     return client
+
+
+def _minted_session_gone() -> bool:
+    """Whether the session this process minted has been closed by the broker;
+    forgets it if so, and the next call mints another."""
+    client = _CLIENT
+    if not (_MINTED and client and client.session_id):
+        return False
+    try:
+        client.me()
+    except BrokerError as exc:
+        if exc.status_code == 401 and exc.detail == STALE_SESSION:
+            client.session_id = ""
+            return True
+    return False
 
 
 def _client_for(session_key: str | None) -> BrokerClient:
@@ -130,7 +152,15 @@ def _client_for(session_key: str | None) -> BrokerClient:
 
 def _safe(fn) -> str:
     try:
-        return json.dumps(fn(), indent=2, default=str)
+        try:
+            out = fn()
+        except BrokerError as exc:
+            if not (exc.status_code == 401 and exc.detail == STALE_SESSION):
+                raise
+            if not _minted_session_gone():
+                raise
+            out = fn()
+        return json.dumps(out, indent=2, default=str)
     except BrokerError as exc:
         return json.dumps({"error": exc.detail, "status_code": exc.status_code})
 
@@ -286,7 +316,7 @@ def list_grants(status: str = "active") -> str:
 
 
 @mcp.tool()
-def get_credential(grant_id: str) -> str:
+def get_credential(grant_id: str, to_file: bool = False) -> str:
     """Fetch the live credential for an active grant, by `kind`:
     - github_installation_token (github "repo"): a token for git/the API, valid
       under an hour — refetch rather than storing it; it stops being issued the
@@ -300,9 +330,52 @@ def get_credential(grant_id: str) -> str:
       added to the group; you already have its password.
     a2a grants carry no credential.
 
+    to_file=True keeps a secret out of your conversation and out of the
+    commands you run: the value is written to a file only you can read and
+    the reply carries `file` (its path) instead of `value`. Prefer it for
+    anything you only hand to a program — commands then name the file, not
+    the secret: kubectl --token="$(cat <file>)", and for git `git_helper`
+    in the reply is a credential.helper that reads the file. Call again to
+    refresh the file once the token has expired.
+
     Credentials are for your own use: never pass one to another agent (in an
     a2a message or result) — it requests its own access."""
-    return _safe(lambda: _client().credential(grant_id))
+
+    def go():
+        out = _client().credential(grant_id)
+        return _to_file(grant_id, out) if to_file else out
+
+    return _safe(go)
+
+
+# Kinds whose `value` is a secret a program consumes (a created repo's URL, a
+# group membership and the like stay in the reply).
+SECRET_KINDS = {"github_installation_token", "kubernetes_token", "mcp_token", "lldap_account"}
+
+
+def _credential_dir() -> Path:
+    base = os.environ.get("XDG_RUNTIME_DIR") or os.path.expanduser("~/.cache")
+    return Path(base) / "agent-auth" / "credentials"
+
+
+def _to_file(grant_id: str, out: dict[str, Any]) -> dict[str, Any]:
+    if out.get("kind") not in SECRET_KINDS or not out.get("value"):
+        return out
+    directory = _credential_dir()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = directory / "".join(c for c in grant_id if c.isalnum() or c == "-")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(out["value"])
+    out = {**out, "value": None, "file": str(path)}
+    if out["kind"] == "github_installation_token":
+        helper = f'!f() {{ echo username=x-access-token; echo "password=$(cat {path})"; }}; f'
+        out["git_helper"] = helper
+        out["git_example"] = (
+            f"git -c credential.helper= -c credential.helper={helper!r} "
+            "push https://github.com/<owner>/<repo>.git <branch>"
+        )
+    return out
 
 
 @mcp.tool()
