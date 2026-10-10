@@ -28,7 +28,7 @@ against the pinned versions; **[open]** = needs your call (collected in §16).
 |---|---|
 | 1. Daemon channel + hostd skeleton | built, tested; deployed |
 | 2. Agent VM (nixos-dots) | built; being brought up on excelsior |
-| 3. sandboxd | built, including routing triage and the claude mid-turn doorbell; tested against a real broker with a fake runtime. `avm --host` (nixos-dots) not built |
+| 3. sandboxd | built, including routing triage and the claude mid-turn doorbell; tested against a real broker with a fake runtime. `avm --host` is in nixos-dots (not run) |
 | 4. hostexec `run` + kill switch | built, tested against the real hostd with a fake executor; **the systemd-run paths have not run on a host** |
 | 5. Shells | built, same caveat |
 | 6. MCP catalog + proxy | not started |
@@ -644,7 +644,7 @@ transcript.
 **Host CLI `avm`** (on the agent VM's host; `--host <h>` reaches another host
 over tailnet SSH, which `jrt` already has). **[built: avm runs
 `agent-auth-sandboxctl` in the guest over vsock SSH; `avm claude|codex
-<project>` stands in for `avm new`; `--host` not yet]**
+<project>` stands in for `avm new`; `--host` runs the other host's `avm` over SSH]**
 
 | command | does |
 |---|---|
