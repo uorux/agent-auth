@@ -688,9 +688,12 @@ async def test_the_host_bounds_shells_itself(db, stack, host):
                    "digest": hx.digest(hx.shell_spec(HOST, "user", 7200)), "totp": host.code("user-direct")})
         await stack["hostexec"].call(
             HOST, {"type": "shell.open", "shell_id": long.id, "spec": hx.shell_spec(HOST, "user", 7200)})
+    # What the host reported as off is denied at once, without asking anyone…
     _, root = await ask(stack, db, shell_request(tier="root"))
-    with pytest.raises(TransitionError, match="root shells are not enabled"):
-        await approve(stack, root.id, totp=host.code("root-direct"))
+    assert root.status == RequestStatus.DENIED and "root shells are not enabled" in root.decision_reason
+    # …and refused by the host itself, whatever the broker checked.
+    with pytest.raises(HostExecError, match="root shells are not enabled"):
+        await stack["hostexec"].call(HOST, {"type": "hostexec.precheck", "kind": "shell", "tier": "root", "duration": 60})
 
     agent, req = await ask(stack, db, shell_request(duration="1m"))
     await approve(stack, req.id, totp=host.code("user-direct"))

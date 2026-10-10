@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import socket
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,23 @@ def socket_on_host(path: Path, tmp: Path) -> Path:
     return path
 
 
+def connect_unix(path: Path) -> socket.socket:
+    """A connected stream socket. The real socket's path (the project's tmp
+    dir + codex-daemon-<uid>/<64 hex>) is longer than a unix address may be
+    (108 bytes), so it is reached through its directory's descriptor."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    dir_fd = os.open(path.parent, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        sock.connect(f"/proc/self/fd/{dir_fd}/{path.name}")
+    except BaseException:
+        sock.close()
+        raise
+    finally:
+        os.close(dir_fd)
+    sock.setblocking(False)
+    return sock
+
+
 class CodexRun:
     def __init__(self, host: Host, ctx: SpawnContext, socket_host_path):
         self.host, self.ctx, self.socket_host_path = host, ctx, socket_host_path
@@ -74,7 +92,7 @@ class CodexRun:
                 f"codex app-server did not open its socket within {SOCKET_WAIT_SECS} s"
                 f" (in the VM: journalctl -u {self.ctx.unit})"
             )
-        self._ws = await unix_connect(str(sock), uri="ws://localhost/")
+        self._ws = await unix_connect(sock=connect_unix(sock), uri="ws://localhost/")
         self._reader = asyncio.create_task(self._read())
         await self._call("initialize", {"clientInfo": {"name": "sandboxd", "version": "1"}})
         base = {

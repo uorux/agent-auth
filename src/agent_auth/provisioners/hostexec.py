@@ -83,6 +83,16 @@ class HostexecProvisioner:
                 raise SpecValidationError('hostexec capability is "run", "tpl.<name>" or "shell"')
         except hx.SpecError as exc:
             raise SpecValidationError(str(exc)) from None
+        # What the host last said it accepts: no point asking a human for
+        # something it will refuse whatever they answer. (The host checks
+        # again; a host that reported nothing is asked later.)
+        reported = ((daemon.last_status or {}).get("tiers") or {}).get(spec.scope.get("tier") or "user")
+        if reported is not None:
+            wanted = spec.scope.get("tier") or "user"
+            if not reported.get("enabled"):
+                raise SpecValidationError(f"the {wanted} tier is not enabled on {host}")
+            if capability == "shell" and not reported.get("shell"):
+                raise SpecValidationError(f"{wanted} shells are not enabled on {host}")
         spec.resource = host
         return spec
 

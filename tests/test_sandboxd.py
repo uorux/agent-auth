@@ -631,3 +631,28 @@ def test_codex_socket_behind_its_symlink(tmp_path):
         path.unlink()
         path.symlink_to(elsewhere)
         assert socket_on_host(path, tmp_path) == path
+
+
+def test_codex_socket_with_a_path_too_long_for_a_unix_address(tmp_path):
+    import socket
+
+    from agent_auth.sandboxd.runtimes.codex import connect_unix
+
+    deep = tmp_path / ("d" * 60) / "codex-daemon-40001"
+    deep.mkdir(parents=True)
+    path = deep / ("c" * 64)
+    assert len(str(path)) > 108
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    fd = os.open(deep, os.O_PATH)
+    try:
+        server.bind(f"/proc/self/fd/{fd}/{path.name}")
+    finally:
+        os.close(fd)
+    server.listen(1)
+    client = connect_unix(path)
+    conn, _ = server.accept()
+    conn.sendall(b"hi")
+    client.setblocking(True)
+    assert client.recv(2) == b"hi"
+    for s in (client, conn, server):
+        s.close()
