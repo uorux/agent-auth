@@ -75,6 +75,14 @@ def agent_matches(pattern: AgentPattern, agent: Any) -> bool:
     return pattern.matches(agent)
 
 
+def pattern_text(pattern: AgentPattern) -> str:
+    """A pattern as a person would write it in the policy."""
+    if isinstance(pattern, str):
+        return pattern
+    fields = pattern.model_dump(exclude_defaults=True)
+    return "{" + ", ".join(f"{k}: {'|'.join(v) if isinstance(v, list) else v}" for k, v in fields.items()) + "}"
+
+
 class Project(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

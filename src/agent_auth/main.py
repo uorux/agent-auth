@@ -19,6 +19,7 @@ from .core.service import RequestService
 from .crypto import SecretBox
 from .db import Database
 from .discord_bot.bot import AgentAuthBot, DiscordNotifier
+from .policy.agents import pattern_text
 from .policy.engine import PolicyEngine
 from .policy.llm import LLMEvaluator
 from .core.tokens import TokenIssuer
@@ -194,7 +195,10 @@ async def serve(settings: Settings) -> None:
     desktop = None
     if daemons.enabled and policy.desktop.enabled:
         desktop = DesktopService(db, daemons, policy.desktop, service, hostexec)
-        log.info("desktop prompts enabled for agents %s", ", ".join(policy.desktop.agents) or "(none listed)")
+        log.info(
+            "desktop prompts enabled for agents %s",
+            ", ".join(pattern_text(p) for p in policy.desktop.agents) or "(none listed)",
+        )
 
     bot: AgentAuthBot | None = None
     notifier = service.notifier

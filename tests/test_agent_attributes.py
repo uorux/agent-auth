@@ -162,3 +162,16 @@ async def test_a_delegator_is_matched_by_its_fields_too(db):
     assert await asked_by(vm_claude) == PolicyAction.APPROVE
     assert await asked_by(host_claude) == PolicyAction.SURFACE
     assert await asked_by(None) == PolicyAction.SURFACE
+
+
+def test_a_pattern_reads_back_the_way_it_was_written():
+    """The start-up log prints desktop.agents; a pattern in the field form
+    crashed the broker there once."""
+    from agent_auth.policy.agents import pattern_text
+
+    policy = PolicyFile.model_validate(
+        {"desktop": {"enabled": True, "agents": [{"placement": "sandbox"}, {"runtime": ["claude", "codex"]}, "hermes-*"]}}
+    )
+    assert ", ".join(pattern_text(p) for p in policy.desktop.agents) == (
+        "{placement: sandbox}, {runtime: claude|codex}, hermes-*"
+    )
