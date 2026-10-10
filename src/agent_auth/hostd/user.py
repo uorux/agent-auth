@@ -26,7 +26,8 @@ log = logging.getLogger(__name__)
 
 PRESENCE_SECS = 10
 DEFAULT_PROMPT = [
-    "zenity", "--question", "--no-markup", "--width", "560",
+    # --default-cancel: a stray Enter (typing as the dialog appears) denies.
+    "zenity", "--question", "--no-markup", "--default-cancel", "--width", "560",
     "--title", "{title}", "--text", "{text}", "--timeout", "{timeout}",
     "--ok-label", "Allow once", "--cancel-label", "Deny",
     "--extra-button", "Mute agent 1h", "--extra-button", "Send to Discord",
@@ -76,6 +77,18 @@ async def _fullscreen() -> bool:
     return value is True or (isinstance(value, int) and value >= 2)
 
 
+async def _busy(argv: list[str]) -> bool:
+    """desktop.busy_command: exit 0 = don't show prompts now. A command that
+    can't be run or doesn't answer counts as busy (unknown is away)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+        )
+        return await asyncio.wait_for(proc.wait(), 5) == 0
+    except (OSError, TimeoutError):
+        return True
+
+
 async def _logind() -> tuple[float | None, bool | None]:
     """(idle seconds, locked) from logind's hints for the user's display
     session — only meaningful where the desktop maintains them."""
@@ -114,7 +127,9 @@ class UserHelper:
             "type": "presence",
             "idle_secs": idle,
             "locked": locked,
-            "fullscreen": await _fullscreen(),
+            # "Not now", whatever the reason: the host's own check, or Hyprland's
+            # focused window being fullscreen.
+            "fullscreen": await (_busy(busy) if (busy := self.config.desktop.busy_command) else _fullscreen()),
             "fresh": self.fresh,
         }
         self.fresh = False

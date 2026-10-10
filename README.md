@@ -514,8 +514,8 @@ desktop:
 
 - **Present** means: hostd's helper in your session (`agent-auth-hostd user`,
   a user service) is connected, the session is unlocked and was used within
-  `desktop.maxIdle`, nothing is fullscreen, and do-not-disturb is off. Unknown
-  counts as away. Hyprland keeps no idle or lock hints, so report them:
+  `desktop.maxIdle`, nothing is fullscreen (or `desktop.busyCommand` says not
+  now), and do-not-disturb is off. Unknown counts as away. Hyprland keeps no idle or lock hints, so report them:
 
   ```
   # hypridle.conf
@@ -523,7 +523,8 @@ desktop:
   # around your lock screen
   agent-auth-hostctl presence locked; hyprlock; agent-auth-hostctl presence unlocked
   ```
-- **Buttons**: Allow once · Deny · Mute agent 1h · Send to Discord. The dialog
+- **Buttons**: Allow once · Deny · Mute agent 1h · Send to Discord. Deny is the
+  default, so a stray Enter denies. The dialog
   is `desktop.promptCommand` (zenity by default; any command that exits 0 for
   allow works, including `sbx-prompt`).
 - **Limits**: one dialog per desktop at a time, 2 in a burst and 6 an hour per

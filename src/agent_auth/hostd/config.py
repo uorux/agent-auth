@@ -69,6 +69,10 @@ class DesktopConfig:
     # stdout for the two extra buttons. Default: zenity.
     prompt_command: list[str] = field(default_factory=list)
     prompt_timeout_secs: int = 90
+    # argv, run every few seconds in the user's session: exit 0 = not now
+    # (a fullscreen window, a presentation, …). Empty: the built-in check
+    # (Hyprland's focused window is fullscreen).
+    busy_command: list[str] = field(default_factory=list)
     # Where "idle" and "locked" come from. "hooks": only what
     # `agent-auth-hostctl presence …` reports (hypridle, the lock screen).
     # "logind": the session's IdleHint/LockedHint, where the desktop keeps
@@ -82,6 +86,7 @@ class DesktopConfig:
             max_idle_secs=duration_secs(raw.get("max_idle", 300)),
             prompt_command=list(raw.get("prompt_command") or []),
             prompt_timeout_secs=duration_secs(raw.get("prompt_timeout", 90)),
+            busy_command=list(raw.get("busy_command") or []),
             idle_source="logind" if raw.get("idle_source") == "logind" else "hooks",
         )
 

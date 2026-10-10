@@ -261,3 +261,13 @@ def test_quiet_hours_wrap_midnight(stack):
     assert desktop._quiet_now()
     desktop.config.quiet_hours = [f"{(hour + 2) % 24:02d}:00", f"{(hour + 3) % 24:02d}:00"]
     assert not desktop._quiet_now()
+
+
+def test_busy_command_decides_whether_prompts_are_shown(tmp_path):
+    """desktop.busy_command: exit 0 = not now; a command that can't run
+    counts as busy too."""
+    from agent_auth.hostd.user import _busy
+
+    assert asyncio.run(_busy(["true"])) is True
+    assert asyncio.run(_busy(["false"])) is False
+    assert asyncio.run(_busy([str(tmp_path / "missing")])) is True

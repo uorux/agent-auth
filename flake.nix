@@ -252,6 +252,7 @@
               idle_source = cfg.desktop.idleSource;
               prompt_command = cfg.desktop.promptCommand;
               prompt_timeout = cfg.desktop.promptTimeout;
+              busy_command = cfg.desktop.busyCommand;
             };
           };
           configFile = pkgs.writeText "hostd.json" (builtins.toJSON settings);
@@ -445,7 +446,7 @@
               promptCommand = lib.mkOption {
                 type = lib.types.listOf lib.types.str;
                 default = [
-                  "${pkgs.zenity}/bin/zenity" "--question" "--no-markup" "--width" "560"
+                  "${pkgs.zenity}/bin/zenity" "--question" "--no-markup" "--default-cancel" "--width" "560"
                   "--title" "{title}" "--text" "{text}" "--timeout" "{timeout}"
                   "--ok-label" "Allow once" "--cancel-label" "Deny"
                   "--extra-button" "Mute agent 1h" "--extra-button" "Send to Discord"
@@ -459,6 +460,18 @@
                 '';
               };
               promptTimeout = lib.mkOption { type = duration; default = "90s"; };
+              busyCommand = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+                description = ''
+                  A command run every few seconds in the user's session: exit
+                  0 = show no prompts now (a fullscreen window, a
+                  presentation, …); failing to run counts as that too. Empty:
+                  the built-in check, Hyprland's focused window being
+                  fullscreen (needs hyprctl and HYPRLAND_INSTANCE_SIGNATURE in
+                  the user service's environment).
+                '';
+              };
             };
           };
 
