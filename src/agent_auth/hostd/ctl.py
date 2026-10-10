@@ -60,7 +60,8 @@ def status(as_json: bool = typer.Option(False, "--json")):
     d = s["desktop"]
     if d["enabled"]:
         dnd = f"  do-not-disturb until {_when(d['dnd_until'])}" if d["dnd_until"] else ""
-        typer.echo(f"desktop: {'present' if d['present'] else 'away'}{dnd}")
+        away = f"away: {d.get('away_reason') or 'unknown'}"
+        typer.echo(f"desktop: {'present' if d['present'] else away}{dnd}")
 
 
 @app.command()

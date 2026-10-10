@@ -176,21 +176,35 @@ class Hostd:
     def armed(self, tier: str) -> bool:
         return self.armed_until.get(tier, 0.0) > time.time()
 
-    def present(self) -> bool:
-        """Is the user at this host's desktop right now? Unknown counts as no."""
+    def away_reason(self) -> str | None:
+        """Why the user doesn't count as being at this host's desktop right
+        now; None if they are. Unknown counts as away."""
         p, now = self.presence, time.time()
-        if not self.config.desktop.enable or not p.connected or p.dnd_until > now or p.fullscreen:
-            return False
+        if not self.config.desktop.enable:
+            return "desktop prompts are off on this host"
+        if not p.connected:
+            return "the session helper isn't connected (systemctl --user status agent-auth-hostd-user)"
+        if p.dnd_until > now:
+            return "do not disturb"
+        if p.fullscreen:
+            return "busy (a fullscreen window, or the host's busy check says not now)"
         locked = p.explicit_locked if p.explicit_locked is not None else p.locked
-        if locked is not False:
-            return False
+        if locked is None:
+            return "lock state unknown (no `presence locked|unlocked` report yet)"
+        if locked:
+            return "the session is locked"
         if p.explicit_idle is not None:
             idle = (now - p.idle_since) if (p.explicit_idle and p.idle_since) else 0.0
         elif p.idle_secs is not None:
             idle = p.idle_secs + (now - p.reported_at)
         else:
-            return False
-        return idle <= self.config.desktop.max_idle_secs
+            return "idle state unknown (no `presence idle|active` report yet)"
+        if idle > self.config.desktop.max_idle_secs:
+            return f"idle for {int(idle)} s"
+        return None
+
+    def present(self) -> bool:
+        return self.away_reason() is None
 
     def status(self) -> dict[str, Any]:
         now = time.time()
@@ -215,6 +229,7 @@ class Hostd:
             "desktop": {
                 "enabled": self.config.desktop.enable,
                 "present": self.present(),
+                "away_reason": self.away_reason(),
                 "dnd_until": self.presence.dnd_until if self.presence.dnd_until > now else None,
             },
         }
