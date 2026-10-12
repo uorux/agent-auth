@@ -643,8 +643,10 @@ per-project rule.
 A page the broker serves at `/ui` for setting agents and hosts up without
 the CLI: the agents and their fields (create, set fields, rename, new key,
 disable), the projects policy names and who is on them, hosts and paired
-daemons (pairing codes, unpair), saved rules (delete), recent requests
-(read-only, revoke a grant).
+daemons (pairing codes, unpair), saved rules (delete). And what happened,
+read-only: every request and who decided it (you, a saved rule, the policy
+file, the LLM), the commands hosts ran with their output, and a diagram of
+which agents talk to which, with the conversations behind each arrow.
 
 ```yaml
 ui:
@@ -673,6 +675,10 @@ groups`; give it your strictest authorization policy (two factors). Needs
   (`core/webui.ALLOWED`). Deciding requests, arming hosts, lifting a lockdown
   and an agent's webhook or LLDAP password are not on it: those stay on
   Discord, the CLI and the hosts' TOTP codes.
+- **What it lets you read.** The log shows command output and what agents
+  wrote to each other (`/admin/log/...`, `/admin/a2a/...`). Either can
+  contain whatever a command printed or an agent said, so the panel is as
+  sensitive as the hosts' journals.
 - **One address.** The panel answers only at `base_url`'s host; under the
   broker's other names (the public one agents use) `/ui` is a 404 and a
   session cookie is ignored. That narrows where it shows up; the sign-in is

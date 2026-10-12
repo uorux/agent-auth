@@ -313,3 +313,125 @@ async def test_the_panel_is_served_at_its_own_address_only(app, ui, provider):
     # Behind a local proxy that does not pass the host on.
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8400") as local:
         assert (await local.get("/admin/agents", headers=headers)).status_code == 200
+
+
+# ── what happened: decisions, commands, conversations ────────────────────────
+
+
+async def _seed_activity(db):
+    from datetime import timedelta
+
+    from agent_auth.core.states import DecisionSource, GrantStatus, Platform, RequestStatus
+    from agent_auth.models import A2AMessage, A2AThread, AccessRequest, Grant, HostJob, utcnow
+
+    claude, _ = await make_agent(db, "claude-x-galaxy", runtime="claude", project="x", host="galaxy", kind="ephemeral")
+    hermes, _ = await make_agent(db, "hermes-homelab-recusant", runtime="hermes", project="homelab", host="recusant")
+    idle, _ = await make_agent(db, "claude-idle-galaxy", runtime="claude", last_seen_at=utcnow() - timedelta(days=3))
+    now = utcnow()
+    async with db.session() as s:
+        talk = AccessRequest(
+            agent_id=claude.id, platform=Platform.A2A, resource=hermes.name, authority={"capability": "talk"},
+            justification="deploy <b>x</b>", requested_duration_secs=3600, status=RequestStatus.GRANTED,
+            decision_source=DecisionSource.POLICY, decision_reason="matched policy rule", decided_at=now,
+        )
+        s.add(talk)
+        await s.flush()
+        grant = Grant(
+            request_id=talk.id, agent_id=claude.id, platform=Platform.A2A, resource=hermes.name,
+            authority={"capability": "talk"}, status=GrantStatus.ACTIVE, expires_at=now + timedelta(hours=1),
+        )
+        s.add(grant)
+        await s.flush()
+        thread = A2AThread(
+            initiator_agent_id=claude.id, responder_agent_id=hermes.id, topic="deploy/x", grant_id=grant.id,
+            state="open", last_seq=2, last_activity_at=now,
+        )
+        old = A2AThread(
+            initiator_agent_id=claude.id, responder_agent_id=hermes.id, topic="old", grant_id=grant.id,
+            state="closed", close_reason="closed", last_activity_at=now - timedelta(days=10),
+        )
+        s.add_all([thread, old])
+        await s.flush()
+        s.add_all([
+            A2AMessage(thread_id=thread.id, seq=1, sender_agent_id=claude.id, recipient_agent_id=hermes.id,
+                       grant_id=grant.id, payload={"type": "request", "text": "please deploy " + "y" * 5000}),
+            A2AMessage(thread_id=thread.id, seq=2, sender_agent_id=hermes.id, recipient_agent_id=claude.id,
+                       grant_id=grant.id, payload={"type": "result", "status": "done"}),
+        ])
+        view = AccessRequest(
+            agent_id=hermes.id, delegator_agent_id=claude.id, delegation_thread_id=thread.id,
+            platform=Platform.KUBERNETES, resource="x", authority={"role": "view"}, justification="look",
+            requested_duration_secs=3600, status=RequestStatus.GRANTED, decision_source=DecisionSource.RULE,
+            decided_by="rule", decision_reason="matched saved rule (hermes for x)", decided_at=now,
+        )
+        run = AccessRequest(
+            agent_id=claude.id, platform=Platform.HOSTEXEC, resource="galaxy",
+            authority={"capability": "run", "tier": "root", "argv": ["nixos-rebuild", "switch"]},
+            justification="rebuild", requested_duration_secs=600, status=RequestStatus.GRANTED,
+            decision_source=DecisionSource.HUMAN, decided_by="jrt", decided_at=now,
+        )
+        s.add_all([view, run])
+        await s.flush()
+        s.add(HostJob(
+            id=run.id, request_id=run.id, agent_id=claude.id, host="galaxy", tier="root",
+            spec={"argv": ["nixos-rebuild", "switch"], "tier": "root"}, status="done", via="totp", exit_code=0,
+            output="x" * 30000 + "the end", output_bytes=30007, duration_ms=4200,
+        ))
+    return thread.id, run.id
+
+
+@respx.mock
+async def test_the_panel_shows_how_requests_were_decided_and_what_hosts_ran(api, db, ui, provider):
+    _, job_id = await _seed_activity(db)
+    headers, _ = await session_headers(api, provider)
+
+    decisions = (await api.get("/admin/log/decisions", headers=headers)).json()
+    by = {(d["agent"], d["platform"]): d for d in decisions}
+    assert by[("hermes-homelab-recusant", "kubernetes")]["source"] == "rule"
+    assert by[("hermes-homelab-recusant", "kubernetes")]["for"] == "claude-x-galaxy"
+    assert "saved rule" in by[("hermes-homelab-recusant", "kubernetes")]["reason"]
+    assert by[("claude-x-galaxy", "hostexec")]["source"] == "human" and by[("claude-x-galaxy", "hostexec")]["by"] == "jrt"
+    assert by[("claude-x-galaxy", "a2a")]["source"] == "policy"
+    only_rules = (await api.get("/admin/log/decisions", headers=headers, params={"source": "rule"})).json()
+    assert [d["platform"] for d in only_rules] == ["kubernetes"]
+
+    commands = (await api.get("/admin/log/commands", headers=headers)).json()
+    assert len(commands) == 1 and "output" not in commands[0]
+    assert commands[0]["command"] == "nixos-rebuild switch" and commands[0]["via"] == "totp" and commands[0]["tier"] == "root"
+    one = (await api.get(f"/admin/log/commands/{job_id}", headers=headers)).json()
+    assert one["output"].endswith("the end") and len(one["output"]) == 20000 and one["output_cut"] is True
+    assert one["justification"] == "rebuild" and one["decided_by"] == "jrt"
+    assert (await api.get("/admin/log/commands/nope", headers=headers)).status_code == 404
+
+
+@respx.mock
+async def test_the_panel_shows_who_talks_to_whom(api, db, ui, provider):
+    thread_id, _ = await _seed_activity(db)
+    headers, _ = await session_headers(api, provider)
+
+    graph = (await api.get("/admin/a2a/graph", headers=headers, params={"hours": 24})).json()
+    nodes = {n["name"]: n for n in graph["nodes"]}
+    # The two that talked; the agent nobody has seen for days is left out.
+    assert set(nodes) == {"claude-x-galaxy", "hermes-homelab-recusant"}
+    assert nodes["hermes-homelab-recusant"]["alive"] is True and nodes["hermes-homelab-recusant"]["runtime"] == "hermes"
+    assert graph["edges"] == [
+        {"from": "claude-x-galaxy", "to": "hermes-homelab-recusant", "threads": 1, "open": 1, "messages": 2,
+         "requests": 1, "last": graph["edges"][0]["last"]}
+    ]
+    assert [t["topic"] for t in graph["threads"]] == ["deploy/x"]
+    wider = (await api.get("/admin/a2a/graph", headers=headers, params={"hours": 24 * 30})).json()
+    assert wider["edges"][0]["threads"] == 2 and wider["edges"][0]["open"] == 1
+
+    thread = (await api.get(f"/admin/a2a/threads/{thread_id}", headers=headers)).json()
+    assert [m["from"] for m in thread["messages"]] == ["claude-x-galaxy", "hermes-homelab-recusant"]
+    assert thread["messages"][0]["cut"] is True and len(thread["messages"][0]["text"]) == 4000
+    assert '"status": "done"' in thread["messages"][1]["text"]
+    assert thread["requests"] == [
+        {"platform": "kubernetes", "what": thread["requests"][0]["what"], "resource": "x", "status": "granted", "source": "rule"}
+    ]
+    # Read-only, and for the signed-in operator or the admin token only.
+    api.cookies.clear()  # the client kept the session cookie from signing in
+    assert (await api.get("/admin/a2a/graph")).status_code == 401
+    assert (await api.get(f"/admin/a2a/threads/{thread_id}")).status_code == 401
+    assert (await api.get("/admin/log/commands")).status_code == 401
+    assert (await api.get("/admin/a2a/graph", headers=ADMIN)).status_code == 200

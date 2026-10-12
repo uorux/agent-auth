@@ -11,6 +11,7 @@ from ..db import Database
 from ..provisioners.base import ProvisionerRegistry
 from . import (
     a2a_routes,
+    admin_log_routes,
     admin_routes,
     agent_routes,
     daemon_routes,
@@ -59,6 +60,7 @@ def create_app(
     app.include_router(agent_routes.router)
     app.include_router(a2a_routes.router)
     app.include_router(admin_routes.router)
+    app.include_router(admin_log_routes.router)
     app.include_router(daemon_routes.router)
     app.include_router(hostexec_routes.router)
     app.include_router(token_routes.router)
