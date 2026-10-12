@@ -9,7 +9,15 @@ from ..core.events import KeyedEvents
 from ..core.service import RequestService
 from ..db import Database
 from ..provisioners.base import ProvisionerRegistry
-from . import a2a_routes, admin_routes, agent_routes, daemon_routes, hostexec_routes, token_routes
+from . import (
+    a2a_routes,
+    admin_routes,
+    agent_routes,
+    daemon_routes,
+    hostexec_routes,
+    token_routes,
+    wiki_routes,
+)
 
 
 def create_app(
@@ -42,6 +50,8 @@ def create_app(
     app.state.daemons = daemons if daemons is not None else DaemonHub(db, settings)
     # core/hostexec.HostExecService; None = the daemon channel is off.
     app.state.hostexec = hostexec
+    # core/wiki.WikiService; None = no wiki on this broker.
+    app.state.wiki = None
 
     app.include_router(agent_routes.router)
     app.include_router(a2a_routes.router)
@@ -49,6 +59,7 @@ def create_app(
     app.include_router(daemon_routes.router)
     app.include_router(hostexec_routes.router)
     app.include_router(token_routes.router)
+    app.include_router(wiki_routes.router)
 
     @app.get("/healthz")
     async def healthz():

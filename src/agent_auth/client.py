@@ -86,6 +86,26 @@ class BrokerClient:
     def attention(self, text: str, urgency: str = "normal"):
         return self._request("POST", "/v1/attention", json={"text": text, "urgency": urgency})
 
+    def wiki_list(self, prefix: str = ""):
+        return self._request("GET", "/v1/wiki", params={"prefix": prefix})
+
+    def wiki_read(self, path: str):
+        return self._request("GET", "/v1/wiki/page", params={"path": path})
+
+    def wiki_search(self, query: str, limit: int = 8):
+        return self._request("GET", "/v1/wiki/search", params={"q": query, "limit": limit})
+
+    def wiki_write(self, path: str, content: str, summary: str, base_sha: str | None = None):
+        return self._request(
+            "PUT", "/v1/wiki/page",
+            json={"path": path, "content": content, "summary": summary, "base_sha": base_sha},
+        )
+
+    def wiki_delete(self, path: str, summary: str, base_sha: str | None = None):
+        return self._request(
+            "POST", "/v1/wiki/delete", json={"path": path, "summary": summary, "base_sha": base_sha}
+        )
+
     def catalog(self):
         return self._request("GET", "/v1/catalog")
 

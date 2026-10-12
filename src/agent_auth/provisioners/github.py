@@ -99,6 +99,7 @@ class GithubProvisioner:
         # Account (owner login, lowercased) the pinned installation belongs to;
         # resolved once on first use.
         self._pinned_account: str | None = None
+        self._own_tokens: dict[tuple, tuple[str, datetime]] = {}
 
     async def validate_request(self, session: AsyncSession, spec: RequestSpec) -> RequestSpec:
         if spec.capability == "create":
@@ -485,6 +486,28 @@ class GithubProvisioner:
             self._installation_cache[repo] = resp.json()["id"]
             return True
         return False
+
+    async def own_token(self, repo: str, permissions: dict[str, str]) -> str:
+        """A token for the broker's own use of one repo (the wiki): never
+        handed to an agent, kept until shortly before it expires."""
+        key = (repo, tuple(sorted(permissions.items())))
+        held = self._own_tokens.get(key)
+        if held and held[1] - datetime.now(timezone.utc) > timedelta(minutes=5):
+            return held[0]
+        installation_id = await self._installation_for(repo)
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{self.api_url}/app/installations/{installation_id}/access_tokens",
+                headers=self._app_headers(),
+                json={"repositories": [repo.split("/", 1)[1]], "permissions": permissions},
+            )
+        if resp.status_code != 201:
+            log.error("GitHub token mint for the broker's use of %s failed (%s): %s", repo, resp.status_code, resp.text[:300])
+            raise ProvisionerError(f"GitHub token mint for {repo!r} failed ({resp.status_code})")
+        data = resp.json()
+        expires_at = datetime.fromisoformat(data["expires_at"].replace("Z", "+00:00")).astimezone(timezone.utc)
+        self._own_tokens[key] = (data["token"], expires_at)
+        return data["token"]
 
     async def _mint(self, grant: Grant) -> tuple[str, datetime]:
         owner_repo = grant.resource.split("/", 1)[1]

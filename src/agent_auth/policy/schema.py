@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..core.states import Platform
 from ..schemas import parse_duration
@@ -281,6 +281,31 @@ class DesktopConfig(BaseModel):
         return v
 
 
+class WikiConfig(BaseModel):
+    """The agents' shared wiki (core/wiki.py): markdown in one GitHub repo
+    that the broker reads and writes as its GitHub App. Off while `repo` is
+    empty. Every agent reads it; an agent writes under projects/<its
+    project>/, and `editors` write anywhere."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    repo: str = ""  # "owner/name"
+    branch: str = "main"
+    # Who may write every page (the shared ones too), as in a rule's `agent`.
+    editors: list[AgentPattern] = Field(default_factory=list)
+    max_page_bytes: int = 64 * 1024
+    # How stale the broker's copy may be before it looks at the repo again
+    # (edits made on GitHub by hand show up within this).
+    refresh_secs: int = 30
+
+    @field_validator("repo")
+    @classmethod
+    def _repo(cls, v: str) -> str:
+        if v and not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", v):
+            raise ValueError(f"wiki.repo {v!r}: owner/name")
+        return v
+
+
 class PlatformsConfig(BaseModel):
     github: GithubPlatformConfig = Field(default_factory=GithubPlatformConfig)
     homelab: HomelabPlatformConfig = Field(default_factory=HomelabPlatformConfig)
@@ -295,6 +320,7 @@ class PolicyFile(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     platforms: PlatformsConfig = Field(default_factory=PlatformsConfig)
     desktop: DesktopConfig = Field(default_factory=DesktopConfig)
+    wiki: WikiConfig = Field(default_factory=WikiConfig)
     # The projects agents work on. A rule may only name a project listed
     # here, so a mistyped one is an error at load and not a rule that never
     # matches.
@@ -308,6 +334,7 @@ class PolicyFile(BaseModel):
         patterns = [(f"rules[{i}]", r.match.agent) for i, r in enumerate(self.rules)]
         patterns += [(f"rules[{i}] delegator", r.match.delegator) for i, r in enumerate(self.rules)]
         patterns += [(f"desktop.agents[{i}]", p) for i, p in enumerate(self.desktop.agents)]
+        patterns += [(f"wiki.editors[{i}]", p) for i, p in enumerate(self.wiki.editors)]
         for where, pattern in patterns:
             if isinstance(pattern, AgentMatch):
                 for project in pattern.project or []:

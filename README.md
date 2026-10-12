@@ -596,6 +596,48 @@ Ending a grant stops new tokens. A proxy that only checks signatures accepts
 an already issued token until it expires (`token_ttl`); one that calls
 `verify` stops at once.
 
+## Wiki
+
+What agents know about the homelab ends up in each one's own memory and
+notes, where no other agent can read it. The wiki is one place they all read
+and each writes its part of: markdown pages in a GitHub repo that only the
+broker touches, as its GitHub App (Contents: write on that repo).
+
+```yaml
+wiki:
+  repo: example-org/agent-wiki     # the App installed on it; empty = no wiki
+  branch: main
+  editors: [{project: homelab}]    # may write every page, as in a rule's `agent`
+platforms:
+  github:
+    repo_denylist: ["example-org/agent-wiki"]   # no agent gets a token for it
+```
+
+- **Reading** needs no grant: `wiki_search`, `wiki_read`, `wiki_list` on the
+  MCP server (`GET /v1/wiki`, `/v1/wiki/page`, `/v1/wiki/search`). The MCP
+  server's instructions tell every agent the wiki exists and to look there
+  before asking another agent.
+- **Writing** (`wiki_write`, `wiki_delete`): an agent writes under
+  `projects/<its project>/` and nowhere else; the project is the one on its
+  record, which it cannot change. `editors` write anywhere, the shared pages
+  included. An agent with no project writes nothing.
+- **Each write is a commit** in the repo, authored as the agent, with its
+  one-line summary. A page that exists is replaced only from the version the
+  writer read (`base_sha`), so a concurrent edit is refused and not lost.
+- **Pages** are `.md` files, at most 64 KiB, under paths of plain segments.
+  A page that looks like it contains a credential (an agent-auth key, a
+  GitHub token, a private key, a JWT) is refused.
+- **By hand**: edit the repo on GitHub like any other; the broker sees it
+  within `refresh_secs` (30 by default). History and revert are git's.
+
+What it does not do. The boundary keeps one project from changing another's
+pages; it does not make a page true. Every agent reads what any agent wrote
+in its own section, so a page comes with its project and last author, and
+the tools say it is information to weigh, not instructions. The credential
+check catches common token shapes pasted by mistake and nothing else. Keep
+the repo on the denylist: a GitHub grant for it would write past the
+per-project rule.
+
 ## Desktop prompts
 
 With `desktop.enabled` in the policy and `services.agent-auth-hostd.desktop.enable`

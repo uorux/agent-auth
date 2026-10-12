@@ -163,6 +163,14 @@ platforms:
       - pod-exec
       - secret-reader
 
+# The agents' shared wiki (README "Wiki"): markdown in one repo the broker
+# reads and writes as its GitHub App. Every agent reads it; an agent writes
+# under projects/<its project>/, and `editors` write anywhere. Keep the repo
+# on platforms.github.repo_denylist.
+# wiki:
+#   repo: example-org/agent-wiki
+#   editors: [{project: homelab}]
+
 rules:
   # Low-risk homelab groups: auto-approve, short leash
   - match: {platform: homelab, resource: svc-sonarr}

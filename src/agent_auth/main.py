@@ -16,6 +16,8 @@ from .core.sandboxes import SandboxService
 from .core.events import KeyedEvents
 from .core.scheduler import ExpiryScheduler
 from .core.service import RequestService
+from .core.states import Platform
+from .core.wiki import GithubWikiBackend, WikiService
 from .crypto import SecretBox
 from .db import Database
 from .discord_bot.bot import AgentAuthBot, DiscordNotifier
@@ -172,6 +174,16 @@ async def serve(settings: Settings) -> None:
                      tokens.issuer, tokens.kid)
         else:
             log.warning("platforms.mcp lists servers but BROKER_SIGNING_KEY is not set: mcp is disabled")
+    # The agents' wiki: a repo the broker reads and writes as its GitHub App.
+    if policy.wiki.repo:
+        if registry.enabled(Platform.GITHUB):
+            app.state.wiki = WikiService(
+                policy.wiki,
+                GithubWikiBackend(registry.get(Platform.GITHUB), policy.wiki.repo, policy.wiki.branch),
+            )
+            log.info("wiki: %s (%s)", policy.wiki.repo, policy.wiki.branch)
+        else:
+            log.warning("wiki.repo is set but GitHub is not configured: the wiki is disabled")
     scheduler = ExpiryScheduler(service, a2a, sandboxes=sandboxes)
 
     server = uvicorn.Server(
