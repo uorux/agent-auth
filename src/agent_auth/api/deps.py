@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import logging
 import math
 from dataclasses import dataclass
 from datetime import timedelta
@@ -13,6 +14,7 @@ from ..crypto import parse_api_key, verify_secret
 from ..models import Agent, AgentSession, utcnow
 
 _bearer = HTTPBearer(auto_error=False)
+log = logging.getLogger(__name__)
 
 # Liveness bookkeeping: skip the UPDATE when last_seen is this fresh. Keeps hot
 # paths read-only; the skew is invisible against the 120s liveness threshold.
@@ -115,6 +117,23 @@ async def require_admin(
     request: Request,
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> None:
+    # The admin panel: a signed-in session, on the routes it may call, with
+    # the CSRF token for anything that changes something.
+    ui = getattr(request.app.state, "ui_auth", None)
+    if ui is not None and creds is None and ui.serves(request.headers):
+        from ..core import webui
+
+        session = ui.session(request.cookies.get(webui.SESSION_COOKIE))
+        if session is not None:
+            if not webui.allowed(request.method, request.url.path):
+                raise HTTPException(403, "not available from the admin panel")
+            if request.method != "GET" and not hmac.compare_digest(
+                request.headers.get(webui.CSRF_HEADER, ""), session.csrf
+            ):
+                raise HTTPException(403, "missing or wrong CSRF token")
+            if request.method != "GET":
+                log.info("admin panel: %s %s %s", session.user, request.method, request.url.path)
+            return
     admin_token = request.app.state.settings.admin_token
     if not admin_token:
         raise HTTPException(503, "admin API disabled: ADMIN_TOKEN not configured")

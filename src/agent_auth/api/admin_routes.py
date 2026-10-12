@@ -404,6 +404,25 @@ async def revoke_grant(grant_id: str, request: Request, reason: str = "revoked b
     return {"ok": True, "grant_id": grant.id, "status": grant.status.value}
 
 
+@router.get("/projects")
+async def list_projects(request: Request):
+    """The projects policy names, and the agents recorded on each (also the
+    projects agents are on that policy does not name)."""
+    policy = request.app.state.service.engine.policy
+    async with request.app.state.db.session() as session:
+        agents = (await session.execute(select(Agent).where(Agent.disabled.is_(False)))).scalars().all()
+    out = {
+        name: {"description": p.description, "repos": p.repos, "in_policy": True, "agents": []}
+        for name, p in policy.projects.items()
+    }
+    for agent in agents:
+        if agent.project:
+            out.setdefault(
+                agent.project, {"description": "", "repos": [], "in_policy": False, "agents": []}
+            )["agents"].append(agent.name)
+    return {"projects": out, "wiki": policy.wiki.repo or None}
+
+
 # --- paired daemons ----------------------------------------------------------
 
 

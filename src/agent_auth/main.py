@@ -17,6 +17,7 @@ from .core.events import KeyedEvents
 from .core.scheduler import ExpiryScheduler
 from .core.service import RequestService
 from .core.states import Platform
+from .core.webui import UiAuth
 from .core.wiki import GithubWikiBackend, WikiService
 from .crypto import SecretBox
 from .db import Database
@@ -184,6 +185,14 @@ async def serve(settings: Settings) -> None:
             log.info("wiki: %s (%s)", policy.wiki.repo, policy.wiki.branch)
         else:
             log.warning("wiki.repo is set but GitHub is not configured: the wiki is disabled")
+    # The admin panel, signed into at the homelab's OpenID provider.
+    if policy.ui.enabled:
+        if settings.encryption_key:
+            app.state.ui_auth = UiAuth(policy.ui, settings.encryption_key)
+            log.info("admin panel: %s/ui (sign-in at %s, group %s)", policy.ui.base_url.rstrip("/"),
+                     policy.ui.issuer, policy.ui.admin_group)
+        else:
+            log.warning("ui.enabled is set but ENCRYPTION_KEY is not: the admin panel is disabled")
     scheduler = ExpiryScheduler(service, a2a, sandboxes=sandboxes)
 
     server = uvicorn.Server(

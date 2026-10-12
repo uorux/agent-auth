@@ -306,6 +306,38 @@ class WikiConfig(BaseModel):
         return v
 
 
+class UiConfig(BaseModel):
+    """The admin panel (core/webui.py): a page the broker serves at /ui,
+    signed into at the homelab's OpenID provider. Off unless enabled."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    # Where the browser reaches the broker; the provider's client must list
+    # <base_url>/ui/callback as a redirect URI.
+    base_url: str = ""
+    issuer: str = ""
+    # A public client with PKCE: the broker holds no client secret.
+    client_id: str = "agent-auth-admin"
+    # Membership the broker itself requires, from the token's `groups`.
+    admin_group: str = "agent-auth-admins"
+    session_ttl: str | int = "8h"
+
+    @field_validator("session_ttl")
+    @classmethod
+    def _ttl(cls, v):
+        parse_duration(v)
+        return v
+
+    @model_validator(mode="after")
+    def _urls(self):
+        if self.enabled:
+            for name in ("base_url", "issuer"):
+                if not getattr(self, name).startswith("https://"):
+                    raise ValueError(f"ui.{name}: an https URL is required when the panel is enabled")
+        return self
+
+
 class PlatformsConfig(BaseModel):
     github: GithubPlatformConfig = Field(default_factory=GithubPlatformConfig)
     homelab: HomelabPlatformConfig = Field(default_factory=HomelabPlatformConfig)
@@ -321,6 +353,7 @@ class PolicyFile(BaseModel):
     platforms: PlatformsConfig = Field(default_factory=PlatformsConfig)
     desktop: DesktopConfig = Field(default_factory=DesktopConfig)
     wiki: WikiConfig = Field(default_factory=WikiConfig)
+    ui: UiConfig = Field(default_factory=UiConfig)
     # The projects agents work on. A rule may only name a project listed
     # here, so a mistyped one is an error at load and not a rule that never
     # matches.

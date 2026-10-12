@@ -171,6 +171,14 @@ platforms:
 #   repo: example-org/agent-wiki
 #   editors: [{project: homelab}]
 
+# The admin panel at /ui (README "Admin panel"): signed into at your OpenID
+# provider, which needs a public PKCE client with <base_url>/ui/callback.
+# ui:
+#   enabled: true
+#   base_url: https://agent-auth.internal.example.org
+#   issuer: https://auth.example.org
+#   admin_group: agent-auth-admins
+
 rules:
   # Low-risk homelab groups: auto-approve, short leash
   - match: {platform: homelab, resource: svc-sonarr}

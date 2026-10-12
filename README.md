@@ -638,6 +638,56 @@ check catches common token shapes pasted by mistake and nothing else. Keep
 the repo on the denylist: a GitHub grant for it would write past the
 per-project rule.
 
+## Admin panel
+
+A page the broker serves at `/ui` for setting agents and hosts up without
+the CLI: the agents and their fields (create, set fields, rename, new key,
+disable), the projects policy names and who is on them, hosts and paired
+daemons (pairing codes, unpair), saved rules (delete), recent requests
+(read-only, revoke a grant).
+
+```yaml
+ui:
+  enabled: true
+  base_url: https://agent-auth.internal.example.org   # where your browser reaches the broker
+  issuer: https://auth.example.org                    # the OpenID provider (Authelia)
+  client_id: agent-auth-admin
+  admin_group: agent-auth-admins
+```
+
+The provider needs a public client `agent-auth-admin` (PKCE S256, no secret)
+with redirect URI `<base_url>/ui/callback` and the scopes `openid profile
+groups`; give it your strictest authorization policy (two factors). Needs
+`ENCRYPTION_KEY`.
+
+- **Sign-in.** The browser goes to the provider; the broker exchanges the
+  code itself, checks the ID token's signature against the provider's keys,
+  its issuer, audience, expiry and nonce, and that the user is in
+  `admin_group`. No header a proxy adds is believed: whoever can reach the
+  broker's port could send one.
+- **Session.** An encrypted cookie (HttpOnly, Secure), eight hours by
+  default. Every change carries a CSRF token the page reads from the broker,
+  and the page loads nothing from anywhere else (CSP), so another site on the
+  same domain cannot act through it.
+- **Not the admin token.** A session may call a fixed list of admin routes
+  (`core/webui.ALLOWED`). Deciding requests, arming hosts, lifting a lockdown
+  and an agent's webhook or LLDAP password are not on it: those stay on
+  Discord, the CLI and the hosts' TOTP codes.
+- **One address.** The panel answers only at `base_url`'s host; under the
+  broker's other names (the public one agents use) `/ui` is a 404 and a
+  session cookie is ignored. That narrows where it shows up; the sign-in is
+  what keeps people out.
+
+What it does not protect against. Whoever can sign in as you at the provider
+(your password, and your second factor if the client asks for one) can create
+agents and read their new keys, re-point a host's pairing and delete saved
+rules. They cannot approve a request with it. Everything shown is text agents
+chose (names, justifications): the page never parses it as HTML, and that is
+the only thing between an agent's justification and your session.
+
+A project in an agent VM is still made on its host (`avm project-create`);
+the broker cannot do that from the panel yet.
+
 ## Desktop prompts
 
 With `desktop.enabled` in the policy and `services.agent-auth-hostd.desktop.enable`

@@ -16,6 +16,7 @@ from . import (
     daemon_routes,
     hostexec_routes,
     token_routes,
+    ui_routes,
     wiki_routes,
 )
 
@@ -52,6 +53,8 @@ def create_app(
     app.state.hostexec = hostexec
     # core/wiki.WikiService; None = no wiki on this broker.
     app.state.wiki = None
+    # core/webui.UiAuth; None = no admin panel.
+    app.state.ui_auth = None
 
     app.include_router(agent_routes.router)
     app.include_router(a2a_routes.router)
@@ -60,6 +63,7 @@ def create_app(
     app.include_router(hostexec_routes.router)
     app.include_router(token_routes.router)
     app.include_router(wiki_routes.router)
+    app.include_router(ui_routes.router)
 
     @app.get("/healthz")
     async def healthz():
