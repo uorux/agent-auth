@@ -200,7 +200,9 @@ class A2AThread(Base, TimestampMixin):
         ForeignKey("agent_sessions.id"), nullable=True
     )
     topic: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    grant_id: Mapped[str] = mapped_column(ForeignKey("grants.id"))
+    # Null only for the operator's threads from the admin panel, which no
+    # grant backs (agent_auth.core.a2a.OPERATOR_KIND).
+    grant_id: Mapped[str | None] = mapped_column(ForeignKey("grants.id"), nullable=True)
     state: Mapped[str] = mapped_column(String(16), default="pending_open", index=True)
     accepted_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     closed_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
@@ -372,8 +374,9 @@ class A2AMessage(Base, TimestampMixin):
         ForeignKey("agent_sessions.id"), nullable=True
     )
     recipient_agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), index=True)
-    # The thread's backing grant (the initiator's), for both directions.
-    grant_id: Mapped[str] = mapped_column(ForeignKey("grants.id"))
+    # The thread's backing grant (the initiator's), for both directions; null
+    # on the operator's threads, as on the thread.
+    grant_id: Mapped[str | None] = mapped_column(ForeignKey("grants.id"), nullable=True)
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
 
     __table_args__ = (

@@ -646,7 +646,8 @@ disable), the projects policy names and who is on them, hosts and paired
 daemons (pairing codes, unpair), saved rules (delete). And what happened,
 read-only: every request and who decided it (you, a saved rule, the policy
 file, the LLM), the commands hosts ran with their output, and a diagram of
-which agents talk to which, with the conversations behind each arrow.
+which agents talk to which, with the conversations behind each arrow. And a
+chat: you write to agents from it.
 
 ```yaml
 ui:
@@ -684,10 +685,24 @@ groups`; give it your strictest authorization policy (two factors). Needs
   session cookie is ignored. That narrows where it shows up; the sign-in is
   what keeps people out.
 
+- **Chat.** A conversation is an a2a thread like any other, opened by the
+  agent row `operator` (made on first use; it has no usable key, cannot be
+  given one, renamed or reclassified, and no other agent may take the name).
+  It goes to service agents only: Hermes, the VMs' orchestrators, not a
+  Claude Code session in a terminal. No grant backs it; the panel's sign-in
+  does, and the panel user is written into each message (`operator` field)
+  and the broker's log. It ends as threads do: either side closes it, or it
+  idles out (`a2a_thread_idle_timeout_secs`, an hour). What the agent asks
+  for on its behalf is a delegated request with `operator` as delegator:
+  rules naming a delegator by runtime (`{runtime: [claude, codex]}`) do not
+  match it, so it goes to the reviewer or to you on Discord as policy says.
+
 What it does not protect against. Whoever can sign in as you at the provider
 (your password, and your second factor if the client asks for one) can create
 agents and read their new keys, re-point a host's pairing and delete saved
-rules. They cannot approve a request with it. Everything shown is text agents
+rules. They can write to agents as you, and an agent that trusts `operator`
+more than another agent will act on it with whatever grants it already holds.
+They cannot approve a request with it. Everything shown is text agents
 chose (names, justifications): the page never parses it as HTML, and that is
 the only thing between an agent's justification and your session.
 

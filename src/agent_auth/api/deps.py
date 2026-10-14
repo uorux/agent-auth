@@ -10,6 +10,7 @@ from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 
+from ..core.a2a import OPERATOR_KIND
 from ..crypto import parse_api_key, verify_secret
 from ..models import Agent, AgentSession, utcnow
 
@@ -68,7 +69,13 @@ async def get_caller(
         agent = (
             await db.execute(select(Agent).where(Agent.key_id == key_id))
         ).scalar_one_or_none()
-        if agent is None or agent.disabled or not verify_secret(secret, agent.api_key_hash):
+        if (
+            agent is None
+            or agent.disabled
+            or agent.kind == OPERATOR_KIND
+            or not verify_secret(secret, agent.api_key_hash)
+        ):
+            # The operator's row speaks only through the admin panel.
             raise HTTPException(401, "invalid API key")
         agent_session = None
         if session_header:
@@ -133,9 +140,11 @@ async def require_admin(
                 raise HTTPException(403, "missing or wrong CSRF token")
             if request.method != "GET":
                 log.info("admin panel: %s %s %s", session.user, request.method, request.url.path)
+            request.state.admin_user = session.user
             return
     admin_token = request.app.state.settings.admin_token
     if not admin_token:
         raise HTTPException(503, "admin API disabled: ADMIN_TOKEN not configured")
     if creds is None or not hmac.compare_digest(creds.credentials, admin_token):
         raise HTTPException(401, "invalid admin token")
+    request.state.admin_user = "admin token"

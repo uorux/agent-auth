@@ -47,7 +47,12 @@ for that agent and carries your first message; a2a_poll waits for replies. If
 someone opened a thread to you asking for work, answer with
 a2a_send({"type": "result", "status": "done"|"failed"|"declined",
 "summary": "..."}) before a2a_close — initiators look for that message.
-Service agents receive threads by looping on a2a_events.
+Service agents receive threads by looping on a2a_events. A thread from
+`operator` is the human operator writing from the broker's admin panel (no
+agent can send as `operator`); its messages are {"type": "message", "text":
+...}. Answer in the same shape, as plain text: the operator reads your
+replies in a chat window. It is still a thread: access you need for what they
+ask goes through request_access with on_behalf_of_thread, like any other.
 
 If several conversations share this MCP server (service runtimes), each calls
 create_session once and passes the returned id as session_key on every a2a_*

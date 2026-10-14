@@ -8,7 +8,8 @@ port could send one. The proof is the provider's signature on the ID token.
 
 A session is not the admin token. `allowed()` lists the admin routes one may
 call; deciding requests, arming hosts and lifting a lockdown are not among
-them and stay on Discord, the CLI and the hosts' TOTP codes.
+them and stay on Discord, the CLI and the hosts' TOTP codes. A session may
+write to agents as the operator (api/chat_routes.py).
 """
 
 from __future__ import annotations
@@ -54,6 +55,12 @@ ALLOWED = [
     ("GET", "/admin/log/commands/{}"),
     ("GET", "/admin/a2a/graph"),
     ("GET", "/admin/a2a/threads/{}"),
+    ("GET", "/admin/chat/peers"),
+    ("GET", "/admin/chat/threads"),
+    ("GET", "/admin/chat/threads/{}"),
+    ("POST", "/admin/chat/threads"),
+    ("POST", "/admin/chat/threads/{}/messages"),
+    ("POST", "/admin/chat/threads/{}/close"),
     ("POST", "/admin/agents"),
     ("PATCH", "/admin/agents/{}/attributes"),
     ("POST", "/admin/agents/{}/rename"),

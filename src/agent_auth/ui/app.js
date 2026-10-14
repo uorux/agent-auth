@@ -3,8 +3,9 @@
 // justifications, so none of it is ever parsed as HTML).
 "use strict";
 
-const state = { csrf: "", tab: "agents", data: {} };
+const state = { csrf: "", user: "", tab: "chat", data: {} };
 const TABS = [
+  ["chat", "Chat"],
   ["agents", "Agents"],
   ["projects", "Projects"],
   ["hosts", "Hosts and VMs"],
@@ -168,7 +169,7 @@ async function agentsView(view) {
       ["Kind", (a) => a.kind],
       ["Seen", (a) => ago(a.last_seen_at)],
       ["State", (a) => (a.disabled ? pill("disabled", "bad") : pill("active", "good"))],
-      ["", (a) => el("span", {},
+      ["", (a) => (a.kind === "operator" ? el("span", { class: "muted" }, "you, in Chat") : el("span", {},
         button("Fields", async () => {
           const next = prompt(`runtime, project, host for ${a.name} (comma-separated; empty clears a field)`, [a.runtime || "", a.project || "", a.host || ""].join(", "));
           if (next === null) return;
@@ -188,7 +189,7 @@ async function agentsView(view) {
         a.disabled ? null : button("Disable", async () => {
           if (!confirm(`Disable ${a.name} and every agent it minted? Their grants end. There is no enable here.`)) return;
           await act("Disabling", () => api("POST", `/admin/agents/${a.id}/disable`));
-        }, "act danger"))],
+        }, "act danger")))],
     ], rows, "No agent matches."));
   }
   filter.addEventListener("input", draw);
@@ -588,7 +589,184 @@ async function conversationsView(view) {
   state.timer = setInterval(() => { if (state.tab === "conversations" && !document.hidden) load().catch(() => {}); }, 20000);
 }
 
-const VIEWS = { agents: agentsView, projects: projectsView, hosts: hostsView, conversations: conversationsView, decisions: decisionsView, commands: commandsView, rules: rulesView };
+// ── Chat ─────────────────────────────────────────────────────────────────
+
+// The operator's conversations with agents: a2a threads opened from here.
+// `gen` stops an old long-poll loop when another conversation is opened or
+// the tab is left.
+const chat = { open: null, seq: 0, gen: 0, to: null };
+
+function said(m) {
+  if (m.text !== null && m.text !== undefined) return m.text;
+  if (m.type === "result") return m.summary || "";
+  return JSON.stringify(m.payload, null, 1);
+}
+
+function stateLabel(t) {
+  if (t.state === "pending_open") return pill("waiting for an answer", "warn");
+  if (t.state === "open") return pill("open", "good");
+  return pill(t.close_reason && t.close_reason !== "closed" ? `closed: ${t.close_reason}` : "closed", "");
+}
+
+const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
+
+async function chatView(view) {
+  const [peers, threads] = await Promise.all([api("GET", "/admin/chat/peers"), api("GET", "/admin/chat/threads")]);
+  const side = el("aside", { class: "chat-side" });
+  const pane = el("section", { class: "chat-pane" });
+  chat.gen += 1;
+
+  function drawSide(list) {
+    put(side,
+      button("New conversation", () => { chat.open = null; drawSide(list); drawNew(); }, "primary wide"),
+      list.length ? null : el("p", { class: "muted" }, "No conversations yet."),
+      el("ul", { class: "chat-list" }, list.map((t) => el("li", {},
+        el("button", { type: "button", class: t.id === chat.open ? "on" : "", onclick: () => openConversation(t.id) },
+          el("span", { class: "chat-to" }, el("span", { class: "mono" }, t.to), " ", el("span", { class: "muted" }, ago(t.last))),
+          t.topic ? el("span", { class: "chat-topic" }, t.topic) : null,
+          el("span", { class: "chat-preview muted" }, `${t.last_from_operator ? "You: " : ""}${t.preview}`),
+          stateLabel(t))))));
+  }
+
+  async function refreshSide() {
+    try { drawSide(await api("GET", "/admin/chat/threads")); } catch (err) { /* the next refresh will do */ }
+  }
+
+  function composer(onsend, placeholder) {
+    const text = el("textarea", { rows: 3, placeholder, "aria-label": "Message" });
+    const send = el("button", { type: "submit", class: "primary" }, "Send");
+    const form = el("form", { class: "composer", onsubmit: async (event) => {
+      event.preventDefault();
+      const body = text.value.trim();
+      if (!body) return;
+      send.disabled = true;
+      notice("");
+      try {
+        await onsend(body);
+        text.value = "";
+      } catch (err) {
+        if (err.message !== "signed out") notice(`Sending: ${err.message}`, true);
+      } finally {
+        send.disabled = false;
+        text.focus();
+      }
+    } }, text, el("div", { class: "composer-bar" }, el("span", { class: "muted" }, "Enter sends, Shift+Enter for a new line"), send));
+    text.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); form.requestSubmit(); }
+    });
+    return { form, text };
+  }
+
+  function drawNew(to) {
+    chat.gen += 1;
+    history.replaceState(null, "", "#chat");
+    const listening = peers.filter((p) => p.reachable);
+    const asleep = peers.filter((p) => !p.reachable);
+    const pick = el("select", { name: "to", "aria-label": "Agent" },
+      listening.map((p) => el("option", { value: p.name, selected: p.name === to }, p.name)),
+      asleep.length ? el("optgroup", { label: "Not listening now" }, asleep.map((p) => el("option", { value: p.name, disabled: true }, p.name))) : null);
+    const topic = el("input", { name: "topic", placeholder: "optional", maxlength: 256, autocomplete: "off" });
+    const { form, text } = composer(async (body) => {
+      const opened = await api("POST", "/admin/chat/threads", { to: pick.value, topic: topic.value.trim() || null, text: body });
+      await openConversation(opened.thread_id);
+    }, "What do you want to say?");
+    put(pane,
+      el("h2", {}, "New conversation"),
+      el("p", { class: "note" }, "You write as operator. Only service agents receive conversations (Hermes, the VMs' orchestrators); a Claude Code session in a terminal cannot be written to. What an agent asks for on your behalf is decided where every request is: rules, the reviewer, or you on Discord."),
+      listening.length
+        ? el("div", { class: "row" }, el("label", {}, "To", pick), el("label", {}, "Topic", topic))
+        : el("p", { class: "note" }, "No agent is listening for conversations right now."),
+      listening.length ? form : null);
+    if (listening.length) text.focus();
+  }
+
+  function bubble(m) {
+    const mine = m.from === "operator";
+    const who = mine ? (m.operator && m.operator !== state.user ? m.operator : "You") : m.from;
+    return el("div", { class: `bubble${mine ? " mine" : ""}${m.type === "result" ? " result" : ""}` },
+      el("div", { class: "bubble-head muted" }, who, " · ", el("span", { title: new Date(m.at).toLocaleString() }, new Date(m.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })),
+        m.type && m.type !== "message" ? ` · ${m.type}` : null),
+      m.type === "result" && m.status ? pill(m.status, statusKind(m.status === "done" ? "done" : m.status === "failed" ? "denied" : "")) : null,
+      el("div", { class: "bubble-text" }, said(m)));
+  }
+
+  async function openConversation(id) {
+    const gen = (chat.gen += 1);
+    chat.open = id;
+    history.replaceState(null, "", `#chat/${id}`);
+    chat.seq = 0;
+    notice("");
+    const head = el("div", { class: "chat-head" });
+    const log = el("div", { class: "chat-log", role: "log", "aria-live": "polite" });
+    const asked = el("div", {});
+    const foot = el("div", {});
+    put(pane, head, log, asked, foot);
+    const { form, text } = composer(async (body) => {
+      await api("POST", `/admin/chat/threads/${id}/messages`, { text: body });
+      await pull(0);
+    }, "Reply…");
+    let last = null;
+
+    function drawHead(t) {
+      chat.to = t.peer;
+      put(head,
+        el("div", {}, el("h2", {}, el("span", { class: "mono" }, t.peer), t.topic ? el("span", { class: "muted" }, ` · ${t.topic}`) : null),
+          el("div", { class: "muted small" }, stateLabel(t), " ", t.state === "closed" ? null : (t.peer_alive ? "connected" : "not seen in the last two minutes"))),
+        t.state === "closed" ? null : button("End conversation", async () => {
+          if (!confirm(`End this conversation with ${t.peer}?`)) return;
+          try { await api("POST", `/admin/chat/threads/${id}/close`, { reason: "ended from the admin panel" }); await pull(0); } catch (err) { notice(err.message, true); }
+        }, "act"));
+      if (t.state === "open") put(foot, form);
+      else if (t.state === "pending_open") put(foot, el("p", { class: "note" }, `Waiting for ${t.peer} to take the conversation; you can write again once it answers.`));
+      else put(foot, el("p", { class: "note" }, `Ended${t.close_reason && t.close_reason !== "closed" ? ` (${t.close_reason})` : ""}${t.close_note ? `: ${t.close_note}` : ""}. `,
+        button(`New conversation with ${t.peer}`, () => { chat.open = null; refreshSide(); drawNew(t.peer); }, "act")));
+    }
+
+    async function pull(wait) {
+      const out = await api("GET", `/admin/chat/threads/${id}?after_seq=${chat.seq}&wait=${wait}`);
+      if (chat.gen !== gen) return out; // left behind: another view owns chat.seq now
+      const fresh = out.messages.filter((m) => m.seq > chat.seq);
+      const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+      for (const m of fresh) { log.append(bubble(m)); chat.seq = Math.max(chat.seq, m.seq); }
+      if (fresh.length && (atBottom || fresh.some((m) => m.from === "operator"))) log.scrollTop = log.scrollHeight;
+      put(asked, out.requests.length ? el("p", { class: "note" }, `Asked for on your behalf: ${out.requests.map((r) => `${r.platform} ${r.what} on ${r.resource} (${r.status})`).join("; ")}`) : null);
+      const changed = !last || last.state !== out.thread.state || last.peer_alive !== out.thread.peer_alive;
+      if (changed) {
+        const focused = document.activeElement === text;
+        drawHead(out.thread);
+        if (focused || (!last && out.thread.state === "open")) text.focus();
+      }
+      if (fresh.length || changed) refreshSide();
+      last = out.thread;
+      return out;
+    }
+
+    try {
+      await pull(0);
+    } catch (err) {
+      if (err.message !== "signed out") notice(err.message, true);
+      return;
+    }
+    // Not awaited: it runs while the conversation is on screen.
+    (async () => {
+      while (chat.gen === gen && state.tab === "chat" && last && last.state !== "closed") {
+        if (document.hidden) { await sleep(3000); continue; }
+        try { await pull(25); } catch (err) {
+          if (err.message === "signed out") return;
+          await sleep(5000);
+        }
+      }
+    })();
+  }
+
+  put(view, el("div", { class: "chat" }, side, pane));
+  drawSide(threads);
+  const resume = chat.open && threads.some((t) => t.id === chat.open) ? chat.open : null;
+  if (resume) await openConversation(resume);
+  else drawNew();
+}
+
+const VIEWS = { chat: chatView, agents: agentsView, projects: projectsView, hosts: hostsView, conversations: conversationsView, decisions: decisionsView, commands: commandsView, rules: rulesView };
 
 async function show(tab, keepNotice) {
   state.tab = tab;
@@ -609,6 +787,7 @@ async function show(tab, keepNotice) {
 async function start() {
   const session = await api("GET", "/ui/session");
   state.csrf = session.csrf;
+  state.user = session.user;
   document.getElementById("who").textContent = session.user;
   document.getElementById("logout").addEventListener("click", async () => {
     await fetch("/ui/logout", { method: "POST", headers: { "X-CSRF-Token": state.csrf }, credentials: "same-origin" });
@@ -619,8 +798,10 @@ async function start() {
     node.dataset.tab = id;
     return node;
   }));
-  const wanted = location.hash.slice(1);
-  await show(VIEWS[wanted] ? wanted : "agents");
+  // #chat/<conversation> opens that conversation.
+  const [wanted, thread] = location.hash.slice(1).split("/");
+  if (wanted === "chat" && thread) chat.open = thread;
+  await show(VIEWS[wanted] ? wanted : "chat");
 }
 
 start().catch((err) => { if (err.message !== "signed out") notice(err.message, true); });

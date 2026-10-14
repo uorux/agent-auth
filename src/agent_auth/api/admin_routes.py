@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy import select, update
 
 from .. import authority as authority_mod
+from ..core.a2a import OPERATOR_KIND, OPERATOR_NAME
 from ..core.daemons import DaemonsDisabled
 from ..core.sandboxes import disable_agent_tree
 from ..core.service import HumanDecision, TransitionError
@@ -58,9 +59,23 @@ def _agent_out(
     )
 
 
+def _not_operator(agent: Agent) -> None:
+    # The operator's row is the panel's side of its chats: giving it a key, a
+    # webhook or another kind would let something other than the panel speak
+    # as the operator.
+    if agent.kind == OPERATOR_KIND:
+        raise HTTPException(409, "the operator's identity belongs to the admin panel's chat")
+
+
+def _not_operator_name(name: str) -> None:
+    if name == OPERATOR_NAME:
+        raise HTTPException(409, f"{OPERATOR_NAME!r} is the admin panel's name for the operator")
+
+
 @router.post("/agents", response_model=AgentOut, response_model_exclude_none=True)
 async def create_agent(body: AgentCreate, request: Request):
     state = request.app.state
+    _not_operator_name(body.name)
     full_key, key_id, key_hash = generate_api_key()
     async with state.db.session() as session:
         existing = (
@@ -101,6 +116,7 @@ async def set_attributes(agent_id: str, body: AgentAttributesBody, request: Requ
             ).scalar_one_or_none()
         if agent is None:
             raise HTTPException(404, "unknown agent")
+        _not_operator(agent)
         if agent.sandbox_id is not None:
             raise HTTPException(409, f"{agent.name} was minted in an agent VM; its fields are the broker's")
         for field in body.model_fields_set:
@@ -123,9 +139,11 @@ async def rename_agent(agent_id: str, body: AgentRenameBody, request: Request):
             ).scalar_one_or_none()
         if agent is None:
             raise HTTPException(404, "unknown agent")
+        _not_operator(agent)
         if agent.sandbox_id is not None:
             raise HTTPException(409, f"{agent.name} was minted in an agent VM; its name is the broker's")
         old, new = agent.name, body.name
+        _not_operator_name(new)
         if new == old:
             return AgentRenamed(agent=_agent_out(agent), previous_name=old, rules=0, grants=0)
         taken = (await session.execute(select(Agent.id).where(Agent.name == new))).scalar_one_or_none()
@@ -169,6 +187,7 @@ async def rotate_key(agent_id: str, request: Request):
         agent = await session.get(Agent, agent_id)
         if agent is None:
             raise HTTPException(404, "unknown agent")
+        _not_operator(agent)
         agent.key_id = key_id
         agent.api_key_hash = key_hash
         return _agent_out(agent, api_key=full_key)
@@ -186,6 +205,7 @@ async def rotate_webhook_secret(agent_id: str, request: Request):
         agent = await session.get(Agent, agent_id)
         if agent is None:
             raise HTTPException(404, "unknown agent")
+        _not_operator(agent)
         agent.webhook_secret = secrets.token_urlsafe(32)
         return _agent_out(agent, webhook_secret=agent.webhook_secret)
 
@@ -210,6 +230,7 @@ async def rotate_lldap_password(agent_id: str, request: Request):
         agent = await session.get(Agent, agent_id)
         if agent is None:
             raise HTTPException(404, "unknown agent")
+        _not_operator(agent)
         try:
             await provisioner.rotate_password(session, agent)
         except ProvisionerError as exc:
@@ -241,6 +262,7 @@ async def set_kind(agent_id: str, body: SetKindBody, request: Request):
         agent = await session.get(Agent, agent_id)
         if agent is None:
             raise HTTPException(404, "unknown agent")
+        _not_operator(agent)
         was = agent.kind
         agent.kind = body.kind
         if body.kind != "service":
@@ -303,6 +325,7 @@ async def set_webhook(agent_id: str, body: SetWebhookBody, request: Request):
         agent = await session.get(Agent, agent_id)
         if agent is None:
             raise HTTPException(404, "unknown agent")
+        _not_operator(agent)
         agent.webhook_url = body.webhook_url
         agent.webhook_secret = secrets.token_urlsafe(32) if body.webhook_url else None
         return _agent_out(agent, webhook_secret=agent.webhook_secret)
