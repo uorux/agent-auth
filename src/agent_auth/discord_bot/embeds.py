@@ -5,7 +5,7 @@ import json
 import discord
 
 from ..policy.agents import describe
-from ..core.states import RequestStatus
+from ..core.states import DecisionSource, RequestStatus
 from ..models import AccessRequest, Agent, A2AThread, Grant, Rule
 from ..schemas import format_duration
 
@@ -105,8 +105,9 @@ def build_rule_applied_embed(
     else:
         verb, color = "auto-approved", COLOR_APPROVED
     resource = request.approved_resource or request.resource
+    decider = {DecisionSource.POLICY: "Policy", DecisionSource.LLM: "LLM reviewer"}.get(request.decision_source, "Rule")
     line = (
-        f"{emoji} Rule {verb}: **{agent.name}** → "
+        f"{emoji} {decider} {verb}: **{agent.name}** → "
         f"{request.platform.value}/{request.capability} on `{_trim(resource, 256)}`"
     )
     if grant is not None and grant.status.value == "active":
@@ -114,11 +115,19 @@ def build_rule_applied_embed(
             f" for **{format_duration(request.approved_duration_secs)}**"
             f" — expires <t:{int(grant.expires_at.timestamp())}:R>"
         )
-    rule_ref = f"rule `{rule.id[:8]}`" if rule is not None else "a since-deleted rule"
-    line += f"\nby {rule_ref}"
-    if rule is not None and rule.notes:
-        line += f" ({_trim(rule.notes, 200)})"
-    line += " — manage with /rules"
+    if decider == "Rule":
+        rule_ref = f"rule `{rule.id[:8]}`" if rule is not None else "a since-deleted rule"
+        line += f"\nby {rule_ref}"
+        if rule is not None and rule.notes:
+            line += f" ({_trim(rule.notes, 200)})"
+        line += " — manage with /rules"
+    else:
+        # The policy file's rule, or the reviewer's reasoning (model text:
+        # trimmed, its markdown shown as text).
+        why = discord.utils.escape_markdown(request.decision_reason or "")
+        line += f"\n{'by' if decider == 'Policy' else 'because'}: {_trim(why, 300)}" if why else ""
+        if request.delegator_agent_id:
+            line += " (on another agent's behalf)"
     embed = discord.Embed(description=line, color=color)
     embed.set_footer(text=f"request {request.id}")
     embed.timestamp = request.decided_at

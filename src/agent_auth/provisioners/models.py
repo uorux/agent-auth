@@ -5,7 +5,9 @@ grant is one LiteLLM virtual key for the agent: the key belongs to a
 LiteLLM user named after the agent, so the gateway counts spend per agent
 across keys, and carries the agent's fields (project, host, runtime) as
 metadata. The key expires with the grant at the gateway itself
-(`duration`), and revoking blocks it at once. The broker keeps the key
+(`duration`), and revoking deletes it at once: LiteLLM moves a deleted key,
+with its spend, to its deleted-keys table, so the live table holds only
+current keys and nothing counted is lost. The broker keeps the key
 encrypted to hand it out again; it is never in the data path.
 
 The gateway holds the model providers' logins; agents hold only their own
@@ -49,7 +51,18 @@ class ModelsProvisioner:
             raise SpecValidationError(f"unknown model gateway {spec.resource!r} (this broker has {self.config.name!r})")
         if spec.scope:
             raise SpecValidationError("no scope for models grants: what a key may call is the gateway's policy")
+        if self.config.by_runtime and spec.agent.runtime not in self.config.by_runtime:
+            raise SpecValidationError(
+                f"no models for runtime {spec.agent.runtime or '(none)'!r} at this gateway "
+                f"(only {', '.join(sorted(self.config.by_runtime))})"
+            )
+        spec.notes.append(f"may call: {', '.join(self._models(spec.agent)) or 'every model the gateway serves'}")
         return spec
+
+    def _models(self, agent: Agent) -> list[str]:
+        if self.config.by_runtime:
+            return list(self.config.by_runtime.get(agent.runtime or "", []))
+        return list(self.config.models)
 
     async def _call(self, method: str, path: str, **kwargs) -> httpx.Response:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
@@ -92,8 +105,11 @@ class ModelsProvisioner:
             "duration": f"{secs}s",
             "metadata": {**_fields(agent), "grant_id": grant.id, "issued_by": "agent-auth"},
         }
-        if self.config.models:
-            body["models"] = list(self.config.models)
+        models = self._models(agent)
+        if self.config.by_runtime and not models:
+            raise ProvisionerError(f"no models for runtime {agent.runtime!r}")
+        if models:
+            body["models"] = models
         if self.config.max_budget is not None:
             body["max_budget"] = self.config.max_budget
             body["budget_duration"] = self.config.budget_duration
@@ -113,12 +129,11 @@ class ModelsProvisioner:
         if not state.get("key_encrypted"):
             return
         key = self.box.decrypt(state["key_encrypted"])
-        # Blocked, not deleted: its spend stays on the gateway's books.
-        resp = await self._call("POST", "/key/block", json={"key": key})
+        resp = await self._call("POST", "/key/delete", json={"keys": [key]})
         if resp.status_code == 404 or (resp.status_code == 400 and "not found" in resp.text.lower()):
-            return  # expired and cleaned up at the gateway: nothing to block
+            return  # already gone at the gateway
         if resp.status_code != 200:
-            raise ProvisionerError(f"model gateway did not block {state.get('key_alias')}: {resp.status_code} {resp.text[:200]}")
+            raise ProvisionerError(f"model gateway did not delete {state.get('key_alias')}: {resp.status_code} {resp.text[:200]}")
 
     async def get_credential(self, session: AsyncSession, grant: Grant) -> CredentialOut:
         if grant.status != GrantStatus.ACTIVE or grant.expires_at <= utcnow():

@@ -24,7 +24,7 @@ agent ──HTTP/MCP/CLI──▶ broker ──policy──▶ deny | approve | 
 | `kubernetes` | role name (`view`, `edit`, `traefik-patcher`, …) | namespace name (or `*` for cluster-wide) | per-grant ServiceAccount + RoleBinding to the named (Cluster)Role — a ClusterRoleBinding when the namespace is `*`; tokens minted on demand via TokenRequest; SA deleted at expiry → all tokens die instantly. The capability *is* the role, so policy rules auto-approve narrow roles and surface broad ones |
 | `a2a`     | `talk`        | target agent name   | authorizes OPENING conversation threads to that (service) agent — see [a2a threads](#a2a-threads); no credential is minted |
 | `hostexec` | `run`, `tpl.<name>`, `shell` | host name | one command (or a time-boxed shell) **on a host**, run by that host's daemon — see [Commands on hosts](#commands-on-hosts-hostexec). The host decides, with its own TOTP secrets and policy; root and shells always reach a human |
-| `models`  | `use`         | gateway name (`litellm`) | a LiteLLM virtual key of the agent's own, under a LiteLLM user named after it — see [Model gateway](#model-gateway-litellm). Blocked at revoke; the gateway also ends it at the grant's end |
+| `models`  | `use`         | gateway name (`litellm`) | a LiteLLM virtual key of the agent's own, under a LiteLLM user named after it — see [Model gateway](#model-gateway-litellm). Deleted at revoke (LiteLLM keeps it, with its spend, among its deleted keys); the gateway also ends it at the grant's end |
 | `google`  | `calendar.*`… | calendar id / label | stub: decisions recorded, no credential minted (501)                        |
 
 Note the Gitea flow: the broker grants the homelab agent the `svc-gitea` LLDAP
@@ -613,6 +613,9 @@ platforms:
     url: https://litellm.example.org       # Anthropic-native here, OpenAI at /v1
     # admin_url: http://litellm.litellm.svc:4000   # if the broker reaches it elsewhere
     models: ["claude-*"]                   # what a key may call; empty = all
+    by_runtime:                            # or per runtime (takes precedence):
+      claude: ["claude-*"]                 #   an agent whose runtime is not
+      codex: ["gpt-*"]                     #   listed gets no key
     # max_budget: 50                       # per key, per budget_duration (30d)
 rules:
   - match: {agent: {placement: sandbox}, platform: models, capability: use}
@@ -627,8 +630,8 @@ The broker needs the gateway's master key as `LITELLM_MASTER_KEY` (and
   with its fields as metadata, then a key under it: alias
   `<agent>/<grant id>`, the agent's fields and the grant id as metadata,
   `duration` = the grant's remaining life, `models` and `max_budget` from
-  the policy. Revoking blocks the key (blocked, not deleted, so its spend
-  stays counted). Only a rule that names `models` (with `capability: use`)
+  the policy. Revoking deletes the key; LiteLLM moves it, with its spend, to
+  its deleted-keys table, so the live table holds only current keys. Only a rule that names `models` (with `capability: use`)
   approves one; a catch-all for an agent does not.
 - **In an agent VM.** sandboxd asks for a 24h grant per agent the first time
   one of its conversations starts, reuses it until two hours before its end,
@@ -638,6 +641,13 @@ The broker needs the gateway's master key as `LITELLM_MASTER_KEY` (and
   is not granted at once, or anything fails, the VM's own logins are used as
   before: the gateway is never a reason a conversation does not start. A
   running process keeps the key it started with.
+- **One tool per subscription.** With `by_runtime`, a claude agent's key
+  can call only the Claude models and a codex agent's only OpenAI's, and an
+  agent of any other runtime (Hermes) gets no key: a subscription meant for
+  Claude Code is not handed to something else. The gateway can check the
+  caller too (a pre-call hook on the client's User-Agent), but both checks
+  stop mistakes, not an agent set on misuse: the key is in its environment
+  and a header is whatever it sends.
 - **Usage.** `GET /admin/models/usage` (the panel's Model usage tab): each
   agent's spend as the gateway counts it, by agent and by project.
 

@@ -141,6 +141,26 @@ class RecordingNotifier:
         )
 
 
+async def test_auto_approvals_are_announced_when_asked(db, service):
+    """notify.auto_approvals: the policy file's approvals get the audit line
+    too, except on the platforms it skips."""
+    from agent_auth.core.states import Platform
+
+    notifier = RecordingNotifier()
+    service.set_notifier(notifier)
+    service.engine.policy.notify.auto_approvals = True
+    sender, _ = await make_agent(db, "auto-sender-log")
+    await make_agent(db, "peer-log")
+    req = await service.create_request(sender.id, a2a_request("peer-log"))
+    assert req.status == RequestStatus.GRANTED
+    assert notifier.applied == [(RequestStatus.GRANTED, None, notifier.applied[0][2])]
+    assert notifier.applied[0][2] is not None
+
+    service.engine.policy.notify.skip_platforms = [Platform.A2A]
+    await service.create_request(sender.id, a2a_request("peer-log"))
+    assert len(notifier.applied) == 1
+
+
 async def test_rule_decisions_notify_channel(db, service):
     notifier = RecordingNotifier()
     service.set_notifier(notifier)

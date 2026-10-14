@@ -265,6 +265,11 @@ class ModelsPlatformConfig(BaseModel):
     # Model names (LiteLLM's model_name, wildcards as it defines them) a
     # key may call. Empty: everything the gateway serves.
     models: list[str] = Field(default_factory=list)
+    # Per runtime instead: an agent's key may call only its runtime's list,
+    # and an agent whose runtime is not listed gets no key. This is what
+    # keeps a subscription meant for one tool (Claude Code) away from
+    # anything else: {claude: ["claude-*"], codex: ["gpt-*"]}.
+    by_runtime: dict[str, list[str]] = Field(default_factory=dict)
     # Spend limit per key, in the gateway's (notional, for subscriptions)
     # dollars, reset every budget_duration. None: no limit.
     max_budget: float | None = None
@@ -378,6 +383,17 @@ class PlatformsConfig(BaseModel):
     models: ModelsPlatformConfig = Field(default_factory=ModelsPlatformConfig)
 
 
+class NotifyConfig(BaseModel):
+    """What is posted to the Discord channel besides requests that need you.
+    A saved rule's decisions always are; these are the rest."""
+
+    # A line for every request approved without you: by the policy file or
+    # the LLM reviewer.
+    auto_approvals: bool = False
+    # ...except these platforms (e.g. models: a key per VM agent each day).
+    skip_platforms: list[Platform] = Field(default_factory=list)
+
+
 class PolicyFile(BaseModel):
     defaults: Defaults = Field(default_factory=Defaults)
     llm: LLMConfig = Field(default_factory=LLMConfig)
@@ -385,6 +401,7 @@ class PolicyFile(BaseModel):
     desktop: DesktopConfig = Field(default_factory=DesktopConfig)
     wiki: WikiConfig = Field(default_factory=WikiConfig)
     ui: UiConfig = Field(default_factory=UiConfig)
+    notify: NotifyConfig = Field(default_factory=NotifyConfig)
     # The projects agents work on. A rule may only name a project listed
     # here, so a mistyped one is an error at load and not a rule that never
     # matches.

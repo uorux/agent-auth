@@ -190,6 +190,29 @@ def test_rule_applied_embed():
     assert embed.color.value == embeds.COLOR_DENIED
 
 
+def test_policy_and_reviewer_approvals_say_who_decided():
+    from agent_auth.core.states import DecisionSource
+
+    agent = Agent(name="sde-agent", description="", key_id="k", api_key_hash="h")
+    request = _request(
+        status=RequestStatus.GRANTED,
+        decision_source=DecisionSource.POLICY,
+        decision_reason="the agent's own project's repo",
+        approved_duration_secs=1800,
+        decided_at=utcnow(),
+    )
+    embed = embeds.build_rule_applied_embed(request, agent, None, None)
+    assert embed.description.startswith("🐙 Policy auto-approved") or "Policy auto-approved" in embed.description
+    assert "by: the agent's own project's repo" in embed.description
+    assert "since-deleted" not in embed.description and "/rules" not in embed.description
+
+    request.decision_source = DecisionSource.LLM
+    request.decision_reason = "narrow and **justified**"
+    embed = embeds.build_rule_applied_embed(request, agent, None, None)
+    assert "LLM reviewer auto-approved" in embed.description
+    assert "because: narrow and \\*\\*justified\\*\\*" in embed.description
+
+
 def test_edit_modal_respects_discord_field_limits():
     # Discord validates these server-side only (400 Invalid Form Body), so
     # enforce them here. Use an oversized resource to cover prefill truncation.

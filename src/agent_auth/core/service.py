@@ -312,6 +312,8 @@ class RequestService:
             await self._surface(request_id)
         elif applied_rule_id is not None:
             await self._notify_rule_applied(request_id, applied_rule_id)
+        elif source == DecisionSource.POLICY and decision.action == PolicyAction.APPROVE:
+            await self._announce_auto_approval(request)
         return request
 
     async def _resolve_delegation(
@@ -479,6 +481,7 @@ class RequestService:
 
         if pending_grant_id is not None:
             await self._finish_provision(pending_grant_id)
+            await self._announce_auto_approval(await self._reload_request(request_id))
         self.events.notify(request_id)
         if status == RequestStatus.AWAITING_HUMAN:
             await self._surface(request_id)
@@ -995,12 +998,20 @@ class RequestService:
         except Exception:
             log.exception("notifier.surface failed for %s", request_id)
 
-    async def _notify_rule_applied(self, request_id: str, rule_id: str) -> None:
+    async def _announce_auto_approval(self, request: AccessRequest) -> None:
+        """notify.auto_approvals: the policy file's and the LLM reviewer's
+        approvals get the same audit line a saved rule's do."""
+        notify = self.engine.policy.notify
+        if notify.auto_approvals and request.platform not in notify.skip_platforms:
+            await self._notify_rule_applied(request.id, None)
+
+    async def _notify_rule_applied(self, request_id: str, rule_id: str | None) -> None:
         async with self.db.session() as session:
             request = await session.get(AccessRequest, request_id)
             agent = await session.get(Agent, request.agent_id)
-            # None if the rule was deleted since matching; notifier copes.
-            rule = await session.get(Rule, rule_id)
+            # None if the rule was deleted since matching (or there is none:
+            # the policy file or the LLM decided); the notifier copes.
+            rule = await session.get(Rule, rule_id) if rule_id else None
             grant = await self._grant_for(session, request_id)
         try:
             await self.notifier.rule_applied(request, agent, rule, grant)

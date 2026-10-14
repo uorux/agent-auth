@@ -67,7 +67,7 @@ class Gateway:
     def __init__(self):
         self.users: dict[str, dict] = {}
         self.keys: dict[str, dict] = {}
-        self.blocked: list[str] = []
+        self.deleted: list[str] = []
 
     def mock(self):
         def auth(request):
@@ -93,9 +93,9 @@ class Gateway:
             self.keys[key] = body
             return httpx.Response(200, json={"key": key, "key_alias": body["key_alias"]})
 
-        def key_block(request):
+        def key_delete(request):
             auth(request)
-            self.blocked.append(json.loads(request.content)["key"])
+            self.deleted.extend(json.loads(request.content)["keys"])
             return httpx.Response(200, json={})
 
         def user_list(request):
@@ -105,7 +105,7 @@ class Gateway:
         respx.get(f"{GW}/user/info").mock(side_effect=user_info)
         respx.post(f"{GW}/user/new").mock(side_effect=user_new)
         respx.post(f"{GW}/key/generate").mock(side_effect=key_generate)
-        respx.post(f"{GW}/key/block").mock(side_effect=key_block)
+        respx.post(f"{GW}/key/delete").mock(side_effect=key_delete)
         respx.get(f"{GW}/user/list").mock(side_effect=user_list)
         return self
 
@@ -149,7 +149,7 @@ async def test_a_grant_is_a_key_of_the_agents_own_that_ends_with_it(db, stack):
     assert req2.status == RequestStatus.GRANTED and len(gw.keys) == 2 and len(gw.users) == 1
 
     await stack["service"].revoke_grant(grant.id, "done", "test")
-    assert gw.blocked == [key]
+    assert gw.deleted == [key]
     async with db.session() as session:
         assert (await session.get(Grant, grant.id)).status == GrantStatus.REVOKED
 
@@ -267,3 +267,27 @@ async def test_the_daemon_reuses_a_grant_and_falls_back_to_the_vms_logins():
             raise OSError("broker unreachable")
 
     assert await sbx.Sandboxd._gateway(daemon_with(Down(CATALOG)), REC) is None
+
+
+@respx.mock
+async def test_by_runtime_keeps_each_subscription_to_its_own_tool(db):
+    from agent_auth.api.app import create_app  # noqa: F401  (the stack, as above, with by_runtime)
+
+    gw = Gateway().mock()
+    policy = PolicyFile.model_validate(
+        {
+            **POLICY,
+            "platforms": {"models": {"url": GW, "by_runtime": {"claude": ["claude-*"], "codex": ["gpt-*"]}}},
+        }
+    )
+    registry = ProvisionerRegistry()
+    registry.register(ModelsProvisioner(policy.platforms.models, "master", SecretBox(generate_fernet_key())))
+    service = RequestService(db, PolicyEngine(policy), registry, KeyedEvents())
+    claude, _ = await make_agent(db, "claude-a-galaxy-sandbox", runtime="claude", placement="sandbox")
+    codex, _ = await make_agent(db, "codex-a-galaxy-sandbox", runtime="codex", placement="sandbox")
+    hermes, _ = await make_agent(db, "hermes-x-sandbox", runtime="hermes", placement="sandbox")
+    assert (await service.create_request(claude.id, use())).status == RequestStatus.GRANTED
+    assert (await service.create_request(codex.id, use())).status == RequestStatus.GRANTED
+    refused = await service.create_request(hermes.id, use())
+    assert refused.status == RequestStatus.DENIED and "no models for runtime 'hermes'" in refused.decision_reason
+    assert [b["models"] for b in gw.keys.values()] == [["claude-*"], ["gpt-*"]]
