@@ -963,6 +963,26 @@ def test_linux_executor_user_tier_command(tmp_path, monkeypatch):
     assert "User=me" not in out and "--working-directory=/" in out
 
 
+def test_linux_executor_systemctl_verbs(tmp_path):
+    """Killing a job stops its unit, and lockdown freezes the VM's: the verb
+    reaches systemctl (an older copy of the class dropped it)."""
+    from agent_auth.hostd import executor
+    from agent_auth.hostd.config import HostConfig
+
+    log = tmp_path / "calls"
+    fake = tmp_path / "systemctl"
+    fake.write_text(f'#!/bin/sh\nprintf "%s " "$@" >> {log}\necho >> {log}\n')
+    fake.chmod(0o755)
+    config = HostConfig(
+        broker_url="http://127.0.0.1:1", broker_public_key="ed25519:" + "A" * 43, name="h",
+        systemctl=str(fake), job_path="/usr/bin:/bin",
+    )
+    ex = executor.LinuxExecutor(config)
+    asyncio.run(ex.kill("j1", "user"))
+    asyncio.run(ex.unit_action("freeze", "agent-vm.service"))
+    assert log.read_text().split("\n")[:2] == ["stop aa-job-j1.service ", "freeze agent-vm.service "]
+
+
 async def test_the_watcher_pings_about_an_alarming_command_and_stops_nothing(db, stack, host):
     """A model looks at shell commands as they run. It only ever tells the
     operator; the command has already been sent."""
