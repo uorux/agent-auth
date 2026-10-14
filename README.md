@@ -438,6 +438,9 @@ pairs, connects and reports heartbeats, as the unprivileged `agent-auth-hostd`
 user. Enabling a tier makes it run approved commands
 ([Commands on hosts](#commands-on-hosts-hostexec)), as root.
 
+- **macOS hosts:** hostd on a Mac (LaunchDaemon, nix-darwin module or install
+  script) — see [docs/hostd-macos.md](docs/hostd-macos.md).
+
 - **Broker key**: `agent-auth admin gen-signing-key --out FILE` writes
   `BROKER_SIGNING_KEY` to a new 0600 file (move it into the broker's env
   secret, never into `settings`) and prints the public key. Without `--out`
