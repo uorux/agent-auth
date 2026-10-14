@@ -1,0 +1,35 @@
+{
+  "broker_url": "https://agent-auth.recusant.rooty.dev",
+  "broker_public_key": "ed25519:REPLACE_WITH_agent-auth_admin_broker-key",
+  "name": "REPLACE_WITH_THIS_MACS_NAME",
+  "state_dir": "/var/db/agent-auth-hostd",
+  "runtime_dir": "/var/run/agent-auth-hostd",
+  "user": "REPLACE_WITH_YOUR_MACOS_USER",
+  "tiers": {
+    "user": {"enable": true, "max_arm": "8h", "accept_approve_all": true, "shell": {"enable": true, "max_duration": "1h"}},
+    "root": {"enable": false, "max_arm": "1h", "shell": {"enable": false, "max_duration": "30m"}}
+  },
+  "auto_commands": [
+    ["xcodebuild", "-list"],
+    ["xcrun", "simctl", "list", "**"],
+    ["swift", "--version"]
+  ],
+  "deny_commands": [
+    ["security", "**"]
+  ],
+  "templates": {
+    "swift-test": {"tier": "user", "argv": ["swift", "test", "--package-path", "{dir}"], "params": {"dir": "/Users/[a-z0-9]+/src/[A-Za-z0-9._-]+"}}
+  },
+  "env_allow": ["LANG", "LC_ALL", "TZ", "TERM", "DEVELOPER_DIR"],
+  "job_path": "/usr/bin:/bin:/usr/sbin:/sbin",
+  "default_timeout": "10m",
+  "max_timeout": "1h",
+  "desktop": {
+    "enable": true,
+    "idle_source": "macos",
+    "max_idle": "5m",
+    "prompt_timeout": "90s",
+    "approve": {"user": false, "root": false},
+    "attention_command": ["/usr/bin/afplay", "/System/Library/Sounds/Glass.aiff"]
+  }
+}

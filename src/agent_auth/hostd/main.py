@@ -29,7 +29,7 @@ from ..daemon_common.channel import (
 )
 from ..daemon_common.crypto import fingerprint, load_or_create_key, parse_public_key
 from ..daemon_common.totp import SECRET_NAMES, TotpError, TotpStore, otpauth_uri
-from .config import CONFIG_ENV, HostConfig
+from .config import CONFIG_ENV, HostConfig, darwin, default_state_dir
 
 log = logging.getLogger("agent_auth.hostd")
 
@@ -57,7 +57,7 @@ BrokerKey = typer.Option(
 )
 Name = typer.Option(None, "--name", envvar="AGENT_AUTH_HOSTD_NAME", help="default: hostname")
 StateDir = typer.Option(
-    Path("/var/lib/agent-auth-hostd"), "--state-dir", envvar="AGENT_AUTH_HOSTD_STATE_DIR"
+    default_state_dir(), "--state-dir", envvar="AGENT_AUTH_HOSTD_STATE_DIR"
 )
 
 
@@ -228,13 +228,13 @@ def run(
     state_dir: Path = StateDir,
     config: Path = ConfigFile,
 ):
-    """The daemon (the systemd service's entry point)."""
+    """The daemon (the systemd service's, or launchd daemon's, entry point)."""
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(levelname)s %(name)s: %(message)s",
     )
     from .daemon import Hostd
-    from .executor import LinuxExecutor
+    from .executor import make_executor
 
     cfg = _load_config(config, broker_url, broker_key, name, state_dir)
     _identity(cfg.broker_url, cfg.broker_public_key, cfg.name, cfg.state_dir)  # validates; creates the key
@@ -246,7 +246,19 @@ def run(
         )
     if cfg.privileged and os.geteuid() != 0:
         log.error("tiers or a VM are configured but hostd is not root: jobs will fail to start")
-    asyncio.run(_run_until_signalled(Hostd(cfg, LinuxExecutor(cfg))))
+    if darwin():
+        prepare_dirs(cfg)
+    asyncio.run(_run_until_signalled(Hostd(cfg, make_executor(cfg))))
+
+
+def prepare_dirs(cfg: HostConfig) -> None:
+    """What systemd's StateDirectory= and RuntimeDirectory= do on Linux: the
+    state private to hostd, the sockets' directory reachable by the user
+    (each socket checks who is calling)."""
+    cfg.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(cfg.state_dir, 0o700)
+    cfg.runtime_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+    os.chmod(cfg.runtime_dir, 0o755)
 
 
 @app.command()

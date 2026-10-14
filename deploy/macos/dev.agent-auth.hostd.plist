@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  hostd as a LaunchDaemon (root). docs/hostd-macos.md.
+  Install: /Library/LaunchDaemons/dev.agent-auth.hostd.plist, root:wheel 0644.
+  No secrets belong here: the host's key and TOTP secrets are files hostd
+  creates itself in /var/db/agent-auth-hostd (0700, root).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.agent-auth.hostd</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/agent-auth/venv/bin/agent-auth-hostd</string>
+    <string>run</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AGENT_AUTH_HOSTD_CONFIG</key>
+    <string>/etc/agent-auth/hostd.json</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>StandardOutPath</key>
+  <string>/var/log/agent-auth-hostd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/agent-auth-hostd.log</string>
+</dict>
+</plist>

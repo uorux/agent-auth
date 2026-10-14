@@ -15,12 +15,13 @@ from datetime import datetime
 import typer
 
 from ..daemon_common.localsock import LocalApiError, call
+from .config import default_runtime_dir
 
 app = typer.Typer(help="control this host's agent-auth daemon", no_args_is_help=True,
                   pretty_exceptions_show_locals=False)
 
 SOCKET_ENV = "AGENT_AUTH_HOSTD_CTL"
-DEFAULT_SOCKET = "/run/agent-auth-hostd/ctl.sock"
+DEFAULT_SOCKET = str(default_runtime_dir() / "ctl.sock")
 
 
 def _call(method: str, **params):

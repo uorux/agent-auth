@@ -1,6 +1,10 @@
 """hostd's configuration and local policy: one JSON file written by its NixOS
-module, so it lives in the nix store and only an audited config change can
-loosen it (docs/sandbox-design.md §8.4). The broker has no say in any of it.
+(or nix-darwin) module, so it lives in the nix store and only an audited
+config change can loosen it (docs/sandbox-design.md §8.4). The broker has no
+say in any of it.
+
+On macOS (docs/hostd-macos.md) the default paths differ, and what needs
+systemd or polkit (a VM unit, approving root commands at the desk) is refused.
 """
 
 from __future__ import annotations
@@ -8,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -16,6 +21,30 @@ from typing import Any
 CONFIG_ENV = "AGENT_AUTH_HOSTD_CONFIG"
 _DURATION_RE = re.compile(r"(\d+)([smhdw]?)")
 _UNIT_SECS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+IDLE_SOURCES = ("hooks", "logind", "macos")
+
+
+def darwin() -> bool:
+    return sys.platform == "darwin"
+
+
+def default_state_dir() -> Path:
+    return Path("/var/db/agent-auth-hostd" if darwin() else "/var/lib/agent-auth-hostd")
+
+
+def default_runtime_dir() -> Path:
+    # /var/run is cleared at boot on macOS, like /run.
+    return Path("/var/run/agent-auth-hostd" if darwin() else "/run/agent-auth-hostd")
+
+
+def default_job_path() -> str:
+    if darwin():
+        # nix-darwin's system profile, the default nix profile, and the
+        # system's own (xcodebuild, xcrun, swift are shims in /usr/bin). Not
+        # Homebrew: its directories belong to the user, and this is the root
+        # tier's PATH too (the user tier adds them).
+        return "/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    return "/run/wrappers/bin:/run/current-system/sw/bin"
 
 
 def duration_secs(value: Any) -> int:
@@ -87,7 +116,8 @@ class DesktopConfig:
     # Where "idle" and "locked" come from. "hooks": only what
     # `agent-auth-hostctl presence …` reports (hypridle, the lock screen).
     # "logind": the session's IdleHint/LockedHint, where the desktop keeps
-    # them up to date (Hyprland does not).
+    # them up to date (Hyprland does not). "macos": the HID idle time and the
+    # console session's lock state, from ioreg.
     idle_source: str = "hooks"
 
     @classmethod
@@ -102,7 +132,7 @@ class DesktopConfig:
             approve_root=bool((raw.get("approve") or {}).get("root", False)),
             attention_command=list(raw.get("attention_command") or []),
             notify_command=list(raw.get("notify_command") or []),
-            idle_source="logind" if raw.get("idle_source") == "logind" else "hooks",
+            idle_source=raw["idle_source"] if raw.get("idle_source") in IDLE_SOURCES else "hooks",
         )
 
 
@@ -111,8 +141,8 @@ class HostConfig:
     broker_url: str
     broker_public_key: str
     name: str
-    state_dir: Path = Path("/var/lib/agent-auth-hostd")
-    runtime_dir: Path = Path("/run/agent-auth-hostd")
+    state_dir: Path = field(default_factory=default_state_dir)
+    runtime_dir: Path = field(default_factory=default_runtime_dir)
     # The account the user tier runs commands as (and whose desktop is asked).
     user: str | None = None
     tiers: dict[str, TierConfig] = field(default_factory=lambda: {"user": TierConfig(), "root": TierConfig()})
@@ -125,7 +155,7 @@ class HostConfig:
     env_allow: list[str] = field(default_factory=lambda: ["LANG", "LC_ALL", "TZ", "TERM"])
     # The agent VM's unit on this host: frozen on lockdown. None = no VM here.
     vm_unit: str | None = None
-    job_path: str = "/run/wrappers/bin:/run/current-system/sw/bin"
+    job_path: str = field(default_factory=default_job_path)
     default_timeout_secs: int = 600
     max_timeout_secs: int = 3600
     systemd_run: str = "systemd-run"
@@ -189,6 +219,13 @@ class HostConfig:
                 re.compile(regex)
         if self.tiers["user"].enable and not self.user:
             raise ValueError("the user tier needs `user` (the account it runs commands as)")
+        if darwin():
+            if self.vm_unit is not None:
+                raise ValueError("vm_unit: there are no systemd units to freeze on macOS")
+            if self.desktop.approve_root:
+                raise ValueError("desktop.approve.root needs polkit, which macOS does not have")
+            if self.desktop.idle_source == "logind":
+                raise ValueError('desktop.idle_source "logind" is Linux; use "macos" or "hooks"')
 
 
 def match_argv(pattern: list[str], argv: list[str], *, loose_program: bool = False) -> bool:

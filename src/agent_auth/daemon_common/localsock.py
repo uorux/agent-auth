@@ -1,5 +1,6 @@
-"""JSON lines over a unix socket, with the caller's uid from SO_PEERCRED:
-the local APIs of sandboxd (agents, operators) and hostd (hostctl).
+"""JSON lines over a unix socket, with the caller's uid from SO_PEERCRED
+(LOCAL_PEERCRED on macOS): the local APIs of sandboxd (agents, operators) and
+hostd (hostctl).
 
 Request: {"method": "...", "params": {...}, "token": "..."}
 Reply:   {"ok": true, "result": ...} | {"ok": false, "error": "..."}
@@ -13,6 +14,7 @@ import logging
 import os
 import socket
 import struct
+import sys
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -29,14 +31,28 @@ class LocalApiError(Exception):
     """Client side: the daemon said no, or didn't answer."""
 
 
+# macOS has no SO_PEERCRED: the peer's credentials are LOCAL_PEERCRED (a
+# struct xucred: version, uid, ngroups, groups[16]) and its pid LOCAL_PEERPID,
+# both at level SOL_LOCAL (0). Values from <sys/un.h>.
+SOL_LOCAL = 0
+LOCAL_PEERCRED = 0x001
+LOCAL_PEERPID = 0x002
+XUCRED_SIZE = 76
+
+
 def peer_uid(writer: asyncio.StreamWriter) -> int:
     sock = writer.get_extra_info("socket")
+    if sys.platform == "darwin":
+        creds = sock.getsockopt(SOL_LOCAL, LOCAL_PEERCRED, XUCRED_SIZE)
+        return struct.unpack_from("=II", creds)[1]
     creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
     return struct.unpack("3i", creds)[1]
 
 
 def peer_pid(writer: asyncio.StreamWriter) -> int:
     sock = writer.get_extra_info("socket")
+    if sys.platform == "darwin":
+        return struct.unpack("=i", sock.getsockopt(SOL_LOCAL, LOCAL_PEERPID, 4))[0]
     creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
     return struct.unpack("3i", creds)[0]
 

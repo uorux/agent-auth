@@ -38,8 +38,25 @@
           ]);
 
       venv = pythonSet.mkVirtualEnv "agent-auth-env" workspace.deps.default;
+
+      # The same virtualenv for a Mac (hostd there: darwinModules.hostd,
+      # docs/hostd-macos.md). Not built from this Linux flake's CI; a Mac
+      # builds it (or a darwin builder).
+      darwinVenv =
+        let
+          darwinPkgs = nixpkgs.legacyPackages.aarch64-darwin;
+          darwinSet =
+            (darwinPkgs.callPackage pyproject-nix.build.packages { python = darwinPkgs.python313; }).overrideScope
+              (lib.composeManyExtensions [
+                pyproject-build-systems.overlays.default
+                overlay
+              ]);
+        in
+        darwinSet.mkVirtualEnv "agent-auth-env" workspace.deps.default;
     in
     {
+      packages.aarch64-darwin.default = darwinVenv;
+
       packages.${system} = {
         default = venv;
 
@@ -640,6 +657,279 @@
                 ExecStart = "${cfg.package}/bin/agent-auth-hostd user";
                 Restart = "always";
                 RestartSec = 5;
+              };
+            };
+          };
+        };
+
+      # hostd on a Mac, for nix-darwin (docs/hostd-macos.md). The same daemon
+      # and local policy as nixosModules.hostd, without what needs systemd or
+      # polkit: no VM unit, and root commands are never approved at the desk.
+      # It is a LaunchDaemon, always root (it holds the host's key and TOTP
+      # secrets out of reach of the user the agents run as); user-tier jobs go
+      # through `launchctl asuser` into the user's session, then drop to them.
+      # Pair once:
+      #   broker admin:  agent-auth admin daemon-pair <name>
+      #   on the Mac:    sudo agent-auth-hostd pair       (prompts for the code)
+      #                  sudo agent-auth-hostd totp-enroll
+      # State: /var/db/agent-auth-hostd. Log: /var/log/agent-auth-hostd.log.
+      darwinModules.hostd = { config, lib, pkgs, ... }:
+        let
+          cfg = config.services.agent-auth-hostd;
+          label = "dev.agent-auth.hostd";
+          tier = t: {
+            inherit (t) enable;
+            max_arm = t.maxArm;
+            accept_approve_all = t.acceptApproveAll;
+            accept_machine_approvals = t.acceptMachineApprovals;
+            shell = { inherit (t.shell) enable; max_duration = t.shell.maxDuration; };
+          };
+          settings = {
+            broker_url = cfg.brokerUrl;
+            broker_public_key = cfg.brokerPublicKey;
+            name = cfg.name;
+            state_dir = "/var/db/agent-auth-hostd";
+            runtime_dir = "/var/run/agent-auth-hostd";
+            user = cfg.user;
+            tiers = { user = tier cfg.tiers.user; root = tier cfg.tiers.root; };
+            auto_commands = cfg.autoCommands;
+            deny_commands = cfg.denyCommands;
+            templates = cfg.templates;
+            env_allow = cfg.envAllow;
+            job_path = cfg.jobPath;
+            default_timeout = cfg.defaultTimeout;
+            max_timeout = cfg.maxTimeout;
+            qrencode = "${pkgs.qrencode}/bin/qrencode";
+            desktop = {
+              inherit (cfg.desktop) enable;
+              max_idle = cfg.desktop.maxIdle;
+              idle_source = cfg.desktop.idleSource;
+              prompt_command = cfg.desktop.promptCommand;
+              prompt_timeout = cfg.desktop.promptTimeout;
+              busy_command = cfg.desktop.busyCommand;
+              approve = { user = cfg.desktop.approve.user; root = false; };
+              attention_command = cfg.desktop.attentionCommand;
+              notify_command = cfg.desktop.notifyCommand;
+            };
+          };
+          configFile = pkgs.writeText "hostd.json" (builtins.toJSON settings);
+          cli = pkgs.writeShellScriptBin "agent-auth-hostd" ''
+            export AGENT_AUTH_HOSTD_CONFIG=${configFile}
+            exec ${cfg.package}/bin/agent-auth-hostd "$@"
+          '';
+          hostctl = pkgs.writeShellScriptBin "agent-auth-hostctl" ''
+            exec ${cfg.package}/bin/agent-auth-hostctl "$@"
+          '';
+          duration = lib.types.either lib.types.ints.positive (lib.types.strMatching "[0-9]+[smhdw]?");
+          argvPattern = lib.types.listOf lib.types.str;
+          tierOptions = { rootDefaults }: {
+            enable = lib.mkEnableOption "this tier";
+            maxArm = lib.mkOption { type = duration; default = if rootDefaults then "1h" else "8h"; };
+            acceptApproveAll = lib.mkOption { type = lib.types.bool; default = !rootDefaults; };
+            acceptMachineApprovals = lib.mkOption {
+              type = lib.types.bool;
+              default = false;
+              description = "As in nixosModules.hostd: off = an armed tier still needs a human's click per command.";
+            };
+            shell = {
+              enable = lib.mkEnableOption "time-boxed shells on this tier (always opened with a TOTP code)";
+              maxDuration = lib.mkOption { type = duration; default = if rootDefaults then "30m" else "1h"; };
+            };
+          };
+        in
+        {
+          options.services.agent-auth-hostd = {
+            enable = lib.mkEnableOption "agent-auth host daemon (macOS)";
+
+            package = lib.mkOption {
+              type = lib.types.package;
+              default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+              defaultText = lib.literalExpression "agent-auth.packages.<system>.default";
+            };
+
+            brokerUrl = lib.mkOption {
+              type = lib.types.strMatching
+                "https://[^/].*|http://(localhost|127\\.0\\.0\\.1|\\[::1])(:[0-9]+)?(/.*)?";
+              example = "https://agent-auth.recusant.rooty.dev";
+            };
+
+            brokerPublicKey = lib.mkOption {
+              type = lib.types.strMatching "ed25519:[A-Za-z0-9_-]{43}";
+              description = "The broker's public signing key (`agent-auth admin broker-key`), pinned here.";
+            };
+
+            name = lib.mkOption {
+              type = lib.types.nullOr (lib.types.strMatching "[a-z0-9][a-z0-9-]{0,62}");
+              default = if config.networking.hostName == null then null else lib.toLower config.networking.hostName;
+              defaultText = lib.literalExpression "lib.toLower config.networking.hostName";
+            };
+
+            user = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              example = "jrt";
+              description = ''
+                The account the user tier runs commands as (in that user's
+                launchd domain, via `launchctl asuser`), and whose desktop is
+                asked.
+              '';
+            };
+
+            tiers.user = tierOptions { rootDefaults = false; };
+            tiers.root = tierOptions { rootDefaults = true; };
+
+            autoCommands = lib.mkOption {
+              type = lib.types.listOf argvPattern;
+              default = [ ];
+              example = [ [ "xcodebuild" "-list" ] [ "xcrun" "simctl" "list" "**" ] ];
+              description = "User-tier commands that run on any approval the broker relays. Keep these read-only.";
+            };
+
+            denyCommands = lib.mkOption {
+              type = lib.types.listOf argvPattern;
+              default = [ ];
+              example = [ [ "security" "**" ] ];
+              description = "Never run, whatever the approval. A guard against mistakes, not a boundary.";
+            };
+
+            templates = lib.mkOption {
+              type = lib.types.attrsOf (lib.types.submodule {
+                options = {
+                  tier = lib.mkOption { type = lib.types.enum [ "user" "root" ]; };
+                  argv = lib.mkOption { type = lib.types.listOf lib.types.str; };
+                  params = lib.mkOption { type = lib.types.attrsOf lib.types.str; default = { }; };
+                };
+              });
+              default = { };
+              example = lib.literalExpression ''
+                {
+                  darwin-rebuild = {
+                    tier = "root";
+                    argv = [ "darwin-rebuild" "switch" "--flake" "{flake}" ];
+                    params.flake = "/Users/me/dots#[a-z0-9-]+";
+                  };
+                  xcode-test = {
+                    tier = "user";
+                    argv = [ "xcodebuild" "test" "-scheme" "{scheme}" "-destination" "platform=iOS Simulator,name={device}" ];
+                    params = { scheme = "[A-Za-z0-9_-]+"; device = "iPhone [0-9]+( Pro)?"; };
+                  };
+                }
+              '';
+              description = "Named commands with checked parameters (capability tpl.<name>).";
+            };
+
+            envAllow = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ "LANG" "LC_ALL" "TZ" "TERM" ];
+            };
+
+            jobPath = lib.mkOption {
+              type = lib.types.str;
+              default = "/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+              description = ''
+                PATH of commands; the user tier adds /etc/profiles/per-user/<user>/bin
+                and Homebrew's. Root-owned directories only: hostd refuses root
+                jobs while any directory here is writable by someone else.
+              '';
+            };
+
+            defaultTimeout = lib.mkOption { type = duration; default = "10m"; };
+            maxTimeout = lib.mkOption { type = duration; default = "1h"; };
+
+            desktop = {
+              enable = lib.mkEnableOption ''
+                approval prompts on this Mac: a LaunchAgent in the user's GUI
+                session (hostd-user) reports presence and shows them
+              '';
+              maxIdle = lib.mkOption { type = duration; default = "5m"; };
+              idleSource = lib.mkOption {
+                type = lib.types.enum [ "macos" "hooks" ];
+                default = "macos";
+                description = ''
+                  "macos": keyboard/mouse idle time and the screen lock, from
+                  ioreg. "hooks": only what `agent-auth-hostctl presence …` reports.
+                '';
+              };
+              approve.user = lib.mkEnableOption ''
+                Allow at this desk as this host's own approval of a user-tier
+                command on this host (no arming or TOTP code). Anything running
+                as the user can answer that dialog, and could run the command
+                itself anyway. (Root has no desk approval on macOS: no polkit.)
+              '';
+              attentionCommand = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+                example = [ "/usr/bin/afplay" "/System/Library/Sounds/Glass.aiff" ];
+              };
+              notifyCommand = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+                description = "Empty: a notification through osascript. {title} {text} {urgency} are replaced.";
+              };
+              promptCommand = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+                description = ''
+                  Empty: an osascript dialog (Deny / Send to Discord / Allow once;
+                  AppleScript has no fourth button, so no "Mute agent 1h").
+                  Otherwise as in nixosModules.hostd.
+                '';
+              };
+              promptTimeout = lib.mkOption { type = duration; default = "90s"; };
+              busyCommand = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+                description = "Exit 0 = show no prompts now. Empty: never busy.";
+              };
+            };
+          };
+
+          config = lib.mkIf cfg.enable {
+            assertions = [
+              {
+                assertion = cfg.name != null;
+                message = "services.agent-auth-hostd.name: set it, or networking.hostName.";
+              }
+              {
+                assertion = !cfg.tiers.user.enable || cfg.user != null;
+                message = "services.agent-auth-hostd: the user tier needs `user`.";
+              }
+              {
+                assertion = !cfg.desktop.approve.user || cfg.desktop.enable;
+                message = "services.agent-auth-hostd.desktop.approve needs desktop.enable.";
+              }
+              {
+                assertion = !cfg.desktop.enable || cfg.user != null;
+                message = "services.agent-auth-hostd: desktop prompts need `user`.";
+              }
+            ];
+
+            environment.systemPackages = [ cli hostctl ];
+            environment.etc."agent-auth/hostd.json".source = configFile;
+
+            launchd.daemons.agent-auth-hostd.serviceConfig = {
+              Label = label;
+              ProgramArguments = [ "${cfg.package}/bin/agent-auth-hostd" "run" ];
+              EnvironmentVariables.AGENT_AUTH_HOSTD_CONFIG = "${configFile}"; # a config change changes the plist: launchd restarts it
+              RunAtLoad = true;
+              KeepAlive = true;
+              ThrottleInterval = 10;
+              Umask = 63; # 0077
+              StandardOutPath = "/var/log/agent-auth-hostd.log";
+              StandardErrorPath = "/var/log/agent-auth-hostd.log";
+            };
+
+            # hostd-user: in the GUI session, so its dialogs have a display.
+            # Installed for every user who logs in; hostd listens only to `user`.
+            launchd.user.agents.agent-auth-hostd-user = lib.mkIf cfg.desktop.enable {
+              serviceConfig = {
+                Label = "${label}-user";
+                ProgramArguments = [ "${cfg.package}/bin/agent-auth-hostd" "user" ];
+                EnvironmentVariables.AGENT_AUTH_HOSTD_CONFIG = "${configFile}";
+                RunAtLoad = true;
+                KeepAlive = true;
+                LimitLoadToSessionType = "Aqua";
+                ProcessType = "Interactive";
               };
             };
           };

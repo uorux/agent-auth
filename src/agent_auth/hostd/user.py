@@ -18,10 +18,12 @@ import html
 import json
 import logging
 import os
+import plistlib
+import re
 import time
 from typing import Any
 
-from .config import HostConfig
+from .config import HostConfig, darwin
 
 log = logging.getLogger(__name__)
 
@@ -34,13 +36,51 @@ DEFAULT_PROMPT = [
     "--extra-button", "Mute agent 1h", "--extra-button", "Send to Discord",
 ]
 # What the dialog printed → the answer. zenity prints an extra button's
-# label; sbx-prompt prints once | session | deny.
+# label; sbx-prompt prints once | session | deny; the macOS dialog prints
+# allow | discord | timeout (and fails on Deny).
 STDOUT_ANSWERS = {
     "mute agent 1h": "mute", "mute": "mute",
     "send to discord": "discord", "discord": "discord",
     "once": "allow", "session": "allow", "allow": "allow",
     "deny": "deny",
+    "timeout": "timeout",
 }
+
+
+def _osascript(lines: list[str], *args: str) -> list[str]:
+    """AppleScript whose inputs are the run handler's arguments: an agent's
+    text is never part of the script."""
+    command = ["/usr/bin/osascript"]
+    for line in lines:
+        command += ["-e", line]
+    return [*command, *args]
+
+
+# macOS: AppleScript dialogs have at most three buttons, so there is no
+# "Mute agent 1h" here. Deny is the default and the cancel button: a stray
+# Enter denies, and so does Escape.
+DARWIN_PROMPT = _osascript(
+    [
+        "on run argv",
+        'set r to display dialog (item 2 of argv) with title (item 1 of argv) buttons {"Deny", '
+        '"Send to Discord", "Allow once"} default button "Deny" cancel button "Deny" '
+        "giving up after ((item 3 of argv) as integer) with icon caution",
+        'if gave up of r then return "timeout"',
+        'if button returned of r is "Allow once" then return "allow"',
+        'if button returned of r is "Send to Discord" then return "discord"',
+        'return "deny"',
+        "end run",
+    ],
+    "{title}", "{text}", "{timeout}",
+)
+DARWIN_NOTIFY = _osascript(
+    ["on run argv", "display notification (item 2 of argv) with title (item 1 of argv)", "end run"],
+    "{title}", "{text}",
+)
+
+
+def default_prompt() -> list[str]:
+    return DARWIN_PROMPT if darwin() else DEFAULT_PROMPT
 ZENITY_TIMEOUT = 5
 
 
@@ -117,6 +157,34 @@ async def _logind() -> tuple[float | None, bool | None]:
     return (max(0.0, time.time() - since) if since else None), locked
 
 
+def parse_hid_idle(ioreg_text: str) -> float | None:
+    """Seconds since the last keyboard/mouse input, from `ioreg -c IOHIDSystem`."""
+    m = re.search(r'"HIDIdleTime" = (\d+)', ioreg_text)
+    return int(m.group(1)) / 1e9 if m else None
+
+
+def parse_console_locked(ioreg_plist: bytes, uid: int) -> bool | None:
+    """Is `uid`'s console session locked (or switched away from)? From
+    `ioreg -n Root -d 1 -a`; None when it can't be told."""
+    try:
+        root = plistlib.loads(ioreg_plist)
+    except (ValueError, plistlib.InvalidFileException):
+        return None
+    if isinstance(root, list):
+        root = root[0] if root else {}
+    users = root.get("IOConsoleUsers") if isinstance(root, dict) else None
+    for entry in users or []:
+        if isinstance(entry, dict) and entry.get("kCGSSessionUserIDKey") == uid:
+            return bool(entry.get("CGSSessionScreenIsLocked")) or not entry.get("kCGSSessionOnConsoleKey", True)
+    return None
+
+
+async def _macos() -> tuple[float | None, bool | None]:
+    idle = parse_hid_idle(await _output("/usr/sbin/ioreg", "-c", "IOHIDSystem", "-d", "4") or "")
+    tree = await _output("/usr/sbin/ioreg", "-n", "Root", "-d", "1", "-a")
+    return idle, (parse_console_locked(tree.encode(), os.getuid()) if tree else None)
+
+
 class UserHelper:
     def __init__(self, config: HostConfig):
         self.config = config
@@ -130,6 +198,8 @@ class UserHelper:
         idle, locked = (None, None)
         if self.config.desktop.idle_source == "logind":
             idle, locked = await _logind()
+        elif self.config.desktop.idle_source == "macos":
+            idle, locked = await _macos()
         report = {
             "type": "presence",
             "idle_secs": idle,
@@ -160,7 +230,7 @@ class UserHelper:
                 "text": f"{who} asks to:\n    {what}" + (f"\n\n{detail}" if detail else ""),
                 "timeout": str(int(prompt.get("timeout", 90))),
             }
-            template = self.config.desktop.prompt_command or DEFAULT_PROMPT
+            template = self.config.desktop.prompt_command or default_prompt()
             argv = _fill(template, fields)
             self.attention()
             try:
@@ -192,11 +262,15 @@ class UserHelper:
         """A notification, and the attention sound. The text may be an
         agent's: markup is escaped (notification daemons render it)."""
         self.attention()
-        if template := self.config.desktop.notify_command:
+        template, escape = self.config.desktop.notify_command, html.escape
+        if not template and darwin():
+            # macOS notifications show no markup: nothing to escape.
+            template, escape = DARWIN_NOTIFY, str
+        if template:
             urgency = msg.get("urgency") if msg.get("urgency") in ("low", "normal", "critical") else "normal"
             self._spawn(_fill(template, {
-                "title": html.escape(str(msg.get("title") or "agent-auth")),
-                "text": html.escape(str(msg.get("text") or "")),
+                "title": escape(str(msg.get("title") or "agent-auth")),
+                "text": escape(str(msg.get("text") or "")),
                 "urgency": urgency,
             }))
 
