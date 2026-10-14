@@ -110,6 +110,7 @@ class HostExecService:
         self.events = events
         self.service = None  # RequestService, via bind()
         self.a2a = None
+        self.containment = None  # core/lockdown.ContainmentService, set by main
         # policy/risk.Watcher: looks at shell commands, and commands no human
         # saw individually, as they run. None = nobody is watching.
         self.watcher = None
@@ -615,7 +616,13 @@ class HostExecService:
                 if agent.sandbox_id:
                     closed += await self.a2a.orphan_inbound_threads(agent.id)
         log.warning("LOCKDOWN (%s%s) by %s: %d grants revoked", scope, f" {host}" if host else "", by, revoked)
-        return {"scope": scope, "host": host, "daemons": reports, "grants_revoked": revoked, "threads_closed": closed}
+        out = {"scope": scope, "host": host, "daemons": reports, "grants_revoked": revoked, "threads_closed": closed}
+        if self.containment is not None:
+            # The same agents are refused new requests until it is lifted.
+            match = {"all": {}, "sandboxes": {"placement": "sandbox"}, "host": {"host": host}}[scope]
+            entry = await self.containment.record(match, f"lockdown ({scope}{f' {host}' if host else ''})", by, source="lockdown")
+            await self.containment.announce({**entry, **out, "agents": [a.name for a in affected]})
+        return out
 
     async def unlock(self, host: str | None = None, totp: str | None = None, by: str = "") -> dict[str, Any]:
         """Without a host: clear the broker's side (and tell sandboxes). With
@@ -642,6 +649,12 @@ class HostExecService:
                 if await self.hub.send(daemon.role, daemon.name, {"type": "unlock"}):
                     reports[f"sandbox:{daemon.name}"] = "unlocked"
         log.warning("UNLOCK (%s) by %s", host or "broker", by)
+        if self.containment is not None:
+            # The entries lockdown recorded; a containment made for agents
+            # (not a lockdown) is lifted on its own.
+            await self.containment.lift_where(
+                lambda e: e.get("source") == "lockdown" and (host is None or e.get("match") == {"host": host}), by
+            )
         async with self.db.session() as session:
             still = await session.get(BrokerFlag, LOCKDOWN_FLAG)
         return {"host": host, "daemons": reports, "broker_locked": sorted((still.value.get("hosts") or [])) if still else []}
@@ -666,6 +679,13 @@ class HostExecService:
                 stale = [g.request_id for g in ended if g.capability == "shell"]
         if locked:
             await self.hub.send(live.role, live.name, {"type": "lockdown", "kill_vm": False})
+        if live.role == SANDBOX_ROLE and self.containment is not None:
+            async with self.db.session() as session:
+                daemon = (
+                    await session.execute(select(Daemon).where(Daemon.role == SANDBOX_ROLE, Daemon.name == live.name))
+                ).scalar_one_or_none()
+                held = await self.containment.held_in(session, daemon.id) if daemon else []
+            await self.hub.send(live.role, live.name, {"type": "agents.contained", "agents": held})
         for shell_id in stale:
             await self.hub.send(live.role, live.name, {"type": "shell.close", "shell_id": shell_id})
 

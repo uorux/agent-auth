@@ -542,7 +542,20 @@ services.agent-auth-hostd = {
   kills its jobs and shells, and freezes its agent VM from outside (`kill_vm`
   stops it). `/unlock` lifts the broker's side; **each host stays locked**
   until `/unlock host:<h> code:<root-arm code>` or `sudo agent-auth-hostctl
-  unlock` there.
+  unlock` there. The agents it covers are also contained (below) until then.
+- **Containment.** Holding some agents wherever they run, by the fields a
+  rule matches on: `agent-auth admin contain --project x --reason "..."`
+  (or `--name`, `--host`, `--runtime`, `--all`). Their grants are revoked
+  (their host commands killed, shells closed, model-gateway keys deleted, so
+  an agent whose model calls go through the gateway cannot take another
+  step), every request and credential fetch of theirs is refused, their a2a
+  conversations close, and the agent VMs freeze their conversations where
+  they stand and queue what arrives. You are pinged on Discord each time.
+  `agent-auth admin contain-list`, and `contain-lift [id]` to lift one (or
+  all); their grants do not come back, they ask again. It does not stop a
+  process that needs nothing more from the broker or the gateway on a host
+  outside an agent VM (a lockdown freezes the VMs), nor reach credentials an
+  agent got some other way.
 - **Audit.** Every decision hostd makes is in its journal
   (`journalctl -u agent-auth-hostd`), with the evidence it was made on.
 

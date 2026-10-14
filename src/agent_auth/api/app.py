@@ -13,6 +13,7 @@ from . import (
     a2a_routes,
     admin_log_routes,
     chat_routes,
+    containment_routes,
     admin_routes,
     agent_routes,
     daemon_routes,
@@ -57,12 +58,23 @@ def create_app(
     app.state.wiki = None
     # core/webui.UiAuth; None = no admin panel.
     app.state.ui_auth = None
+    # core/lockdown.ContainmentService: agents held wherever they run. The
+    # agent VMs hear of it over the daemon channel, when there is one.
+    from ..core.lockdown import ContainmentService
+
+    app.state.containment = ContainmentService(
+        db, service, a2a, app.state.daemons if app.state.daemons.enabled else None
+    )
+    if hostexec is not None:
+        hostexec.containment = app.state.containment
 
     app.include_router(agent_routes.router)
     app.include_router(a2a_routes.router)
     app.include_router(admin_routes.router)
     app.include_router(admin_log_routes.router)
     app.include_router(chat_routes.router)
+    app.include_router(containment_routes.admin)
+    app.include_router(containment_routes.agents)
     app.include_router(daemon_routes.router)
     app.include_router(hostexec_routes.router)
     app.include_router(token_routes.router)

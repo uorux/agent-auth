@@ -618,6 +618,24 @@ async def test_lockdown_freezes_agent_units_and_holds_work_until_it_is_lifted(db
     assert await wait_for(lambda: any(e.get("turn") == "while locked" for e in read_log(fake_log)))
 
 
+async def test_a_contained_agent_is_frozen_and_held_until_released(db, live, sbx, fake_log, stack):
+    daemon, host = sbx
+    conv = await daemon.new_conversation("orchestrator-excelsior-sandbox", created_by="test")
+    await daemon.deliver(conv.id, "first")
+    assert await wait_for(lambda: any(e.get("turn") == "first" for e in read_log(fake_log)))
+
+    await stack["hub"].call("sandbox", "excelsior", {"type": "agents.contained", "agents": ["orchestrator-excelsior-sandbox"]})
+    assert daemon.contained("orchestrator-excelsior-sandbox") and not daemon.locked
+    assert (daemon._unit(conv.id), True) in host.frozen
+    await daemon.deliver(conv.id, "while held")
+    assert daemon.state.peek(conv.id) == ["while held"]
+
+    await stack["hub"].send("sandbox", "excelsior", {"type": "agents.contained", "agents": []})
+    assert await wait_for(lambda: not daemon.contained("orchestrator-excelsior-sandbox"))
+    assert (daemon._unit(conv.id), False) in host.frozen
+    assert await wait_for(lambda: any(e.get("turn") == "while held" for e in read_log(fake_log)))
+
+
 def test_codex_socket_behind_its_symlink(tmp_path):
     """codex leaves a symlink to /tmp/codex-daemon-<uid>/<hash> at the socket
     path: /tmp is the unit's, so outside it the target is under its tmp dir."""

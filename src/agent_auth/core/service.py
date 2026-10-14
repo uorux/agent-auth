@@ -32,6 +32,7 @@ from ..provisioners.base import (
     SpecValidationError,
 )
 from ..schemas import RequestCreate
+from . import lockdown as lockdown_mod
 from .events import KeyedEvents
 from .states import (
     THREAD_CLOSED,
@@ -71,6 +72,8 @@ class Notifier(Protocol):
     # An agent wants the operator's attention (core/attention.py); `desks`
     # are the hosts whose desktops already showed it.
     async def attention(self, agent: Agent, text: str, urgency: str, desks: list[str]) -> None: ...
+    # Agents were contained or locked down (core/lockdown.py): always a ping.
+    async def contained(self, event: dict) -> None: ...
 
 
 # Runs before a human approval takes effect, outside any transaction, and
@@ -106,6 +109,9 @@ class NullNotifier:
 
     async def attention(self, agent: Agent, text: str, urgency: str, desks: list[str]) -> None:
         log.info("attention (%s) from %s: %s", urgency, agent.name, text)
+
+    async def contained(self, event: dict) -> None:
+        log.warning("contained (no notifier): %s", event.get("reason"))
 
 
 class TransitionError(Exception):
@@ -176,6 +182,17 @@ class RequestService:
                 justification=body.justification,
                 requested_duration_secs=body.duration_secs,
             )
+
+            # Containment (core/lockdown.py): nothing new for a held agent.
+            held = await lockdown_mod.holding(session, agent)
+            if held is not None:
+                request.status = RequestStatus.DENIED
+                request.decision_source = DecisionSource.POLICY
+                request.decision_reason = f"contained ({held['id']}): {held.get('reason') or 'by the operator'}"
+                request.decided_at = utcnow()
+                session.add(request)
+                await session.flush()
+                return request
 
             if body.on_behalf_of_thread:
                 problem = await self._resolve_delegation(

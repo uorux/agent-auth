@@ -560,6 +560,29 @@ class A2AThreadService:
         await self._deliver_pings(pings)
         return len(threads)
 
+    async def close_all_for(self, agent_id: str, note: str) -> int:
+        """Close every open thread this agent is on, either side (containment)."""
+        notices: list[str] = []
+        pings: list = []
+        async with self.db.session() as db:
+            threads = list(
+                (
+                    await db.execute(
+                        select(A2AThread).where(
+                            (A2AThread.initiator_agent_id == agent_id) | (A2AThread.responder_agent_id == agent_id),
+                            A2AThread.state != THREAD_CLOSED,
+                        )
+                    )
+                ).scalars()
+            )
+            for thread in threads:
+                await self._close(db, thread, CLOSE_CLOSED, closed_by=None, note=note)
+                notices.extend(self._closure_notices(thread))
+                pings.extend(await self._closure_pings(db, thread))
+        self._fire_notices(notices)
+        await self._deliver_pings(pings)
+        return len(threads)
+
     # --------------------------------------------------------------- sweep
 
     async def sweep(self) -> dict[str, int]:

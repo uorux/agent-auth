@@ -136,6 +136,10 @@ class Live:
 
 
 
+class NoModelKey(RuntimeError):
+    """The broker has a model gateway but no key for this agent."""
+
+
 # Model-gateway keys: how long one is asked for, and how close to its end a
 # new one is fetched instead (a conversation's process keeps the key it
 # started with).
@@ -299,6 +303,12 @@ class Sandboxd:
                 await self.unlock()
             if self.channel and msg.get("call_id"):
                 await self.channel.send({"type": "reply", "call_id": msg["call_id"], "ok": True})
+        elif kind == "agents.contained":
+            # The whole list for this VM, each time: idempotent, and what a
+            # reconnecting VM is told.
+            await self.set_contained([str(n) for n in msg.get("agents") or []])
+            if self.channel and msg.get("call_id"):
+                await self.channel.send({"type": "reply", "call_id": msg["call_id"], "ok": True})
 
     # --- lockdown (docs/sandbox-design.md §9) ------------------------------------------
 
@@ -334,6 +344,56 @@ class Sandboxd:
                 queued = self.state.drain(conv.id)
                 if queued:
                     await self.deliver(conv.id, "\n\n".join(queued))
+
+    # Containment of some agents (the broker's core/lockdown.py): the lockdown
+    # above, for their conversations only.
+
+    def contained(self, agent: str) -> bool:
+        return agent in (self.state.get("contained", []) or [])
+
+    async def _freeze_agent(self, agent: str, frozen: bool) -> None:
+        for conv in self.state.conversations(agent=agent):
+            lv = self.live.get(conv.id)
+            if lv is None:
+                continue
+            if lv.run is not None:
+                await self.host.freeze_unit(self._unit(conv.id), frozen)
+            if lv.tui:
+                await self.host.freeze_unit(self._tui_unit(conv.id), frozen)
+
+    async def set_contained(self, agents: list[str]) -> None:
+        before = set(self.state.get("contained", []) or [])
+        now = set(agents)
+        if now - before:
+            await self.contain(sorted(now - before))
+        if before - now:
+            await self.release(sorted(before - now))
+
+    async def contain(self, agents: list[str]) -> None:
+        """Freeze these agents' processes where they stand (kept to look at,
+        not killed) and start nothing for them; what arrives is queued."""
+        held = set(self.state.get("contained", []) or []) | set(agents)
+        self.state.set("contained", sorted(held))
+        for agent in agents:
+            self._gateway_keys.pop(agent, None)  # deleted at the gateway anyway
+            log.warning("CONTAINED: freezing the conversations of %s", agent)
+            await self._freeze_agent(agent, True)
+
+    async def release(self, agents: list[str]) -> None:
+        held = set(self.state.get("contained", []) or [])
+        self.state.set("contained", sorted(held - set(agents)))
+        for agent in agents:
+            if agent not in held:
+                continue
+            log.warning("containment of %s lifted: thawing", agent)
+            await self._freeze_agent(agent, False)
+            if self.locked:
+                continue  # the VM-wide lockdown still holds them
+            for conv in self.state.conversations(agent=agent):
+                if not self._live(conv.id).tui:
+                    queued = self.state.drain(conv.id)
+                    if queued:
+                        await self.deliver(conv.id, "\n\n".join(queued))
 
     async def _key_lost(self, agent: str) -> None:
         log.warning("the broker no longer accepts the key of %s; asking for a new one", agent)
@@ -514,7 +574,11 @@ class Sandboxd:
         token_file = c.secrets_dir / "claude-oauth-token"
         if token_file.exists():
             env["CLAUDE_CODE_OAUTH_TOKEN"] = token_file.read_text().strip()
-        gateway = await self._gateway(rec)
+        try:
+            gateway = await self._gateway(rec)
+        except NoModelKey as exc:
+            log.warning("triage for %s: no model key (%s)", rec.name, exc)
+            return None
         if gateway:
             _gateway_env(env, gateway)
         from .host import UnitSpec
@@ -746,18 +810,28 @@ class Sandboxd:
     async def _gateway(self, rec: AgentRecord) -> dict[str, Any] | None:
         """The model gateway and this agent's own key for it, when the broker
         has one (platforms.models): asked for once and reused until shortly
-        before it ends. None, and the VM's own logins are used, when there is
-        no gateway or the key was not granted right away."""
+        before it ends. None (the VM's own logins) only when the broker has
+        no gateway or cannot be reached. A gateway with no key for this agent
+        (refused, contained, waiting for a human) raises NoModelKey: falling
+        back to the VM's logins then would undo a containment."""
         now = time.time()
         held = self._gateway_keys.get(rec.name)
         if held and held["expires"] - now > GATEWAY_MARGIN_SECS:
             return held
         try:
             catalog = await self.broker.call(rec.api_key, "GET", "/v1/catalog")
-            gw = next((p for p in catalog.get("platforms", []) if p.get("platform") == "models"), None)
-            if gw is None or not (gw.get("gateway") or {}).get("url"):
-                return None
-            name = gw["gateway"]["name"]
+        except BrokerCallError as exc:
+            # The broker answered and refused this agent (a disabled key):
+            # not a reason to run it on the VM's logins.
+            raise NoModelKey(str(exc)) from None
+        except Exception as exc:
+            log.warning("model gateway for %s: broker unreachable (%s); using the VM's logins", rec.name, exc)
+            return None
+        gw = next((p for p in catalog.get("platforms", []) if p.get("platform") == "models"), None)
+        if gw is None or not (gw.get("gateway") or {}).get("url"):
+            return None
+        name = gw["gateway"]["name"]
+        try:
             grants = await self.broker.call(rec.api_key, "GET", "/v1/grants", params={"status": "active"})
             grant_id = next(
                 (
@@ -785,18 +859,33 @@ class Sandboxd:
                 if made.get("status") in ("approved", "provisioning", "pending"):
                     made = await self.broker.call(rec.api_key, "GET", f"/v1/requests/{made['id']}/wait", params={"timeout": 20})
                 if made.get("status") != "granted" or not made.get("grant_id"):
-                    log.warning("model gateway for %s: request %s is %s; using the VM's logins", rec.name, made.get("id"), made.get("status"))
-                    return None
+                    raise NoModelKey(
+                        f"request {made.get('id')} is {made.get('status')}: {made.get('decision_reason') or ''}"
+                    )
                 grant_id = made["grant_id"]
             cred = await self.broker.call(rec.api_key, "GET", f"/v1/grants/{grant_id}/credential")
-        except Exception as exc:  # the gateway is an improvement, never a reason not to start
-            log.warning("model gateway for %s: %s; using the VM's logins", rec.name, exc)
-            return None
+        except NoModelKey:
+            raise
+        except Exception as exc:
+            raise NoModelKey(str(exc)) from None
         if not cred.get("value") or not cred.get("url"):
-            return None
+            raise NoModelKey("the broker gave no key")
         held = {"url": cred["url"], "key": cred["value"], "expires": _epoch(cred["expires_at"]) if cred.get("expires_at") else now + 3600}
         self._gateway_keys[rec.name] = held
         return held
+
+    async def _use_gateway(self, ctx: SpawnContext, rec: AgentRecord) -> bool:
+        """Point a process at the gateway with the agent's key. False: no
+        gateway, the VM's logins. Raises NoModelKey: the process must not
+        start."""
+        if self.contained(rec.name):
+            raise NoModelKey(f"{rec.name} is contained")
+        gateway = await self._gateway(rec)
+        if not gateway:
+            return False
+        _gateway_env(ctx.env, gateway)
+        ctx.model_gateway = gateway["url"]
+        return True
 
     async def _sync_codex_auth(self, home: Path, uid: int, into_project: bool) -> None:
         """One subscription login shared by every project: copy the newest
@@ -831,11 +920,7 @@ class Sandboxd:
         async with self._spawn_slots:
             ctx = self._context(conv, lv)
             await self._add_mcp_servers(ctx, rec)
-            gateway = await self._gateway(rec)
-            if gateway:
-                _gateway_env(ctx.env, gateway)
-                ctx.model_gateway = gateway["url"]
-            elif conv.runtime == "codex":
+            if not await self._use_gateway(ctx, rec) and conv.runtime == "codex":
                 await self._sync_codex_auth(ctx.home, ctx.uid, into_project=True)
             run = await self.runtimes[conv.runtime].start(self.host, ctx)
         lv.run, lv.ctx = run, ctx
@@ -852,7 +937,7 @@ class Sandboxd:
         lv = self._live(conv_id)
         self._log(conv_id, "in", text)
         self.state.touch(conv_id)
-        if self.locked:
+        if self.locked or self.contained(conv.agent):
             self.state.queue(conv_id, text)  # delivered when the lockdown is lifted
             return
         if lv.tui and not self.runtimes[conv.runtime].shares_live_process:
@@ -1009,6 +1094,7 @@ class Sandboxd:
                 run = None
             ctx = self._context(self.state.conversation(conv_id), lv, tui=True)
             await self._add_mcp_servers(ctx, self.state.agent(conv.agent))
+            await self._use_gateway(ctx, self.state.agent(conv.agent))
             if conv.runtime == "claude" and not ctx.runtime_session_id:
                 import uuid
 

@@ -361,6 +361,15 @@ class BrokerClient:
             "POST", f"/admin/hosts/{host}/disarm", admin=True, params={"tier": tier} if tier else None
         )
 
+    def admin_contain(self, match: dict, reason: str, evidence: str = ""):
+        return self._request("POST", "/admin/containment", admin=True, json={"match": match, "reason": reason, "evidence": evidence})
+
+    def admin_containment(self):
+        return self._request("GET", "/admin/containment", admin=True)
+
+    def admin_contain_lift(self, entry: str | None):
+        return self._request("POST", "/admin/containment/lift", admin=True, json={"id": entry})
+
     def admin_lockdown(self, scope: str, host: str | None, kill_vm: bool):
         return self._request(
             "POST", "/admin/lockdown", admin=True, json={"scope": scope, "host": host, "kill_vm": kill_vm}

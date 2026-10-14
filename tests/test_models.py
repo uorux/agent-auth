@@ -245,13 +245,13 @@ async def test_the_daemon_asks_once_and_points_both_runtimes_at_the_gateway():
     assert sbx._with_gateway(codex.triage_argv(None), codex, None) == codex.triage_argv(None)
 
 
-async def test_the_daemon_reuses_a_grant_and_falls_back_to_the_vms_logins():
+async def test_the_daemon_reuses_a_grant_and_falls_back_only_without_a_gateway():
     later = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 20 * 3600))
     broker = FakeBroker(CATALOG, grants=[{"id": "g9", "platform": "models", "resource": "litellm", "expires_at": later}])
     assert (await sbx.Sandboxd._gateway(daemon_with(broker), REC))["key"] == "sk-agent"
     assert ("POST", "/v1/requests") not in broker.calls and ("GET", "/v1/grants/g9/credential") in broker.calls
 
-    # No gateway at the broker, or a request a human must decide: the VM's logins.
+    # No gateway at the broker, or no broker: the VM's logins.
     assert await sbx.Sandboxd._gateway(daemon_with(FakeBroker({"platforms": []})), REC) is None
 
     class Waiting(FakeBroker):
@@ -260,13 +260,25 @@ async def test_the_daemon_reuses_a_grant_and_falls_back_to_the_vms_logins():
                 return {"id": "r1", "status": "awaiting_human"}
             return await super().call(api_key, method, path, **kwargs)
 
-    assert await sbx.Sandboxd._gateway(daemon_with(Waiting(CATALOG, request_status="awaiting_human")), REC) is None
-
     class Down(FakeBroker):
         async def call(self, *a, **k):
             raise OSError("broker unreachable")
 
     assert await sbx.Sandboxd._gateway(daemon_with(Down(CATALOG)), REC) is None
+
+    # A gateway but no key (a human must decide, refused, contained, the
+    # agent's key refused): no start, rather than the VM's logins.
+    with pytest.raises(sbx.NoModelKey, match="awaiting_human"):
+        await sbx.Sandboxd._gateway(daemon_with(Waiting(CATALOG, request_status="awaiting_human")), REC)
+    with pytest.raises(sbx.NoModelKey, match="denied"):
+        await sbx.Sandboxd._gateway(daemon_with(FakeBroker(CATALOG, request_status="denied")), REC)
+
+    class Refused(FakeBroker):
+        async def call(self, *a, **k):
+            raise sbx.BrokerCallError(401, "invalid API key")
+
+    with pytest.raises(sbx.NoModelKey):
+        await sbx.Sandboxd._gateway(daemon_with(Refused(CATALOG)), REC)
 
 
 @respx.mock
@@ -291,3 +303,24 @@ async def test_by_runtime_keeps_each_subscription_to_its_own_tool(db):
     refused = await service.create_request(hermes.id, use())
     assert refused.status == RequestStatus.DENIED and "no models for runtime 'hermes'" in refused.decision_reason
     assert [b["models"] for b in gw.keys.values()] == [["claude-*"], ["gpt-*"]]
+
+
+@respx.mock
+async def test_by_runtime_star_covers_the_runtimes_not_named(db):
+    gw = Gateway().mock()
+    policy = PolicyFile.model_validate(
+        {
+            **POLICY,
+            "rules": [{"match": {"platform": "models", "capability": "use"}, "action": "approve"}],
+            "platforms": {"models": {"url": GW, "by_runtime": {"claude": ["claude-*", "gpt-*"], "*": ["gpt-*"]}}},
+        }
+    )
+    registry = ProvisionerRegistry()
+    registry.register(ModelsProvisioner(policy.platforms.models, "master", SecretBox(generate_fernet_key())))
+    service = RequestService(db, PolicyEngine(policy), registry, KeyedEvents())
+    claude, _ = await make_agent(db, "claude-a", runtime="claude")
+    hermes, _ = await make_agent(db, "hermes-a", runtime="hermes")
+    soc, _ = await make_agent(db, "soc-a")  # no runtime on record: "*" too
+    for agent in (claude, hermes, soc):
+        assert (await service.create_request(agent.id, use())).status == RequestStatus.GRANTED
+    assert [b["models"] for b in gw.keys.values()] == [["claude-*", "gpt-*"], ["gpt-*"], ["gpt-*"]]

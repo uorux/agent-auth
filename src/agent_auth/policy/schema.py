@@ -265,10 +265,11 @@ class ModelsPlatformConfig(BaseModel):
     # Model names (LiteLLM's model_name, wildcards as it defines them) a
     # key may call. Empty: everything the gateway serves.
     models: list[str] = Field(default_factory=list)
-    # Per runtime instead: an agent's key may call only its runtime's list,
-    # and an agent whose runtime is not listed gets no key. This is what
-    # keeps a subscription meant for one tool (Claude Code) away from
-    # anything else: {claude: ["claude-*"], codex: ["gpt-*"]}.
+    # Per runtime instead: an agent's key may call only its runtime's list
+    # ("*": every runtime not named), and an agent whose runtime has no list
+    # gets no key. This is what keeps a subscription meant for one tool
+    # (Claude Code) away from anything else:
+    # {claude: ["claude-*", "gpt-*"], "*": ["gpt-*"]}.
     by_runtime: dict[str, list[str]] = Field(default_factory=dict)
     # Spend limit per key, in the gateway's (notional, for subscriptions)
     # dollars, reset every budget_duration. None: no limit.
@@ -383,6 +384,15 @@ class PlatformsConfig(BaseModel):
     models: ModelsPlatformConfig = Field(default_factory=ModelsPlatformConfig)
 
 
+class ContainmentConfig(BaseModel):
+    """Which agents may contain others (core/lockdown.py), and how far.
+    Lifting is always the operator's."""
+
+    agents: list[AgentPattern] = Field(default_factory=list)
+    # May it contain every agent at once ({}), not only some?
+    allow_all: bool = False
+
+
 class NotifyConfig(BaseModel):
     """What is posted to the Discord channel besides requests that need you.
     A saved rule's decisions always are; these are the rest."""
@@ -402,6 +412,7 @@ class PolicyFile(BaseModel):
     wiki: WikiConfig = Field(default_factory=WikiConfig)
     ui: UiConfig = Field(default_factory=UiConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
+    containment: ContainmentConfig = Field(default_factory=ContainmentConfig)
     # The projects agents work on. A rule may only name a project listed
     # here, so a mistyped one is an error at load and not a rule that never
     # matches.

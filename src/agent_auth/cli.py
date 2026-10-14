@@ -637,5 +637,34 @@ def unlock(host: str = typer.Option(None, "--host", help="also unlock this host'
     _run(lambda: _client().admin_unlock(host, code))
 
 
+@admin.command("contain")
+def contain(
+    reason: str = typer.Option(..., "--reason"),
+    name: str = typer.Option(None, "--name", help="agent name glob"),
+    project: str = typer.Option(None, "--project"),
+    host: str = typer.Option(None, "--host"),
+    runtime: str = typer.Option(None, "--runtime"),
+    everyone: bool = typer.Option(False, "--all", help="every agent"),
+):
+    """Hold agents wherever they run: revoke their grants (model keys too),
+    refuse their requests and credentials, close their conversations, freeze
+    their processes in agent VMs, kill their host commands."""
+    match = {k: v for k, v in {"name": name, "project": project, "host": host, "runtime": runtime}.items() if v}
+    if not match and not everyone:
+        raise typer.BadParameter("say which agents (--name/--project/--host/--runtime) or --all")
+    _run(lambda: _client().admin_contain(match, reason))
+
+
+@admin.command("contain-list")
+def contain_list():
+    _run(lambda: _client().admin_containment())
+
+
+@admin.command("contain-lift")
+def contain_lift(entry: str = typer.Argument(None, help="its id; none: every containment")):
+    """Lift a containment (the agents' grants do not come back: they ask again)."""
+    _run(lambda: _client().admin_contain_lift(entry))
+
+
 if __name__ == "__main__":
     app()

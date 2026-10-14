@@ -220,6 +220,12 @@ async def get_credential(grant_id: str, request: Request, agent: Agent = Depends
         grant = await session.get(Grant, grant_id)
         if grant is None or grant.agent_id != agent.id:
             raise HTTPException(404, "unknown grant")
+        # Containment: its grants are being revoked; none is issued meanwhile.
+        from ..core import lockdown
+
+        held = await lockdown.holding(session, agent)
+        if held is not None:
+            raise HTTPException(403, f"contained ({held['id']}): credentials are not issued")
         # Delegated grants stop minting the moment their thread closes — the
         # scheduler revokes them within a tick, but credentials must not be
         # issuable in the gap.

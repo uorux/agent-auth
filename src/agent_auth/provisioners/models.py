@@ -51,7 +51,7 @@ class ModelsProvisioner:
             raise SpecValidationError(f"unknown model gateway {spec.resource!r} (this broker has {self.config.name!r})")
         if spec.scope:
             raise SpecValidationError("no scope for models grants: what a key may call is the gateway's policy")
-        if self.config.by_runtime and spec.agent.runtime not in self.config.by_runtime:
+        if self.config.by_runtime and not self._models(spec.agent):
             raise SpecValidationError(
                 f"no models for runtime {spec.agent.runtime or '(none)'!r} at this gateway "
                 f"(only {', '.join(sorted(self.config.by_runtime))})"
@@ -61,7 +61,9 @@ class ModelsProvisioner:
 
     def _models(self, agent: Agent) -> list[str]:
         if self.config.by_runtime:
-            return list(self.config.by_runtime.get(agent.runtime or "", []))
+            # "*": every runtime not listed by name.
+            by = self.config.by_runtime
+            return list(by[agent.runtime] if agent.runtime in by else by.get("*", []))
         return list(self.config.models)
 
     async def _call(self, method: str, path: str, **kwargs) -> httpx.Response:

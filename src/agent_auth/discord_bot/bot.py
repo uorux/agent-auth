@@ -180,6 +180,40 @@ class DiscordNotifier:
         except Exception:
             log.exception("could not post an attention message")
 
+    async def contained(self, event: dict) -> None:
+        """Agents were contained or locked down: always a ping, with who did
+        it, why, and what was done. The reason and evidence may be a
+        containing agent's words: escaped."""
+        try:
+            channel = self.bot.get_channel(
+                self.settings.discord_channel_id
+            ) or await self.bot.fetch_channel(self.settings.discord_channel_id)
+            owner = self.settings.discord_owner_id
+
+            def said(text: str, limit: int) -> str:
+                text = discord.utils.escape_mentions(discord.utils.escape_markdown(text or ""))
+                return text if len(text) <= limit else text[: limit - 1] + "…"
+
+            agents = event.get("agents") or []
+            lines = [
+                f"{f'<@{owner}> ' if owner else ''}🛑 **Containment `{event.get('id')}`** by {said(event.get('by', ''), 80)}",
+                f"> {said(event.get('reason', ''), 400)}",
+                f"Agents ({len(agents)}): {said(', '.join(agents), 500) or 'none right now (new ones matching are held too)'}",
+                f"Grants revoked: {event.get('grants_revoked', 0)} · conversations closed: {event.get('threads_closed', 0)}",
+            ]
+            if event.get("daemons"):
+                lines.append("Hosts/VMs: " + said(", ".join(f"{k} {v}" for k, v in event["daemons"].items()), 500))
+            if event.get("evidence"):
+                lines.append(f"Evidence:\n> {said(event['evidence'], 700)}")
+            lines.append(f"Lift: `agent-auth admin contain-lift {event.get('id')}` (or /unlock for a lockdown)")
+            await channel.send(
+                "\n".join(lines)[:2000],
+                allowed_mentions=discord.AllowedMentions(users=[discord.Object(owner)] if owner else False,
+                                                         everyone=False, roles=False),
+            )
+        except Exception:
+            log.exception("could not post a containment message")
+
     async def job_finished(self, request: AccessRequest, job) -> None:
         """A host command's result: on the approval message for a run, in the
         shell's thread for a shell command."""
