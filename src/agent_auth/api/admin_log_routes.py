@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import func, select
 
 from .. import authority as authority_mod
+from ..core.states import Platform
 from ..models import A2AMessage, A2AThread, AccessRequest, Agent, HostJob, utcnow
 from .deps import require_admin
 
@@ -275,3 +276,42 @@ async def a2a_thread(thread_id: str, request: Request):
             for r in requests
         ],
     }
+
+
+@router.get("/models/usage")
+async def models_usage(request: Request):
+    """What each agent has spent at the model gateway (platforms.models), by
+    the gateway's own count: one LiteLLM user per agent, across its keys.
+    With subscriptions behind the gateway the dollars are list prices, not
+    a bill; they still compare agents."""
+    from ..provisioners.base import ProvisionerError
+
+    registry = request.app.state.registry
+    if not registry.enabled(Platform.MODELS):
+        return {"enabled": False, "agents": []}
+    gateway = registry.get(Platform.MODELS)
+    try:
+        users = await gateway.usage()
+    except ProvisionerError as exc:
+        return {"enabled": True, "gateway": gateway.config.url, "error": str(exc), "agents": []}
+    async with request.app.state.db.session() as session:
+        agents = {a.name: a for a in (await session.execute(select(Agent))).scalars()}
+    rows = []
+    for u in users:
+        name = u.get("user_id")
+        agent = agents.get(name)
+        if agent is None:
+            continue  # the gateway's other users (people, its admin) are not ours to show
+        rows.append(
+            {
+                "agent": name,
+                "runtime": agent.runtime,
+                "project": agent.project,
+                "host": agent.host,
+                "placement": agent.placement,
+                "spend": float(u.get("spend") or 0),
+                "max_budget": u.get("max_budget"),
+            }
+        )
+    rows.sort(key=lambda r: r["spend"], reverse=True)
+    return {"enabled": True, "gateway": gateway.config.url, "agents": rows}

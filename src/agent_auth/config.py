@@ -28,6 +28,9 @@ class Settings(BaseSettings):
 
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    # The LiteLLM gateway's master key (platforms.models): the broker mints
+    # each agent's key with it.
+    litellm_master_key: str = ""
 
     github_app_id: str = ""
     github_installation_id: str = ""

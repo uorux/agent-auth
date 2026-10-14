@@ -128,3 +128,8 @@ button.wide { width: 100%; }
 .composer { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
 .composer textarea { font: inherit; background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; resize: vertical; min-height: 4.5em; }
 .composer-bar { display: flex; justify-content: space-between; align-items: center; gap: 10px; font-size: 12px; }
+
+/* Model usage: one bar per row, the largest full width. */
+td.wide { width: 50%; min-width: 24ch; }
+.spend { display: flex; align-items: center; gap: 8px; }
+.spend-bar { display: inline-block; height: 10px; border-radius: 0 4px 4px 0; background: var(--rt-claude); min-width: 2px; max-width: calc(100% - 9ch); flex: none; }

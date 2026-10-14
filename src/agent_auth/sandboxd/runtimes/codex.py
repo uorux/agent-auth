@@ -25,7 +25,7 @@ import websockets
 from websockets.asyncio.client import unix_connect
 
 from ..host import Host
-from .base import Event, SpawnContext
+from .base import GATEWAY_KEY_ENV, Event, SpawnContext
 
 log = logging.getLogger(__name__)
 
@@ -213,7 +213,7 @@ class CodexRuntime:
     async def start(self, host: Host, ctx: SpawnContext) -> CodexRun:
         sock = self.socket_name(ctx)
         (ctx.tmp / sock).unlink(missing_ok=True)
-        argv = [self.command, "app-server", "--listen", f"unix:///tmp/{sock}"]
+        argv = [self.command, *self.gateway_argv(ctx.model_gateway), "app-server", "--listen", f"unix:///tmp/{sock}"]
         for name, server in ctx.mcp_servers.items():
             prefix = f"mcp_servers.{name}"
             argv += ["-c", f"{prefix}.command={_toml_str(server['command'])}"]
@@ -230,10 +230,25 @@ class CodexRuntime:
         return run
 
     def tui_argv(self, ctx: SpawnContext, run=None) -> list[str]:
-        argv = [self.command, "--remote", f"unix:///tmp/{self.socket_name(ctx)}", "resume"]
+        argv = [self.command, *self.gateway_argv(ctx.model_gateway), "--remote", f"unix:///tmp/{self.socket_name(ctx)}", "resume"]
         if ctx.runtime_session_id:
             argv.append(ctx.runtime_session_id)
         return argv
+
+    def gateway_argv(self, url: str | None) -> list[str]:
+        """A model provider for the gateway (OpenAI Responses API at /v1,
+        authenticated with the agent's key). NOT verified against a live
+        codex and LiteLLM."""
+        if not url:
+            return []
+        prefix = "model_providers.agentauth"
+        return [
+            "-c", 'model_provider="agentauth"',
+            "-c", f'{prefix}.name="model gateway"',
+            "-c", f"{prefix}.base_url={_toml_str(url.rstrip('/') + '/v1')}",
+            "-c", f'{prefix}.env_key="{GATEWAY_KEY_ENV}"',
+            "-c", f'{prefix}.wire_api="responses"',
+        ]
 
     def triage_argv(self, model: str | None) -> list[str]:
         # NOT verified against a live codex: `exec -` reads the prompt from

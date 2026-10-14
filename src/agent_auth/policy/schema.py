@@ -250,6 +250,36 @@ class McpPlatformConfig(BaseModel):
         return self
 
 
+class ModelsPlatformConfig(BaseModel):
+    """The LiteLLM gateway agents send model calls through. A grant is a
+    virtual key of the agent's own (provisioners/models.py); the gateway's
+    master key is LITELLM_MASTER_KEY in the broker's environment. Off while
+    `url` is empty."""
+
+    # Its name in requests (the resource of a "models" grant).
+    name: str = "litellm"
+    # Where agents reach it (Anthropic-native at this URL, OpenAI at /v1).
+    url: str = ""
+    # Where the broker reaches its admin API, if not at `url`.
+    admin_url: str | None = None
+    # Model names (LiteLLM's model_name, wildcards as it defines them) a
+    # key may call. Empty: everything the gateway serves.
+    models: list[str] = Field(default_factory=list)
+    # Spend limit per key, in the gateway's (notional, for subscriptions)
+    # dollars, reset every budget_duration. None: no limit.
+    max_budget: float | None = None
+    budget_duration: str = "30d"
+
+    @model_validator(mode="after")
+    def _urls(self):
+        for value in (self.url, self.admin_url):
+            if value and not re.fullmatch(r"https?://[^\s/]+(/[^\s]*)?", value):
+                raise ValueError(f"platforms.models: {value!r} is not an http(s) URL")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", self.name):
+            raise ValueError("platforms.models.name: lowercase letters, digits and dashes")
+        return self
+
+
 class DesktopConfig(BaseModel):
     """Approval prompts and notifications on the desktops you are at
     (hostd-user), next to Discord. Off unless enabled; see
@@ -345,6 +375,7 @@ class PlatformsConfig(BaseModel):
     agents: AgentsPlatformConfig = Field(default_factory=AgentsPlatformConfig)
     hostexec: HostexecPlatformConfig = Field(default_factory=HostexecPlatformConfig)
     mcp: McpPlatformConfig = Field(default_factory=McpPlatformConfig)
+    models: ModelsPlatformConfig = Field(default_factory=ModelsPlatformConfig)
 
 
 class PolicyFile(BaseModel):

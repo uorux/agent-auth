@@ -36,6 +36,7 @@ from .broker import Broker, BrokerCallError
 from .config import Config
 from .host import ORCHESTRATOR_DIR, ORCHESTRATOR_USER, Host, project_user
 from .runtimes import ClaudeRuntime, CodexRuntime, Event, Run, Runtime, SpawnContext
+from .runtimes.base import GATEWAY_KEY_ENV
 from .state import AgentRecord, Conversation, State
 
 log = logging.getLogger(__name__)
@@ -134,6 +135,32 @@ class Live:
     tui: bool = False  # an interactive TUI holds the session
 
 
+
+# Model-gateway keys: how long one is asked for, and how close to its end a
+# new one is fetched instead (a conversation's process keeps the key it
+# started with).
+GATEWAY_GRANT = "24h"
+GATEWAY_MARGIN_SECS = 2 * 3600
+
+
+def _epoch(value: str) -> float:
+    from datetime import datetime
+
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+
+def _gateway_env(env: dict[str, str], gateway: dict[str, Any]) -> None:
+    """Calls go to the gateway with the agent's key, not the VM's logins."""
+    env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    env["ANTHROPIC_BASE_URL"] = gateway["url"]
+    env["ANTHROPIC_AUTH_TOKEN"] = gateway["key"]
+    env[GATEWAY_KEY_ENV] = gateway["key"]
+
+
+def _with_gateway(argv: list[str], runtime: Runtime, gateway: dict[str, Any] | None) -> list[str]:
+    return [argv[0], *runtime.gateway_argv(gateway["url"] if gateway else None), *argv[1:]]
+
+
 class Sandboxd:
     def __init__(self, config: Config, host: Host, broker: Broker | None = None):
         self.config = config
@@ -153,6 +180,8 @@ class Sandboxd:
         self._spawn_slots = asyncio.Semaphore(config.max_processes)
         self.started_at = time.time()
         self.orchestrator = orchestrator_name(config.name)
+        # agent name -> {"url", "key", "expires"}: its model-gateway key.
+        self._gateway_keys: dict[str, dict[str, Any]] = {}
 
     # --- lifecycle -----------------------------------------------------------------
 
@@ -485,12 +514,15 @@ class Sandboxd:
         token_file = c.secrets_dir / "claude-oauth-token"
         if token_file.exists():
             env["CLAUDE_CODE_OAUTH_TOKEN"] = token_file.read_text().strip()
+        gateway = await self._gateway(rec)
+        if gateway:
+            _gateway_env(env, gateway)
         from .host import UnitSpec
 
         spec = UnitSpec(
             name=f"sbx-triage-{secrets.token_hex(6)}",
             uid=self.project_uid(project),
-            argv=runtime.triage_argv(c.triage_model),
+            argv=_with_gateway(runtime.triage_argv(c.triage_model), runtime, gateway),
             # Not the project: its own instructions and files are no part of this.
             workdir=home,
             home=home,
@@ -711,6 +743,61 @@ class Sandboxd:
                     "env_vars": ["AGENT_AUTH_URL", "AGENT_AUTH_API_KEY", "AGENT_AUTH_SESSION"],
                 }
 
+    async def _gateway(self, rec: AgentRecord) -> dict[str, Any] | None:
+        """The model gateway and this agent's own key for it, when the broker
+        has one (platforms.models): asked for once and reused until shortly
+        before it ends. None, and the VM's own logins are used, when there is
+        no gateway or the key was not granted right away."""
+        now = time.time()
+        held = self._gateway_keys.get(rec.name)
+        if held and held["expires"] - now > GATEWAY_MARGIN_SECS:
+            return held
+        try:
+            catalog = await self.broker.call(rec.api_key, "GET", "/v1/catalog")
+            gw = next((p for p in catalog.get("platforms", []) if p.get("platform") == "models"), None)
+            if gw is None or not (gw.get("gateway") or {}).get("url"):
+                return None
+            name = gw["gateway"]["name"]
+            grants = await self.broker.call(rec.api_key, "GET", "/v1/grants", params={"status": "active"})
+            grant_id = next(
+                (
+                    g["id"]
+                    for g in grants
+                    if g.get("platform") == "models"
+                    and g.get("resource") == name
+                    and _epoch(g["expires_at"]) - now > GATEWAY_MARGIN_SECS
+                ),
+                None,
+            )
+            if grant_id is None:
+                made = await self.broker.call(
+                    rec.api_key,
+                    "POST",
+                    "/v1/requests",
+                    json={
+                        "platform": "models",
+                        "capability": "use",
+                        "resource": name,
+                        "justification": f"Model calls for {rec.name}'s conversations in the agent VM on {self.config.name}.",
+                        "requested_duration": GATEWAY_GRANT,
+                    },
+                )
+                if made.get("status") in ("approved", "provisioning", "pending"):
+                    made = await self.broker.call(rec.api_key, "GET", f"/v1/requests/{made['id']}/wait", params={"timeout": 20})
+                if made.get("status") != "granted" or not made.get("grant_id"):
+                    log.warning("model gateway for %s: request %s is %s; using the VM's logins", rec.name, made.get("id"), made.get("status"))
+                    return None
+                grant_id = made["grant_id"]
+            cred = await self.broker.call(rec.api_key, "GET", f"/v1/grants/{grant_id}/credential")
+        except Exception as exc:  # the gateway is an improvement, never a reason not to start
+            log.warning("model gateway for %s: %s; using the VM's logins", rec.name, exc)
+            return None
+        if not cred.get("value") or not cred.get("url"):
+            return None
+        held = {"url": cred["url"], "key": cred["value"], "expires": _epoch(cred["expires_at"]) if cred.get("expires_at") else now + 3600}
+        self._gateway_keys[rec.name] = held
+        return held
+
     async def _sync_codex_auth(self, home: Path, uid: int, into_project: bool) -> None:
         """One subscription login shared by every project: copy the newest
         auth.json each way around a codex process (refresh rotates tokens).
@@ -744,7 +831,11 @@ class Sandboxd:
         async with self._spawn_slots:
             ctx = self._context(conv, lv)
             await self._add_mcp_servers(ctx, rec)
-            if conv.runtime == "codex":
+            gateway = await self._gateway(rec)
+            if gateway:
+                _gateway_env(ctx.env, gateway)
+                ctx.model_gateway = gateway["url"]
+            elif conv.runtime == "codex":
                 await self._sync_codex_auth(ctx.home, ctx.uid, into_project=True)
             run = await self.runtimes[conv.runtime].start(self.host, ctx)
         lv.run, lv.ctx = run, ctx

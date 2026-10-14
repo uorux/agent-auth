@@ -12,6 +12,7 @@ const TABS = [
   ["conversations", "Conversations"],
   ["decisions", "Decisions"],
   ["commands", "Commands"],
+  ["usage", "Model usage"],
   ["rules", "Saved rules"],
 ];
 
@@ -384,6 +385,55 @@ async function commandsView(view) {
         } catch (err) { notice(err.message, true); }
       })],
     ], rows, "No host has run anything yet."));
+}
+
+// ── Model usage ──────────────────────────────────────────────────────────
+
+const dollars = (v) => (v >= 100 ? `$${Math.round(v)}` : `$${v.toFixed(2)}`);
+
+function spendBar(value, most) {
+  const pct = most > 0 ? Math.max(1, Math.round((value / most) * 100)) : 0;
+  return el("span", { class: "spend" }, el("span", { class: "spend-bar", "data-pct": pct }), el("span", {}, dollars(value)));
+}
+
+async function usageView(view) {
+  const data = await api("GET", "/admin/models/usage");
+  if (!data.enabled) {
+    put(view, el("h2", {}, "Model usage"),
+      el("p", { class: "note" }, "No model gateway is set up (platforms.models in the policy file). Once it is, each agent gets its own LiteLLM key and its spend shows here."));
+    return;
+  }
+  const byProject = new Map();
+  for (const r of data.agents) {
+    const key = r.project || "(no project)";
+    byProject.set(key, (byProject.get(key) || 0) + r.spend);
+  }
+  const projects = [...byProject.entries()].map(([project, spend]) => ({ project, spend })).sort((a, b) => b.spend - a.spend);
+  const mostAgent = Math.max(0, ...data.agents.map((r) => r.spend));
+  const mostProject = Math.max(0, ...projects.map((r) => r.spend));
+  const total = data.agents.reduce((sum, r) => sum + r.spend, 0);
+  put(view,
+    el("h2", {}, "Model usage"),
+    el("p", { class: "note" }, `Counted by the gateway (${data.gateway}): each agent is a LiteLLM user, across every key the broker gave it. With subscriptions behind the gateway these are list prices, not a bill; they compare agents.`),
+    data.error ? el("p", { class: "note" }, `The gateway did not answer: ${data.error}`) : null,
+    el("p", {}, el("strong", {}, dollars(total)), el("span", { class: "muted" }, " in all")),
+    el("h2", {}, "By project"),
+    table([
+      ["Project", (r) => el("span", { class: "mono" }, r.project)],
+      ["Spend", (r) => spendBar(r.spend, mostProject), "wide"],
+    ], projects, "Nothing spent yet."),
+    el("h2", {}, "By agent"),
+    table([
+      ["Agent", (r) => el("span", { class: "mono" }, r.agent)],
+      ["Runtime", (r) => r.runtime],
+      ["Project", (r) => r.project],
+      ["Host", (r) => r.host],
+      ["Where", (r) => (r.placement === "sandbox" ? "VM" : "host")],
+      ["Spend", (r) => spendBar(r.spend, mostAgent), "wide"],
+      ["Budget", (r) => (r.max_budget ? dollars(r.max_budget) : null)],
+    ], data.agents, "No agent has a key yet."));
+  // Widths set here, not inline in markup: the page's CSP has no inline styles.
+  for (const bar of view.querySelectorAll(".spend-bar")) bar.style.width = `${bar.dataset.pct}%`;
 }
 
 // ── Conversations between agents ─────────────────────────────────────────
@@ -766,7 +816,7 @@ async function chatView(view) {
   else drawNew();
 }
 
-const VIEWS = { chat: chatView, agents: agentsView, projects: projectsView, hosts: hostsView, conversations: conversationsView, decisions: decisionsView, commands: commandsView, rules: rulesView };
+const VIEWS = { usage: usageView, chat: chatView, agents: agentsView, projects: projectsView, hosts: hostsView, conversations: conversationsView, decisions: decisionsView, commands: commandsView, rules: rulesView };
 
 async function show(tab, keepNotice) {
   state.tab = tab;

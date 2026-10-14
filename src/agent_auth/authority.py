@@ -76,6 +76,8 @@ def fold(platform: Platform, capability: str, scope: dict[str, Any] | None) -> d
         # the same set is the same authority; "*" alone means all of them.
         tools = sorted({str(t) for t in scope.get("tools") or ["*"]})
         return {"tools": ["*"] if "*" in tools else tools}
+    if platform == Platform.MODELS:
+        return {"action": "use"}
     return {}  # HOMELAB: membership only; the group is the resource
 
 
@@ -111,6 +113,8 @@ def split(platform: Platform, authority: dict[str, Any] | None) -> tuple[str, di
         return "run", {**scope, "argv": list(authority.get("argv") or [])}
     if platform == Platform.MCP:
         return "use", {"tools": list(authority.get("tools") or ["*"])}
+    if platform == Platform.MODELS:
+        return "use", {}
     return "group", {}  # HOMELAB
 
 
@@ -159,6 +163,9 @@ def needs_explicit_rule(platform: Platform, authority: dict[str, Any] | None) ->
         return True
     if platform == Platform.MCP:
         # Tools on a server: only a rule about mcp itself.
+        return True
+    if platform == Platform.MODELS:
+        # Spending on models: only a rule about models itself.
         return True
     return False
 

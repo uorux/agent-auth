@@ -29,6 +29,7 @@ from .core.tokens import TokenIssuer
 from .daemon_common.crypto import private_key_from_text
 from .policy.risk import RiskSummarizer, Watcher
 from .provisioners.mcp import McpProvisioner
+from .provisioners.models import ModelsProvisioner
 from .policy.schema import load_policy
 from .provisioners.a2a import A2AProvisioner
 from .provisioners.agents import AgentsProvisioner
@@ -107,6 +108,13 @@ def build_registry(settings: Settings, policy) -> ProvisionerRegistry:
         )
     else:
         log.info("kubernetes provisioner disabled (KUBERNETES_API_URL not set)")
+    models = policy.platforms.models
+    if models.url:
+        if not settings.litellm_master_key or not settings.encryption_key:
+            log.warning("platforms.models has a url but LITELLM_MASTER_KEY or ENCRYPTION_KEY is unset: models is disabled")
+        else:
+            registry.register(ModelsProvisioner(models, settings.litellm_master_key, SecretBox(settings.encryption_key)))
+            log.info("models: gateway %s at %s", models.name, models.url)
     return registry
 
 

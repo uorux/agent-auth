@@ -16,6 +16,8 @@ class Platform(str, enum.Enum):
     # §8: commands (and time-boxed shells) on a host, outside the agent VM.
     HOSTEXEC = "hostexec"
     MCP = "mcp"
+    # Model calls through the LiteLLM gateway (provisioners/models.py).
+    MODELS = "models"
 
 
 class RequestStatus(str, enum.Enum):

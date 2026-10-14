@@ -128,6 +128,18 @@ async def build_catalog(
             )
         )
 
+    if registry.enabled(Platform.MODELS):
+        gw = policy.platforms.models
+        platforms.append(
+            PlatformCatalog(
+                platform=Platform.MODELS,
+                capability_hint="use",
+                resource_hint=gw.name,
+                capabilities=["use"],
+                gateway={"name": gw.name, "url": gw.url, "models": gw.models or None},
+            )
+        )
+
     if registry.enabled(Platform.HOMELAB):
         hl = policy.platforms.homelab
         platforms.append(

@@ -24,6 +24,7 @@ agent ──HTTP/MCP/CLI──▶ broker ──policy──▶ deny | approve | 
 | `kubernetes` | role name (`view`, `edit`, `traefik-patcher`, …) | namespace name (or `*` for cluster-wide) | per-grant ServiceAccount + RoleBinding to the named (Cluster)Role — a ClusterRoleBinding when the namespace is `*`; tokens minted on demand via TokenRequest; SA deleted at expiry → all tokens die instantly. The capability *is* the role, so policy rules auto-approve narrow roles and surface broad ones |
 | `a2a`     | `talk`        | target agent name   | authorizes OPENING conversation threads to that (service) agent — see [a2a threads](#a2a-threads); no credential is minted |
 | `hostexec` | `run`, `tpl.<name>`, `shell` | host name | one command (or a time-boxed shell) **on a host**, run by that host's daemon — see [Commands on hosts](#commands-on-hosts-hostexec). The host decides, with its own TOTP secrets and policy; root and shells always reach a human |
+| `models`  | `use`         | gateway name (`litellm`) | a LiteLLM virtual key of the agent's own, under a LiteLLM user named after it — see [Model gateway](#model-gateway-litellm). Blocked at revoke; the gateway also ends it at the grant's end |
 | `google`  | `calendar.*`… | calendar id / label | stub: decisions recorded, no credential minted (501)                        |
 
 Note the Gitea flow: the broker grants the homelab agent the `svc-gitea` LLDAP
@@ -595,6 +596,55 @@ rules:
 Ending a grant stops new tokens. A proxy that only checks signatures accepts
 an already issued token until it expires (`token_ttl`); one that calls
 `verify` stops at once.
+
+## Model gateway (LiteLLM)
+
+The agent VMs' model calls can go through one LiteLLM proxy instead of a
+login in every VM. The gateway holds the providers' logins; each agent gets a
+key of its own from the broker, so the gateway counts spend per agent.
+
+```yaml
+platforms:
+  models:
+    name: litellm                          # the resource agents ask for
+    url: https://litellm.example.org       # Anthropic-native here, OpenAI at /v1
+    # admin_url: http://litellm.litellm.svc:4000   # if the broker reaches it elsewhere
+    models: ["claude-*"]                   # what a key may call; empty = all
+    # max_budget: 50                       # per key, per budget_duration (30d)
+rules:
+  - match: {agent: {placement: sandbox}, platform: models, capability: use}
+    action: approve
+    max_duration: 24h
+```
+
+The broker needs the gateway's master key as `LITELLM_MASTER_KEY` (and
+`ENCRYPTION_KEY`: it keeps each key encrypted to hand it out again).
+
+- **A grant.** The broker makes (once) a LiteLLM user named after the agent
+  with its fields as metadata, then a key under it: alias
+  `<agent>/<grant id>`, the agent's fields and the grant id as metadata,
+  `duration` = the grant's remaining life, `models` and `max_budget` from
+  the policy. Revoking blocks the key (blocked, not deleted, so its spend
+  stays counted). Only a rule that names `models` (with `capability: use`)
+  approves one; a catch-all for an agent does not.
+- **In an agent VM.** sandboxd asks for a 24h grant per agent the first time
+  one of its conversations starts, reuses it until two hours before its end,
+  and starts claude with `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` (no
+  `CLAUDE_CODE_OAUTH_TOKEN`) and codex with a `model_providers` entry for the
+  gateway's `/v1` (Responses API). When there is no gateway, or the request
+  is not granted at once, or anything fails, the VM's own logins are used as
+  before: the gateway is never a reason a conversation does not start. A
+  running process keeps the key it started with.
+- **Usage.** `GET /admin/models/usage` (the panel's Model usage tab): each
+  agent's spend as the gateway counts it, by agent and by project.
+
+What it does not protect against. An agent's key is a bearer credential for
+the gateway until its grant ends: whatever runs as that project's user in the
+VM can read it from the process environment and spend on it. With
+subscriptions behind the gateway, every agent draws on the same subscription
+and its limits; the dollars shown are list prices, not a bill. Not verified:
+claude and codex against a live LiteLLM (the codex provider settings in
+particular), and which of Claude Code's beta headers the gateway forwards.
 
 ## Wiki
 

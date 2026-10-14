@@ -55,6 +55,7 @@ ALLOWED = [
     ("GET", "/admin/log/commands/{}"),
     ("GET", "/admin/a2a/graph"),
     ("GET", "/admin/a2a/threads/{}"),
+    ("GET", "/admin/models/usage"),
     ("GET", "/admin/chat/peers"),
     ("GET", "/admin/chat/threads"),
     ("GET", "/admin/chat/threads/{}"),

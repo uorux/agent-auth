@@ -105,6 +105,8 @@ class CredentialOut(BaseModel):
     value: str | None = None
     # Login name when the credential is an account (kind="lldap_account").
     username: str | None = None
+    # Where to use it, when that is part of the credential (a model gateway).
+    url: str | None = None
     expires_at: datetime | None = None
     note: str | None = None
 
@@ -313,6 +315,8 @@ class PlatformCatalog(BaseModel):
     # mcp: the servers that take this broker's tokens (name, url, what it is
     # for, its tools if listed).
     servers: list[dict[str, Any]] | None = None
+    # models: the gateway (name, url).
+    gateway: dict[str, Any] | None = None
 
 
 class CatalogOut(BaseModel):

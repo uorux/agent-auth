@@ -43,6 +43,9 @@ platforms:
   #   window_max: 8h
 
   # MCP servers that take this broker's own tokens (README: "MCP servers").
+  # models:                                   # the LiteLLM gateway (README "Model gateway")
+  #   url: https://litellm.example.org
+  #   models: ["claude-*"]
   # mcp:
   #   issuer: https://agent-auth.example.org   # this broker's public URL
   #   token_ttl: 1h

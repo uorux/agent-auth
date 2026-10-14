@@ -15,6 +15,10 @@ class Event:
     data: dict[str, Any] = field(default_factory=dict)
 
 
+# The environment variable holding the agent's model-gateway key.
+GATEWAY_KEY_ENV = "AGENT_AUTH_MODELS_KEY"
+
+
 @dataclass
 class SpawnContext:
     """Everything a runtime needs to start one conversation's process."""
@@ -34,6 +38,9 @@ class SpawnContext:
     model: str | None = None
     # Hook commands by event name (claude: PostToolUse, UserPromptSubmit).
     hooks: dict[str, str] = field(default_factory=dict)
+    # The model gateway's URL when calls go through it (the agent's key is
+    # in env as GATEWAY_KEY_ENV); None = the runtime's own login.
+    model_gateway: str | None = None
 
     def unit_spec(self, argv: list[str], description: str) -> UnitSpec:
         return UnitSpec(
@@ -75,5 +82,6 @@ class Runtime(Protocol):
     def tui_argv(self, ctx: SpawnContext, run: Run | None) -> list[str]: ...
     # One-shot, tool-less call for routing triage: the prompt goes to stdin,
     # triage_answer() extracts the model's reply from stdout.
+    def gateway_argv(self, url: str | None) -> list[str]: ...
     def triage_argv(self, model: str | None) -> list[str]: ...
     def triage_answer(self, stdout: str) -> str: ...

@@ -145,6 +145,9 @@ class ClaudeRuntime:
             argv += ["--resume", ctx.runtime_session_id]
         return argv
 
+    def gateway_argv(self, url: str | None) -> list[str]:
+        return []  # claude finds the gateway in its environment
+
     def triage_argv(self, model: str | None) -> list[str]:
         # No tools, no MCP, no project or user settings, nothing saved: the
         # prompt (on stdin) carries untrusted text and only its one-line
