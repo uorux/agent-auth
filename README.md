@@ -552,7 +552,8 @@ services.agent-auth-hostd = {
   conversations close, and the agent VMs freeze their conversations where
   they stand and queue what arrives. You are pinged on Discord each time.
   `agent-auth admin contain-list`, and `contain-lift [id]` to lift one (or
-  all); their grants do not come back, they ask again. It does not stop a
+  all); their grants do not come back, they ask again. On Discord:
+  `/contain`, `/contained`, `/release`. It does not stop a
   process that needs nothing more from the broker or the gateway on a host
   outside an agent VM (a lockdown freezes the VMs), nor reach credentials an
   agent got some other way.

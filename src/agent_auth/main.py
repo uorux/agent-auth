@@ -233,6 +233,7 @@ async def serve(settings: Settings) -> None:
     notifier = service.notifier
     if settings.discord_token:
         bot = AgentAuthBot(settings, db, service, daemons, hostexec, desktop)
+        bot.containment = app.state.containment
         notifier = DiscordNotifier(bot, db, settings)
         tasks.append(asyncio.create_task(bot.start(settings.discord_token), name="discord"))
     else:

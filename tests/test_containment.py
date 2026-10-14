@@ -96,3 +96,50 @@ async def test_lockdown_entries_are_lifted_by_unlock_and_others_are_not(app, db)
     assert [e["reason"] for e in await containment.list()] == ["lockdown (all)", "odd pushes"]
     await containment.lift_where(lambda e: e.get("source") == "lockdown", "jrt")
     assert [e["id"] for e in await containment.list()] == [mine["id"]]
+
+
+async def test_discord_commands_contain_list_and_release(app, db, settings):
+    """The slash commands, called as Discord would, by the owner."""
+    from types import SimpleNamespace
+
+    from agent_auth.discord_bot.bot import AgentAuthBot
+
+    settings.discord_owner_id = 42
+    bot = AgentAuthBot(settings, db, app.state.service)
+    bot.containment = app.state.containment
+    await make_agent(db, "codex-food-galaxy", project="food")
+    names = {c.name for c in bot.tree.get_commands()}
+    assert {"contain", "contained", "release"} <= names
+
+    sent: list[str] = []
+
+    class Response:
+        def is_done(self):
+            return False
+
+        async def send_message(self, text=None, **kw):
+            sent.append(text)
+
+        async def defer(self, **kw):
+            pass
+
+    class Followup:
+        async def send(self, text=None, **kw):
+            sent.append(text)
+
+    def interaction(user_id=42):
+        return SimpleNamespace(
+            client=bot, user=SimpleNamespace(id=user_id), response=Response(), followup=Followup()
+        )
+
+    contain = bot.tree.get_command("contain")
+    await contain.callback(interaction(), reason="odd", project="food")
+    assert sent[-1].startswith("Contained `") and "1 agent(s)" in sent[-1]
+    entry = (await app.state.containment.list())[0]
+    await bot.tree.get_command("contained").callback(interaction())
+    assert entry["id"] in sent[-1]
+    # Not the owner: refused, nothing lifted.
+    await bot.tree.get_command("release").callback(interaction(user_id=7), entry=entry["id"])
+    assert len(await app.state.containment.list()) == 1
+    await bot.tree.get_command("release").callback(interaction(), entry=entry["id"])
+    assert await app.state.containment.list() == []

@@ -12,7 +12,7 @@ from ..core.service import RequestService
 from ..db import Database
 from ..core.states import GrantStatus
 from ..models import AccessRequest, Agent, A2AThread, Grant, Rule
-from . import embeds, hostexec as hx_views, hosts, rules, views
+from . import containment as containment_cmds, embeds, hostexec as hx_views, hosts, rules, views
 
 log = logging.getLogger(__name__)
 
@@ -35,11 +35,14 @@ class AgentAuthBot(discord.Client):
         # core/hostexec.HostExecService and core/desktop.DesktopService (or None).
         self.hostexec = hostexec
         self.desktop = desktop
+        # core/lockdown.ContainmentService, set by main once the app exists.
+        self.containment = None
         self.tree = app_commands.CommandTree(self)
         self._commands_synced = False
         rules.register(self)
         hosts.register(self)
         hx_views.register(self)
+        containment_cmds.register(self)
 
     async def setup_hook(self) -> None:
         self.add_dynamic_items(
