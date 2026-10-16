@@ -480,3 +480,42 @@ class BrokerFlag(Base):
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     value: Mapped[dict] = mapped_column(JSON, default=dict)
     updated_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow, onupdate=utcnow)
+
+
+class OAuthClient(Base, TimestampMixin):
+    """A web UI's connector, registered with the broker's OAuth server
+    (api/oauth_routes.py; dynamic registration, RFC 7591). It acts as one
+    agent (`agent_id`, set when someone first authorizes it)."""
+
+    __tablename__ = "oauth_clients"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # client_id
+    name: Mapped[str] = mapped_column(String(200), default="")
+    redirect_uris: Mapped[list] = mapped_column(JSON, default=list)
+    # Null: a public client (PKCE alone). Else sha256 of its secret.
+    secret_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    agent_id: Mapped[str | None] = mapped_column(ForeignKey("agents.id"), nullable=True, index=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+
+
+class OAuthToken(Base, TimestampMixin):
+    """An authorization code, access token or refresh token, by its sha256.
+    One authorization's tokens share a `family`: a refresh token used twice
+    revokes the whole family (it was stolen, or replayed)."""
+
+    __tablename__ = "oauth_tokens"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    kind: Mapped[str] = mapped_column(String(8))  # code | access | refresh
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    client_id: Mapped[str] = mapped_column(ForeignKey("oauth_clients.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), index=True)
+    family: Mapped[str] = mapped_column(String(36), index=True)
+    expires_at: Mapped[datetime] = mapped_column(TZDateTime(), index=True)
+    used_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    # A code's PKCE challenge and the redirect it was issued for.
+    code_challenge: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    redirect_uri: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    authorized_by: Mapped[str] = mapped_column(String(128), default="")

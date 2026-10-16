@@ -666,5 +666,17 @@ def contain_lift(entry: str = typer.Argument(None, help="its id; none: every con
     _run(lambda: _client().admin_contain_lift(entry))
 
 
+@admin.command("connectors")
+def connectors():
+    """Web UI connectors (remote MCP): who registered, which agent each acts as."""
+    _run(lambda: _client().admin_connectors())
+
+
+@admin.command("connector-revoke")
+def connector_revoke(client_id: str):
+    """Revoke a connector: its tokens stop now; it must register and be authorized again."""
+    _run(lambda: _client().admin_connector_revoke(client_id))
+
+
 if __name__ == "__main__":
     app()

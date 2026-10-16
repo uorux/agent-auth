@@ -35,6 +35,7 @@ from ..schemas import RequestCreate
 from . import lockdown as lockdown_mod
 from .events import KeyedEvents
 from .zones import Zones
+from .oauth import WEB_RUNTIME
 from .states import (
     THREAD_CLOSED,
     THREAD_OPEN,
@@ -269,6 +270,19 @@ class RequestService:
                 decision.action = PolicyAction.SURFACE
                 decision.pinned_authority = decision.explicit = False
                 request.risk_notes = [*request.risk_notes, "always decided by a human"]
+
+            # A web UI's connector (core/oauth.py), or a request made on one's
+            # behalf: always a person, whatever a policy rule, a saved rule or
+            # the LLM reviewer would say. What drives it is a chat on someone
+            # else's service.
+            if decision.action in (PolicyAction.APPROVE, PolicyAction.LLM):
+                delegator = (
+                    await session.get(Agent, request.delegator_agent_id) if request.delegator_agent_id else None
+                )
+                if agent.runtime == WEB_RUNTIME or (delegator is not None and delegator.runtime == WEB_RUNTIME):
+                    decision.action = PolicyAction.SURFACE
+                    decision.pinned_authority = decision.explicit = False
+                    request.risk_notes = [*request.risk_notes, "for a web UI connector: always decided by a human"]
 
             # Sensitive capabilities always reach a human, even if a YAML rule or
             # the LLM path would clear them — unless a human's own rule pinned to

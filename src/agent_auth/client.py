@@ -364,6 +364,12 @@ class BrokerClient:
     def admin_contain(self, match: dict, reason: str, evidence: str = ""):
         return self._request("POST", "/admin/containment", admin=True, json={"match": match, "reason": reason, "evidence": evidence})
 
+    def admin_connectors(self):
+        return self._request("GET", "/admin/connectors", admin=True)
+
+    def admin_connector_revoke(self, client_id: str):
+        return self._request("POST", f"/admin/connectors/{client_id}/revoke", admin=True)
+
     def admin_containment(self):
         return self._request("GET", "/admin/containment", admin=True)
 

@@ -758,6 +758,51 @@ check catches common token shapes pasted by mistake and nothing else. Keep
 the repo on the denylist: a GitHub grant for it would write past the
 per-project rule.
 
+## Web UIs (remote MCP)
+
+claude.ai and ChatGPT can use the broker as a remote MCP server: add a custom
+connector with the URL `https://<public name>/mcp` and sign in when asked.
+
+```yaml
+remote_mcp:
+  enabled: true
+  base_url: https://agent-auth.example   # what the UIs reach
+  # redirect_hosts: [claude.ai, claude.com, chatgpt.com, chat.openai.com]
+  # tools: [...]                         # default: no credentials, no host commands
+```
+
+- **Sign-in.** OAuth 2.1 with PKCE, dynamic client registration (the UIs
+  register themselves), at `/oauth/*`; discovery at
+  `/.well-known/oauth-authorization-server` and
+  `/.well-known/oauth-protected-resource`. Authorizing signs you in at the
+  admin panel's provider (`ui.issuer`, `ui.client_id`; the client must also
+  list `<base_url>/oauth/callback` as a redirect URI) and requires
+  `ui.admin_group`. The consent page names where the browser goes back to
+  and the agent the connector will be. A client may only register redirects
+  to `redirect_hosts`, so a link someone else registered can't send your
+  sign-in elsewhere.
+- **Identity.** Each connector acts as an agent of its own, `web-<name>`,
+  runtime `web`, kind ephemeral, with no API key of its own. **Every request
+  it makes, and every request another agent makes on its behalf, goes to a
+  person**: no policy rule, saved rule or LLM reviewer approves one.
+  Containment, zones and the audit apply as to any agent.
+- **Tokens.** Access tokens last `access_ttl` (1h); refresh tokens
+  (`refresh_ttl`, 30d) rotate, and one used twice ends that authorization.
+  The panel's **Web connectors** tab (or `agent-auth admin connectors`,
+  `connector-revoke`) lists them and revokes a connector at once.
+- **Tools.** By default: whoami, the catalog, requesting access and following
+  decisions, a2a threads, reading the wiki, notify_operator. Not
+  get_credential: a token would land in a third party's chat history. Not
+  host commands or wiki writes. Waiting tools return after 50 s at most here
+  (Cloudflare ends longer requests) and tell the model to call again.
+- **Exposure.** Only `/healthz`, `/.well-known/*`, `/mcp` and `/oauth/*`
+  need to be public; the agent API, admin API, panel and daemon channel
+  don't.
+
+What it doesn't protect against: whatever the UI's operator sees of your
+chat (tool results included), and a connector you authorized acting within
+what you then approve for it.
+
 ## Admin panel
 
 A page the broker serves at `/ui` for setting agents and hosts up without

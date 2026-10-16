@@ -310,3 +310,10 @@ rules:
 # Agents that read the broker's own record (GET /v1/audit/events):
 # audit:
 #   readers: [{project: private-thing, runtime: auditor}]
+
+# Web UIs (claude.ai, ChatGPT) as MCP clients (README "Web UIs (remote MCP)").
+# Needs ui.issuer/client_id for the sign-in; every request a connector
+# makes goes to a human.
+# remote_mcp:
+#   enabled: true
+#   base_url: https://agent-auth.example

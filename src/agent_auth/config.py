@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     # More policy merged over it, comma-separated paths (policy/schema.py
     # load_policy): what must not sit beside the base file, from a secret.
     policy_overlays: str = ""
+    # Where the remote MCP server's tools reach the broker's own API
+    # (api/remote_mcp.py); default http://127.0.0.1:<listen_port>.
+    remote_mcp_loopback_url: str = ""
     listen_host: str = "0.0.0.0"
     listen_port: int = 8400
 

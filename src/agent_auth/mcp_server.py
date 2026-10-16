@@ -6,6 +6,7 @@ Configure per-agent:
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import threading
@@ -117,8 +118,30 @@ STALE_SESSION = "unknown or closed session"
 KEEPALIVE_SECS = 240.0
 
 
+# Remote mode (api/remote_mcp.py): the same tools served over HTTP to web
+# UIs, inside the broker. Each request carries its caller (the broker's own
+# address and the connector's access token) here, so nothing of one caller
+# is kept in the process-wide client above.
+_REMOTE: contextvars.ContextVar["RemoteCaller | None"] = contextvars.ContextVar("agent_auth_remote", default=None)
+
+
+class RemoteCaller:
+    """One web UI connector, for the length of one MCP request. Its a2a
+    session (a connector's agent is ephemeral) is kept across requests in
+    `sessions`, by access token."""
+
+    def __init__(self, url: str, token: str, sessions: dict[str, str]):
+        self.url, self.token, self.sessions = url, token, sessions
+
+    def client(self) -> BrokerClient:
+        return BrokerClient(self.url, self.token)
+
+
 def _client() -> BrokerClient:
     global _CLIENT
+    remote = _REMOTE.get()
+    if remote is not None:
+        return remote.client()
     if _CLIENT is None:
         _CLIENT = BrokerClient()
     return _CLIENT
@@ -128,6 +151,14 @@ def _session_client() -> BrokerClient:
     """Client for a2a calls: ephemeral agents get a session auto-created on
     first use (label = cwd basename); service agents skip session machinery."""
     global _KIND, _MINTED
+    remote = _REMOTE.get()
+    if remote is not None:
+        client = remote.client()
+        if not remote.sessions.get(remote.token):
+            client.create_session("web")
+            remote.sessions[remote.token] = client.session_id
+        client.session_id = remote.sessions[remote.token]
+        return client
     client = _client()
     if client.session_id:
         return client
@@ -164,6 +195,9 @@ def _keep_alive(client: BrokerClient, session_id: str) -> None:
 def _minted_session_gone() -> bool:
     """Whether the session this process minted has been closed by the broker;
     forgets it if so, and the next call mints another."""
+    remote = _REMOTE.get()
+    if remote is not None:
+        return remote.sessions.pop(remote.token, None) is not None
     client = _CLIENT
     if not (_MINTED and client and client.session_id):
         return False
@@ -184,7 +218,8 @@ def _client_for(session_key: str | None) -> BrokerClient:
     each other. Omitted → the legacy path: ephemeral cwd-auto session,
     service sessionless."""
     if session_key:
-        client = BrokerClient()
+        remote = _REMOTE.get()
+        client = remote.client() if remote is not None else BrokerClient()
         client.session_id = session_key  # → X-Agent-Session on this call
         return client
     return _session_client()

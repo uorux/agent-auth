@@ -5,7 +5,7 @@ import logging
 
 import uvicorn
 
-from .api.app import create_app
+from .api.app import create_app, enable_remote_mcp
 from .config import Settings, get_settings
 from .core.a2a import A2AThreadService
 from .core.daemons import DaemonHub
@@ -203,6 +203,16 @@ async def serve(settings: Settings) -> None:
                      policy.ui.issuer, policy.ui.admin_group)
         else:
             log.warning("ui.enabled is set but ENCRYPTION_KEY is not: the admin panel is disabled")
+    # Web UIs (claude.ai, ChatGPT): /mcp, signed into with OAuth at the
+    # panel's provider.
+    if policy.remote_mcp.enabled:
+        if settings.encryption_key:
+            signin = app.state.ui_auth or UiAuth(policy.ui, settings.encryption_key)
+            enable_remote_mcp(app, policy, settings, signin)
+            log.info("remote mcp: %s/mcp, %d tool(s), redirects to %s", policy.remote_mcp.base_url.rstrip("/"),
+                     len(policy.remote_mcp.tools), ", ".join(policy.remote_mcp.redirect_hosts))
+        else:
+            log.warning("remote_mcp.enabled is set but ENCRYPTION_KEY is not: remote MCP is disabled")
     scheduler = ExpiryScheduler(service, a2a, sandboxes=sandboxes)
 
     server = uvicorn.Server(

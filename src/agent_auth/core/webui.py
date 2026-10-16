@@ -56,6 +56,8 @@ ALLOWED = [
     ("GET", "/admin/a2a/graph"),
     ("GET", "/admin/a2a/threads/{}"),
     ("GET", "/admin/models/usage"),
+    ("GET", "/admin/connectors"),
+    ("POST", "/admin/connectors/{}/revoke"),
     ("GET", "/admin/chat/peers"),
     ("GET", "/admin/chat/threads"),
     ("GET", "/admin/chat/threads/{}"),
@@ -166,15 +168,18 @@ class UiAuth:
             self._jwks = resp.json()
         return self._jwks
 
-    async def begin(self) -> tuple[str, str]:
+    async def begin(self, redirect_uri: str | None = None, carry: dict[str, Any] | None = None) -> tuple[str, str]:
         """Where to send the browser, and the cookie that ties its return to
-        this attempt (state, nonce and the PKCE verifier)."""
+        this attempt (state, nonce and the PKCE verifier). `redirect_uri` and
+        `carry` are for another sign-in than the panel's (the OAuth server
+        for web UIs, api/oauth_routes.py): where the provider sends the
+        browser back, and what the cookie carries for the return."""
         state, nonce, verifier = secrets.token_urlsafe(24), secrets.token_urlsafe(24), secrets.token_urlsafe(48)
         query = urlencode(
             {
                 "response_type": "code",
                 "client_id": self.config.client_id,
-                "redirect_uri": self.redirect_uri,
+                "redirect_uri": redirect_uri or self.redirect_uri,
                 "scope": "openid profile groups",
                 "state": state,
                 "nonce": nonce,
@@ -183,11 +188,27 @@ class UiAuth:
             }
         )
         url = f"{(await self._discover())['authorization_endpoint']}?{query}"
-        return url, self._seal("login", {"state": state, "nonce": nonce, "verifier": verifier})
+        sealed = {"state": state, "nonce": nonce, "verifier": verifier, "redirect_uri": redirect_uri or self.redirect_uri}
+        return url, self._seal("login", {**sealed, "carry": carry or {}})
 
     async def finish(self, login_cookie: str | None, code: str, state: str) -> str:
         """The provider sent the browser back: check everything and return a
         session cookie, or raise UiAuthError."""
+        user, _ = await self.identify(login_cookie, code, state)
+        log.info("admin panel: %s signed in", user)
+        return self._seal(
+            "session", {"user": user, "csrf": secrets.token_urlsafe(24), "exp": int(time.time()) + self.ttl}
+        )
+
+    def seal(self, kind: str, data: dict[str, Any]) -> str:
+        return self._seal(kind, data)
+
+    def unseal(self, kind: str, value: str | None, max_age: int) -> dict[str, Any] | None:
+        return self._open(kind, value, max_age)
+
+    async def identify(self, login_cookie: str | None, code: str, state: str) -> tuple[str, dict[str, Any]]:
+        """Who signed in, if they are in the admin group (else UiAuthError),
+        and what the attempt carried."""
         attempt = self._open("login", login_cookie, LOGIN_TTL)
         if attempt is None or not secrets.compare_digest(attempt["state"], state or ""):
             raise UiAuthError("this sign-in was not started here, or took too long; try again")
@@ -198,7 +219,7 @@ class UiAuth:
                 data={
                     "grant_type": "authorization_code",
                     "code": code,
-                    "redirect_uri": self.redirect_uri,
+                    "redirect_uri": attempt.get("redirect_uri") or self.redirect_uri,
                     "client_id": self.config.client_id,
                     "code_verifier": attempt["verifier"],
                 },
@@ -224,10 +245,7 @@ class UiAuth:
         if not isinstance(groups, list) or self.config.admin_group not in groups:
             log.warning("admin panel: %s signed in but is not in %s", user, self.config.admin_group)
             raise UiAuthError(f"{user} is not in the group {self.config.admin_group}")
-        log.info("admin panel: %s signed in", user)
-        return self._seal(
-            "session", {"user": user, "csrf": secrets.token_urlsafe(24), "exp": int(time.time()) + self.ttl}
-        )
+        return user, attempt.get("carry") or {}
 
     async def _verify(self, id_token: str, nonce: str) -> dict[str, Any]:
         try:

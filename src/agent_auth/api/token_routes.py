@@ -29,7 +29,20 @@ async def jwks(request: Request):
 
 @router.get("/.well-known/openid-configuration")
 async def discovery(request: Request):
-    return _tokens(request).discovery()
+    tokens = getattr(request.app.state, "tokens", None)
+    oauth = getattr(request.app.state, "oauth", None)
+    found = tokens.discovery() if tokens is not None else None
+    if oauth is not None:
+        # Clients that look for the authorization server here (RFC 8414's
+        # fallback) find it too, when it is the same issuer.
+        from .oauth_routes import authorization_server_metadata
+
+        base = oauth.config.base_url.rstrip("/")
+        if found is None or str(found.get("issuer", "")).rstrip("/") == base:
+            found = {**(found or {}), **authorization_server_metadata(base)}
+    if found is None:
+        raise HTTPException(404)
+    return found
 
 
 def _no(why: str) -> Response:

@@ -12,6 +12,7 @@ from sqlalchemy import select
 
 from ..core import security_log
 from ..core.a2a import OPERATOR_KIND
+from ..core.oauth import ACCESS_PREFIX as OAUTH_ACCESS_PREFIX
 from ..crypto import parse_api_key, verify_secret
 from ..models import Agent, AgentSession, utcnow
 
@@ -60,13 +61,22 @@ async def get_caller(
 ) -> Caller:
     if creds is None:
         raise HTTPException(401, "missing bearer token")
+    session_header = request.headers.get("X-Agent-Session")
+    now = utcnow()
+    oauth = getattr(request.app.state, "oauth", None)
+    if oauth is not None and creds.credentials.startswith(OAUTH_ACCESS_PREFIX):
+        # A web UI's connector (core/oauth.py): its access token is its agent.
+        async with request.app.state.db.session() as db:
+            agent = await oauth.agent_for_access(db, creds.credentials)
+            if agent is None or agent.disabled:
+                security_log.record(request, "bad_key", agent=agent.name if agent else None, reason="oauth token")
+                raise HTTPException(401, "invalid or expired access token")
+            return await _with_session(db, agent, session_header, now)
     parsed = parse_api_key(creds.credentials)
     if parsed is None:
         security_log.record(request, "bad_key", reason="malformed")
         raise HTTPException(401, "malformed API key")
     key_id, secret = parsed
-    session_header = request.headers.get("X-Agent-Session")
-    now = utcnow()
     async with request.app.state.db.session() as db:
         agent = (
             await db.execute(select(Agent).where(Agent.key_id == key_id))
@@ -86,18 +96,22 @@ async def get_caller(
                 reason="unknown key" if agent is None else "disabled" if agent.disabled else "operator" if agent.kind == OPERATOR_KIND else "wrong secret",
             )
             raise HTTPException(401, "invalid API key")
-        agent_session = None
-        if session_header:
-            agent_session = await db.get(AgentSession, session_header)
-            if (
-                agent_session is None
-                or agent_session.agent_id != agent.id
-                or agent_session.closed_at is not None
-            ):
-                # 401 (not 404): the auth context is stale — mint a new session.
-                raise HTTPException(401, "unknown or closed session")
-            _touch(agent_session, now)
-        _touch(agent, now)
+        return await _with_session(db, agent, session_header, now)
+
+
+async def _with_session(db, agent: Agent, session_header: str | None, now) -> Caller:
+    agent_session = None
+    if session_header:
+        agent_session = await db.get(AgentSession, session_header)
+        if (
+            agent_session is None
+            or agent_session.agent_id != agent.id
+            or agent_session.closed_at is not None
+        ):
+            # 401 (not 404): the auth context is stale — mint a new session.
+            raise HTTPException(401, "unknown or closed session")
+        _touch(agent_session, now)
+    _touch(agent, now)
     return Caller(agent=agent, session=agent_session)
 
 

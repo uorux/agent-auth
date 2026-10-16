@@ -394,6 +394,51 @@ class ContainmentConfig(BaseModel):
     allow_all: bool = False
 
 
+# The tools a web UI gets by default (remote_mcp.tools): asking for access,
+# talking to agents, reading the wiki. Not get_credential (a secret would land
+# in a third party's chat history), not host commands or shells, not wiki
+# writes; a2a_events is for service agents.
+REMOTE_MCP_TOOLS = [
+    "whoami", "list_capabilities", "list_grants", "request_access", "wait_for_decision",
+    "check_status", "retry_request", "escalate_request", "create_session", "close_session",
+    "check_a2a", "a2a_open", "a2a_send", "a2a_poll", "a2a_threads", "a2a_accept",
+    "a2a_reject", "a2a_close", "wiki_search", "wiki_read", "wiki_list", "notify_operator",
+]
+
+
+class RemoteMcpConfig(BaseModel):
+    """The broker as a remote MCP server for web UIs (claude.ai, ChatGPT
+    connectors): /mcp, signed into with OAuth (/oauth/*), where the person
+    authorizing signs in at the admin panel's OpenID provider and must be in
+    its admin group (ui.*). Each connector acts as an agent of its own,
+    `web-<name>`, runtime `web`, and asks for access like any agent. Off
+    unless enabled. README "Web UIs (remote MCP)"."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    # The public address the UIs reach (its /oauth/callback must be a
+    # redirect URI of the provider's client, ui.client_id).
+    base_url: str = ""
+    # Where a connector may send the browser back to: a client registering
+    # any other redirect is refused, so a link someone else registered can't
+    # hand them a token after you sign in.
+    redirect_hosts: list[str] = Field(
+        default_factory=lambda: ["claude.ai", "claude.com", "chatgpt.com", "chat.openai.com"]
+    )
+    tools: list[str] = Field(default_factory=lambda: list(REMOTE_MCP_TOOLS))
+    access_ttl: str | int = "1h"
+    refresh_ttl: str | int = "30d"
+    # Registered clients at most (registration is open to the internet).
+    max_clients: int = 50
+
+    @field_validator("access_ttl", "refresh_ttl")
+    @classmethod
+    def _ttl(cls, v):
+        parse_duration(v)
+        return v
+
+
 class RestrictedZone(BaseModel):
     """Resources only these agents reach (core/zones.py). To every other
     agent they don't exist, whatever any rule says."""
@@ -438,6 +483,7 @@ class PolicyFile(BaseModel):
     # Restricted zones (core/zones.py), by name.
     restricted: dict[str, RestrictedZone] = Field(default_factory=dict)
     audit: AuditConfig = Field(default_factory=AuditConfig)
+    remote_mcp: RemoteMcpConfig = Field(default_factory=RemoteMcpConfig)
     # The projects agents work on. A rule may only name a project listed
     # here, so a mistyped one is an error at load and not a rule that never
     # matches.
@@ -464,6 +510,14 @@ class PolicyFile(BaseModel):
                 for project in pattern.project or []:
                     if project not in self.projects:
                         raise ValueError(f"{where}: project {project!r} is not listed under `projects`")
+        if self.remote_mcp.enabled:
+            if not (self.ui.issuer and self.ui.client_id and self.remote_mcp.base_url):
+                raise ValueError("remote_mcp needs base_url, and ui.issuer and ui.client_id to sign in with")
+            from ..mcp_names import TOOL_NAMES
+
+            unknown = set(self.remote_mcp.tools) - TOOL_NAMES
+            if unknown:
+                raise ValueError(f"remote_mcp.tools: no such tools: {', '.join(sorted(unknown))}")
         for i, rule in enumerate(self.rules):
             try:
                 check_resource(rule.match.resource)

@@ -13,6 +13,7 @@ const TABS = [
   ["decisions", "Decisions"],
   ["commands", "Commands"],
   ["usage", "Model usage"],
+  ["connectors", "Web connectors"],
   ["rules", "Saved rules"],
 ];
 
@@ -436,6 +437,34 @@ async function usageView(view) {
   for (const bar of view.querySelectorAll(".spend-bar")) bar.style.width = `${bar.dataset.pct}%`;
 }
 
+// ── Web connectors (remote MCP) ──────────────────────────────────────────
+
+async function connectorsView(view) {
+  let rows;
+  try {
+    rows = await api("GET", "/admin/connectors");
+  } catch (err) {
+    put(view, el("h2", {}, "Web connectors"),
+      el("p", { class: "note" }, "Web UIs can't connect to this broker (remote_mcp in the policy file is off)."));
+    return;
+  }
+  put(view,
+    el("h2", {}, "Web connectors"),
+    el("p", { class: "note" }, "Web UIs (claude.ai, ChatGPT) that registered to use the broker as an MCP server. Each acts as its own web agent, and everything it asks for comes to you: no rule or reviewer decides for it. Revoking ends its tokens at once; it would have to register and be authorized again."),
+    table([
+      ["Name", (c) => c.name || el("span", { class: "muted" }, "(no name)")],
+      ["Acts as", (c) => (c.agent ? el("span", { class: "mono" }, c.agent) : el("span", { class: "muted" }, "not authorized"))],
+      ["Returns to", (c) => el("span", { class: "mono" }, (c.redirect_uris || []).map((u) => { try { return new URL(u).host; } catch { return u; } }).join(", ")), "wrap"],
+      ["Registered", (c) => ago(c.created_at)],
+      ["Last used", (c) => (c.last_used_at ? ago(c.last_used_at) : null)],
+      ["Signed in", (c) => (c.revoked_at ? pill("revoked", "warn") : String(c.live_authorizations))],
+      ["", (c) => (c.revoked_at ? null : button("Revoke", async () => {
+        if (!confirm(`Revoke ${c.name || c.client_id}? Its tokens stop working now.`)) return;
+        await act("Revoking the connector", () => api("POST", `/admin/connectors/${encodeURIComponent(c.client_id)}/revoke`));
+      }, "act danger"))],
+    ], rows, "No web UI has registered."));
+}
+
 // ── Conversations between agents ─────────────────────────────────────────
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -816,7 +845,7 @@ async function chatView(view) {
   else drawNew();
 }
 
-const VIEWS = { usage: usageView, chat: chatView, agents: agentsView, projects: projectsView, hosts: hostsView, conversations: conversationsView, decisions: decisionsView, commands: commandsView, rules: rulesView };
+const VIEWS = { connectors: connectorsView, usage: usageView, chat: chatView, agents: agentsView, projects: projectsView, hosts: hostsView, conversations: conversationsView, decisions: decisionsView, commands: commandsView, rules: rulesView };
 
 async function show(tab, keepNotice) {
   state.tab = tab;
