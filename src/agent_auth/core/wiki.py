@@ -115,6 +115,8 @@ class WikiService:
         self._loaded_at = 0.0
         self._lock = asyncio.Lock()
         self._changes: dict[str, dict[str, Any] | None] = {}  # by blob sha
+        # Restricted zones (core/zones.py): their members don't write here.
+        self.zones = None
 
     # ── who may write what ────────────────────────────────────────────────
 
@@ -123,11 +125,16 @@ class WikiService:
 
     def writable(self, agent) -> list[str]:
         """Where this agent may write, for a person or an agent to read."""
+        if self.zones is not None and not self.zones.may_write_wiki(agent):
+            return []
         if self.is_editor(agent):
             return ["(every page)"]
         return [f"{PROJECTS_DIR}/{agent.project}/"] if agent.project else []
 
     def _check_write(self, agent, path: str) -> None:
+        if self.zones is not None and not self.zones.may_write_wiki(agent):
+            # Every agent reads the wiki; what this one knows stays where it is.
+            raise WikiError(403, "you don't write the shared wiki")
         if self.is_editor(agent):
             return
         if not agent.project:

@@ -378,11 +378,17 @@ def k8s_mock():
             # retry of this grant) or a foreign object (name squatting).
             self.sa_conflict: str | None = None
             self.last_sa_body: dict | None = None
+            # What GET /api/v1/namespaces lists; every request's (method, path).
+            self.namespaces = ["agent-auth", "apps-a", "apps-soc", "personal-site"]
+            self.paths: list[tuple[str, str]] = []
 
     recorder = Recorder()
 
     def handler(request):
         path = request.url.path
+        recorder.paths.append((request.method, path))
+        if request.method == "GET" and path == "/api/v1/namespaces":
+            return httpx.Response(200, json={"items": [{"metadata": {"name": n}} for n in recorder.namespaces]})
         if request.method == "POST" and path.endswith("/token"):
             recorder.calls.append(("token", path.rsplit("/", 2)[-2]))
             body = _json.loads(request.content)

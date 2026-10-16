@@ -12,6 +12,7 @@ from ..provisioners.base import ProvisionerRegistry
 from . import (
     a2a_routes,
     admin_log_routes,
+    audit_routes,
     chat_routes,
     containment_routes,
     admin_routes,
@@ -67,11 +68,17 @@ def create_app(
     )
     if hostexec is not None:
         hostexec.containment = app.state.containment
+    # core/security_log.py: refusals the database doesn't keep, for the audit feed.
+    from ..core.security_log import SecurityLog
+
+    app.state.security_log = SecurityLog()
+    app.state.containment.security_log = app.state.security_log
 
     app.include_router(agent_routes.router)
     app.include_router(a2a_routes.router)
     app.include_router(admin_routes.router)
     app.include_router(admin_log_routes.router)
+    app.include_router(audit_routes.router)
     app.include_router(chat_routes.router)
     app.include_router(containment_routes.admin)
     app.include_router(containment_routes.agents)

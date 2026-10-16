@@ -31,6 +31,7 @@ from .policy.risk import RiskSummarizer, Watcher
 from .provisioners.mcp import McpProvisioner
 from .provisioners.models import ModelsProvisioner
 from .policy.schema import load_policy
+from .core.zones import Zones
 from .provisioners.a2a import A2AProvisioner
 from .provisioners.agents import AgentsProvisioner
 from .provisioners.sandbox import SandboxProvisioner
@@ -96,16 +97,16 @@ def build_registry(settings: Settings, policy) -> ProvisionerRegistry:
     else:
         log.info("homelab provisioner disabled (LLDAP_URL not set)")
     if settings.kubernetes_api_url:
-        registry.register(
-            KubernetesProvisioner(
-                api_url=settings.kubernetes_api_url,
-                config=policy.platforms.kubernetes,
-                token=settings.kubernetes_token,
-                token_file=settings.kubernetes_token_file,
-                ca_file=settings.kubernetes_ca_file,
-                insecure_skip_verify=settings.kubernetes_insecure_skip_verify,
-            )
+        k8s = KubernetesProvisioner(
+            api_url=settings.kubernetes_api_url,
+            config=policy.platforms.kubernetes,
+            token=settings.kubernetes_token,
+            token_file=settings.kubernetes_token_file,
+            ca_file=settings.kubernetes_ca_file,
+            insecure_skip_verify=settings.kubernetes_insecure_skip_verify,
         )
+        k8s.zones = Zones(policy)
+        registry.register(k8s)
     else:
         log.info("kubernetes provisioner disabled (KUBERNETES_API_URL not set)")
     models = policy.platforms.models
@@ -123,7 +124,7 @@ async def serve(settings: Settings) -> None:
         level=settings.log_level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    policy = load_policy(settings.policy_file)
+    policy = load_policy(settings.policy_file, [p for p in settings.policy_overlays.split(",") if p.strip()])
     db = Database(settings.database_url)
     events = KeyedEvents()
     registry = build_registry(settings, policy)
@@ -190,6 +191,7 @@ async def serve(settings: Settings) -> None:
                 policy.wiki,
                 GithubWikiBackend(registry.get(Platform.GITHUB), policy.wiki.repo, policy.wiki.branch),
             )
+            app.state.wiki.zones = Zones(policy)
             log.info("wiki: %s (%s)", policy.wiki.repo, policy.wiki.branch)
         else:
             log.warning("wiki.repo is set but GitHub is not configured: the wiki is disabled")

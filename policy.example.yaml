@@ -296,3 +296,17 @@ rules:
   # Google (stub) — always a human decision while unimplemented
   - match: {platform: google}
     action: surface
+
+# Restricted zones (README "Restricted zones"): resources only their members
+# reach, checked before any rule. Keep a real zone in an overlay
+# (POLICY_OVERLAYS) rather than here, if agents read this file.
+#
+# restricted:
+#   private-thing:
+#     members: [{project: private-thing}]
+#     kubernetes: [private-thing]
+#     github: [owner/private-thing]
+#
+# Agents that read the broker's own record (GET /v1/audit/events):
+# audit:
+#   readers: [{project: private-thing, runtime: auditor}]

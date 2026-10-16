@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import select
 
 from ..core.a2a import A2AError, reachability, unreachable_detail
+from ..core.zones import Zones
 from ..models import Agent, AgentSession, utcnow
 from ..provisioners import a2a as a2a_mod
 from ..schemas import (
@@ -278,7 +279,8 @@ async def a2a_check(
         peer_agent = (
             await db.execute(select(Agent).where(Agent.name == peer))
         ).scalar_one_or_none()
-        if peer_agent is None:
+        if peer_agent is None or Zones(request.app.state.service.engine.policy).apart(caller.agent, peer_agent):
+            # A restricted zone's member, to anyone outside it, is no one.
             return A2ACheckOut(allowed=False, reason=f"unknown agent {peer!r}")
         peer_out = PeerEntry(
             description=peer_agent.description or None,

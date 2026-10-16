@@ -48,6 +48,12 @@ rules:
   # - apiGroups: [rbac.authorization.k8s.io]
   #   resources: [clusterrolebindings]
   #   verbs: [create, delete, get]
+  # With restricted zones (policy `restricted`), a cluster-wide grant to an
+  # agent outside a zone is a RoleBinding in each other namespace instead,
+  # and the broker lists them first (it fails closed without this):
+  # - apiGroups: [""]
+  #   resources: [namespaces]
+  #   verbs: [list]
   - apiGroups: [rbac.authorization.k8s.io]
     resources: [clusterroles]
     verbs: [bind]

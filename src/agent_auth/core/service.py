@@ -34,6 +34,7 @@ from ..provisioners.base import (
 from ..schemas import RequestCreate
 from . import lockdown as lockdown_mod
 from .events import KeyedEvents
+from .zones import Zones
 from .states import (
     THREAD_CLOSED,
     THREAD_OPEN,
@@ -227,6 +228,20 @@ class RequestService:
                 await session.flush()
                 return request
 
+            # Restricted zones (core/zones.py), before any rule: to an agent
+            # outside one, its resources are not brokered at all.
+            zoned = await Zones(self.engine.policy).check(
+                session, agent, request.platform, spec.resource, spec.scope
+            )
+            if zoned is not None and zoned[0] == "deny":
+                request.status = RequestStatus.DENIED
+                request.decision_source = DecisionSource.POLICY
+                request.decision_reason = f"validator: {zoned[1]}"
+                request.decided_at = utcnow()
+                session.add(request)
+                await session.flush()
+                return request
+
             request.resource = spec.resource
             request.authority = authority_mod.fold(
                 request.platform, spec.capability, spec.scope
@@ -237,6 +252,11 @@ class RequestService:
             await session.flush()
 
             decision = await self.engine.evaluate(session, agent, request)
+            if zoned is not None and decision.action in (PolicyAction.APPROVE, PolicyAction.LLM):
+                # ("human", note): never without a person.
+                decision.action = PolicyAction.SURFACE
+                decision.pinned_authority = decision.explicit = False
+                request.risk_notes = [*request.risk_notes, zoned[1]]
             source = (
                 DecisionSource.RULE if decision.source == "rule" else DecisionSource.POLICY
             )

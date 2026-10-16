@@ -109,6 +109,22 @@
               '';
             };
 
+            policyOverlays = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              example = lib.literalExpression
+                ''[ config.sops.secrets."agent-auth/policy-private".path ]'';
+              description = ''
+                More policy, merged over policyFile in order (mappings key
+                by key, lists with the overlay's items first): policy that
+                must not sit in the repo agents read, such as a restricted
+                zone's project, rules and readers. Paths to secret files
+                (sops-nix), as strings so they never reach the nix store;
+                loaded with LoadCredential. A missing one stops the broker
+                from starting.
+              '';
+            };
+
             listenHost = lib.mkOption {
               type = lib.types.str;
               default = "127.0.0.1";
@@ -174,6 +190,9 @@
               environment = {
                 DATABASE_URL = "sqlite+aiosqlite:////var/lib/agent-auth/agent-auth.db";
                 POLICY_FILE = "${cfg.policyFile}";
+                POLICY_OVERLAYS = lib.concatStringsSep "," (lib.imap0
+                  (i: _: "/run/credentials/agent-auth.service/policy-overlay-${toString i}")
+                  cfg.policyOverlays);
                 LISTEN_HOST = cfg.listenHost;
                 LISTEN_PORT = toString cfg.port;
               } // cfg.settings;
@@ -184,7 +203,8 @@
                 StateDirectory = "agent-auth";
                 WorkingDirectory = "/var/lib/agent-auth";
                 EnvironmentFile = cfg.environmentFiles;
-                LoadCredential = cfg.loadCredentials;
+                LoadCredential = cfg.loadCredentials
+                  ++ lib.imap0 (i: path: "policy-overlay-${toString i}:${path}") cfg.policyOverlays;
                 Restart = "on-failure";
                 RestartSec = 5;
 

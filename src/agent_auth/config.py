@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     # supported: postgresql+asyncpg://user:pw@host:5432/agent_auth
     database_url: str = "sqlite+aiosqlite:///agent-auth.db"
     policy_file: str = "policy.yaml"
+    # More policy merged over it, comma-separated paths (policy/schema.py
+    # load_policy): what must not sit beside the base file, from a secret.
+    policy_overlays: str = ""
     listen_host: str = "0.0.0.0"
     listen_port: int = 8400
 

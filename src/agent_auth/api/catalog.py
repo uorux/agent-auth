@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import authority as authority_mod
 from ..core.a2a import reachability
+from ..core.zones import Zones
 from ..core.states import Platform
 from ..models import AccessRequest, Agent
 from ..policy.engine import PolicyEngine
@@ -191,12 +192,14 @@ async def build_catalog(
                 )
             )
         ).scalars().all()
+        zones = Zones(policy)
         peers = [
             PeerEntry(
                 description=peer.description or None,
                 **reachability(peer, listen_threshold_secs),
             )
             for peer in rows
+            if not zones.apart(agent, peer)
         ]
         platforms.append(
             PlatformCatalog(

@@ -77,6 +77,8 @@ class KubernetesProvisioner:
             raise ValueError("kubernetes api_url is empty")
         self.api_urls = [u.rstrip("/") for u in api_urls]
         self.config = config
+        # Restricted zones (core/zones.py): what a cluster-wide grant leaves out.
+        self.zones = None
         self._token = token
         self._token_file = token_file
         self._verify: bool | str = False if insecure_skip_verify else (ca_file or True)
@@ -167,7 +169,33 @@ class KubernetesProvisioner:
             "kind": "ClusterRole",
             "name": role,
         }
-        if cluster:
+        excluded = self.zones.excluded_namespaces(agent) if (cluster and self.zones) else []
+        bound: list[str] | None = None
+        if cluster and excluded:
+            # A zone is in the way: every other namespace there is now, each
+            # by its own RoleBinding. One created later isn't covered.
+            bound = [ns for ns in await self._namespaces() if not any(fnmatch(ns, g) for g in excluded)]
+            made: list[str] = []
+            try:
+                for ns in bound:
+                    await self._create(
+                        f"/apis/rbac.authorization.k8s.io/v1/namespaces/{ns}/rolebindings",
+                        {
+                            "apiVersion": "rbac.authorization.k8s.io/v1",
+                            "kind": "RoleBinding",
+                            "metadata": {"name": name, "namespace": ns, "labels": labels, "annotations": annotations},
+                            "roleRef": role_ref,
+                            "subjects": [subject],
+                        },
+                    )
+                    made.append(ns)
+            except ProvisionerError:
+                # No state is saved for a grant that failed: undo it here.
+                for ns in made:
+                    await self._delete(f"/apis/rbac.authorization.k8s.io/v1/namespaces/{ns}/rolebindings/{name}")
+                await self._delete(f"/api/v1/namespaces/{sa_namespace}/serviceaccounts/{name}")
+                raise
+        elif cluster:
             await self._create(
                 "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings",
                 {
@@ -194,12 +222,23 @@ class KubernetesProvisioner:
                     "subjects": [subject],
                 },
             )
-        return {
+        out = {
             "namespace": sa_namespace,
             "service_account": name,
             "role": role,
             "cluster": cluster,
         }
+        if bound is not None:
+            out["bound_namespaces"] = bound
+            out["excluded"] = excluded
+        return out
+
+    async def _namespaces(self) -> list[str]:
+        resp = await self._request("GET", "/api/v1/namespaces")
+        if resp.status_code != 200:
+            # Fail closed: without the list there is no grant that leaves the zones out.
+            raise ProvisionerError(f"listing namespaces failed ({resp.status_code})")
+        return sorted(item["metadata"]["name"] for item in resp.json().get("items", []))
 
     async def revoke(self, session: AsyncSession, grant: Grant) -> None:
         state = grant.provisioner_state or {}
@@ -207,7 +246,10 @@ class KubernetesProvisioner:
         name = state.get("service_account")
         if not namespace or not name:
             return
-        if state.get("cluster"):
+        if state.get("bound_namespaces") is not None:
+            for ns in state["bound_namespaces"]:
+                await self._delete(f"/apis/rbac.authorization.k8s.io/v1/namespaces/{ns}/rolebindings/{name}")
+        elif state.get("cluster"):
             await self._delete(
                 f"/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{name}"
             )

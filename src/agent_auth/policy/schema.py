@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import re
 from pathlib import Path
+from typing import Any
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -393,6 +394,27 @@ class ContainmentConfig(BaseModel):
     allow_all: bool = False
 
 
+class RestrictedZone(BaseModel):
+    """Resources only these agents reach (core/zones.py). To every other
+    agent they don't exist, whatever any rule says."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    members: list[AgentPattern] = Field(min_length=1)
+    kubernetes: list[str] = Field(default_factory=list)  # namespace globs
+    github: list[str] = Field(default_factory=list)  # owner/repo globs
+    # May members write the shared wiki (which every agent reads)?
+    wiki: bool = False
+
+
+class AuditConfig(BaseModel):
+    """Agents that read the broker's own record (GET /v1/audit/events):
+    requests and decisions, grants, host commands, a2a threads,
+    containment, refused keys. To any other agent the route doesn't exist."""
+
+    readers: list[AgentPattern] = Field(default_factory=list)
+
+
 class NotifyConfig(BaseModel):
     """What is posted to the Discord channel besides requests that need you.
     A saved rule's decisions always are; these are the rest."""
@@ -413,6 +435,9 @@ class PolicyFile(BaseModel):
     ui: UiConfig = Field(default_factory=UiConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
     containment: ContainmentConfig = Field(default_factory=ContainmentConfig)
+    # Restricted zones (core/zones.py), by name.
+    restricted: dict[str, RestrictedZone] = Field(default_factory=dict)
+    audit: AuditConfig = Field(default_factory=AuditConfig)
     # The projects agents work on. A rule may only name a project listed
     # here, so a mistyped one is an error at load and not a rule that never
     # matches.
@@ -427,6 +452,13 @@ class PolicyFile(BaseModel):
         patterns += [(f"rules[{i}] delegator", r.match.delegator) for i, r in enumerate(self.rules)]
         patterns += [(f"desktop.agents[{i}]", p) for i, p in enumerate(self.desktop.agents)]
         patterns += [(f"wiki.editors[{i}]", p) for i, p in enumerate(self.wiki.editors)]
+        patterns += [(f"containment.agents[{i}]", p) for i, p in enumerate(self.containment.agents)]
+        patterns += [(f"audit.readers[{i}]", p) for i, p in enumerate(self.audit.readers)]
+        patterns += [
+            (f"restricted.{name}.members[{i}]", p)
+            for name, zone in self.restricted.items()
+            for i, p in enumerate(zone.members)
+        ]
         for where, pattern in patterns:
             if isinstance(pattern, AgentMatch):
                 for project in pattern.project or []:
@@ -440,9 +472,32 @@ class PolicyFile(BaseModel):
         return self
 
 
-def load_policy(path: str | Path) -> PolicyFile:
+def _overlay(base: Any, extra: Any) -> Any:
+    """Mappings merge key by key; lists put the overlay's items first (its
+    rules are matched before the base file's); anything else is replaced."""
+    if isinstance(base, dict) and isinstance(extra, dict):
+        out = dict(base)
+        for key, value in extra.items():
+            out[key] = _overlay(base[key], value) if key in base else value
+        return out
+    if isinstance(base, list) and isinstance(extra, list):
+        return [*extra, *base]
+    return extra
+
+
+def load_policy(path: str | Path, overlays: list[str | Path] | tuple = ()) -> PolicyFile:
+    """The policy file, with each overlay merged over it in order.
+
+    An overlay is policy that must not sit in the repo the base file lives
+    in (read by agents): a restricted zone's project, rules and
+    containment, kept in a sops secret. A missing overlay is an error, not
+    an empty one: what it holds is usually what keeps something closed.
+    """
     p = Path(path)
-    if not p.exists():
-        return PolicyFile()
-    data = yaml.safe_load(p.read_text()) or {}
+    data: Any = (yaml.safe_load(p.read_text()) or {}) if p.exists() else {}
+    for extra in overlays:
+        q = Path(extra)
+        if not q.exists():
+            raise FileNotFoundError(f"policy overlay {q} is missing")
+        data = _overlay(data, yaml.safe_load(q.read_text()) or {})
     return PolicyFile.model_validate(data)

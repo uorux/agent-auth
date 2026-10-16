@@ -83,6 +83,7 @@ class ContainmentService:
         self.service = service
         self.a2a = a2a
         self.hub = hub  # the daemon channel: agent VMs freeze held agents
+        self.security_log = None  # core/security_log.py: lifts are read by the audit feed
 
     async def held_in(self, session, sandbox_id: str) -> list[str]:
         """The agents of one agent VM that some entry holds."""
@@ -205,6 +206,8 @@ class ContainmentService:
                     await session.delete(flag)
         for e in lifted:
             log.warning("LIFTED containment %s (%s) by %s", e["id"], describe(e), by)
+            if self.security_log is not None:
+                self.security_log.record("containment_lifted", containment=e["id"], what=describe(e), by=by)
         await self.tell_sandboxes()
         return lifted
 
@@ -214,7 +217,12 @@ class ContainmentService:
             flag = await session.get(BrokerFlag, CONTAIN_FLAG)
             if flag is None:
                 return
-            rest = [e for e in flag.value.get("entries") or [] if not predicate(e)]
+            current = list(flag.value.get("entries") or [])
+            rest = [e for e in current if not predicate(e)]
+            if self.security_log is not None:
+                for e in current:
+                    if predicate(e):
+                        self.security_log.record("containment_lifted", containment=e["id"], what=describe(e), by=by)
             if rest:
                 flag.value = {"entries": rest}
             else:

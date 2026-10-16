@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from ..policy.agents import attributes
+from ..core import security_log
 from ..core.service import TransitionError
 from ..core.states import GrantStatus, RequestStatus, WAITING_STATUSES
 from ..models import AccessRequest, Agent, Grant
@@ -225,6 +226,7 @@ async def get_credential(grant_id: str, request: Request, agent: Agent = Depends
 
         held = await lockdown.holding(session, agent)
         if held is not None:
+            security_log.record(request, "credential_refused", agent=agent.name, grant=grant_id, containment=held["id"])
             raise HTTPException(403, f"contained ({held['id']}): credentials are not issued")
         # Delegated grants stop minting the moment their thread closes — the
         # scheduler revokes them within a tick, but credentials must not be

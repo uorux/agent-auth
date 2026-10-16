@@ -258,6 +258,48 @@ ceiling, or namespace/role allowlist. Auto-approve rules are **scope-pinned**: a
 rule created for `contents:write` won't rubber-stamp a later `secrets:write` on the
 same repo. Manage saved rules with `agent-auth admin rules` / `rule-delete`.
 
+### Restricted zones
+
+Some work shouldn't be reachable from every agent, including the broad ones
+(a homelab operator agent that reads any namespace). A zone names its
+members and what is theirs:
+
+```yaml
+restricted:
+  private-thing:
+    members: [{project: private-thing}]
+    kubernetes: [private-thing]        # namespace globs
+    github: [owner/private-thing]      # repo globs
+    wiki: false                        # members don't write the shared wiki
+```
+
+To an agent outside it, the zone's namespaces and repos aren't brokered: the
+request is refused with the same words as a resource the broker doesn't
+broker, **before any rule is read**, so neither a saved rule nor a policy
+rule opens it. A cluster-wide Kubernetes grant to an outsider becomes a
+RoleBinding in each namespace outside the zone (the broker needs `list
+namespaces`; a namespace created later isn't covered) instead of a
+ClusterRoleBinding. Members and outsiders aren't a2a peers either way, and
+members don't appear in an outsider's catalog or `a2a/check`. An outsider in
+an agent VM can't read a member project's files, and minting a member is
+always a human's call.
+
+It doesn't hide that a namespace exists (anyone who can list namespaces sees
+the name), and it can't stop a change that reaches the cluster some other way:
+Flux applying a merged gitops PR, or credentials held outside the broker.
+
+**Overlays** keep a zone's policy out of the repo the policy file lives in:
+`POLICY_OVERLAYS` (the NixOS module's `policyOverlays`, from sops) lists more
+YAML merged over the file. Mappings merge key by key, and lists put the
+overlay's items first, so its rules are matched first. A missing overlay stops
+the broker from starting.
+
+**The audit feed** (`GET /v1/audit/events?since=`) is the broker's record for
+the agents under `audit.readers`: requests as they change, grants issued and
+ended, host commands, a2a threads opened and closed (never the messages),
+new agents, containments, and refused keys and credentials. It is a 404 to
+everyone else.
+
 ### What an agent is
 
 Rules say which agents they are about by what the broker has on record for
