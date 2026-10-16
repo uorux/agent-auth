@@ -300,3 +300,29 @@ def test_hostexec_result_field():
     assert hx_views.output_file(job) is not None
     refused = HostJob(id="j" * 36, host="excelsior", tier="root", status="refused", error="not_armed", spec={})
     assert "refused by excelsior" in hx_views.result_field(refused) and hx_views.output_file(refused) is None
+
+
+async def test_what_needs_no_one_goes_to_the_activity_channel():
+    from types import SimpleNamespace
+
+    from agent_auth.discord_bot.bot import DiscordNotifier
+
+    sent: dict[int, list] = {}
+
+    class Channel:
+        def __init__(self, cid):
+            self.cid = cid
+
+        async def send(self, *a, **k):
+            sent.setdefault(self.cid, []).append(k.get("embed") or a)
+
+    async def ready():
+        return None
+
+    bot = SimpleNamespace(get_channel=lambda cid: Channel(cid), wait_until_ready=ready)
+    settings = SimpleNamespace(discord_channel_id=1, discord_activity_channel_id=2)
+    notifier = DiscordNotifier.__new__(DiscordNotifier)
+    notifier.bot, notifier.settings = bot, settings
+    assert (await notifier._activity_channel()).cid == 2
+    settings.discord_activity_channel_id = 0
+    assert (await notifier._activity_channel()).cid == 1

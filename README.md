@@ -45,6 +45,7 @@ ADMIN_TOKEN=$(openssl rand -hex 24)
 ENCRYPTION_KEY=$(uv run agent-auth admin gen-key)
 DISCORD_TOKEN=...            # bot token; needs no privileged intents
 DISCORD_CHANNEL_ID=...       # channel for approval requests
+#DISCORD_ACTIVITY_CHANNEL_ID=...  # what needs no one (auto-decisions, rule-run results); default: the one above
 DISCORD_OWNER_ID=...         # your discord user id (gets pinged, may click buttons)
 OPENROUTER_API_KEY=...       # optional; without it, 'llm' rules escalate to human
 EOF

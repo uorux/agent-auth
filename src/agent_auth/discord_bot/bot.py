@@ -231,9 +231,7 @@ class DiscordNotifier:
             message = await self._message(request)
             if message is None:
                 # Decided by a rule: there is no approval message to edit.
-                channel = self.bot.get_channel(
-                    self.settings.discord_channel_id
-                ) or await self.bot.fetch_channel(self.settings.discord_channel_id)
+                channel = await self._activity_channel()
                 await channel.send(
                     f"🖥️ `{job.host}` ({job.tier}) for request `{request.id[:8]}`: {hx_views.result_field(job)}"[:2000],
                     files=files,
@@ -287,9 +285,7 @@ class DiscordNotifier:
     ) -> None:
         try:
             await self.bot.wait_until_ready()
-            channel = self.bot.get_channel(
-                self.settings.discord_channel_id
-            ) or await self.bot.fetch_channel(self.settings.discord_channel_id)
+            channel = await self._activity_channel()
             await channel.send(embed=embeds.build_rule_applied_embed(request, agent, rule, grant))
         except Exception:
             log.exception("failed to log rule application for request %s", request.id)
@@ -303,6 +299,11 @@ class DiscordNotifier:
             await message.edit(embed=embeds.apply_grant_ended(embed, grant))
         except Exception:
             log.exception("failed to mark grant ended for request %s", request.id)
+
+    async def _activity_channel(self):
+        """What needs no one: the activity channel, else the approvals one."""
+        channel_id = self.settings.discord_activity_channel_id or self.settings.discord_channel_id
+        return self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
 
     async def _message(self, request: AccessRequest) -> discord.Message | None:
         if not request.discord_message_id or not request.discord_channel_id:

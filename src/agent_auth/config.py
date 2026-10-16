@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     # Where shell requests (hostexec "shell") are posted, if not the approvals
     # channel: somewhere that notifies loudly. 0 = the approvals channel.
     discord_loud_channel_id: int = 0
+    # Where what needs no one goes, if not the approvals channel: requests
+    # a rule or the LLM reviewer decided (notify.auto_approvals), and the
+    # results of commands nobody approved by hand. 0 = the approvals channel.
+    discord_activity_channel_id: int = 0
 
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
