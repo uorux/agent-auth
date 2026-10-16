@@ -17,6 +17,7 @@ platforms.models.models (empty: every model the gateway has).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -156,19 +157,24 @@ class ModelsProvisioner:
             ),
         )
 
-    async def usage(self) -> list[dict[str, Any]]:
-        """Spend per agent: the gateway's users, as many pages as there are."""
-        users: list[dict[str, Any]] = []
-        for page in range(1, 51):
-            resp = await self._call("GET", "/user/list", params={"page": page, "page_size": 100})
+    async def usage(self, names: list[str]) -> list[dict[str, Any]]:
+        """Spend per agent: each agent's gateway user, by name. (/user/info,
+        not /user/list: the gateway's ingress admits only the endpoints the
+        broker needs, and listing every user isn't one.)"""
+        sem = asyncio.Semaphore(8)
+
+        async def one(name: str) -> dict[str, Any] | None:
+            async with sem:
+                resp = await self._call("GET", "/user/info", params={"user_id": name})
+            if resp.status_code in (400, 404):  # no such user (LiteLLM answers either)
+                return None
             if resp.status_code != 200:
                 raise ProvisionerError(f"model gateway: {resp.status_code} {resp.text[:200]}")
-            data = resp.json()
-            batch = data.get("users") if isinstance(data, dict) else data
-            users.extend(batch or [])
-            if not batch or (isinstance(data, dict) and page >= int(data.get("total_pages") or 1)):
-                break
-        return users
+            info = resp.json().get("user_info") or {}
+            return info if info.get("user_id") == name else None
+
+        found = await asyncio.gather(*(one(n) for n in names))
+        return [u for u in found if u]
 
 
 def _fields(agent: Agent) -> dict[str, Any]:

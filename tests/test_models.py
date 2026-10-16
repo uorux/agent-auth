@@ -98,15 +98,12 @@ class Gateway:
             self.deleted.extend(json.loads(request.content)["keys"])
             return httpx.Response(200, json={})
 
-        def user_list(request):
-            auth(request)
-            return httpx.Response(200, json={"users": list(self.users.values()), "total_pages": 1})
-
         respx.get(f"{GW}/user/info").mock(side_effect=user_info)
         respx.post(f"{GW}/user/new").mock(side_effect=user_new)
         respx.post(f"{GW}/key/generate").mock(side_effect=key_generate)
         respx.post(f"{GW}/key/delete").mock(side_effect=key_delete)
-        respx.get(f"{GW}/user/list").mock(side_effect=user_list)
+        # Not in the gateway's ingress allowlist: the broker must never call it.
+        respx.get(f"{GW}/user/list").mock(return_value=httpx.Response(404))
         return self
 
 
@@ -177,7 +174,7 @@ async def test_the_catalog_names_the_gateway_and_usage_is_per_agent(db, stack):
     agent, key = await make_agent(db, "claude-a-galaxy-sandbox", project="a", host="galaxy", placement="sandbox")
     await stack["service"].create_request(agent.id, use())
     gw.users["claude-a-galaxy-sandbox"]["spend"] = 3.5
-    gw.users["jrt"] = {"user_id": "jrt", "spend": 99.0}  # not an agent: not shown
+    gw.users["jrt"] = {"user_id": "jrt", "spend": 99.0}  # not an agent: never asked for
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=stack["app"]), base_url="http://t") as api:
         catalog = (await api.get("/v1/catalog", headers={"Authorization": f"Bearer {key}"})).json()
         models = next(p for p in catalog["platforms"] if p["platform"] == "models")

@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 
 from .. import authority as authority_mod
 from ..core.states import Platform
-from ..models import A2AMessage, A2AThread, AccessRequest, Agent, HostJob, utcnow
+from ..models import A2AMessage, A2AThread, AccessRequest, Agent, Grant, HostJob, utcnow
 from .deps import require_admin
 
 router = APIRouter(prefix="/admin", dependencies=[Depends(require_admin)])
@@ -290,12 +290,16 @@ async def models_usage(request: Request):
     if not registry.enabled(Platform.MODELS):
         return {"enabled": False, "agents": []}
     gateway = registry.get(Platform.MODELS)
-    try:
-        users = await gateway.usage()
-    except ProvisionerError as exc:
-        return {"enabled": True, "gateway": gateway.config.url, "error": str(exc), "agents": []}
     async with request.app.state.db.session() as session:
         agents = {a.name: a for a in (await session.execute(select(Agent))).scalars()}
+        # The agents that have ever held a gateway key: those have a user there.
+        holders = set(
+            (await session.execute(select(Grant.agent_id).where(Grant.platform == Platform.MODELS).distinct())).scalars()
+        )
+    try:
+        users = await gateway.usage(sorted(a.name for a in agents.values() if a.id in holders))
+    except ProvisionerError as exc:
+        return {"enabled": True, "gateway": gateway.config.url, "error": str(exc), "agents": []}
     rows = []
     for u in users:
         name = u.get("user_id")
