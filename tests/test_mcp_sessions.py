@@ -241,3 +241,39 @@ def test_a_minted_session_is_kept_in_use_while_the_agent_is_quiet(monkeypatch):
         assert me.calls[-1].request.headers["X-Agent-Session"] == "sess-2"
         m._client().session_id = ""  # stop the thread before the mock goes away
         time.sleep(0.05)
+
+
+async def test_a_waiting_tool_does_not_hold_up_the_others():
+    """One call waiting on the broker (a host job, a decision) leaves the
+    connection free: FastMCP runs synchronous tools on its event loop, so
+    each runs in a worker thread instead."""
+    import threading
+
+    import anyio
+    import httpx
+
+    release = threading.Event()
+
+    def slow_job(request):
+        release.wait(5)
+        return httpx.Response(200, json={"job_id": "j1", "status": "done"})
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BROKER}/v1/hostexec/jobs/j1").mock(side_effect=slow_job)
+        mock.get(f"{BROKER}/v1/me").respond(200, json={"name": "claude-x-host", "kind": "ephemeral"})
+        done: dict[str, str] = {}
+
+        async def call(name, args):
+            content = await m.mcp.call_tool(name, args)
+            blocks = content[0] if isinstance(content, tuple) else content
+            done[name] = blocks[0].text
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(call, "host_job", {"job_id": "j1", "wait_secs": 5})
+            await anyio.sleep(0.2)  # the job's call is in flight
+            with anyio.fail_after(2):
+                await call("whoami", {})
+            assert "host_job" not in done
+            release.set()
+    assert json.loads(done["whoami"])["name"] == "claude-x-host"
+    assert json.loads(done["host_job"])["status"] == "done"

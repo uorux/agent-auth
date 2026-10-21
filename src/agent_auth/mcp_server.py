@@ -7,12 +7,14 @@ Configure per-agent:
 from __future__ import annotations
 
 import contextvars
+import functools
 import json
 import os
 import threading
 from pathlib import Path
 from typing import Any
 
+import anyio
 from mcp.server.fastmcp import FastMCP
 
 from .client import BrokerClient, BrokerError
@@ -103,6 +105,23 @@ Trust and credentials:
 
 mcp = FastMCP("agent-auth", instructions=INSTRUCTIONS)
 
+
+def _tool(fn):
+    """Serve fn as a tool, run in a worker thread with the caller's context.
+    The tools block on HTTP, some for minutes (a decision, a reply, a host
+    job), and FastMCP runs a synchronous tool on its event loop: one waiting
+    call held up every other call on the connection, a2a and host commands
+    alike. Returns fn itself, which remote_mcp serves the same way."""
+
+    @functools.wraps(fn)
+    async def run(**kwargs):
+        ctx = contextvars.copy_context()
+        return await anyio.to_thread.run_sync(lambda: ctx.run(fn, **kwargs))
+
+    mcp.add_tool(run, name=fn.__name__, description=fn.__doc__ or "")
+    return fn
+
+
 # One client per MCP server process so the a2a session (minted lazily below)
 # sticks for the life of this agent instance — exactly the intended lifetime
 # of an ephemeral agent's session.
@@ -137,14 +156,20 @@ class RemoteCaller:
         return BrokerClient(self.url, self.token)
 
 
+# Tools run concurrently (_tool): the process-wide client and the session it
+# mints are made once, under this, not once per call that got there first.
+_STATE_LOCK = threading.RLock()
+
+
 def _client() -> BrokerClient:
     global _CLIENT
     remote = _REMOTE.get()
     if remote is not None:
         return remote.client()
-    if _CLIENT is None:
-        _CLIENT = BrokerClient()
-    return _CLIENT
+    with _STATE_LOCK:
+        if _CLIENT is None:
+            _CLIENT = BrokerClient()
+        return _CLIENT
 
 
 def _session_client() -> BrokerClient:
@@ -162,17 +187,20 @@ def _session_client() -> BrokerClient:
     client = _client()
     if client.session_id:
         return client
-    if _KIND is None:
-        _KIND = client.me().get("kind", "service")
-    if _KIND == "ephemeral":
-        label = os.path.basename(os.getcwd()) or "session"
-        label = "".join(c for c in label if c.isalnum() or c in "._-")[:64] or "session"
-        client.create_session(label)
-        _MINTED = True
-        threading.Thread(
-            target=_keep_alive, args=(client, client.session_id), name="session-keepalive", daemon=True
-        ).start()
-    return client
+    with _STATE_LOCK:
+        if client.session_id:
+            return client
+        if _KIND is None:
+            _KIND = client.me().get("kind", "service")
+        if _KIND == "ephemeral":
+            label = os.path.basename(os.getcwd()) or "session"
+            label = "".join(c for c in label if c.isalnum() or c in "._-")[:64] or "session"
+            client.create_session(label)
+            _MINTED = True
+            threading.Thread(
+                target=_keep_alive, args=(client, client.session_id), name="session-keepalive", daemon=True
+            ).start()
+        return client
 
 
 def _keep_alive(client: BrokerClient, session_id: str) -> None:
@@ -240,7 +268,7 @@ def _safe(fn) -> str:
         return json.dumps({"error": exc.detail, "status_code": exc.status_code})
 
 
-@mcp.tool()
+@_tool
 def whoami() -> str:
     """Your agent identity: name, kind ("ephemeral" = a CLI agent like Claude
     Code or Codex, which can open a2a threads but not receive them; "service" =
@@ -249,7 +277,7 @@ def whoami() -> str:
     return _safe(lambda: _client().me())
 
 
-@mcp.tool()
+@_tool
 def list_capabilities() -> str:
     """List what you can request from this broker before composing a request.
 
@@ -272,7 +300,7 @@ def list_capabilities() -> str:
     return _safe(lambda: _client().catalog())
 
 
-@mcp.tool()
+@_tool
 def request_access(
     platform: str,
     capability: str,
@@ -349,7 +377,7 @@ def request_access(
     )
 
 
-@mcp.tool()
+@_tool
 def wait_for_decision(request_id: str, timeout_secs: float = 120) -> str:
     """Block until the request is decided (or timeout). Read `status` and `guidance`:
     - granted: access is live; get_credential(grant_id) if it carries a credential
@@ -364,33 +392,33 @@ def wait_for_decision(request_id: str, timeout_secs: float = 120) -> str:
     return _safe(lambda: _client().wait(request_id, timeout_secs))
 
 
-@mcp.tool()
+@_tool
 def check_status(request_id: str) -> str:
     """Get a request's current status without blocking."""
     return _safe(lambda: _client().get_request(request_id))
 
 
-@mcp.tool()
+@_tool
 def retry_request(request_id: str, justification: str) -> str:
     """After an LLM denial, retry with a REVISED justification that addresses the
     denial reasoning. Limited attempts; when exhausted, use escalate_request."""
     return _safe(lambda: _client().retry(request_id, justification))
 
 
-@mcp.tool()
+@_tool
 def escalate_request(request_id: str) -> str:
     """Escalate an LLM-denied request to human review on Discord."""
     return _safe(lambda: _client().escalate(request_id))
 
 
-@mcp.tool()
+@_tool
 def list_grants(status: str = "active") -> str:
     """List your grants (status: active|expired|revoked|all). Check here before
     requesting access you might already have."""
     return _safe(lambda: _client().grants(status))
 
 
-@mcp.tool()
+@_tool
 def get_credential(grant_id: str, to_file: bool = False) -> str:
     """Fetch the live credential for an active grant, by `kind`:
     - github_installation_token (github "repo"): a token for git/the API, valid
@@ -453,7 +481,7 @@ def _to_file(grant_id: str, out: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-@mcp.tool()
+@_tool
 def create_session(label: str = "session") -> str:
     """Mint one session at the start of THIS conversation and pass the returned
     session_id as `session_key` on every subsequent a2a_* / request_access call,
@@ -465,7 +493,7 @@ def create_session(label: str = "session") -> str:
     return _safe(lambda: BrokerClient().create_session(label))
 
 
-@mcp.tool()
+@_tool
 def close_session(session_key: str) -> str:
     """Close this conversation's session when its work is done: threads it
     owns end peer_gone for their peers and delegated grants get revoked."""
@@ -478,7 +506,7 @@ def close_session(session_key: str) -> str:
     return _safe(go)
 
 
-@mcp.tool()
+@_tool
 def check_a2a(
     peer: str,
     direction: str = "out",
@@ -499,7 +527,7 @@ def check_a2a(
     return _safe(lambda: _client_for(session_key).a2a_check(peer, direction, topic))
 
 
-@mcp.tool()
+@_tool
 def a2a_open(
     to: str,
     payload: dict[str, Any],
@@ -527,7 +555,7 @@ def a2a_open(
     return _safe(lambda: _client_for(session_key).a2a_open(to, payload, topic))
 
 
-@mcp.tool()
+@_tool
 def a2a_send(
     thread_id: str, payload: dict[str, Any], session_key: str | None = None
 ) -> str:
@@ -546,7 +574,7 @@ def a2a_send(
     return _safe(lambda: _client_for(session_key).a2a_send(thread_id, payload))
 
 
-@mcp.tool()
+@_tool
 def a2a_poll(
     thread_id: str,
     after_seq: int = 0,
@@ -561,7 +589,7 @@ def a2a_poll(
     return _safe(lambda: _client_for(session_key).a2a_poll(thread_id, after_seq, wait))
 
 
-@mcp.tool()
+@_tool
 def a2a_threads(state: str | None = None, session_key: str | None = None) -> str:
     """List your threads (state: pending_open|open|closed), most recently
     active first, with peer liveness (peer_alive/peer_last_seen_at). With a
@@ -569,7 +597,7 @@ def a2a_threads(state: str | None = None, session_key: str | None = None) -> str
     return _safe(lambda: _client_for(session_key).a2a_threads(state))
 
 
-@mcp.tool()
+@_tool
 def a2a_accept(thread_id: str, session_key: str | None = None) -> str:
     """Accept a pending_open thread another agent opened to you (service
     agents; sending a reply accepts implicitly too). Pass your conversation's
@@ -580,7 +608,7 @@ def a2a_accept(thread_id: str, session_key: str | None = None) -> str:
     return _safe(lambda: _client_for(session_key).a2a_accept(thread_id))
 
 
-@mcp.tool()
+@_tool
 def a2a_reject(
     thread_id: str, reason: str | None = None, session_key: str | None = None
 ) -> str:
@@ -588,7 +616,7 @@ def a2a_reject(
     return _safe(lambda: _client_for(session_key).a2a_reject(thread_id, reason))
 
 
-@mcp.tool()
+@_tool
 def a2a_close(
     thread_id: str, reason: str | None = None, session_key: str | None = None
 ) -> str:
@@ -599,7 +627,7 @@ def a2a_close(
     return _safe(lambda: _client_for(session_key).a2a_close(thread_id, reason))
 
 
-@mcp.tool()
+@_tool
 def a2a_events(
     wait: float = 60, after: str | None = None, session_key: str | None = None
 ) -> str:
@@ -615,7 +643,7 @@ def a2a_events(
     return _safe(lambda: _client_for(session_key).a2a_events(wait, after))
 
 
-@mcp.tool()
+@_tool
 def wiki_search(query: str, limit: int = 8) -> str:
     """Search the agents' shared wiki: pages containing every word of
     `query` (case-insensitive, in the text, title or path), best first, each
@@ -624,7 +652,7 @@ def wiki_search(query: str, limit: int = 8) -> str:
     return _safe(lambda: _client().wiki_search(query, limit))
 
 
-@mcp.tool()
+@_tool
 def wiki_read(path: str) -> str:
     """One wiki page: its markdown `content`, the `project` it belongs to
     (null = a shared page), who last changed it and when, and its `sha`
@@ -633,7 +661,7 @@ def wiki_read(path: str) -> str:
     return _safe(lambda: _client().wiki_read(path))
 
 
-@mcp.tool()
+@_tool
 def wiki_list(prefix: str = "") -> str:
     """The wiki's pages (path, title, size), optionally under a path prefix
     such as "projects/homelab/", and `you_may_write`: where you may write.
@@ -642,7 +670,7 @@ def wiki_list(prefix: str = "") -> str:
     return _safe(lambda: _client().wiki_list(prefix))
 
 
-@mcp.tool()
+@_tool
 def wiki_write(path: str, content: str, summary: str, base_sha: str | None = None) -> str:
     """Create or replace a wiki page with `content` (markdown, the whole
     page). path ends in .md, e.g. "projects/<your project>/deploy.md"; you
@@ -660,14 +688,14 @@ def wiki_write(path: str, content: str, summary: str, base_sha: str | None = Non
     return _safe(lambda: _client().wiki_write(path, content, summary, base_sha))
 
 
-@mcp.tool()
+@_tool
 def wiki_delete(path: str, summary: str, base_sha: str | None = None) -> str:
     """Remove a wiki page you may write (wrong, or replaced by another).
     Pass the sha from wiki_read as base_sha and say why in summary."""
     return _safe(lambda: _client().wiki_delete(path, summary, base_sha))
 
 
-@mcp.tool()
+@_tool
 def notify_operator(message: str, urgency: str = "normal") -> str:
     """Get your operator's attention when you are blocked on them or have
     something they asked to be told: a message on Discord and, if they are at
@@ -679,7 +707,7 @@ def notify_operator(message: str, urgency: str = "normal") -> str:
     return _safe(lambda: _client().attention(message, urgency))
 
 
-@mcp.tool()
+@_tool
 def host_run(
     host: str,
     argv: list[str],
@@ -736,7 +764,7 @@ def host_run(
     return _safe(go)
 
 
-@mcp.tool()
+@_tool
 def host_job(job_id: str, wait_secs: float = 60) -> str:
     """Status and result of a host command (the `job` of host_run, or of
     host_shell_exec): status starting|running|done|refused|lost, exit_code,
@@ -745,7 +773,7 @@ def host_job(job_id: str, wait_secs: float = 60) -> str:
     return _safe(lambda: _client().host_job(job_id, wait_secs))
 
 
-@mcp.tool()
+@_tool
 def host_shell_exec(
     grant_id: str,
     argv: list[str],
@@ -766,7 +794,7 @@ def host_shell_exec(
     )
 
 
-@mcp.tool()
+@_tool
 def host_shell_close(grant_id: str) -> str:
     """End a shell as soon as you are done with it."""
     return _safe(lambda: _client().host_shell_close(grant_id))
