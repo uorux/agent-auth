@@ -62,6 +62,8 @@ async def test_a_rule_about_the_agents_own_project(db):
     mine, _ = await make_agent(db, "a", runtime="claude", project="agent-auth")
     theirs, _ = await make_agent(db, "b", runtime="claude", project="larder")
     none, _ = await make_agent(db, "c", runtime="claude")
+    # A project no `projects:` entry declares, as an orchestrator may mint.
+    stray, _ = await make_agent(db, "d", runtime="claude", project="flux-system")
 
     async def gh(agent, repo):
         return await _decide(db, policy, agent, _request(agent, Platform.GITHUB, repo))
@@ -75,6 +77,7 @@ async def test_a_rule_about_the_agents_own_project(db):
     for agent, namespace, expected in [
         (mine, "agent-auth", PolicyAction.APPROVE), (mine, "larder", PolicyAction.SURFACE),
         (none, "", PolicyAction.SURFACE), (none, "None", PolicyAction.SURFACE),
+        (stray, "flux-system", PolicyAction.SURFACE),
     ]:
         request = _request(agent, Platform.KUBERNETES, namespace, "view")
         assert await _decide(db, policy, agent, request) == expected
@@ -82,9 +85,9 @@ async def test_a_rule_about_the_agents_own_project(db):
 
 def test_a_field_value_is_literal_inside_the_glob():
     class A:
-        runtime, project, host, placement, name = "claude", "a*b", "h", "host", "n"
+        runtime, project, host, placement, name = "claude", "p", "a*b", "host", "n"
 
-    assert resources_for("org/{agent.project}-*", A, {}) == ["org/a[*]b-*"]
+    assert resources_for("org/{agent.host}-*", A, {}) == ["org/a[*]b-*"]
     assert resources_for("plain/*", A, {}) == ["plain/*"]
 
 

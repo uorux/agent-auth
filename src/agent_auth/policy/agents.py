@@ -111,7 +111,11 @@ def check_resource(resource: str) -> None:
 def resources_for(resource: str, agent: Any, projects: dict[str, Project]) -> list[str]:
     """The rule's resource globs with the agent's own fields filled in. A
     placeholder the agent has no value for leaves nothing to match: a rule
-    about "your project's repo" says nothing to an agent without a project."""
+    about "your project's repo" says nothing to an agent without a project.
+    Nor does one about "your project" to an agent whose project isn't
+    declared in `projects:` — an agent VM's orchestrator names the project of
+    each agent it mints, so an undeclared name (say, flux-system) must not
+    stand for the namespace of the same name."""
     names = set(PLACEHOLDER_RE.findall(resource))
     if not names:
         return [resource]
@@ -120,6 +124,9 @@ def resources_for(resource: str, agent: Any, projects: dict[str, Project]) -> li
         if name == "repos":
             project = projects.get(getattr(agent, "project", None) or "")
             values = list(project.repos) if project else []
+        elif name == "project":
+            value = getattr(agent, "project", None)
+            values = [value] if value and value in projects else []
         else:
             value = getattr(agent, name, None)
             values = [value] if value else []

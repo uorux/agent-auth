@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import enum
 import re
+from fnmatch import fnmatchcase as fnmatch
 from pathlib import Path
 from typing import Any
 
@@ -150,6 +151,19 @@ class KubernetesPlatformConfig(BaseModel):
     # Roles always surfaced to a human, even when a rule would auto-approve or
     # LLM-review them (a human's own scope-pinned auto-approve rule still holds).
     sensitive_roles: list[str] = Field(default_factory=lambda: ["edit", "admin"])
+    # Namespaces (globs) where every grant reaches a human, whatever the role
+    # or rule: a role that can patch a workload or start a Job there runs as
+    # that namespace's ServiceAccounts — in these, the cluster's own
+    # controllers. Add the namespace holding the broker's own credential.
+    # cluster_grant_namespace is always one (its SAs back cluster-wide grants).
+    sensitive_namespaces: list[str] = Field(
+        default_factory=lambda: ["kube-system", "kube-public", "kube-node-lease", "flux-system"]
+    )
+
+    def namespace_is_sensitive(self, namespace: str) -> bool:
+        return namespace == self.cluster_grant_namespace or any(
+            fnmatch(namespace, p) for p in self.sensitive_namespaces
+        )
 
 
 class AgentsPlatformConfig(BaseModel):

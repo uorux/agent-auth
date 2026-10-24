@@ -197,7 +197,7 @@ class PolicyEngine:
         """An authority that must always reach a human (unless a human's own
         authority-pinned rule already approved this exact privilege)."""
         return authority_mod.is_sensitive(
-            request.platform, request.authority, self.policy.platforms
+            request.platform, request.authority, self.policy.platforms, request.resource
         )
 
     def needs_explicit_rule(self, request: AccessRequest) -> bool:
