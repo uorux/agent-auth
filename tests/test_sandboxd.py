@@ -636,6 +636,29 @@ async def test_a_contained_agent_is_frozen_and_held_until_released(db, live, sbx
     assert await wait_for(lambda: any(e.get("turn") == "while held" for e in read_log(fake_log)))
 
 
+async def test_a_conversation_held_while_it_starts_is_frozen_and_sent_nothing(db, live, sbx, fake_log, stack):
+    """contain() freezes the runs it finds; one still starting had none yet."""
+    daemon, host = sbx
+    conv = await daemon.new_conversation("orchestrator-excelsior-sandbox", created_by="test")
+    start = daemon._ensure_running
+
+    async def held_meanwhile(conv, lv):
+        run = await start(conv, lv)
+        # contain() ran while the runtime was starting (a codex connect can
+        # take 30s), and found no run to freeze.
+        daemon.state.set("contained", [conv.agent])
+        return run
+
+    daemon._ensure_running = held_meanwhile
+    await daemon.deliver(conv.id, "first")
+    assert (daemon._unit(conv.id), True) in host.frozen
+    assert daemon.state.peek(conv.id) == ["first"]
+    with pytest.raises(RuntimeError, match="contained"):
+        await daemon.attach(conv.id)
+    rec = daemon.state.agent(conv.agent)
+    assert await daemon.triage(rec, {"thread_id": "t", "peer": "x"}, "hi") is None
+
+
 def test_codex_socket_behind_its_symlink(tmp_path):
     """codex leaves a symlink to /tmp/codex-daemon-<uid>/<hash> at the socket
     path: /tmp is the unit's, so outside it the target is under its tmp dir."""

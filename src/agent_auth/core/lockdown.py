@@ -8,9 +8,13 @@ it matches:
   stop being issued, Kubernetes service accounts are deleted, LDAP groups
   dropped, and their model-gateway keys deleted, so an agent whose model
   calls go through the gateway cannot think another step;
-- are refused every new request (RequestService.create_request) and every
-  credential fetch;
-- have their a2a conversations closed.
+- have their pending requests denied, and are refused every new request,
+  retry and escalation, and every credential fetch; nothing is provisioned
+  for them whatever approves it (RequestService._begin_provision), and a
+  grant that was being provisioned as they were contained is revoked;
+- have their a2a conversations closed, and can't open, accept or write in
+  one, nor be opened to (core/a2a.py);
+- can't write or delete wiki pages.
 
 The hosts and agent VMs (hostexec's lockdown: disarm, kill jobs, freeze
 VMs) are the other half; hostexec records an entry here for what it locks,
@@ -156,6 +160,7 @@ class ContainmentService:
                 if ids
                 else []
             )
+        denied = await self.service.deny_pending(ids, f"contained: {reason[:120]}", by)
         revoked = 0
         for grant_id in grant_ids:
             try:
@@ -174,6 +179,7 @@ class ContainmentService:
             **entry,
             "agents": [a.name for a in held],
             "grants_revoked": revoked,
+            "requests_denied": denied,
             "threads_closed": closed,
             "daemons": daemons,
         }

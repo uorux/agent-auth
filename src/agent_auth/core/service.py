@@ -120,6 +120,10 @@ class TransitionError(Exception):
     """Illegal or lost-race state transition."""
 
 
+def _held_text(entry: dict[str, Any]) -> str:
+    return f"contained ({entry['id']}): {entry.get('reason') or 'by the operator'}"
+
+
 @dataclass
 class HumanDecision:
     approve: bool
@@ -190,7 +194,7 @@ class RequestService:
             if held is not None:
                 request.status = RequestStatus.DENIED
                 request.decision_source = DecisionSource.POLICY
-                request.decision_reason = f"contained ({held['id']}): {held.get('reason') or 'by the operator'}"
+                request.decision_reason = _held_text(held)
                 request.decided_at = utcnow()
                 session.add(request)
                 await session.flush()
@@ -543,6 +547,7 @@ class RequestService:
             if request.status != RequestStatus.LLM_DENIED:
                 raise TransitionError(f"cannot retry from status {request.status.value}")
             agent = await session.get(Agent, request.agent_id)
+            await self._refuse_if_held(session, agent)
             decision = await self.engine.evaluate(session, agent, request)
             retry_budget = (
                 decision.retry_budget
@@ -564,6 +569,7 @@ class RequestService:
             request = await self._own_request(session, request_id, agent_id)
             if request.status != RequestStatus.LLM_DENIED:
                 raise TransitionError(f"cannot escalate from status {request.status.value}")
+            await self._refuse_if_held(session, await session.get(Agent, request.agent_id))
             if not await self._guarded_transition(session, request, RequestStatus.AWAITING_HUMAN):
                 raise TransitionError("request was decided concurrently")
             request.risk_notes = [
@@ -832,6 +838,14 @@ class RequestService:
         if not await self._guarded_transition(session, request, RequestStatus.PROVISIONING):
             raise TransitionError("request changed state concurrently")
 
+        # Containment: whatever cleared it (a rule, the LLM, a window, a
+        # human who wasn't told), nothing is provisioned for a held agent.
+        held = await lockdown_mod.holding(session, await session.get(Agent, request.agent_id))
+        if held is not None:
+            await self._guarded_transition(session, request, RequestStatus.PROVISION_FAILED)
+            request.decision_reason = (request.decision_reason or "") + f" | provisioning failed: {_held_text(held)}"
+            return None
+
         expires_at = utcnow() + timedelta(seconds=request.approved_duration_secs)
         if request.delegation_thread_id is not None:
             # Approval may land long after the request: the thread (and its
@@ -883,6 +897,13 @@ class RequestService:
                 return
             request = await session.get(AccessRequest, grant.request_id)
             assert request is not None
+            held = await lockdown_mod.holding(session, await session.get(Agent, grant.agent_id))
+            if held is not None:
+                grant.status = GrantStatus.PROVISION_FAILED
+                grant.revoke_reason = _held_text(held)
+                await self._guarded_transition(session, request, RequestStatus.PROVISION_FAILED)
+                request.decision_reason = (request.decision_reason or "") + f" | provisioning failed: {_held_text(held)}"
+                return
             provisioner = self.registry.get(grant.platform)
             try:
                 grant.provisioner_state = await provisioner.provision(session, grant)
@@ -899,6 +920,16 @@ class RequestService:
                 return
             grant.status = GrantStatus.ACTIVE
             await self._guarded_transition(session, request, RequestStatus.GRANTED)
+        # A containment recorded while the provisioner ran found no ACTIVE
+        # grant to revoke: this one is revoked here instead.
+        async with self.db.session() as session:
+            grant = await session.get(Grant, grant_id)
+            held = await lockdown_mod.holding(session, await session.get(Agent, grant.agent_id))
+        if held is not None:
+            try:
+                await self.revoke_grant(grant_id, _held_text(held), "containment")
+            except TransitionError:
+                pass  # revoked meanwhile (by contain() itself)
 
     async def reap_stale_provisioning(self, max_age_secs: float) -> int:
         """Scheduler pass: grants left in PROVISIONING had their provisioner
@@ -945,6 +976,42 @@ class RequestService:
                 # Stays PROVISIONING (never issuable); retried next tick.
                 log.exception("failed to reap stale provisioning grant %s; will retry", grant_id)
         return reaped
+
+    async def _refuse_if_held(self, session: AsyncSession, agent: Agent | None) -> None:
+        held = await lockdown_mod.holding(session, agent) if agent is not None else None
+        if held is not None:
+            raise TransitionError(_held_text(held))
+
+    async def deny_pending(self, agent_ids: list[str], reason: str, by: str) -> int:
+        """Containment: deny every request of these agents still waiting on
+        a rule, the LLM or a human. Returns how many."""
+        if not agent_ids:
+            return 0
+        async with self.db.session() as session:
+            ids = (
+                (
+                    await session.execute(
+                        select(AccessRequest.id).where(
+                            AccessRequest.agent_id.in_(agent_ids),
+                            AccessRequest.status.in_(
+                                [
+                                    RequestStatus.AWAITING_HUMAN,
+                                    RequestStatus.LLM_EVALUATING,
+                                    RequestStatus.LLM_DENIED,
+                                ]
+                            ),
+                        )
+                    )
+                ).scalars().all()
+            )
+        denied = 0
+        for request_id in ids:
+            try:
+                await self.decide(request_id, HumanDecision(approve=False, decided_by=by, reason=reason))
+                denied += 1
+            except TransitionError:
+                pass  # decided meanwhile; _begin_provision refuses it anyway
+        return denied
 
     async def _reload_request(self, request_id: str) -> AccessRequest:
         async with self.db.session() as session:

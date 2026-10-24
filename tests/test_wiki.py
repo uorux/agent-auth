@@ -316,3 +316,15 @@ async def test_an_empty_repo_is_an_empty_wiki(registry):
     )
     respx.get(f"{GITHUB_API}/repos/{REPO}/git/trees/main").mock(return_value=httpx.Response(409, json={"message": "Git Repository is empty."}))
     assert await backend.snapshot({}) == {}
+
+
+async def test_a_held_agent_reads_but_writes_nothing(app, api, db, wiki, backend):
+    _, key = await make_agent(db, "claude-task-tracker-galaxy", project="task-tracker", runtime="claude")
+    await app.state.containment.record({"project": "task-tracker"}, "odd edits", "jrt")
+    body = {"path": "projects/task-tracker/x.md", "content": "# X\n", "summary": "x"}
+    resp = await api.put("/v1/wiki/page", headers=auth(key), json=body)
+    assert resp.status_code == 403 and "contained" in resp.text
+    resp = await api.post("/v1/wiki/delete", headers=auth(key), json={"path": "shared/services.md", "summary": "x"})
+    assert resp.status_code == 403
+    assert (await api.get("/v1/wiki/page", headers=auth(key), params={"path": "shared/services.md"})).status_code == 200
+    assert backend.commits == []

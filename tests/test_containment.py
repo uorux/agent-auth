@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-from agent_auth.core.states import GrantStatus, RequestStatus
-from agent_auth.models import Grant
-from agent_auth.policy.agents import AgentMatch
+import pytest
 
-from .conftest import make_agent
-from .test_lifecycle import a2a_request
+from agent_auth.core.service import HumanDecision, TransitionError
+from agent_auth.core.states import GrantStatus, Platform, RequestStatus
+from agent_auth.models import AccessRequest, Grant
+from agent_auth.policy.agents import AgentMatch
+from agent_auth.schemas import RequestCreate
+
+from .conftest import make_agent, openrouter_verdicts
+from .test_lifecycle import a2a_request, wait_for_status
 
 ADMIN = {"Authorization": "Bearer admin-secret"}
 
@@ -63,6 +67,71 @@ async def test_a_held_agent_loses_its_grants_and_gets_nothing_new_until_lifted(a
     lifted = await api.post("/admin/containment/lift", headers=ADMIN, json={"id": entry["id"]})
     assert lifted.status_code == 200 and lifted.json()["lifted"][0]["id"] == entry["id"]
     assert (await service.create_request(held.id, a2a_request("peer"))).status == RequestStatus.GRANTED
+
+
+def github_write(repo="jrt/cactus"):
+    return RequestCreate(
+        platform=Platform.GITHUB, capability="repo", resource=repo,
+        scope={"permissions": {"contents": "write"}}, justification="push the fix", requested_duration="2h",
+    )
+
+
+def k8s_edit(namespace="apps-a"):
+    return RequestCreate(
+        platform=Platform.KUBERNETES, capability="edit", resource=namespace,
+        justification="debug the deploy", requested_duration="1h",
+    )
+
+
+async def test_nothing_is_provisioned_for_a_held_agent_whatever_approves_it(app, db, service):
+    """The request was made before the hold: a retry, an escalation or a
+    human's Approve (who may not know) still provisions nothing."""
+    agent, _ = await make_agent(db, "dev-x", project="x")
+    with openrouter_verdicts({"verdict": "deny", "reasoning": "vague"}):
+        denied = await service.create_request(agent.id, github_write())
+        await wait_for_status(db, denied.id, {RequestStatus.LLM_DENIED})
+    waiting = await service.create_request(agent.id, k8s_edit())
+    assert waiting.status == RequestStatus.AWAITING_HUMAN
+
+    # Recorded only, so the pending requests are left for the gates below.
+    entry = await app.state.containment.record({"project": "x"}, "odd pushes", "jrt")
+    with pytest.raises(TransitionError, match=f"contained \\({entry['id']}\\)"):
+        await service.retry(denied.id, agent.id, "but really")
+    with pytest.raises(TransitionError, match="contained"):
+        await service.escalate(denied.id, agent.id)
+    done = await service.decide(waiting.id, HumanDecision(approve=True, decided_by="jrt"))
+    assert done.status == RequestStatus.PROVISION_FAILED and "contained" in done.decision_reason
+    async with db.session() as session:
+        from sqlalchemy import select
+
+        assert (await session.execute(select(Grant).where(Grant.request_id == waiting.id))).first() is None
+
+
+async def test_containing_denies_pending_requests_and_takes_the_agent_out_of_a2a(api, db, service):
+    held, _ = await make_agent(db, "auto-x-galaxy", project="x")
+    peer, peer_key = await make_agent(db, "auto-y-galaxy", project="y")
+    pending = await service.create_request(held.id, k8s_edit())
+    assert pending.status == RequestStatus.AWAITING_HUMAN
+    # Another agent's talk grant to the one about to be held.
+    assert (await service.create_request(peer.id, a2a_request("auto-x-galaxy"))).status == RequestStatus.GRANTED
+
+    out = await api.post("/admin/containment", headers=ADMIN, json={"match": {"project": "x"}, "reason": "odd"})
+    assert out.status_code == 200, out.text
+    assert out.json()["requests_denied"] == 1
+    async with db.session() as session:
+        assert (await session.get(AccessRequest, pending.id)).status == RequestStatus.DENIED
+
+    opened = await api.post(
+        "/v1/a2a/threads", headers={"Authorization": f"Bearer {peer_key}"}, json={"to": "auto-x-galaxy", "payload": {"q": 1}}
+    )
+    assert opened.status_code == 403 and "contained" in opened.text
+
+    await api.post("/admin/containment/lift", headers=ADMIN, json={"id": out.json()["id"]})
+    opened = await api.post(
+        "/v1/a2a/threads", headers={"Authorization": f"Bearer {peer_key}"}, json={"to": "auto-x-galaxy", "payload": {"q": 1}}
+    )
+    # Past the hold; only liveness is left (nothing polls for this test agent).
+    assert opened.status_code == 409 and "not listening" in opened.text, opened.text
 
 
 async def test_an_allowed_agent_may_contain_but_not_everyone_and_not_lift(api, db, service):

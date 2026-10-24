@@ -6,6 +6,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from ..core.lockdown import holding
 from ..core.wiki import WikiError
 from ..models import Agent
 from .deps import get_agent
@@ -25,6 +26,15 @@ async def _answer(call):
         return await call
     except WikiError as exc:
         raise HTTPException(exc.status, exc.detail) from None
+
+
+async def _not_held(request: Request, agent: Agent) -> None:
+    """A contained agent (core/lockdown.py) still reads, but writes nothing
+    every other agent would read."""
+    async with request.app.state.db.session() as db:
+        held = await holding(db, agent)
+    if held is not None:
+        raise HTTPException(403, f"contained ({held['id']}): no wiki writes while you are held")
 
 
 class PageWrite(BaseModel):
@@ -57,9 +67,11 @@ async def search(request: Request, q: str, limit: int = 8, agent: Agent = Depend
 
 @router.put("/page")
 async def write_page(body: PageWrite, request: Request, agent: Agent = Depends(get_agent)):
+    await _not_held(request, agent)
     return await _answer(_wiki(request).write(agent, body.path, body.content, body.summary, body.base_sha))
 
 
 @router.post("/delete")
 async def delete_page(body: PageDelete, request: Request, agent: Agent = Depends(get_agent)):
+    await _not_held(request, agent)
     return await _answer(_wiki(request).delete(agent, body.path, body.summary, body.base_sha))
