@@ -467,6 +467,24 @@ async def test_a_totp_code_is_bound_to_the_request_it_was_typed_for(db, stack, h
     assert host.executor.runs == []
 
 
+async def test_a_totp_code_only_approves_a_job_of_its_own_tier(db, stack, host):
+    """A broker that relays a user code as the authorization of a root
+    command's digest gets nothing: the host checked the code as a user
+    code, so it stands for a user job only."""
+    _, req = await ask(stack, db, run_request(["id"], tier="root"))
+    root_spec = hx.make_spec(kind="run", host=HOST, tier="root", argv=["id"])
+    await stack["hostexec"].call(
+        HOST,
+        {"type": "hostexec.authorize", "job_id": req.id, "tier": "user", "digest": hx.digest(root_spec),
+         "totp": host.code("user-direct")},
+    )
+    with pytest.raises(HostExecError, match="not_armed"):
+        await stack["hostexec"].call(
+            HOST, {"type": "job.start", "job_id": req.id, "spec": root_spec, "evidence": {"source": "human"}}
+        )
+    assert host.executor.runs == []
+
+
 async def test_the_host_decides_about_approvals_no_human_made(db, stack, host):
     # Policy approves this agent's commands; the host isn't armed: refused there.
     agent, req = await ask(stack, db, run_request(["echo", "hi"]), name="trusted-builder")
