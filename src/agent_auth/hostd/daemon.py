@@ -74,6 +74,9 @@ class Authorization:
     digest: str
     expires_at: float
     via: str = "totp"
+    # The tier the code (or the desk) approved: a code only stands for a job
+    # of its own tier, whatever tier the broker later names.
+    tier: str = "user"
 
 
 @dataclass
@@ -351,18 +354,23 @@ class Hostd:
                 raise Refused("that command is denied by this host's policy")
         return spec
 
-    def _authorization(self, job_id: str, digest: str, *, take: bool) -> str | None:
+    def _authorization(self, job_id: str, digest: str, tier: str, *, take: bool) -> str | None:
         """How this host itself approved that exact job ("totp" | "desk"),
-        if it did. `take` spends it."""
+        if it did, for a job of that tier. `take` spends it."""
         authz = self.authorizations.pop(job_id, None) if take else self.authorizations.get(job_id)
-        if authz is not None and authz.expires_at > time.time() and authz.digest == digest:
+        if (
+            authz is not None
+            and authz.expires_at > time.time()
+            and authz.digest == digest
+            and authz.tier == tier
+        ):
             return authz.via
         return None
 
-    def _authorize_job(self, job_id: str, digest: str, via: str) -> None:
+    def _authorize_job(self, job_id: str, digest: str, via: str, tier: str) -> None:
         now = time.time()
         self.authorizations = {k: v for k, v in self.authorizations.items() if v.expires_at > now}
-        self.authorizations[job_id] = Authorization(digest, now + AUTHZ_TTL_SECS, via)
+        self.authorizations[job_id] = Authorization(digest, now + AUTHZ_TTL_SECS, via, tier)
 
     def _admit(self, job_id: str, raw: dict[str, Any], spec: dict[str, Any], evidence: dict[str, Any]) -> str:
         """§8.5, in order. Returns what the job is admitted on; raises Refused."""
@@ -371,7 +379,7 @@ class Hostd:
         tier = spec["tier"]
         # A TOTP code, or Allow at this desk, was given for the request as
         # the broker described it.
-        if via := self._authorization(job_id, hx.digest(raw), take=True):
+        if via := self._authorization(job_id, hx.digest(raw), tier, take=True):
             return via
         if spec["kind"] == "run" and tier == "user" and any(
             match_argv(p, spec["argv"]) for p in self.config.auto_commands
@@ -422,7 +430,7 @@ class Hostd:
             return {"via": "totp"}
         job_id = msg.get("job_id")
         if isinstance(job_id, str) and not self.locked_down:
-            if via := self._authorization(job_id, hx.digest(raw), take=False):
+            if via := self._authorization(job_id, hx.digest(raw), spec["tier"], take=False):
                 return {"via": via}
         # A stand-in id: a precheck consumes no authorization.
         return {"via": self._admit("precheck", raw, spec, evidence)}
@@ -442,7 +450,7 @@ class Hostd:
         except TotpError as exc:
             self._audit("totp.refused", job=job_id, tier=tier, why=str(exc))
             raise
-        self._authorize_job(job_id, digest, "totp")
+        self._authorize_job(job_id, digest, "totp", tier)
         self._audit("totp.accepted", job=job_id, tier=tier, digest=digest)
         return {"authorized": True}
 
@@ -636,7 +644,7 @@ class Hostd:
                 )
             # Nothing but a direct TOTP code for this exact shell opens one:
             # arming, windows and rules never do.
-            if self._authorization(shell_id, hx.digest(spec), take=True) != "totp":
+            if self._authorization(shell_id, hx.digest(spec), tier, take=True) != "totp":
                 raise Refused("a shell is opened with a TOTP code only")
         except Refused as exc:
             self._audit("shell.refused", shell=shell_id, tier=tier, why=str(exc))
@@ -949,7 +957,7 @@ class Hostd:
                     self._user_pid, self._user_uid(), desk.message, self.config.desktop.prompt_timeout_secs
                 )
             if ok:
-                self._authorize_job(desk.job_id, desk.digest, "desk")
+                self._authorize_job(desk.job_id, desk.digest, "desk", desk.tier)
                 authorized = True
                 self._audit("desk.accepted", job=desk.job_id, tier=desk.tier, digest=desk.digest)
             else:

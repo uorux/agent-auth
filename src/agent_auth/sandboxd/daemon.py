@@ -549,6 +549,8 @@ class Sandboxd:
         continues one of the agent's conversations. None (a new conversation)
         on anything short of a clear answer naming a candidate."""
         c = self.config
+        if self.locked or self.contained(rec.name):
+            return None  # no model runs for a held agent, not even this one
         candidates = self._triage_candidates(rec, thread) if c.triage else []
         runtime = self.runtimes.get(c.triage_runtime or c.orchestrator_runtime)
         if not candidates or runtime is None:
@@ -956,7 +958,21 @@ class Sandboxd:
                 lv.park_timer.cancel()
                 lv.park_timer = None
             pending = self.state.drain(conv_id)
-            run = await self._ensure_running(conv, lv)
+            try:
+                run = await self._ensure_running(conv, lv)
+            except BaseException:
+                # Not started (no model key, the broker away, a runtime
+                # that failed): what was drained waits for the next start.
+                for queued in [*pending, text]:
+                    self.state.queue(conv_id, queued)
+                raise
+            if self.locked or self.contained(conv.agent):
+                # Held while it was starting: lockdown()/contain() saw no run
+                # to freeze. Freeze it here, and send it nothing.
+                await self.host.freeze_unit(self._unit(conv_id), True)
+                for queued in [*pending, text]:
+                    self.state.queue(conv_id, queued)
+                return
             for queued in pending:
                 await run.send(queued)
             await run.send(text)
@@ -1070,6 +1086,8 @@ class Sandboxd:
             raise LookupError(f"no open conversation {conv_id}")
         if self.locked:
             raise RuntimeError("locked down")
+        if self.contained(conv.agent):
+            raise RuntimeError(f"{conv.agent} is contained")
         lv = self._live(conv_id)
         runtime = self.runtimes[conv.runtime]
         host_sock, _ = self.tui_socket(conv_id)

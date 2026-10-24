@@ -133,6 +133,11 @@ class KubernetesProvisioner:
             spec.notes.append(
                 f"{role} can run pods as any ServiceAccount in {namespace} — broad"
             )
+        if self.config.namespace_is_sensitive(namespace):
+            spec.notes.append(
+                f"{namespace} is a sensitive namespace (its ServiceAccounts are the cluster's "
+                "own or back other grants) — always human-reviewed"
+            )
         return spec
 
     async def provision(self, session: AsyncSession, grant: Grant) -> dict:

@@ -148,6 +148,7 @@ class A2AThreadService:
             ).scalar_one_or_none()
             if responder is None or responder.disabled:
                 raise A2AError(404, f"unknown agent {to!r}")
+            await self._refuse_if_held(db, agent, responder)
             reach = reachability(responder, self.settings.a2a_listen_threshold_secs)
             if not reach["addressable"]:
                 # Initiate-only: ephemeral agents can never receive threads.
@@ -225,6 +226,11 @@ class A2AThreadService:
             thread = await self._own_thread(db, thread_id, agent, agent_session)
             self._require_not_closed(thread)
             is_initiator = thread.initiator_agent_id == agent.id
+            await self._refuse_if_held(
+                db,
+                agent,
+                await db.get(Agent, thread.responder_agent_id if is_initiator else thread.initiator_agent_id),
+            )
 
             grant = await db.get(Grant, thread.grant_id) if thread.grant_id else None
             # An operator thread has no grant (OPERATOR_KIND).
@@ -298,6 +304,7 @@ class A2AThreadService:
             thread = await self._own_thread(db, thread_id, agent, agent_session)
             self._require_responder(thread, agent.id)
             self._require_pending(thread)
+            await self._refuse_if_held(db, agent, await db.get(Agent, thread.initiator_agent_id))
             thread.state = THREAD_OPEN
             thread.accepted_at = utcnow()
             thread.last_activity_at = utcnow()
@@ -693,6 +700,18 @@ class A2AThreadService:
                 "ephemeral agents must open a session before using a2a "
                 "(POST /v1/sessions, then send X-Agent-Session)",
             )
+
+    async def _refuse_if_held(self, db, agent: Agent, peer: Agent | None) -> None:
+        """Containment (core/lockdown.py): a held agent neither talks nor is
+        talked to — except with the operator, who may still ask it what it
+        was doing."""
+        from .lockdown import holding
+
+        if peer is None or OPERATOR_KIND in (agent.kind, peer.kind):
+            return
+        for who in (agent, peer):
+            if (held := await holding(db, who)) is not None:
+                raise A2AError(403, f"{who.name} is contained ({held['id']}): no a2a while it is held")
 
     async def _own_thread(
         self, db, thread_id: str, agent: Agent, agent_session: AgentSession | None

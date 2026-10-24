@@ -194,8 +194,11 @@ def rule_covers(
     return False
 
 
-def is_sensitive(platform: Platform, authority: dict[str, Any] | None, platforms_cfg) -> bool:
-    """Does this authority always require a human, regardless of policy routing?"""
+def is_sensitive(
+    platform: Platform, authority: dict[str, Any] | None, platforms_cfg, resource: str | None = None
+) -> bool:
+    """Does this authority (over that resource) always require a human,
+    regardless of policy routing?"""
     authority = authority or {}
     if platform == Platform.GITHUB:
         # A public repo publishes whatever is pushed to it: a human's call.
@@ -207,6 +210,8 @@ def is_sensitive(platform: Platform, authority: dict[str, Any] | None, platforms
         # Cluster-wide binds a ClusterRole across every namespace — always a
         # human's call, whatever the role or how routing would otherwise clear it.
         if authority.get("cluster"):
+            return True
+        if resource is not None and platforms_cfg.kubernetes.namespace_is_sensitive(resource):
             return True
         return authority.get("role") in set(platforms_cfg.kubernetes.sensitive_roles)
     if platform == Platform.SANDBOX:

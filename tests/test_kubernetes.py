@@ -343,3 +343,22 @@ async def test_all_endpoints_down_raises():
         )
         with pytest.raises(ProvisionerError, match="unreachable"):
             await provisioner._request("GET", "/healthz")
+
+
+async def test_a_sensitive_namespace_always_reaches_a_human(db, policy, service, k8s_mock):
+    """A rule that clears `view` anywhere doesn't clear it in a namespace whose
+    ServiceAccounts are the cluster's own (or back other grants): a role that
+    patches a workload or starts a Job there runs as them."""
+    policy.platforms.kubernetes.sensitive_namespaces = ["apps-sys*"]
+    a, _ = await make_agent(db, "ops-agent", lldap_username=None)
+
+    plain = await service.create_request(a.id, k8s_request("apps-cactus", role="view"))
+    assert plain.status == RequestStatus.GRANTED
+    held = await service.create_request(a.id, k8s_request("apps-system", role="view"))
+    assert held.status == RequestStatus.AWAITING_HUMAN
+    assert any("sensitive namespace" in n for n in held.risk_notes)
+
+    # cluster_grant_namespace is one whatever the list says.
+    policy.platforms.kubernetes.sensitive_namespaces = []
+    assert policy.platforms.kubernetes.namespace_is_sensitive("agent-auth")
+    assert not policy.platforms.kubernetes.namespace_is_sensitive("apps-system")
