@@ -332,7 +332,10 @@ Every field given must hold; a field takes one value or a list, compared
 exactly. A `resource` may use the agent's own `{agent.project}`,
 `{agent.host}`, `{agent.runtime}` and `{agent.repos}` (each repo of its
 project). An agent without the field is not matched: "your project's repo"
-says nothing to an agent with no project.
+says nothing to an agent with no project. `{agent.project}` and
+`{agent.repos}` only stand for a project listed under `projects`: an agent
+VM's orchestrator names the project of each agent it mints, so an
+undeclared one (`flux-system`, say) matches nothing.
 
 A mistake is an error when the policy loads: an unknown field, a project
 not listed under `projects`, a placeholder that doesn't exist. `agent` may
@@ -356,8 +359,11 @@ LLM review calls OpenRouter with a structured verdict schema; the model is set
 per-rule (`constraints.llm_model`) or globally (`llm.model`). Evaluator errors
 always escalate to a human — never auto-approve. **Sensitive scopes always reach a
 human**: `platforms.github.sensitive_permissions` (default `secrets`,
-`administration`) and `platforms.kubernetes.sensitive_roles` (default `edit`,
-`admin`) force a request to `surface` even if a YAML rule or the LLM would clear it,
+`administration`), `platforms.kubernetes.sensitive_roles` (default `edit`,
+`admin`) and `platforms.kubernetes.sensitive_namespaces` (default the `kube-*`
+namespaces and `flux-system`, plus `cluster_grant_namespace` always: any role
+that patches a workload or starts a Job there runs as the cluster's own
+controllers) force a request to `surface` even if a YAML rule or the LLM would clear it,
 so attacker-controlled justification text can't talk the model into a broad grant.
 A human's own scope-pinned auto-approve rule still applies.
 
@@ -391,6 +397,27 @@ Uploading Actions secrets (libsodium sealed box) is the *agent's* job with its
 minted token; the broker only grants `secrets: write`. A minted token can outlive
 revocation by up to ~55 min (GitHub tokens are not remotely revocable by the
 broker beyond best effort); enforcement is refusal to re-mint.
+
+**Known issue: write access to a repo can reach past the repo.** The broker
+can't tell what a permission leads to once it is granted. Two cases:
+
+- **`workflows: write` (or `contents: write` on a repo whose workflows run on
+  push).** The agent can push a workflow that runs on whatever runners the repo
+  may use. A self-hosted runner, in particular a privileged one
+  (`containerMode: dind`) on a cluster node, then hands the agent that node,
+  plus the Actions secrets the repo can see.
+- **`contents: write` on a repo that something deploys from.** A GitOps repo
+  that Flux applies from its default branch is the obvious one: a push to it is
+  a change to the cluster.
+
+The guards for both are outside the broker:
+- runner groups that admit only the repos that need them;
+- branch protection that the App can't bypass (required reviews or status
+  checks on the deployed branch);
+- keeping such repos out of auto-approve rules.
+
+None of it is checked here, so whether an "own repo" rule is narrow depends on
+those GitHub settings.
 
 ## LLDAP setup
 
@@ -432,7 +459,10 @@ you enable cluster-wide grants (below), it also needs create/delete on
 
 Ceilings: `namespace_allowlist: ["*"]` is fine — containment comes from narrow
 roles and human review, not from walling namespaces off (an agent with gitops
-access reaches them anyway). Keep `role_allowlist` enumerated and prefer
+access reaches them anyway). The exception is `sensitive_namespaces`. List
+there every namespace whose ServiceAccounts are worth more than the roles
+granted in it: the cluster's controllers, and the namespace holding the
+broker's own token Secret. A grant in one of them always reaches a human. Keep `role_allowlist` enumerated and prefer
 purpose-built roles over `edit`/`admin`: it must match the ClusterRoles/Roles
 the broker holds `bind` on, so a tight role means a tight grant *and* a tight
 broker credential.
@@ -591,9 +621,12 @@ services.agent-auth-hostd = {
   (or `--name`, `--host`, `--runtime`, `--all`). Their grants are revoked
   (their host commands killed, shells closed, model-gateway keys deleted, so
   an agent whose model calls go through the gateway cannot take another
-  step), every request and credential fetch of theirs is refused, their a2a
-  conversations close, and the agent VMs freeze their conversations where
-  they stand and queue what arrives. You are pinged on Discord each time.
+  step), their pending requests are denied, every new request, retry,
+  escalation and credential fetch of theirs is refused, and nothing is
+  provisioned for them whatever approves it. Their a2a conversations close,
+  and no thread is opened, accepted or written to by or to them (except
+  with the operator). They can't write the wiki. The agent VMs freeze their
+  conversations where they stand and queue what arrives. You are pinged on Discord each time.
   `agent-auth admin contain-list`, and `contain-lift [id]` to lift one (or
   all); their grants do not come back, they ask again. On Discord:
   `/contain`, `/contained`, `/release`. It does not stop a
