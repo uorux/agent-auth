@@ -14,6 +14,7 @@ pub mod canonical_json;
 pub mod containment;
 pub mod durations;
 pub mod glob;
+pub mod hostd;
 pub mod hostexec;
 pub mod ids;
 pub mod lifecycle;
@@ -22,6 +23,8 @@ pub mod platform;
 pub mod policy;
 #[cfg(kani)]
 mod proofs;
+#[cfg(kani)]
+mod proofs_hostd;
 #[cfg(kani)]
 mod proofs_policy;
 pub mod pyfmt;
