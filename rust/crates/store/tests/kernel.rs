@@ -473,3 +473,33 @@ async fn delegated_grants_live_and_die_with_their_thread(pool: PgPool) {
         .unwrap_err();
     assert_eq!(refused, BeginRefused::DelegationClosed);
 }
+
+/// Final review (mail): `set_created_alias` checks its provisioning proof.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_created_alias_needs_the_proof_of_its_transaction(pool: PgPool) {
+    use agent_auth_core::mail::MailAuthority;
+    let store = Store::from_pool(pool);
+    let a = agent(&store, "alias-maker", AgentKind::Service).await;
+    let scope = serde_json::Map::new();
+    let authority =
+        agent_auth_core::Authority::Mail(MailAuthority::from_wire("create", &scope).unwrap());
+    let id = awaiting_on(&store, a.id, &authority, "agents.example", None).await;
+    let g = provisioning_grant(&store, id).await;
+    let tx = store.begin().await.unwrap();
+    let pg = grants::load_provisioning(&tx, g.id).await.unwrap().unwrap();
+    let other = store.begin().await.unwrap();
+    let err = agent_auth_store::mail::set_created_alias(&other, &pg, "x@agents.example")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::WrongProof), "{err:?}");
+    drop(other);
+    agent_auth_store::mail::set_created_alias(&tx, &pg, "x@agents.example")
+        .await
+        .unwrap();
+    assert_eq!(
+        agent_auth_store::mail::alias_creator(&tx, "X@agents.example")
+            .await
+            .unwrap(),
+        Some(a.id)
+    );
+}

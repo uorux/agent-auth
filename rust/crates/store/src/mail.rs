@@ -171,13 +171,25 @@ fn rows(raw: Vec<RawItem>) -> Result<Vec<MailItemRow>, StoreError> {
 }
 
 /// A `create` grant's alias: the grant is for it from now on (while it is
-/// being provisioned; the table allows this one move only).
+/// being provisioned; the table allows this one move only), and the alias
+/// is its agent's (`alias_creator`). The proof must be of `tx`.
 pub async fn set_created_alias(
     tx: &Tx<'_>,
     grant: &ProvisioningGrant<'_>,
     alias: &str,
 ) -> Result<(), StoreError> {
+    grant.verify(tx)?;
+    let g = grant.grant();
     let mut c = tx.conn().await;
+    sqlx::query!(
+        "INSERT INTO mail_created_aliases (address, agent_id, grant_id) VALUES ($1, $2, $3)
+         ON CONFLICT (address) DO NOTHING",
+        alias.to_lowercase(),
+        Uuid::from(g.agent_id),
+        Uuid::from(g.id)
+    )
+    .execute(&mut **c)
+    .await?;
     sqlx::query!(
         "UPDATE grants SET resource = $2 WHERE id = $1 AND status = 'provisioning'",
         Uuid::from(grant.grant().id),
@@ -186,6 +198,18 @@ pub async fn set_created_alias(
     .execute(&mut **c)
     .await?;
     Ok(())
+}
+
+/// The agent that had the broker create this alias, if it did.
+pub async fn alias_creator(tx: &Tx<'_>, address: &str) -> Result<Option<AgentId>, StoreError> {
+    let mut c = tx.conn().await;
+    Ok(sqlx::query_scalar!(
+        "SELECT agent_id FROM mail_created_aliases WHERE address = $1",
+        address.to_lowercase()
+    )
+    .fetch_optional(&mut **c)
+    .await?
+    .map(AgentId::from_uuid))
 }
 
 /// The inbound items of a grant for these message keys.

@@ -234,7 +234,16 @@ pub async fn create(
         resource: &validated.resource,
         authority: &validated.authority,
     };
-    let (decision, routed) = evaluate_and_route(&st.policy, draft.id, &input, &saved, &zone, now);
+    let (decision, mut routed) =
+        evaluate_and_route(&st.policy, draft.id, &input, &saved, &zone, now);
+    super::routing::stored_gates(
+        &tx,
+        &agent,
+        &validated.authority,
+        &validated.resource,
+        &mut routed,
+    )
+    .await?;
     draft.notes.extend(routed.notes.iter().cloned());
     let source = decision.source();
     let final_action = routed.route.action();

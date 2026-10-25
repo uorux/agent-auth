@@ -197,9 +197,12 @@ struct Sl {
     aliases: Mutex<BTreeMap<String, i64>>,
     contacts: Mutex<Vec<(i64, String)>>,
     created: Mutex<Vec<Value>>,
+    /// Held by a test to stall alias lookups.
+    gate: tokio::sync::Mutex<()>,
 }
 
 async fn sl_aliases(State(s): State<Arc<Sl>>, body: Bytes) -> axum::Json<Value> {
+    drop(s.gate.lock().await);
     let q: Value = serde_json::from_slice(&body).unwrap();
     let query = q["query"].as_str().unwrap_or("");
     let found: Vec<Value> = s
@@ -252,6 +255,8 @@ struct Judge {
     bodies: Mutex<Vec<String>>,
     outbound: Mutex<(String, String)>,
     outbound_calls: Mutex<Vec<String>>,
+    /// Held by a test to stall a review.
+    gate: tokio::sync::Mutex<()>,
 }
 
 impl Default for Judge {
@@ -262,6 +267,7 @@ impl Default for Judge {
             bodies: Mutex::default(),
             outbound: Mutex::new(("send".into(), "fine".into())),
             outbound_calls: Mutex::default(),
+            gate: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -308,6 +314,7 @@ async fn judge(State(j): State<Arc<Judge>>, body: Bytes) -> Result<axum::Json<Va
         json!({"topic": topic, "topic_reason": format!("topic {topic}"),
                "injection": injection, "injection_reason": format!("injection {injection}")})
     } else {
+        drop(j.gate.lock().await);
         j.outbound_calls.lock().unwrap().push(user.clone());
         let (verdict, reason) = j.outbound.lock().unwrap().clone();
         json!({"verdict": verdict, "reason": reason})
@@ -1885,4 +1892,142 @@ async fn review4_search_pages_are_no_oracle(pool: sqlx::PgPool) {
         )
         .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
+}
+
+// --------------------------------------------------------- final review
+
+async fn contain(w: &World, name: &str) {
+    let (s, v) = w
+        .call(
+            "POST",
+            "/admin/containment",
+            ADMIN,
+            Some(json!({"match": {"name": name}, "reason": "odd"})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+}
+
+/// Item 1: a send is checked against the grant again after the judge
+/// returns, in the transaction that records it: an agent contained
+/// during the review sends nothing.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn final_a_send_contained_during_review_is_stopped(pool: sqlx::PgPool) {
+    let w = Arc::new(world(pool).await);
+    let key = w.agent("mailer-f1", json!({})).await;
+    let grant = w
+        .granted(
+            &key,
+            "send",
+            ALIAS,
+            json!({"correspondents": ["*@qantas.example"]}),
+        )
+        .await;
+    let stall = w.judge.gate.lock().await;
+    let sender = {
+        let (w, key, grant) = (Arc::clone(&w), key.clone(), grant.clone());
+        tokio::spawn(async move {
+            w.send(
+                &key,
+                &grant,
+                json!({"to": ["a@qantas.example"], "subject": "hi", "body": "hello"}),
+            )
+            .await
+        })
+    };
+    // The review has the draft and waits on the gate.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    contain(&w, "mailer-f1").await;
+    drop(stall);
+    let (s, v) = sender.await.unwrap();
+    assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+    assert!(v["detail"].as_str().unwrap().contains("contained"), "{v}");
+    assert!(w.gmail.sent.lock().unwrap().is_empty());
+    let (_, held) = w.call("GET", "/admin/mail/held", ADMIN, None).await;
+    assert!(held.as_array().unwrap().is_empty());
+}
+
+/// Item 1: a release checks the grant again in the transaction that
+/// claims the item: an agent contained while the draft was being checked
+/// sends nothing.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn final_a_release_contained_meanwhile_is_stopped(pool: sqlx::PgPool) {
+    let mut w = world_with(pool, true, "human").await;
+    let key = w.agent("mailer-f2", json!({})).await;
+    let grant = w
+        .granted(
+            &key,
+            "send",
+            ALIAS,
+            json!({"correspondents": ["*@qantas.example"]}),
+        )
+        .await;
+    let (_, held) = w
+        .send(
+            &key,
+            &grant,
+            json!({"to": ["a@qantas.example"], "subject": "hi", "body": "hello"}),
+        )
+        .await;
+    let item = held["id"].as_str().unwrap().to_owned();
+    w.call("GET", &format!("/admin/mail/items/{item}"), ADMIN, None)
+        .await;
+    // A restart: the alias lookup the release makes goes to SimpleLogin,
+    // which a test can stall.
+    w.rebuild("", true, "human");
+    let w = Arc::new(w);
+    let stall = w.sl.gate.lock().await;
+    let releaser = {
+        let (w, item) = (Arc::clone(&w), item.clone());
+        tokio::spawn(async move { w.release_unshown(&item).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    contain(&w, "mailer-f2").await;
+    drop(stall);
+    let (s, v) = releaser.await.unwrap();
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(v["detail"].as_str().unwrap().contains("contained"), "{v}");
+    assert!(w.gmail.sent.lock().unwrap().is_empty());
+}
+
+/// Item 2: an alias the broker created is its creator's: another agent's
+/// grant on it is a human's decision, whatever the rules say.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn final_a_created_alias_is_its_creators(pool: sqlx::PgPool) {
+    let w = world(pool).await;
+    let creator = w.agent("mailer-f3", json!({})).await;
+    let other = w.agent("mailer-f4", json!({})).await;
+    let grant = w
+        .granted(
+            &creator,
+            "create",
+            "agents.example",
+            json!({"prefix": "mine", "topic": "signup"}),
+        )
+        .await;
+    assert!(!grant.is_empty());
+    let r = w
+        .ask(&other, "read", "mine@agents.example", json!({}))
+        .await;
+    assert_eq!(r["status"], "awaiting_human", "{r}");
+    let id: agent_auth_core::RequestId = r["id"].as_str().unwrap().parse().unwrap();
+    let tx = w.store.begin().await.unwrap();
+    let row = agent_auth_store::requests::get(&tx, id)
+        .await
+        .unwrap()
+        .unwrap()
+        .into_row();
+    assert!(
+        row.risk_notes
+            .iter()
+            .any(|n| n == "mine@agents.example was created for another agent: always a human"),
+        "{:?}",
+        row.risk_notes
+    );
+    drop(tx);
+    // The creator itself is routed as usual.
+    let mine = w
+        .ask(&creator, "read", "mine@agents.example", json!({}))
+        .await;
+    assert_eq!(mine["status"], "granted", "{mine}");
 }

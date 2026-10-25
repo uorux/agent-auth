@@ -291,7 +291,9 @@ impl ProvisioningGrant<'_> {
         &self.grant
     }
 
-    fn verify(&self, tx: &Tx<'_>) -> Result<(), StoreError> {
+    /// Was it loaded in `tx`? (Writes made on its behalf, here and in other
+    /// store modules such as `mail::set_created_alias`, check it.)
+    pub(crate) fn verify(&self, tx: &Tx<'_>) -> Result<(), StoreError> {
         if self.tx == tx.addr() {
             Ok(())
         } else {

@@ -184,6 +184,26 @@ pub(crate) struct Subject<'a> {
     pub authority: &'a Authority,
 }
 
+/// Gates that need the database, after the policy's (applied wherever a
+/// request is routed: on creation and on every re-route). A mail alias the
+/// broker created for another agent is that agent's: anyone else's grant
+/// on it is a human's decision.
+pub(crate) async fn stored_gates(
+    tx: &Tx<'_>,
+    agent: &AgentRow,
+    authority: &Authority,
+    resource: &str,
+    routed: &mut RoutedRequest,
+) -> Result<(), StoreError> {
+    if let Some(note) = crate::mail::created_for_another(tx, agent.id, authority, resource).await?
+        && routed.route.action().is_auto()
+    {
+        routed.route = agent_auth_core::Route::Surface;
+        routed.notes.push(note);
+    }
+    Ok(())
+}
+
 pub(crate) async fn reroute(
     policy: &Policy,
     tx: &Tx<'_>,
@@ -206,8 +226,9 @@ pub(crate) async fn reroute(
     };
     match zone_check(policy, tx, agent, authority, resource).await? {
         Ok(zone) => {
-            let (decision, routed) =
+            let (decision, mut routed) =
                 evaluate_and_route(policy, request, &input, &saved, &zone, now);
+            stored_gates(tx, agent, authority, resource, &mut routed).await?;
             Ok(Rerouted {
                 decision,
                 routed: Some(routed),

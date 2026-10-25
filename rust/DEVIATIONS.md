@@ -1287,6 +1287,26 @@ characters stripped; `mail_attachment` never served remotely). Beyond it:
 - **Defence in depth**: `imap::quote`, IMAP command arguments and
   `compose` refuse CR, LF and NUL themselves.
 
+### Mail: final review
+
+- **Sends and releases re-check the grant where they act.** A send runs
+  `grants::issuable` (grant live, agent not held, delegation thread open)
+  again in the transaction that records the outbound item, after the
+  judge returned and right before it goes to SMTP or Gmail (403 with the
+  credential route's text, nothing recorded or sent). A release runs it
+  again in the transaction of its compare-and-set claim (a held agent:
+  409; an ended grant or closed thread: discarded with the reason). The
+  Python (and the port until now) checked first, then waited on the judge
+  or the draft checks and acted.
+- **A created alias is its creator's** (migration 0016,
+  `mail_created_aliases`): `create` records the agent; another agent's
+  grant on that alias is always a human's (routed to surface wherever a
+  request is routed, creation and every re-route, with the note `<alias>
+  was created for another agent: always a human`). The Python let a
+  `*@<create domain>` rule hand one agent's alias to another.
+- **`store::mail::set_created_alias` checks its `ProvisioningGrant`**
+  belongs to the transaction (`ProvisioningGrant::verify` is crate-wide).
+
 ## Agent VMs (`crates/sandboxd`, broker `sandboxes`)
 
 Broker side:

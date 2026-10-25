@@ -238,6 +238,53 @@ fn timestamp(t: OffsetDateTime) -> String {
     agent_auth_wire::timestamp::format(t).unwrap_or_default()
 }
 
+/// What `grants::issuable` says about a held item's grant at release: a
+/// held agent is a 409 (discard it or lift the containment); an ended grant
+/// or a closed thread is why the draft is discarded.
+fn grant_problem<T>(usable: &Result<T, NotIssuable>) -> Result<Option<String>, MailError> {
+    match usable {
+        Err(NotIssuable::Held(held)) => {
+            let which = match held {
+                lockdown::Held::Contained(e) => e.id.clone(),
+                other => other.text(),
+            };
+            Err(MailError::new(
+                409,
+                format!(
+                    "its agent is contained ({which}); discard it or lift the containment first"
+                ),
+            ))
+        }
+        Err(NotIssuable::DelegationClosed) => {
+            Ok(Some("the thread it was sent for has closed".to_owned()))
+        }
+        Err(NotIssuable::UnknownGrant | NotIssuable::NotActive { .. }) => {
+            Ok(Some("its grant ended before it was released".to_owned()))
+        }
+        Ok(_) => Ok(None),
+    }
+}
+
+/// A grant on an alias the broker created for another agent is a human's
+/// decision (final review): the note saying so, when it is one.
+pub(crate) async fn created_for_another(
+    tx: &agent_auth_store::Tx<'_>,
+    agent: agent_auth_core::AgentId,
+    authority: &Authority,
+    resource: &str,
+) -> Result<Option<String>, StoreError> {
+    let Authority::Mail(m) = authority else {
+        return Ok(None);
+    };
+    if m.action == agent_auth_core::mail::MailAction::Create {
+        return Ok(None);
+    }
+    Ok(store_mail::alias_creator(tx, resource)
+        .await?
+        .filter(|creator| *creator != agent)
+        .map(|_| format!("{resource} was created for another agent: always a human")))
+}
+
 /// Backend pages a search reads at most to fill one page.
 const SEARCH_PAGES: usize = 5;
 
@@ -1323,7 +1370,19 @@ impl Mail {
         summary.insert("date".into(), json!(timestamp(now)));
         summary.insert("snippet".into(), json!(chars(body, 200)));
         summary.insert("from".into(), json!(target.address));
+        // The grant checked again in the transaction that records the item,
+        // after the judge returned and right before it goes out (final
+        // review): a containment, a revoke or a closed thread meanwhile
+        // stops it.
         let tx = self.store.begin().await?;
+        if let Err(refusal) =
+            grants::issuable(&tx, grant.agent_id, grant.id, OffsetDateTime::now_utc()).await?
+        {
+            return Err(MailError::new(
+                if refusal.is_not_found() { 404 } else { 403 },
+                refusal.detail(),
+            ));
+        }
         store_mail::insert_outbound(
             &tx,
             &store_mail::Outbound {
@@ -1665,7 +1724,6 @@ impl Mail {
     /// draft within the constraints as they read now). Once: a second
     /// release is refused.
     pub async fn release(&self, id: MailItemId, by: &str) -> Result<MailItem, MailError> {
-        let now = OffsetDateTime::now_utc();
         let tx = self.store.begin().await?;
         let row = store_mail::get(&tx, id)
             .await?
@@ -1685,38 +1743,14 @@ impl Mail {
         }
         // The grant as `grants::issuable` sees it: its agent not held, its
         // delegation thread open, live.
-        let usable = grants::issuable(&tx, row.agent_id, row.grant_id, now).await?;
-        let mut problem = match &usable {
-            Err(NotIssuable::Held(held)) => {
-                let which = match held {
-                    lockdown::Held::Contained(e) => e.id.clone(),
-                    other => other.text(),
-                };
-                return Err(MailError::new(
-                    409,
-                    format!(
-                        "its agent is contained ({which}); discard it or lift the containment first"
-                    ),
-                ));
-            }
-            Err(NotIssuable::DelegationClosed) => {
-                Some("the thread it was sent for has closed".to_owned())
-            }
-            Err(NotIssuable::UnknownGrant | NotIssuable::NotActive { .. }) => {
-                Some("its grant ended before it was released".to_owned())
-            }
-            Ok(_) => None,
-        };
+        let usable =
+            grants::issuable(&tx, row.agent_id, row.grant_id, OffsetDateTime::now_utc()).await?;
+        let mut problem = grant_problem(&usable)?;
         let grant = usable.ok().map(|g| g.grant().clone());
         tx.commit().await?;
-        if row.direction == Direction::In {
-            if !self.claim(id, ItemStatus::Released, by).await? {
-                return Err(MailError::new(409, "decided meanwhile"));
-            }
-            return self.describe(id).await;
-        }
         let mut send = None;
-        if problem.is_none()
+        if row.direction == Direction::Out
+            && problem.is_none()
             && let Some(grant) = &grant
         {
             let draft = self.open_draft(&row)?;
@@ -1737,22 +1771,34 @@ impl Mail {
                 _ => problem = Some("its grant ended before it was released".to_owned()),
             }
         }
-        if let Some(problem) = problem {
-            if !self.claim(id, ItemStatus::Discarded, by).await? {
-                return Err(MailError::new(409, "decided meanwhile"));
+        // The decision, with the grant checked again in the transaction
+        // that claims the item (final review): nothing that happened while
+        // the draft was checked (a containment, the grant ending) is missed.
+        let tx = self.store.begin().await?;
+        let usable =
+            grants::issuable(&tx, row.agent_id, row.grant_id, OffsetDateTime::now_utc()).await?;
+        let late = grant_problem(&usable)?;
+        drop(usable);
+        let now = OffsetDateTime::now_utc();
+        let claimed = if row.direction == Direction::In {
+            store_mail::claim(&tx, id, ItemStatus::Released, by, now).await?
+        } else if let Some(problem) = problem.or(late) {
+            let done = store_mail::claim(&tx, id, ItemStatus::Discarded, by, now).await?;
+            if done {
+                store_mail::drop_payload(&tx, id, Some(&chars(&problem, 4000))).await?;
             }
-            let tx = self.store.begin().await?;
-            store_mail::drop_payload(&tx, id, Some(&chars(&problem, 4000))).await?;
-            tx.commit().await?;
-            return self.describe(id).await;
-        }
-        let Some((target, draft)) = send else {
-            return Err(MailError::new(409, "decided meanwhile"));
+            send = None;
+            done
+        } else {
+            store_mail::claim(&tx, id, ItemStatus::Sending, by, now).await?
         };
-        if !self.claim(id, ItemStatus::Sending, by).await? {
+        if !claimed {
             return Err(MailError::new(409, "decided meanwhile"));
         }
-        self.deliver(id, &target, &draft).await;
+        tx.commit().await?;
+        if let Some((target, draft)) = send {
+            self.deliver(id, &target, &draft).await;
+        }
         self.describe(id).await
     }
 
