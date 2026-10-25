@@ -15,3 +15,13 @@ out read-only at `.claude/worktrees/upstream-snapshot`. Its review log is
   pool by name, the previous one, or by matching properties); a real
   `google` provisioner with an OAuth consent flow (`google_consent.py`);
   `grant_access.py`, `mail_routes.py`, `discord_bot/mail.py`, `mail/`.
+
+Ported from that snapshot (branch `rust-catchup`): `pool`, the real
+`google` and `admin google-consent`, `release_grant`, and every
+"Fixed → Existing code" item of the review log outside hostd/hostexec,
+sandboxd and mail (checked one by one; most were already fixed in the
+port, see DEVIATIONS.md), plus the flagged items: timestamped webhook
+signatures without a broker-wide key, the `GoogleTokens` lock, the
+stub-era Google rules warning, lowercase GitHub rule resources and project
+repos, one `AgentKind`/`Placement`. Not here: `mail` (and
+`grant_access.require_web_tool` for mail routes), hostd/hostexec, sandboxd.
