@@ -187,6 +187,7 @@ fn sandbox_every_type() {
         json!({"type": "unlock"}),
         json!({"type": "agents.contained", "agents": ["claude-a-galaxy-sandbox"]}),
         json!({"type": "agents.contained", "agents": [], "call_id": CALL}),
+        json!({"type": "agents.contained", "agents": [], "epoch": "0b1c", "version": 7}),
         json!({"type": "project.grants", "grants": [GRANT]}),
     ];
     for sample in to_sandbox {

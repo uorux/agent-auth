@@ -144,6 +144,13 @@ pub struct SandboxUnlock {
 #[serde(deny_unknown_fields)]
 pub struct AgentsContained {
     pub agents: BoundedVec<Text<1, 128>, 0, 10_000>,
+    /// Which list this is: the broker process (`epoch`) and its order
+    /// (`version`, increasing; not `seq`, an envelope key). A VM ignores a list older than one it applied
+    /// from the same broker (a contain and a lift racing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<Text<1, 64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_id: Option<CallId>,
 }

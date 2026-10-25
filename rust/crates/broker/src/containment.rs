@@ -119,10 +119,18 @@ pub async fn record(
     )
     .await?;
     let entry = recorded.map_err(|e| ContainError::BadMatch(e.to_string()))?;
-    let held: Vec<AgentRow> = agents::list(&tx)
-        .await?
+    let all = agents::list(&tx).await?;
+    let by_id: std::collections::HashMap<_, _> = all.iter().map(|a| (a.id, a.clone())).collect();
+    // Held with whatever minted it: a contained orchestrator's agents too.
+    let held: Vec<AgentRow> = all
         .into_iter()
-        .filter(|a| a.kind != AgentKind::Operator && holds(&entry.r#match, &a.facts()))
+        .filter(|a| {
+            let anc: Vec<_> = agents::chain_in(a, &by_id)
+                .into_iter()
+                .map(AgentRow::facts)
+                .collect();
+            a.kind != AgentKind::Operator && holds(&entry.r#match, &a.facts_with(&anc))
+        })
         .collect();
     for a in &held {
         grants::expire_now_of_agent(&tx, a.id, now).await?;
@@ -236,17 +244,24 @@ pub async fn sweep_held(st: &AppState) -> usize {
         if entries.is_empty() {
             return Ok::<_, StoreError>(Vec::new());
         }
-        let held: Vec<(AgentRow, ContainmentEntry)> = agents::list(&tx)
-            .await?
+        let all = agents::list(&tx).await?;
+        let by_id: std::collections::HashMap<_, _> =
+            all.iter().map(|a| (a.id, a.clone())).collect();
+        let held: Vec<(AgentRow, ContainmentEntry)> = all
             .into_iter()
             .filter(|a| a.kind != AgentKind::Operator)
             .filter_map(|a| {
+                let anc: Vec<_> = agents::chain_in(&a, &by_id)
+                    .into_iter()
+                    .map(AgentRow::facts)
+                    .collect();
                 let e = agent_auth_core::containment::first_holding(
                     &entries,
                     |e| &e.r#match,
-                    &a.facts(),
+                    &a.facts_with(&anc),
                 )
                 .cloned();
+                drop(anc);
                 e.map(|e| (a, e))
             })
             .collect();

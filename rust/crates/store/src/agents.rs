@@ -70,6 +70,17 @@ impl AgentRow {
             project: self.project.as_deref(),
             host: self.host.as_deref(),
             placement: self.placement,
+            ancestors: &[],
+        }
+    }
+
+    /// [`AgentRow::facts`] with the agents that minted it (see [`chain`]),
+    /// as containment matches on them.
+    #[must_use]
+    pub fn facts_with<'a>(&'a self, ancestors: &'a [AgentFacts<'a>]) -> AgentFacts<'a> {
+        AgentFacts {
+            ancestors,
+            ..self.facts()
         }
     }
 
@@ -746,4 +757,42 @@ pub async fn reenable_after_lease(
     .await?
     .rows_affected();
     Ok(n == 1)
+}
+
+/// The longest parent chain followed (minting nests a level or two).
+pub const MAX_CHAIN: usize = 64;
+
+/// The agents that minted `agent`, nearest first, from `by_id`; stops at a
+/// cycle (impossible by the schema) or [`MAX_CHAIN`] levels.
+#[must_use]
+pub fn chain_in<'a>(
+    agent: &AgentRow,
+    by_id: &'a std::collections::HashMap<AgentId, AgentRow>,
+) -> Vec<&'a AgentRow> {
+    let mut out: Vec<&'a AgentRow> = Vec::new();
+    let mut next = agent.parent_agent_id;
+    while let Some(id) = next {
+        if out.len() >= MAX_CHAIN || id == agent.id || out.iter().any(|a| a.id == id) {
+            break;
+        }
+        let Some(p) = by_id.get(&id) else { break };
+        out.push(p);
+        next = p.parent_agent_id;
+    }
+    out
+}
+
+/// The agents that minted `agent`, nearest first, read one by one.
+pub async fn chain(tx: &Tx<'_>, agent: &AgentRow) -> Result<Vec<AgentRow>, StoreError> {
+    let mut out: Vec<AgentRow> = Vec::new();
+    let mut next = agent.parent_agent_id;
+    while let Some(id) = next {
+        if out.len() >= MAX_CHAIN || id == agent.id || out.iter().any(|a| a.id == id) {
+            break;
+        }
+        let Some(p) = get(tx, id).await? else { break };
+        next = p.parent_agent_id;
+        out.push(p);
+    }
+    Ok(out)
 }

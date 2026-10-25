@@ -1178,7 +1178,7 @@ round_trips! {
         (grant_id(), name::<1, 64>(), name::<1, 64>(), call_id())
             .prop_map(|(grant_id, project, target, call_id)| BrokerToSandbox::ProjectRevoke(ProjectRevoke { grant_id, project, target, call_id })),
         call_id().prop_map(|call_id| BrokerToSandbox::Unlock(SandboxUnlock { call_id })),
-        (vec(name::<1, 128>(), 0..4), call_id()).prop_map(|(agents, call_id)| BrokerToSandbox::AgentsContained(AgentsContained { agents: BoundedVec::new(agents).unwrap(), call_id })),
+        (vec(name::<1, 128>(), 0..4), call_id()).prop_map(|(agents, call_id)| BrokerToSandbox::AgentsContained(AgentsContained { agents: BoundedVec::new(agents).unwrap(), epoch: None, version: None, call_id })),
         (vec(grant_id(), 0..4), call_id()).prop_map(|(grants, call_id)| BrokerToSandbox::ProjectGrants(crate::daemon::sandbox::ProjectGrants { grants: BoundedVec::new(grants).unwrap(), call_id })),
     ];
     rt_sandbox_to_broker: prop_oneof![

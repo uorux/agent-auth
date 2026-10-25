@@ -83,6 +83,11 @@ pub struct Sandboxes {
     /// held list): keys go only to a greeted connection, so a VM always
     /// knows it is locked or holding agents before any key arrives.
     greeted: std::sync::Mutex<std::collections::HashMap<String, Weak<DaemonPeer>>>,
+    /// This process's held lists: an epoch and an increasing sequence,
+    /// assigned under `tell_lock` with the read they report.
+    held_epoch: String,
+    held_seq: std::sync::atomic::AtomicU64,
+    tell_lock: tokio::sync::Mutex<()>,
     /// `key.rotate` per agent name: a token bucket (review #5).
     rotations: std::sync::Mutex<std::collections::HashMap<String, (f64, tokio::time::Instant)>>,
 }
@@ -129,6 +134,9 @@ impl Sandboxes {
             st: OnceLock::new(),
             rotations: std::sync::Mutex::new(std::collections::HashMap::new()),
             greeted: std::sync::Mutex::new(std::collections::HashMap::new()),
+            held_epoch: Uuid::new_v4().simple().to_string(),
+            held_seq: std::sync::atomic::AtomicU64::new(0),
+            tell_lock: tokio::sync::Mutex::new(()),
         });
         let s = Arc::clone(&me);
         hub.on_paired(Arc::new(move |role, name, id| {
@@ -508,6 +516,7 @@ impl Sandboxes {
         if !is_sandbox(peer) {
             return;
         }
+        let told = self.tell_lock.lock().await;
         let facts = async {
             let tx = self.store.begin().await?;
             let locked = flags::locked(&tx, peer.name()).await?;
@@ -536,18 +545,10 @@ impl Sandboxes {
             .send_default(
                 Role::Sandbox,
                 peer.name(),
-                &payload(json!({"type": "agents.contained", "agents": held})),
+                &payload(self.held_message(&held)),
             )
             .await;
-        // The grants it should have (B-7): it revokes any other it holds.
-        let ids: Vec<String> = grants.iter().map(ToString::to_string).collect();
-        self.hub
-            .send_default(
-                Role::Sandbox,
-                peer.name(),
-                &payload(json!({"type": "project.grants", "grants": ids})),
-            )
-            .await;
+        drop(told);
         // The grants it should have (B-7): it revokes any other it holds.
         let ids: Vec<String> = grants.iter().map(ToString::to_string).collect();
         self.hub
@@ -567,6 +568,9 @@ impl Sandboxes {
     /// Every agent VM gets its complete held list. Returns
     /// `{"sandbox:<name>": "<n> held" | "not connected; told when it reconnects"}`.
     pub async fn tell(&self) -> Map<String, Value> {
+        // One list at a time, numbered in the order it was read: an older
+        // list never arrives with a newer number.
+        let _told = self.tell_lock.lock().await;
         let lists = async {
             let tx = self.store.begin().await?;
             let mut out = Vec::new();
@@ -585,11 +589,7 @@ impl Sandboxes {
                     let n = held.len();
                     let sent = self
                         .hub
-                        .send_default(
-                            Role::Sandbox,
-                            &name,
-                            &payload(json!({"type": "agents.contained", "agents": held})),
-                        )
+                        .send_default(Role::Sandbox, &name, &payload(self.held_message(&held)))
                         .await;
                     reports.insert(
                         format!("sandbox:{name}"),
@@ -604,6 +604,15 @@ impl Sandboxes {
             Err(e) => tracing::error!(error = %e, "telling agent VMs their held agents failed"),
         }
         reports
+    }
+
+    /// `agents.contained` with the next version.
+    fn held_message(&self, held: &[String]) -> Value {
+        let seq = self
+            .held_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .saturating_add(1);
+        json!({"type": "agents.contained", "agents": held, "epoch": self.held_epoch, "version": seq})
     }
 
     /// The scheduler's step: pending keys go to every connected sandbox.

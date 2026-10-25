@@ -151,18 +151,23 @@ pub async fn holding(
     agent: &AgentRow,
 ) -> Result<Option<ContainmentEntry>, StoreError> {
     let all = entries(tx).await?;
-    Ok(containment::first_holding(&all, |e| &e.r#match, &agent.facts()).cloned())
+    let chain = agents::chain(tx, agent).await?;
+    let anc: Vec<_> = chain.iter().map(AgentRow::facts).collect();
+    Ok(containment::first_holding(&all, |e| &e.r#match, &agent.facts_with(&anc)).cloned())
 }
 
 /// Names of one agent VM's agents that some entry holds, sorted.
 pub async fn held_in(tx: &Tx<'_>, sandbox: DaemonId) -> Result<Vec<String>, StoreError> {
     let all = entries(tx).await?;
-    let mut names: Vec<String> = agents::list_in_sandbox(tx, sandbox)
-        .await?
-        .into_iter()
-        .filter(|a| containment::first_holding(&all, |e| &e.r#match, &a.facts()).is_some())
-        .map(|a| a.name)
-        .collect();
+    let mut names = Vec::new();
+    for a in agents::list_in_sandbox(tx, sandbox).await? {
+        // Held with whatever minted it (a contained orchestrator's agents).
+        let chain = agents::chain(tx, &a).await?;
+        let anc: Vec<_> = chain.iter().map(AgentRow::facts).collect();
+        if containment::first_holding(&all, |e| &e.r#match, &a.facts_with(&anc)).is_some() {
+            names.push(a.name.clone());
+        }
+    }
     names.sort();
     Ok(names)
 }
@@ -312,14 +317,20 @@ impl NotHeld<'_> {
     }
 }
 
-fn held(agent: Option<&AgentRow>, all: &[ContainmentEntry], now: OffsetDateTime) -> Option<Held> {
+fn held(
+    agent: Option<&AgentRow>,
+    chain: &[AgentRow],
+    all: &[ContainmentEntry],
+    now: OffsetDateTime,
+) -> Option<Held> {
     let Some(agent) = agent else {
         return Some(Held::Unknown);
     };
     if agent.disabled || agent.lease_expires_at.is_some_and(|l| l <= now) {
         return Some(Held::Disabled);
     }
-    containment::first_holding(all, |e| &e.r#match, &agent.facts())
+    let anc: Vec<_> = chain.iter().map(AgentRow::facts).collect();
+    containment::first_holding(all, |e| &e.r#match, &agent.facts_with(&anc))
         .map(|e| Held::Contained(e.clone()))
 }
 
@@ -334,7 +345,11 @@ pub async fn check<'t>(
     lock_shared(tx).await?;
     let row = agents::get_for_share(tx, agent).await?;
     let all = entries(tx).await?;
-    if let Some(h) = held(row.as_ref(), &all, now) {
+    let chain = match &row {
+        Some(r) => agents::chain(tx, r).await?,
+        None => Vec::new(),
+    };
+    if let Some(h) = held(row.as_ref(), &chain, &all, now) {
         return Ok(Err(h));
     }
     let Some(agent) = row else {
@@ -400,7 +415,12 @@ pub async fn check_pair<'t>(
         entries(tx).await?
     };
     for r in [&ra, &rb] {
-        if let Some(h) = held(Some(r), &all, now) {
+        let chain = if operator {
+            Vec::new()
+        } else {
+            agents::chain(tx, r).await?
+        };
+        if let Some(h) = held(Some(r), &chain, &all, now) {
             return Ok(Err((r.id, h)));
         }
     }

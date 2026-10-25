@@ -1559,6 +1559,24 @@ inherited from the Python; "port" what the port introduced.
   updates. A quota of zero pods in the grant namespace. Python's
   `deploy/k8s.yaml` gave a ClusterRole with unrestricted token creation.
 
+Final review (sandboxes), fixed:
+- **Containment holds what a held agent minted** (port; the Python held
+  only matching agents, while `disable_tree` took the tree): an entry that
+  holds an agent holds every agent whose parent chain includes it. The
+  core matcher stays pure (`AgentFacts::ancestors`, the parent chain
+  nearest first); the store's `check`, `check_pair`, `holding` and
+  `held_in` and the broker's `record` and held sweep pass the chain, so a
+  contained orchestrator's children lose their grants, are refused, and
+  are frozen in their VM. Property-tested (held exactly when the agent or
+  an ancestor matches).
+- **Held lists are versioned**: `agents.contained` carries `epoch` (the
+  broker process) and `version` (increasing, assigned under one lock with
+  the read it reports; not `seq`, which is an envelope key). sandboxd
+  ignores a list older than one it applied from the same broker, so a
+  contain and a lift that race can't thaw a contained agent; an
+  unversioned list (an older broker) still applies.
+- `project.grants` is sent once per connect (a merge had doubled it).
+
 ## Open questions
 
 (for Jacob; nothing here is implemented until decided)
