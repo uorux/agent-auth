@@ -21,7 +21,7 @@ agent-auth-store.workspace = true
 agent-auth-tls = { workspace = true, features = ["reqwest"] }
 ring.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "sync", "macros", "net", "signal"] }
-axum.workspace = true
+axum = { workspace = true, features = ["ws"] }
 tower = { workspace = true, features = ["util"] }
 tower-http.workspace = true
 reqwest.workspace = true
