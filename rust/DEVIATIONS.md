@@ -481,6 +481,107 @@ and why. Keep entries short. Group by area.
   its agent's session-bound threads (a2a B8, metadata only; every read is
   403).
 
+## Provisioners (`broker/src/provisioners`)
+
+- **Agent-visible errors carry no upstream bodies** (provisioners B13,
+  INV-6). Models errors were `"{status} {text[:200]}"`; now only the status
+  (`model gateway refused the key: 500`, `... refused the user for x: 500`,
+  `... did not delete <alias>: 503`, usage `model gateway: 500`); bodies go
+  to the broker log. Transport failures say `GitHub API unreachable (...)`,
+  `LLDAP unreachable (...)`, `model gateway: ...` without URLs (the
+  Python's uncaught httpx text could include them).
+- **GitHub owner `.`/`..` refused** (B6): `invalid github repository`.
+- **GitHub ceiling values are checked at startup** (B7): a
+  `permission_ceiling` value other than read/write/admin (any case) stops
+  the broker (the Python raised `KeyError`, a 500, at request time).
+- **GitHub repo grants re-check policy at every mint** (B7): after a policy
+  tightening (and restart), a grant whose repo is now denylisted / outside
+  the allowlist, or whose permission exceeds the ceiling, gets `policy no
+  longer allows this grant (<reason>); refusing to mint a token`.
+- **GitHub provisioning does not cache its proof token** (store review:
+  `credentials::replace` needs an `IssuableGrant`). Provision still mints a
+  repo token (proving the installation covers the repo) and revokes it at
+  once; the first credential fetch mints and caches. One more mint per
+  grant; no unused token lives on (B8).
+- **GitHub installation cache entries are dropped when a mint fails** (B9),
+  so a reinstalled app is found again without a restart.
+- **LLDAP administration groups are never brokered** (B1): `lldap_admin`,
+  `lldap_password_manager`, `lldap_strict_readonly` (any case) are refused
+  at validation (`group '<g>' is never brokered (it administers LLDAP
+  itself)`) and at provision, whatever `allowed_groups` says, and are left
+  out of the catalog. The meaning of an empty `allowed_groups` is unchanged
+  (see Open questions).
+- **LLDAP managed accounts are never taken over** (B2, INV-L5). Adoption of
+  an existing LLDAP user requires that no other agent row holds that user
+  id (case-insensitively: `LLDAP account '<u>' belongs to another agent;
+  refusing to adopt it`) and that the user's display name is the broker's
+  `"<agent> (agent-auth managed)"` (`LLDAP user '<u>' exists and was not
+  created by the broker for this agent; refusing to adopt it`). Migration
+  `0003` adds a unique index on `lower(agents.lldap_username)`: two agents
+  can no longer share an LLDAP account (an admin setting one that another
+  agent has now fails).
+- **LLDAP account creation holds the agent row** (B3): `ensure_account`
+  locks the agent row `FOR UPDATE` in the provisioning transaction, so a
+  concurrent provision for the same fresh agent waits for the commit (or,
+  if both already hold the containment check's share lock, Postgres aborts
+  one as a deadlock: that grant fails and can be requested again). The
+  Python's in-process mutex released before the commit.
+- **LLDAP passwords are set over LDAP, not `lldap_set_password`** (B4).
+  `lldap_set_password` takes the admin JWT only on its command line (no
+  env/stdin option), where `/proc/<pid>/cmdline` shows it to every local
+  user. The broker now binds to LLDAP's LDAP interface as the admin and
+  uses the Password Modify extended operation (RFC 3062), which LLDAP
+  supports; new settings `LLDAP_LDAP_URL` (`ldap://host:3890` or
+  `ldaps://host:6360`) and `LLDAP_BASE_DN` (`dc=example,dc=com`).
+  `LLDAP_SET_PASSWORD_BIN` is ignored (a warning). Managed accounts need
+  `ENCRYPTION_KEY` **and** `LLDAP_LDAP_URL`/`LLDAP_BASE_DN`; without them
+  they are off as before (hand-registered accounts and existing managed
+  accounts keep working; rotation fails). The failure text is `setting the
+  LLDAP password failed (see broker logs)` (was `lldap_set_password failed
+  (see broker logs)`), and the unavailable text names the new settings.
+- **LLDAP group ids are looked up for every add** (B5), never cached.
+- **LLDAP revoke treats a deleted user as not a member** (B17): a grant no
+  longer stays ACTIVE forever when its account was deleted out of band.
+- **LLDAP `UserExists` also reads `displayName`** (for the B2 check).
+- **Kubernetes half-made provisions clean up** (B10): when a binding (or
+  the namespace listing of the zone branch) fails after the ServiceAccount
+  was made, the SA (and any bindings made) is deleted before the error is
+  returned. A revoke with no recorded state (the reaper) derives the names
+  from the grant (`aa-<agent>-<grant id>` in its namespace; cluster-wide:
+  the ClusterRoleBinding, and per-namespace RoleBindings when the agent has
+  zone exclusions) and deletes them (404 is fine).
+- **Models reuses only its own gateway user** (B12): an existing LiteLLM
+  user named like the agent is reused only if its `user_role` is
+  `internal_user_viewer` and `metadata.agent` is the agent's name;
+  otherwise `the model gateway has a user <name> the broker did not create;
+  refusing to issue a key under it`, and no key is generated. A runtime
+  with no models (`by_runtime`) is refused before any gateway call.
+- **`/v1/tokens/verify` checks what the credential route checks** (B20):
+  the grant must be issuable (`grants::issuable`: active, unexpired, agent
+  not held, delegation thread open), not only active and unexpired.
+- **Credentials carry `crypto::Secret`** (`Credential.value`); the MCP
+  credential of a deleted agent is a refusal, not a 500 (B18).
+- **Missing `server` on `/v1/tokens/verify`** is 422 `{"detail": "query
+  parameter 'server' is required"}` (FastAPI's 422 had a list detail).
+- **Secrets at rest bind to their row**: GitHub token cache
+  (`credentials.value_encrypted`, row = credential id), LLDAP passwords
+  (`agents.lldap_password_encrypted`, row = agent id), gateway keys
+  (`grants.provisioner_state.key_encrypted`, row = grant id).
+
+## Wiki (`broker/src/wiki`)
+
+- **`last_change` is cached per (path, blob sha), and a failed lookup is
+  not cached** (a2a B12): two pages with the same content no longer share
+  an author, and a transient GitHub error no longer hides it until the page
+  changes.
+- **The commit summary is checked for credentials too** (a2a B13), on
+  write and delete, with the same 400 text as for the content.
+- **A truncated tree listing is logged** (a2a B15).
+- A write or delete GitHub could not be reached for answers 502 `the wiki's
+  repo refused the <write|delete> (unreachable)` (the Python raised a 500).
+- Query parameters missing on `/v1/wiki/page` (`path`) or `/search` (`q`)
+  are 422 `{"detail": "query parameter '<p>' is required"}`.
+
 ## Open questions
 
 (for Jacob; nothing here is implemented until decided)
@@ -501,6 +602,20 @@ and why. Keep entries short. Group by area.
 - **`/release` with no entry lifts every containment** (Discord, as the
   Python; its option says so). The admin API now needs an explicit
   `{"all": true}`. Should Discord ask for confirmation, or require an entry?
+- **Does an empty `platforms.homelab.allowed_groups` mean "nothing"?**
+  (provisioners B1). The Python (and the port, for now) reads it as "every
+  group"; Kubernetes reads an empty `namespace_allowlist` as nothing, and
+  the homelab catalog then lists no groups although all are grantable.
+  The LLDAP administration groups are refused either way.
+- **LLDAP over LDAP needs two new settings** (B4 fix): `LLDAP_LDAP_URL` and
+  `LLDAP_BASE_DN` for managed accounts. Plain `ldap://` sends the admin
+  password like the existing HTTP login to `LLDAP_URL` does; prefer
+  `ldaps://` when LLDAP is not on a trusted network.
+- **Models user ids**: the port refuses a pre-existing gateway user it did
+  not create (B12) instead of prefixing user ids; prefixing would change
+  existing gateways' accounting.
+- **B19**: should the credential route refuse web-UI OAuth callers? (The
+  spine's route.)
 
 ## To do (engineering, tracked here until done)
 

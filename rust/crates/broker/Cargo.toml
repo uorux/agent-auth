@@ -41,9 +41,10 @@ rmcp = { workspace = true, features = ["server", "transport-streamable-http-serv
 twilight-model.workspace = true
 tokio-tungstenite.workspace = true
 hex.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "sync", "io-util"] }
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true
 ring.workspace = true

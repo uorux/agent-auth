@@ -14,6 +14,7 @@
 //! - `provisioners`: the contract, the registry, one module per platform.
 //! - `webui`: the admin panel (`/ui`) and its OpenID sign-in; `oauth`: the
 //!   OAuth server for web-UI connectors; `remote_mcp`: `/mcp` for them.
+//! - `wiki`: the agents' shared wiki (a GitHub repo the broker writes).
 
 pub mod a2a;
 pub mod auth;
@@ -27,3 +28,4 @@ pub mod remote_mcp;
 pub mod security_log;
 pub mod state;
 pub mod webui;
+pub mod wiki;
