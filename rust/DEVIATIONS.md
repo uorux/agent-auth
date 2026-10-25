@@ -1605,8 +1605,6 @@ inherited from the Python; "port" what the port introduced.
 - **Models user ids**: the port refuses a pre-existing gateway user it did
   not create (B12) instead of prefixing user ids; prefixing would change
   existing gateways' accounting.
-- **B19**: should the credential route refuse web-UI OAuth callers? (The
-  spine's route.)
 
 - **Remote MCP redirect URIs.** The allowlist is now exact callback URIs
   (`remote_mcp.redirect_uris`, replacing `redirect_hosts`; a policy with the
@@ -1636,9 +1634,6 @@ inherited from the Python; "port" what the port introduced.
 
 ## To do (engineering, tracked here until done)
 
-- Local unix-socket protocols (hostctl, hostd-user, sandboxd local API) are
-  typed in the daemon crate, not wire.
-- A missing `POLICY_FILE` (B-12): the broker refuses to start.
 - ES256 MCP token key: derived from `BROKER_SIGNING_KEY` via ring's
   deprecated `test::rand::FixedSliceRandom` (ring has no scalar-to-key
   constructor). Pinned by known-answer tests against the Python; revisit
