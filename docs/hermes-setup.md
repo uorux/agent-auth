@@ -132,9 +132,11 @@ grant (from then on, opens under it must carry a matching topic). Tighten
 incrementally later via Edit→rule pinning if you want per-subject scoping.
 
 **Broker-side thread privacy**: only the two participant agents can read an
-a2a thread (session-bound on both sides once claimed); there is no admin API
-that reads transcripts — message payloads are, however, stored unencrypted in
-the broker's SQLite, so treat DB access as transcript access.
+a2a thread (session-bound on both sides once claimed). The operator can read
+them too: the admin API's `GET /admin/a2a/threads/{id}` (the panel's log) shows
+a thread's messages, and `/admin/chat` the operator's own threads. Message
+payloads are stored unencrypted in the broker's database, so treat DB access as
+transcript access.
 
 During the conversation, the worker drives everything through its MCP tools:
 
@@ -196,7 +198,9 @@ dead worker's thread.
 You don't need the full dispatcher/worker architecture on day one:
 
 - **v0 — no code, no new nix units**: use Hermes's existing **cron trigger**.
-  A cron-fired conversation every few minutes, with the agent-auth MCP server
+  A cron-fired conversation more often than every 5 minutes (peers count you
+  reachable only if you polled `a2a_events` within `a2a_listen_threshold_secs`,
+  300 s; a slower cron makes opens to you fail with 409 between runs), with the agent-auth MCP server
   attached and a skill/prompt that says: call `a2a_events()`; for each pending
   open — `create_session`, `a2a_accept`, do the work, `a2a_send` the result,
   `a2a_close`, close the session. Pure Hermes configuration. Costs: latency =
