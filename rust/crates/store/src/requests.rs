@@ -978,16 +978,20 @@ pub async fn decisions(
 }
 
 /// Changed at or after `since`, oldest change first (audit feed).
+/// Keyset-paginated: with `after`, rows at exactly `since` only past
+/// that id; ordered by (time, id), so a page boundary is exact.
 pub async fn updated_since(
     tx: &Tx<'_>,
     since: OffsetDateTime,
+    after: Option<Uuid>,
     limit: i64,
 ) -> Result<Vec<RequestRow>, StoreError> {
     let mut c = tx.conn().await;
     let raw = sqlx::query_as!(
         RawRequest,
-        "SELECT * FROM access_requests WHERE updated_at >= $1 ORDER BY updated_at LIMIT $2",
+        "SELECT * FROM access_requests WHERE updated_at > $1 OR (updated_at = $1 AND ($2::uuid IS NULL OR id > $2)) ORDER BY updated_at, id LIMIT $3",
         since,
+        after,
         limit
     )
     .fetch_all(&mut **c)

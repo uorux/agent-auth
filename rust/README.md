@@ -152,7 +152,7 @@ Managed accounts need `ENCRYPTION_KEY`, `LLDAP_LDAP_URL` and `LLDAP_BASE_DN`.
 | `KUBERNETES_API_URL` | (none: platform off) | `in-cluster`, or comma-separated API servers (tried in turn) |
 | `KUBERNETES_TOKEN_FILE` | in-cluster: the pod's token | read at every call (rotation is picked up) |
 | `KUBERNETES_TOKEN` | (none) | a fixed token; the file wins |
-| `KUBERNETES_CA_FILE` | in-cluster: the pod's CA | otherwise the shared root store |
+| `KUBERNETES_CA_FILE` | in-cluster: the pod's CA | the only CA trusted for the API server (the public roots are not); unset outside the cluster: the shared root store |
 | `KUBERNETES_INSECURE_SKIP_VERIFY` | `false` | only for an API on localhost (refused otherwise) |
 | `KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT` | `kubernetes.default.svc`, `443` | in-cluster only (the kubelet sets them) |
 
@@ -190,8 +190,10 @@ the policy points at are files (`secret_file`, `client_secret_file`,
 
 TLS: every outbound connection (HTTP, Discord's gateway, IMAP/SMTP, LDAP,
 Postgres) trusts Mozilla's roots minus the distrusted ones, built in; the
-system's CA bundle is never read. A private CA goes in `KUBERNETES_CA_FILE`,
-`MAIL_CA_FILE` or the Postgres URL's `sslrootcert`.
+system's CA bundle is never read. A private CA goes in `KUBERNETES_CA_FILE`
+(it then replaces the public roots for the API server), `MAIL_CA_FILE`
+(added to them: mail also reaches Gmail and SimpleLogin) or the Postgres
+URL's `sslrootcert` (sqlx adds it to its own public roots).
 
 ### Policy
 

@@ -379,16 +379,20 @@ pub async fn unfinished_before(
 }
 
 /// Created at or after `since`, oldest first (audit feed).
+/// Keyset-paginated: with `after`, rows at exactly `since` only past
+/// that id; ordered by (time, id), so a page boundary is exact.
 pub async fn created_since(
     tx: &Tx<'_>,
     since: OffsetDateTime,
+    after: Option<Uuid>,
     limit: i64,
 ) -> Result<Vec<JobRow>, StoreError> {
     let mut c = tx.conn().await;
     let raw = sqlx::query_as!(
         RawJob,
-        "SELECT * FROM host_jobs WHERE created_at >= $1 ORDER BY created_at LIMIT $2",
+        "SELECT * FROM host_jobs WHERE created_at > $1 OR (created_at = $1 AND ($2::uuid IS NULL OR id > $2)) ORDER BY created_at, id LIMIT $3",
         since,
+        after,
         limit
     )
     .fetch_all(&mut **c)
@@ -397,16 +401,20 @@ pub async fn created_since(
 }
 
 /// Finished at or after `since`, oldest first (audit feed).
+/// Keyset-paginated: with `after`, rows at exactly `since` only past
+/// that id; ordered by (time, id), so a page boundary is exact.
 pub async fn finished_since(
     tx: &Tx<'_>,
     since: OffsetDateTime,
+    after: Option<Uuid>,
     limit: i64,
 ) -> Result<Vec<JobRow>, StoreError> {
     let mut c = tx.conn().await;
     let raw = sqlx::query_as!(
         RawJob,
-        "SELECT * FROM host_jobs WHERE finished_at >= $1 ORDER BY finished_at LIMIT $2",
+        "SELECT * FROM host_jobs WHERE finished_at > $1 OR (finished_at = $1 AND ($2::uuid IS NULL OR id > $2)) ORDER BY finished_at, id LIMIT $3",
         since,
+        after,
         limit
     )
     .fetch_all(&mut **c)

@@ -1021,7 +1021,7 @@ round_trips! {
         (s(), s()).prop_map(|(path, sha)| WikiWritten::Unchanged { path, sha, unchanged: True }),
     ];
     rt_wiki_deleted: s().prop_map(|path| WikiDeleted { path, deleted: True });
-    rt_audit_page: (vec(audit_event(), 0..4), ts(), any::<bool>()).prop_map(|(events, next, truncated)| AuditPage { events, next, truncated });
+    rt_audit_page: (vec(audit_event(), 0..4), ts(), s(), any::<bool>()).prop_map(|(events, next, cursor, truncated)| AuditPage { events, next, cursor, truncated });
     rt_containment_entry: containment_entry();
     rt_contain_result: (containment_entry(), strings(), any::<u32>(), any::<u32>(), any::<u32>(), btree_map(s(), leaf(), 0..3))
         .prop_map(|(entry, agents, grants_revoked, requests_denied, threads_closed, daemons)| ContainResult {

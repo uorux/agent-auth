@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT * FROM access_requests WHERE updated_at >= $1 ORDER BY updated_at LIMIT $2",
+  "query": "SELECT * FROM access_requests WHERE updated_at > $1 OR (updated_at = $1 AND ($2::uuid IS NULL OR id > $2)) ORDER BY updated_at, id LIMIT $3",
   "describe": {
     "columns": [
       {
@@ -304,6 +304,7 @@
     "parameters": {
       "Left": [
         "Timestamptz",
+        "Uuid",
         "Int8"
       ]
     },
@@ -337,5 +338,5 @@
       false
     ]
   },
-  "hash": "3cda3d11720f0a2e85761ce498ebcf37f2fe6ef3080ad95532c79a0c63d21f90"
+  "hash": "d8791798c9ca417083806bbc358bd38a01831a390cdd8d52c918909c34ef2d45"
 }

@@ -1026,7 +1026,8 @@ and why. Keep entries short. Group by area.
 - **The reviewer's history** quotes earlier reasoning as a JSON string
   labelled model output, and the system prompt says not to follow it.
 - **Security log**: failed authentications have a ring of their own, so a
-  flood of them cannot evict the other events.
+  flood of them cannot evict the other events (and agent-caused events are
+  kept per agent: see "Security review 2026-10" below).
 - **The boot tick** (reaper catch-up, stalled LLM work) completes before
   the HTTP listener and the Discord bot start.
 - **The instance lock is watched** (final review): every 5 s the broker
@@ -1075,6 +1076,78 @@ and why. Keep entries short. Group by area.
   connection or a proxy's 502–504 is retried (1 s, doubling to 8 s) until
   the wait's deadline, which returns the last answer. A broker that never
   answered is still an error at once.
+
+### Security review 2026-10: TLS, config, audit, auth, prompts
+
+- **A private CA replaces the public roots** (`agent-auth-tls`). The port
+  added `KUBERNETES_CA_FILE` (in-cluster: the pod's `ca.crt`) to the
+  Mozilla roots, so with a public name for the API server any publicly
+  trusted certificate for that name would have received the broker's
+  service-account token (RBAC on every brokered namespace). The Python
+  (`httpx.AsyncClient(verify=ca_file)`) trusted only that file. Now
+  `private_root_store` (the default meaning of "a CA for this service")
+  trusts only the file; `root_store_plus` (public roots plus a CA) is kept
+  for mail alone, whose one config also reaches Gmail and SimpleLogin next
+  to a private IMAP/SMTP server (`MAIL_CA_FILE`, unchanged). **Operator:**
+  in-cluster nothing changes (the pod's `ca.crt` signs the API server's
+  certificate). With `KUBERNETES_API_URL` set to a URL, `KUBERNETES_CA_FILE`
+  must hold the CA (or CAs, concatenated PEM) that signs that API server's
+  certificate; for an API server with a publicly trusted certificate,
+  leave `KUBERNETES_CA_FILE` unset (the public roots are then used). A
+  wrong file now fails the TLS handshake (`kubernetes API unreachable`)
+  instead of passing on a public root. Postgres is not covered: sqlx adds
+  `sslrootcert` to its own webpki roots and takes no TLS config from us
+  (see Open questions).
+- **`DATABASE_URL` is checked as sqlx reads it.** The check parsed the URL
+  with `url` and looked at its host and the first `sslmode`, while sqlx
+  lets a later `host=`/`hostaddr=` replace a loopback host, takes the last
+  `sslmode`/`ssl-mode`, and falls back to `PGHOST`/`PGSSLMODE`: e.g.
+  `postgres://u@localhost/db?host=db.example` passed as local and connected
+  in plain text to `db.example`, and `?sslmode=verify-full&ssl-mode=disable`
+  passed and disabled TLS. Now the URL goes through
+  `PgConnectOptions::from_str` (the store's own parser) and the effective
+  socket, host and SSL mode are judged. Error text: `DATABASE_URL is not a
+  valid Postgres URL` for an unparsable one.
+- **Agent-caused security events are kept per agent.** `credential_refused`
+  (a held agent asking for a credential, as often as it likes) shared one
+  5000-event ring with `containment_lifted`, so a held agent could evict
+  every other agent's refusals and the operator's lifts from the audit feed
+  in seconds. Now they are kept per agent (200 each; at 5000 together the
+  agent with the most loses its oldest), and the operator's events keep a
+  ring of their own (failed authentications already had one).
+- **The audit feed has an exact cursor** (new). `since`/`next` are
+  inclusive times, so more than `limit` items at one time (a burst of
+  agent creations in one transaction, refusals in one microsecond) made a
+  reader fetch the same page forever. Each page now also carries `cursor`
+  (opaque: the last item's time, source and id; with no items, the request's
+  position), and `?after=<cursor>` returns what comes strictly after it
+  (422 `after: a cursor from a previous page` for anything else; `after`
+  wins over `since`). Every source is read keyset-paginated on (time, id)
+  (the queries were ordered by time alone, so even the cut inside one time
+  was arbitrary); security events compare at microseconds, as on the wire.
+  `since`/`next` are unchanged. The client's `audit_events` takes `after`.
+- **The admin token is compared in time independent of its length**:
+  SHA-256 of the presented and the configured token, then a constant-time
+  comparison of the digests (`ct_eq_hashed`, which existed but was unused;
+  `ct_eq` returned early on a length mismatch, revealing the configured
+  token's length). The other secret comparisons are of fixed-length values
+  (hashes, HMACs, generated nonces, TOTP codes) and keep `ct_eq`.
+- **No angle bracket of an agent survives in an LLM prompt**
+  (`agent_auth_core::prompt`). The Python and the port broke only the exact
+  `</justification` (and `</request`, `</watch`), so `</JUSTIFICATION>` or
+  `</ justification>` ended the block for the reviewer and the rest read
+  as broker text. Now free text (the justification, the agent's
+  description, a non-standard capability, names) has `&`, `<`, `>` written
+  as `&amp;`, `&lt;`, `&gt;` and look-alike brackets (fullwidth, small,
+  guillemets, CJK/mathematical angle brackets...) as `&#x...;`; JSON
+  bodies (the risk summarizer's `<request>`, the watcher's `<watch>`, the
+  mail judge's blocks, the reviewer's quoted resource, scope, context notes
+  and prior reasoning) have them as `\u003c`-style escapes (same JSON). The
+  reviewer's system prompt says the agent's `< > &` appear escaped. The
+  agent description and a non-standard capability are also collapsed to
+  one line. sandboxd's triage (`inert`, which broke every `</` but not
+  `< /`) uses the same function. The mail judge kept its any-case breaking
+  as a second line.
 
 ## Daemons, hostd and hostexec (`crates/daemon`, `crates/hostd`, broker `daemons`, `hostexec`, `desktop`, `attention`)
 
@@ -1776,6 +1849,15 @@ Final review (sandboxes), fixed:
 ## Open questions
 
 (for Jacob; nothing here is implemented until decided)
+
+- **Postgres `sslrootcert` adds to the public roots** (security review
+  2026-10, finding 1): sqlx builds its own rustls config from webpki roots
+  plus `sslrootcert`, with no hook for ours, so a database whose name a
+  public CA can certify would accept a public certificate under
+  `sslmode=verify-full`. Not exploitable for a cluster-internal name
+  (`*.svc`, a private zone, an IP) that no public CA issues for. Options:
+  require such a host when `sslrootcert` is set, connect over a unix
+  socket or a TLS sidecar, or patch sqlx. Undecided.
 
 - **Shells "one at a time"** (daemons bug 11): neither side enforces it
   (as in the Python); enforce on hostd (refuse a command while another of

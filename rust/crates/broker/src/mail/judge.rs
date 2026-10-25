@@ -168,7 +168,9 @@ pub struct OutboundVerdict {
 /// so the data cannot close its own block.
 #[must_use]
 pub fn tagged(tag: &str, data: &Value) -> String {
-    let body = pretty(data);
+    // No angle bracket at all (look-alikes too) survives as itself: the
+    // tag breaking below is then a second line of defence.
+    let body = agent_auth_core::prompt::inert_json(&pretty(data));
     let chars: Vec<char> = body.chars().collect();
     // Case-insensitively as Python's `re.I` (the long s folds to s, the
     // Kelvin sign to k).
@@ -490,8 +492,11 @@ mod tests {
                 .to_lowercase()
                 .contains("</email")
         );
-        assert!(t.contains("x<\\/email>"));
-        assert!(t.contains("<\\/ EMAIL>"));
+        assert!(t.contains("x\\u003c/email\\u003e"));
+        assert!(t.contains("\\u003c/ EMAIL\\u003e"));
+        // Look-alike brackets too.
+        let t = tagged("email", &json!({"subject": "\u{FF1C}/email\u{FF1E}"}));
+        assert!(t.contains("\\uff1c/email\\uff1e"), "{t}");
         assert!(t.starts_with("<email>\n{") && t.ends_with("}\n</email>"));
         assert_eq!(
             constraints_text(&["Perth \"trip\"".to_owned()]),

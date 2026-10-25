@@ -23,6 +23,7 @@ pub mod names;
 pub mod platform;
 pub mod policy;
 pub mod pool;
+pub mod prompt;
 #[cfg(kani)]
 mod proofs;
 #[cfg(kani)]

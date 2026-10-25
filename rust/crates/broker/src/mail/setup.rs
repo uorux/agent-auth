@@ -36,7 +36,7 @@ pub struct MailSettings {
 /// The TLS config for the mail servers, SimpleLogin and Gmail.
 pub fn tls(extra_ca_pem: Option<&[u8]>) -> anyhow::Result<rustls::ClientConfig> {
     let roots = match extra_ca_pem {
-        Some(pem) => agent_auth_tls::root_store_with(pem)
+        Some(pem) => agent_auth_tls::root_store_plus(pem)
             .map_err(|e| anyhow::anyhow!("MAIL_CA_FILE: {e}"))?,
         None => agent_auth_tls::root_store(),
     };

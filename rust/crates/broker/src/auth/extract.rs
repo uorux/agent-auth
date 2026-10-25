@@ -279,8 +279,12 @@ impl FromRequestParts<AppState> for AdminCaller {
             ));
         };
         let presented = bearer_token(parts);
-        let ok = presented
-            .is_some_and(|t| agent_auth_crypto::ct_eq(t.as_bytes(), expected.expose().as_bytes()));
+        // Digests of both, compared in constant time: the time depends on
+        // neither the token's contents nor its length (the operator picks
+        // the length; plain `ct_eq` returns early when lengths differ).
+        let ok = presented.is_some_and(|t| {
+            agent_auth_crypto::ct_eq_hashed(t.as_bytes(), expected.expose().as_bytes())
+        });
         if !ok {
             if presented.is_some() || parts.headers.contains_key(AUTHORIZATION) {
                 record(state, parts, "bad_admin_token", state.now(), &[]);

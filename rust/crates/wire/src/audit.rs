@@ -15,13 +15,18 @@ use crate::a2a::{CloseReason, ThreadState};
 use crate::common::{AgentKind, Placement, TierName};
 use crate::literal::literal_str;
 
-/// `{events, next, truncated}`. `next` is inclusive: pass it back as
-/// `since` and drop items whose `(kind, id, status)` you have seen.
+/// `{events, next, cursor, truncated}`. `next` is inclusive: pass it back
+/// as `since` and drop items whose `(kind, id, status)` you have seen; it
+/// cannot get past more than `limit` items sharing one time. `cursor`
+/// (new) is exclusive and exact: pass it back as `after` and every page
+/// advances.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditPage {
     pub events: Vec<AuditEvent>,
     #[serde(with = "crate::timestamp")]
     pub next: OffsetDateTime,
+    /// Opaque: the last item's position (or the request's, with no items).
+    pub cursor: String,
     pub truncated: bool,
 }
 
