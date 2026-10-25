@@ -12,9 +12,11 @@ use agent_auth_core::policy::Policy;
 use agent_auth_store::Store;
 use time::OffsetDateTime;
 
+use crate::auth::AuthConfig;
 use crate::events::KeyedEvents;
 use crate::notify::Notifier;
 use crate::provisioners::Registry;
+use crate::security_log::SecurityLog;
 
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -24,6 +26,8 @@ pub struct AppState {
     pub notifier: Arc<Notifier>,
     /// Wakes `GET /v1/requests/{id}/wait` when a request changes.
     pub request_events: Arc<KeyedEvents<RequestId>>,
+    pub auth: Arc<AuthConfig>,
+    pub security_log: Arc<SecurityLog>,
 }
 
 impl AppState {
@@ -32,5 +36,22 @@ impl AppState {
     #[must_use]
     pub fn now(&self) -> OffsetDateTime {
         OffsetDateTime::now_utc()
+    }
+}
+
+impl AppState {
+    /// The core of a state: everything optional left at its default
+    /// (no provisioners, no notifier). Tests and `main` start from here.
+    #[must_use]
+    pub fn new(store: Store, policy: Policy, auth: AuthConfig) -> AppState {
+        AppState {
+            store,
+            policy: Arc::new(policy),
+            registry: Arc::default(),
+            notifier: Arc::default(),
+            request_events: Arc::default(),
+            auth: Arc::new(auth),
+            security_log: Arc::default(),
+        }
     }
 }

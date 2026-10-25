@@ -33,10 +33,6 @@ pub struct AgentCaller {
 }
 
 impl AgentCaller {
-    #[expect(
-        dead_code,
-        reason = "called by the extractors (auth::extract), not yet written"
-    )]
     pub(crate) fn new(
         agent: AgentRow,
         session: Option<SessionRow>,
@@ -84,10 +80,6 @@ pub struct AdminCaller {
 }
 
 impl AdminCaller {
-    #[expect(
-        dead_code,
-        reason = "called by the extractors (auth::extract), not yet written"
-    )]
     pub(crate) fn new(who: AdminIdentity) -> AdminCaller {
         AdminCaller { who }
     }
@@ -115,10 +107,7 @@ pub struct DiscordOwner {
 }
 
 impl DiscordOwner {
-    #[expect(
-        dead_code,
-        reason = "called by the extractors (auth::extract), not yet written"
-    )]
+    #[expect(dead_code, reason = "called by the Discord bot, not yet written")]
     pub(crate) fn new(user_id: u64, name: String) -> DiscordOwner {
         DiscordOwner { user_id, name }
     }
@@ -162,3 +151,6 @@ impl From<&DiscordOwner> for HumanDecider {
         }
     }
 }
+
+mod extract;
+pub use extract::{AuthConfig, bearer_token, client_address};

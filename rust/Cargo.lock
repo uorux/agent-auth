@@ -14,6 +14,7 @@ dependencies = [
  "axum",
  "clap",
  "futures",
+ "http-body-util",
  "reqwest",
  "rustls",
  "serde",
