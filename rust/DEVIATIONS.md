@@ -677,3 +677,5 @@ and why. Keep entries short. Group by area.
   deprecated `test::rand::FixedSliceRandom` (ring has no scalar-to-key
   constructor). Pinned by known-answer tests against the Python; revisit
   (a dedicated PKCS#8 key) in review.
+- Core defines `AgentKind` and `Placement` twice (containment and policy);
+  provisioners map between them. Unify in core.
