@@ -12,6 +12,7 @@
 //! echo, never taken as arguments, and nothing prints a traceback.
 
 pub mod args;
+pub mod google_consent;
 pub mod run;
 pub mod serve;
 

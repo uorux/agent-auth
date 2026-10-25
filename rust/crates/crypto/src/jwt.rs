@@ -504,6 +504,98 @@ impl GitHubAppKey {
     }
 }
 
+/// A Google service account's private key (the `private_key` of its JSON
+/// key file, PKCS#8 PEM), for the RS256 assertion of the OAuth JWT-bearer
+/// grant (domain-wide delegation, RFC 7523).
+pub struct ServiceAccountKey {
+    pair: RsaKeyPair,
+}
+
+impl fmt::Debug for ServiceAccountKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ServiceAccountKey(..)")
+    }
+}
+
+/// What a service-account assertion says (Google's claims).
+#[derive(Debug, Clone, Copy)]
+pub struct AssertionClaims<'a> {
+    /// The service account's `client_email`.
+    pub iss: &'a str,
+    /// Whom it acts as (the Workspace user).
+    pub sub: &'a str,
+    /// Space-separated scopes.
+    pub scope: &'a str,
+    /// The token endpoint.
+    pub aud: &'a str,
+    pub iat: i64,
+    pub exp: i64,
+}
+
+impl ServiceAccountKey {
+    /// From a PKCS#8 `PRIVATE KEY` PEM (what Google's key files hold) or a
+    /// PKCS#1 `RSA PRIVATE KEY`. ring requires at least 2048 bits.
+    pub fn from_pem(text: &str) -> Result<Self, JwtError> {
+        let block = pem::parse(text)?;
+        let der = block.der.expose();
+        let pair = match block.label.as_str() {
+            "PRIVATE KEY" => RsaKeyPair::from_pkcs8(der),
+            "RSA PRIVATE KEY" => RsaKeyPair::from_der(der),
+            other => return Err(JwtError::RsaKey(format!("unexpected PEM label {other:?}"))),
+        }
+        .map_err(|e| JwtError::RsaKey(e.to_string()))?;
+        Ok(Self { pair })
+    }
+
+    /// The signed assertion: header `{"alg":"RS256","kid":<kid>,"typ":"JWT"}`
+    /// (no `kid` when None), claims `iss sub scope aud iat exp`.
+    pub fn assertion(
+        &self,
+        kid: Option<&str>,
+        claims: &AssertionClaims<'_>,
+    ) -> Result<Secret<String>, JwtError> {
+        let mut header = Map::new();
+        header.insert("alg".to_owned(), json!("RS256"));
+        header.insert("typ".to_owned(), json!("JWT"));
+        if let Some(kid) = kid {
+            header.insert("kid".to_owned(), json!(kid));
+        }
+        let payload = json!({
+            "iss": claims.iss,
+            "sub": claims.sub,
+            "scope": claims.scope,
+            "aud": claims.aud,
+            "iat": claims.iat,
+            "exp": claims.exp,
+        });
+        let header = to_canonical_string(&Value::Object(header)).map_err(|_| JwtError::Sign)?;
+        let payload = to_canonical_string(&payload).map_err(|_| JwtError::Sign)?;
+        rs256(&self.pair, header.as_bytes(), payload.as_bytes())
+    }
+
+    /// The public key (DER `RSAPublicKey`), to verify with in tests.
+    #[must_use]
+    pub fn public_key_der(&self) -> Vec<u8> {
+        self.pair.public().as_ref().to_vec()
+    }
+}
+
+fn rs256(pair: &RsaKeyPair, header: &[u8], payload: &[u8]) -> Result<Secret<String>, JwtError> {
+    let signing_input = format!("{}.{}", b64url_encode(header), b64url_encode(payload));
+    let mut sig = vec![0u8; pair.public().modulus_len()];
+    pair.sign(
+        &signature::RSA_PKCS1_SHA256,
+        &SystemRandom::new(),
+        signing_input.as_bytes(),
+        &mut sig,
+    )
+    .map_err(|_| JwtError::Sign)?;
+    Ok(Secret::new(format!(
+        "{signing_input}.{}",
+        b64url_encode(&sig)
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -746,6 +838,53 @@ mod tests {
             Err(JwtError::RsaKey(_))
         ));
         assert!(GitHubAppKey::from_pem("nope").is_err());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn service_account_assertion_verifies() {
+        let v = &vectors()["github_app"];
+        let key = ServiceAccountKey::from_pem(s(&v["pkcs8_pem"])).unwrap();
+        let claims = AssertionClaims {
+            iss: "broker@proj.iam.gserviceaccount.com",
+            sub: "jacob@corp.example",
+            scope: "https://www.googleapis.com/auth/calendar.readonly",
+            aud: "https://oauth2.googleapis.com/token",
+            iat: 1_700_000_000,
+            exp: 1_700_003_600,
+        };
+        let token = key.assertion(Some("kid1"), &claims).unwrap();
+        let parts: Vec<&str> = token.expose().split('.').collect();
+        assert_eq!(parts.len(), 3);
+        let header: Value = serde_json::from_slice(&b64url_decode(parts[0]).unwrap()).unwrap();
+        assert_eq!(header, json!({"alg": "RS256", "typ": "JWT", "kid": "kid1"}));
+        let body: Value = serde_json::from_slice(&b64url_decode(parts[1]).unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "iss": "broker@proj.iam.gserviceaccount.com",
+                "sub": "jacob@corp.example",
+                "scope": "https://www.googleapis.com/auth/calendar.readonly",
+                "aud": "https://oauth2.googleapis.com/token",
+                "iat": 1_700_000_000,
+                "exp": 1_700_003_600,
+            })
+        );
+        let public = signature::UnparsedPublicKey::new(
+            &signature::RSA_PKCS1_2048_8192_SHA256,
+            key.public_key_der(),
+        );
+        let signed = format!("{}.{}", parts[0], parts[1]);
+        let sig = b64url_decode(parts[2]).unwrap();
+        assert!(public.verify(signed.as_bytes(), &sig).is_ok());
+        assert!(public.verify(b"other", &sig).is_err());
+        let no_kid = key.assertion(None, &claims).unwrap();
+        let header: Value = serde_json::from_slice(
+            &b64url_decode(no_kid.expose().split('.').next().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert!(header.get("kid").is_none());
+        assert!(ServiceAccountKey::from_pem("nope").is_err());
     }
 }
 

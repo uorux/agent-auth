@@ -10,7 +10,7 @@ membership, a2a permissions) and revoked when they expire.
 ```
 agent ──HTTP/MCP/CLI──▶ broker ──policy──▶ deny | approve | llm | surface ──▶ Discord ping
                           │                                                    Approve/Deny/Edit
-                          └─▶ provisioners: GitHub App tokens · LLDAP groups · a2a grants · google (stub)
+                          └─▶ provisioners: GitHub App tokens · LLDAP groups · a2a grants · Google tokens
                               └─ expiry scheduler revokes at expires_at
 ```
 
@@ -25,7 +25,7 @@ agent ──HTTP/MCP/CLI──▶ broker ──policy──▶ deny | approve | 
 | `a2a`     | `talk`        | target agent name   | authorizes OPENING conversation threads to that (service) agent — see [a2a threads](#a2a-threads); no credential is minted |
 | `hostexec` | `run`, `tpl.<name>`, `shell` | host name | one command (or a time-boxed shell) **on a host**, run by that host's daemon — see [Commands on hosts](#commands-on-hosts-hostexec). The host decides, with its own TOTP secrets and policy; root and shells always reach a human |
 | `models`  | `use`         | gateway name (`litellm`) | a LiteLLM virtual key of the agent's own, under a LiteLLM user named after it — see [Model gateway](#model-gateway-litellm). Deleted at revoke (LiteLLM keeps it, with its spend, among its deleted keys); the gateway also ends it at the grant's end |
-| `google`  | `calendar.*`… | calendar id / label | stub: decisions recorded, no credential minted (501)                        |
+| `google`  | `calendar.read`, `calendar.write`, `drive.read` | account name or address | a short-lived Google API token with just that scope (account-wide, by Google's design); a stub when no account is configured. Gmail is never a token — see [Google](#google) |
 
 Note the Gitea flow: the broker grants the homelab agent the `svc-gitea` LLDAP
 group; the agent then authenticates to Gitea itself and mints its own tokens.
@@ -645,6 +645,55 @@ anything in that tier. Disarmed and without codes it can run only the
 
 Not yet run on a real host: the systemd-run paths (the user tier's in
 particular). The tests drive the real daemon with a fake executor.
+
+## Google
+
+`platforms.google.accounts` are the Google logins the broker holds: an OAuth
+client and a refresh token per account (any Gmail or Workspace account), or
+on Workspace a service account with domain-wide delegation (`subject`).
+
+```yaml
+platforms:
+  google:
+    accounts:
+      main:
+        address: me@example.com
+        client_secret_file: /run/credentials/agent-auth.service/google-client.json
+        refresh_token_file: /run/credentials/agent-auth.service/google-refresh
+      work:                                     # Workspace: domain-wide delegation
+        address: jacob@corp.example
+        service_account_file: /run/credentials/agent-auth.service/google-sa.json
+        # subject: someone@corp.example         # whom it acts as (default: address)
+```
+
+`calendar.read` (`calendar.readonly`), `calendar.write` (`calendar.events`)
+and `drive.read` (`drive.readonly`) are access tokens the broker mints with
+exactly that scope, and it checks the scopes Google says the token carries:
+a token wider than the grant is refused, so give such an account a login
+consented for only what agents may hold (or use delegation). Writing a
+calendar and reading a Drive always reach a human, and only a rule naming
+the platform and capability clears any of them. Gmail is never a token.
+
+The refresh token comes from `agent-auth admin google-consent
+--client-secret-file client.json --scopes calendar.readonly --out refresh`,
+run on your own machine (a *Desktop app* OAuth client; loopback redirect with
+PKCE; the token goes to a new 0600 file and is never printed). An OAuth app
+in "Testing" status issues refresh tokens that last 7 days: set it to "In
+production" (or Internal on Workspace). The consent screen lets you untick
+scopes; the command says what was not granted. A login file's `token_uri`
+must be https (plain http only to a loopback address).
+
+At startup, if accounts are configured and saved rules for `google` exist,
+the broker logs a loud warning: rules saved while google was a stub would
+now approve real, account-wide tokens. Review them with `agent-auth admin
+rules`.
+
+What it does not protect against: those scopes reach the whole account
+(every calendar, every file); Google has nothing per calendar or folder. A
+token is not revoked at the grant's end and lives up to an hour: revoking a
+token Google issued from a refresh token revokes the refresh token too.
+Without accounts the platform is the old stub (decisions recorded, 501 on
+the credential).
 
 ## MCP servers
 

@@ -190,6 +190,8 @@ pub enum AnyProvisioner {
     Google(google::GoogleProvisioner),
     /// Commands on hosts (`crate::hostexec::provisioner`).
     Hostexec(crate::hostexec::provisioner::HostexecProvisioner),
+    /// Google with no account configured (decisions only).
+    GoogleStub(google::GoogleStubProvisioner),
 }
 
 macro_rules! dispatch {
@@ -204,6 +206,7 @@ macro_rules! dispatch {
             AnyProvisioner::Mcp($p) => $e,
             AnyProvisioner::Google($p) => $e,
             AnyProvisioner::Hostexec($p) => $e,
+            AnyProvisioner::GoogleStub($p) => $e,
         }
     };
 }

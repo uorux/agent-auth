@@ -52,6 +52,9 @@ pub struct PlatformCatalog {
     pub servers: Option<Vec<McpServerEntry>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway: Option<GatewayEntry>,
+    /// google: the accounts (name, address).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounts: Option<Vec<GoogleAccountEntry>>,
 }
 
 impl PlatformCatalog {
@@ -79,6 +82,7 @@ impl PlatformCatalog {
             hosts: None,
             servers: None,
             gateway: None,
+            accounts: None,
         }
     }
 }
@@ -131,6 +135,13 @@ pub struct McpServerEntry {
     pub description: String,
     /// Null when the server's tools are not listed.
     pub tools: Option<Vec<String>>,
+}
+
+/// google: an account the broker holds a login for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoogleAccountEntry {
+    pub name: String,
+    pub address: String,
 }
 
 /// models: the gateway.

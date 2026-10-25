@@ -730,6 +730,29 @@ and why. Keep entries short. Group by area.
   (`agents.lldap_password_encrypted`, row = agent id), gateway keys
   (`grants.provisioner_state.key_encrypted`, row = grant id).
 
+- **Google tokens are minted per (account, scopes) lock** (flagged
+  upstream): the Python held one lock across every mint, so a slow Google
+  for one account stalled all of them. Each cached token has its own lock
+  (concurrent fetches of one token still make one call).
+- **Google token endpoint texts** (provisioners, `_explain`): Google's
+  free-text `error_description` is logged, not shown; the agent-visible text
+  names only the OAuth error code (`invalid_grant`, `unauthorized_client`,
+  ...), and the refresh-token and delegation texts keep the Python's advice.
+  A transport failure is `google token endpoint unreachable (see broker
+  logs)`; an unreadable login file names what is wrong (`no such file`,
+  `not JSON`, `no client_id`), not the Python exception's repr.
+- **A login file's `token_uri` must be https** (plain http only to a
+  loopback address), in the broker and in `admin google-consent`: `google
+  account <a>: its token_uri is not an https URL`. The Python posted the
+  refresh token or assertion to whatever the file named.
+- **`admin google-consent` never writes through a link**: an existing
+  `--out` that is not a regular file is refused like a non-empty one; a
+  client JSON that does not parse is a clean error (the Python raised).
+- **Google texts**: a scope on a google request is refused with core's
+  `no scope for google grants: the capability is the scope (unknown scope
+  keys: ...)`; the stub's 501 reads `no google account is configured on this
+  broker` (the Python's).
+
 ## Wiki (`broker/src/wiki`)
 
 - **`last_change` is cached per (path, blob sha), and a failed lookup is

@@ -257,7 +257,7 @@ async fn credential(
         Ok(c) => c,
         Err(ProvisionError::NotImplemented) => {
             let detail = if platform == agent_auth_core::Platform::Google {
-                "google workspace provisioning is not implemented"
+                "no google account is configured on this broker"
             } else {
                 "not implemented"
             };

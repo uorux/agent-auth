@@ -214,6 +214,38 @@ pub async fn serve_until(
 }
 
 /// Run the broker until a signal (or the server failing).
+/// Saved rules for google made while it was a stub (nothing was issued, so
+/// approving was harmless) would auto-approve real, account-wide tokens
+/// once accounts are configured: said loudly at every start until they
+/// are reviewed (flagged upstream).
+async fn warn_stub_era_google_rules(store: &Store, policy: &Policy) -> anyhow::Result<()> {
+    if policy.platforms().google.accounts.is_empty() {
+        return Ok(());
+    }
+    let tx = store.begin().await?;
+    let rules = agent_auth_store::rules::live_for(
+        &tx,
+        agent_auth_core::Platform::Google,
+        time::OffsetDateTime::now_utc(),
+    )
+    .await?;
+    tx.rollback().await?;
+    let approving = rules
+        .iter()
+        .filter(|r| r.action == agent_auth_store::rules::RuleAction::AutoApprove)
+        .count();
+    if approving > 0 {
+        tracing::warn!(
+            rules = approving,
+            "!!! google accounts are configured and {approving} saved rule(s) auto-approve \
+             google requests. Rules saved while google was a stub (nothing was issued) now \
+             approve real, account-wide Calendar/Drive tokens: review them with \
+             `agent-auth admin rules` and delete any you did not mean for real accounts !!!"
+        );
+    }
+    Ok(())
+}
+
 pub async fn run(env: Env) -> anyhow::Result<()> {
     let config = Config::from_env(&env)?;
     let policy = config.load_policy()?;
@@ -230,6 +262,7 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
     };
     store.migrate().await.context("migrating the database")?;
     ensure_operator(&store).await?;
+    warn_stub_era_google_rules(&store, &policy).await?;
 
     let policy = Arc::new(policy);
     let (mut registry, platform_services) = register_provisioners(&env, &config, &policy)?;

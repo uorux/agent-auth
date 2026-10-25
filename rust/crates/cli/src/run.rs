@@ -494,6 +494,13 @@ async fn admin(cmd: AdminCommand, client: &BrokerClient, io: &mut Io<'_>) -> u8 
         AdminCommand::Revoke { grant_id, reason } => {
             show(io, client.admin_revoke_grant(&grant_id, &reason).await)
         }
+        AdminCommand::GoogleConsent {
+            client_secret_file,
+            scopes,
+            out,
+            no_browser,
+            port,
+        } => google_consent(io, &client_secret_file, &scopes, &out, !no_browser, port).await,
         AdminCommand::GenSigningKey { out, to_stdout } => {
             gen_signing_key(io, out.as_deref(), to_stdout)
         }
@@ -612,6 +619,57 @@ async fn admin(cmd: AdminCommand, client: &BrokerClient, io: &mut Io<'_>) -> u8 
 /// `admin gen-signing-key`: never the seed on a non-terminal stdout without
 /// `--stdout`; `--out` makes a new 0600 file and never overwrites or
 /// follows a link (`O_CREAT|O_EXCL`).
+async fn google_consent(
+    io: &mut Io<'_>,
+    client_secret_file: &Path,
+    scopes: &str,
+    out: &Path,
+    open_browser: bool,
+    port: u16,
+) -> u8 {
+    use crate::google_consent::{ConsentOptions, consent};
+    let opts = ConsentOptions {
+        client_secret_file: client_secret_file.to_string_lossy().into_owned(),
+        scopes: scopes
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        out: out.to_string_lossy().into_owned(),
+        port,
+    };
+    let result = consent(&opts, |url| {
+        io.line(&format!(
+            "Open this URL and sign in as the account to broker:\n\n  {url}\n"
+        ));
+        let _ = io.out.flush();
+        if open_browser {
+            crate::google_consent::open_browser(url);
+        }
+    })
+    .await;
+    match result {
+        Ok(result) => {
+            let code = io.json(&result);
+            if !result.missing.is_empty() {
+                io.styled(
+                    YELLOW,
+                    &format!(
+                        "not granted on the consent screen: {}",
+                        result.missing.join(", ")
+                    ),
+                );
+            }
+            code
+        }
+        Err(e) => {
+            io.styled(RED, &e.0);
+            1
+        }
+    }
+}
+
 fn gen_signing_key(io: &mut Io<'_>, out: Option<&Path>, to_stdout: bool) -> u8 {
     if out.is_none() && !to_stdout && !io.stdout_tty {
         // Piped or captured output (agent transcripts, logs) would keep it.

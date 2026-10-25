@@ -58,8 +58,10 @@ dependencies = [
  "rpassword",
  "serde",
  "serde_json",
+ "thiserror",
  "time",
  "tokio",
+ "url",
 ]
 
 [[package]]

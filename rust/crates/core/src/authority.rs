@@ -251,6 +251,25 @@ pub enum Authority {
 /// scope). Gmail is never one: mail goes through the broker.
 pub const GOOGLE_CAPABILITIES: [&str; 3] = ["calendar.read", "calendar.write", "drive.read"];
 
+/// The Google OAuth scopes the broker speaks of, by short name (what the
+/// consent helper and the config use); sorted.
+pub const GOOGLE_SCOPES: [&str; 5] = [
+    "calendar.events",
+    "calendar.readonly",
+    "drive.readonly",
+    "gmail.readonly",
+    "gmail.send",
+];
+
+/// A short scope name's full URL (`calendar.readonly` →
+/// `https://www.googleapis.com/auth/calendar.readonly`).
+#[must_use]
+pub fn google_scope_url(short: &str) -> Option<String> {
+    GOOGLE_SCOPES
+        .contains(&short)
+        .then(|| format!("https://www.googleapis.com/auth/{short}"))
+}
+
 /// The parts of the policy configuration that sensitivity depends on.
 #[derive(Debug, Clone)]
 pub struct SensitivityConfig {
@@ -576,7 +595,11 @@ impl Authority {
                 Ok(Authority::A2a { topic })
             }
             Platform::Google => {
-                only_keys(scope, &[], "a google grant takes no scope")?;
+                only_keys(
+                    scope,
+                    &[],
+                    "no scope for google grants: the capability is the scope",
+                )?;
                 Ok(Authority::Google {
                     action: capability.to_owned(),
                 })

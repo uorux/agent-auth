@@ -41,6 +41,8 @@ pub struct Call {
     pub query: String,
     pub headers: BTreeMap<String, String>,
     pub body: Value,
+    /// The body as text (form posts).
+    pub raw: String,
 }
 
 impl Call {
@@ -90,6 +92,7 @@ impl Fake {
                             })
                             .collect(),
                         body: serde_json::from_slice(&body).unwrap_or(Value::Null),
+                        raw: String::from_utf8_lossy(&body).into_owned(),
                     };
                     c.lock().unwrap().push(call.clone());
                     let handler = h.lock().unwrap().clone();

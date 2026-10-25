@@ -347,6 +347,30 @@ pub enum AdminCommand {
         #[arg(long = "stdout")]
         to_stdout: bool,
     },
+    /// Sign a Google account in for the broker, on your own machine: the
+    /// consent screen in a browser, then a refresh token in --out (never
+    /// printed). Put that file where the broker's refresh_token_file points
+    /// (a sops secret). Consent only what the broker should hold for that
+    /// account: the broker asks Google for just a grant's scope, and refuses
+    /// the token if Google returns a wider one.
+    GoogleConsent {
+        /// the OAuth client JSON (a Desktop client)
+        #[arg(long)]
+        client_secret_file: PathBuf,
+        /// comma-separated: gmail.readonly, gmail.send, calendar.readonly,
+        /// calendar.events, drive.readonly
+        #[arg(long, default_value = "gmail.readonly,gmail.send")]
+        scopes: String,
+        /// where the refresh token goes (new 0600 file)
+        #[arg(long)]
+        out: PathBuf,
+        /// print the URL only
+        #[arg(long)]
+        no_browser: bool,
+        /// loopback port (0: any free one)
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+    },
     /// Issue a one-time pairing code; on the host, run `sudo agent-auth-hostd
     /// pair` and enter it at the prompt (never as an argument).
     DaemonPair {

@@ -12,7 +12,7 @@ use agent_auth_crypto::secretbox::SecretBox;
 
 use super::AnyProvisioner;
 use super::github::{GithubApp, GithubProvisioner};
-use super::google::GoogleProvisioner;
+use super::google::{GoogleProvisioner, GoogleStubProvisioner, GoogleTokens};
 use super::kubernetes::KubernetesProvisioner;
 use super::lldap::LldapProvisioner;
 use super::mcp::McpProvisioner;
@@ -104,14 +104,29 @@ pub struct Keys<'a> {
 }
 
 /// Every platform this part owns whose configuration is present (§1.3).
-/// google is always on; the others need their settings. A platform whose
+/// google is always on (the stub without accounts); the others need their
+/// settings. A platform whose
 /// configuration is present but unusable is an error (the broker does not
 /// start), except where the Python only warned (models, homelab managed
 /// accounts), which log a warning.
 pub fn build(env: &Env<'_>, policy: &Arc<Policy>, keys: Keys<'_>) -> Result<Built, ConfigError> {
     let platforms = policy.platforms();
-    let mut provisioners = vec![AnyProvisioner::Google(GoogleProvisioner)];
+    let mut provisioners = Vec::new();
     let mut services = PlatformServices::default();
+
+    if platforms.google.accounts.is_empty() {
+        provisioners.push(AnyProvisioner::GoogleStub(GoogleStubProvisioner));
+    } else {
+        let tokens = Arc::new(GoogleTokens::new(&platforms.google)?);
+        provisioners.push(AnyProvisioner::Google(GoogleProvisioner::new(
+            &platforms.google,
+            tokens,
+        )));
+        tracing::info!(
+            accounts = platforms.google.accounts.len(),
+            "google: account(s) configured"
+        );
+    }
 
     if let Some(app) = GithubApp::from_env(env)? {
         let app = Arc::new(app);

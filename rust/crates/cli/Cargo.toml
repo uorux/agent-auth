@@ -24,8 +24,10 @@ reqwest.workspace = true
 rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "net", "io-util"] }
+url.workspace = true
 
 [dev-dependencies]
 agent-auth-client = { workspace = true, features = ["testing"] }
