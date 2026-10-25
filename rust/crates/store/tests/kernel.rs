@@ -9,8 +9,6 @@
 
 mod common;
 
-use std::time::Duration as StdDuration;
-
 use agent_auth_core::containment::AgentKind;
 use agent_auth_core::lifecycle::state;
 use agent_auth_core::{GrantId, GrantStatus, MessageId, ThreadId};
@@ -141,7 +139,7 @@ async fn recording_containment_waits_for_in_flight_checks(pool: PgPool) {
     let nh = lockdown::check(&tx1, a.id, now()).await.unwrap().unwrap();
     let s2 = store.clone();
     let recorder = tokio::spawn(async move { contain(&s2, "0000000d", json!({})).await });
-    tokio::time::sleep(StdDuration::from_millis(200)).await;
+    until_waiting_on_a_lock(&store).await;
     assert!(
         !recorder.is_finished(),
         "record must wait for the check's transaction"

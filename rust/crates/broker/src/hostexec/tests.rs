@@ -40,7 +40,7 @@ async fn request(b: &Broker, id: RequestId) -> agent_auth_store::requests::Reque
 }
 
 async fn job(b: &Broker, id: JobId) -> agent_auth_store::hostexec::JobRow {
-    for _ in 0..500 {
+    for _ in 0..1500 {
         let tx = b.st.store.begin().await.unwrap();
         let j = store::get(&tx, id).await.unwrap();
         if let Some(j) = j.filter(|j| !matches!(j.status, JobStatus::Starting | JobStatus::Running))

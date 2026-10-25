@@ -6,7 +6,7 @@ use std::time::Duration;
 use serde_json::json;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
-use crate::harness::{Broker, TempDir, Who, eventually, free_port};
+use crate::harness::{Broker, TempDir, Who, eventually};
 use crate::world::World;
 
 const WRITE: &str = r#"{"permissions": {"contents": "write"}}"#;
@@ -118,7 +118,7 @@ async fn containment_holds_and_releases(_: PgPoolOptions, opts: PgConnectOptions
     assert_eq!(r["decision_reason"], json!(reason));
     // Its cached token was revoked upstream; the other agent's was not.
     eventually(
-        Duration::from_secs(10),
+        Duration::from_secs(30),
         "the held agent's token revoked upstream",
         || async { w.github.calls_to("DELETE", "/installation/token").len() > tokens_before },
     )
@@ -188,7 +188,12 @@ async fn a_short_grant_expires(_: PgPoolOptions, opts: PgConnectOptions) {
     let cred = w.broker.cli(a.who(), &["cred", &grant]).await.ok();
     let token = cred["value"].as_str().unwrap().to_owned();
 
-    tokio::time::sleep(Duration::from_millis(3500)).await;
+    // Refused once it expired (3 s after the approval).
+    eventually(Duration::from_secs(30), "the grant expires", || {
+        let (w, a, grant) = (&w, &a, &grant);
+        async move { w.broker.cli(a.who(), &["cred", grant]).await.code != 0 }
+    })
+    .await;
     let refused = w.broker.cli(a.who(), &["cred", &grant]).await.refused();
     assert!(refused.contains("not active"), "{refused}");
     let revoked = |w: &World| {
@@ -199,7 +204,7 @@ async fn a_short_grant_expires(_: PgPoolOptions, opts: PgConnectOptions) {
     };
     w.broker.restart().await;
     eventually(
-        Duration::from_secs(10),
+        Duration::from_secs(30),
         "the expired grant's token revoked upstream",
         || {
             let done = revoked(&w);
@@ -229,7 +234,6 @@ async fn one_broker_per_database(_: PgPoolOptions, opts: PgConnectOptions) {
         w.broker.setup.clone(),
         w.broker.encryption_key.clone(),
         TempDir::new(),
-        free_port(),
     );
     let status = second
         .exited(Duration::from_secs(30))

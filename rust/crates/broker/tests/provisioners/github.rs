@@ -622,7 +622,7 @@ async fn a_cancelled_create_still_revokes_the_admin_token(pool: PgPool) {
     let n = t.n.clone();
     t.fake.set(move |c| {
         if c.is("POST", "/orgs/acme/repos") {
-            R(201, json!({"id": 1}), 3000)
+            R(201, json!({"id": 1}), 60_000)
         } else {
             github_default(c, &n)
         }
@@ -639,17 +639,25 @@ async fn a_cancelled_create_still_revokes_the_admin_token(pool: PgPool) {
     let tx = t.store.begin().await.unwrap();
     let _held = lockdown::check(&tx, a.id, now()).await.unwrap().unwrap();
     let pg = grants::load_provisioning(&tx, g.id).await.unwrap().unwrap();
-    let out =
-        tokio::time::timeout(Duration::from_millis(500), t.p.provision(&tx, &pg, now())).await;
+    // Cancelled once the create is in flight (not after a guessed time:
+    // under load, minting the admin token alone can take longer).
+    let create_sent = async {
+        while t.fake.count("POST", "/orgs/acme/repos") == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let out = tokio::select! {
+        out = t.p.provision(&tx, &pg, now()) => Some(out),
+        () = create_sent => None,
+    };
     drop(pg);
-    assert!(out.is_err(), "the create should still be pending");
+    assert!(out.is_none(), "the create should still be pending");
     drop(_held);
     tx.rollback().await.unwrap();
-    for _ in 0..50 {
-        if t.fake.count("DELETE", "/installation/token") == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while t.fake.count("DELETE", "/installation/token") < 1 && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let revokes = t.fake.find("DELETE", "/installation/token");
     assert_eq!(revokes.len(), 1);

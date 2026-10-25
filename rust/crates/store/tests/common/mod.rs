@@ -209,3 +209,29 @@ pub fn hours(n: i64) -> Duration {
 pub fn platform_of(a: &Authority) -> Platform {
     a.platform()
 }
+
+/// Wait until some transaction of this test's database is blocked on a
+/// lock (row, table or advisory): what a test of "B waits for A" waits for
+/// before checking B is still waiting and releasing A. A sleep there only
+/// guessed that B got as far as the lock; under load B might not have, and
+/// the test passed without testing the wait (30 s at most).
+pub async fn until_waiting_on_a_lock(store: &Store) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        if waiting > 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "nothing waited on a lock in 30 s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}

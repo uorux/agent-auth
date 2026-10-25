@@ -93,11 +93,13 @@ async fn a_thread_with_long_poll_and_delegation(_: PgPoolOptions, opts: PgConnec
         "{read}"
     );
 
-    // The initiator long-polls; the reply wakes it.
+    // The initiator long-polls; the reply ends it (as a wake-up or found by
+    // the first read, whichever way the two processes race; the wake-up
+    // itself is pinned by the broker's tests, which wait for the poll to
+    // park).
     let poll = ["a2a", "poll", &tid, "--after-seq", "1", "--wait", "30"];
     let waiting = b.cli(sde.who(), &poll);
     let reply = async {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         b.cli(
             ops.who(),
             &[
@@ -115,8 +117,8 @@ async fn a_thread_with_long_poll_and_delegation(_: PgPoolOptions, opts: PgConnec
     let (got, sent) = tokio::join!(waiting, reply);
     let got = got.ok();
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(15),
-        "woken, not timed out"
+        started.elapsed() < std::time::Duration::from_secs(25),
+        "ended by the reply, not the 30 s wait"
     );
     assert_eq!(sent["seq"], 2, "{sent}");
     assert_eq!(

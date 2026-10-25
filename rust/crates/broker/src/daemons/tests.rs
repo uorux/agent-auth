@@ -254,7 +254,7 @@ async fn channel_end_to_end(pool: sqlx::PgPool) {
     // The first heartbeat is stored, with the daemon's version.
     let store = b.st.store.clone();
     let mut row = None;
-    for _ in 0..200 {
+    for _ in 0..1500 {
         let tx = store.begin().await.unwrap();
         row = daemons::by_name(&tx, DaemonRole::Host, HOST).await.unwrap();
         if row.as_ref().is_some_and(|r| r.last_status.is_some()) {

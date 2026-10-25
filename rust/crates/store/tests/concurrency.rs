@@ -597,7 +597,6 @@ async fn send(
 #[sqlx::test(migrations = "./migrations")]
 async fn a_send_racing_a_revoke_never_lands_on_a_dead_grant(pool: PgPool) {
     use agent_auth_store::grants::{self, GrantEnd};
-    use std::time::Duration;
     let store = Store::from_pool(pool);
     let i = agent(&store, "asker", AgentKind::Service).await;
     let r = agent(&store, "doer", AgentKind::Service).await;
@@ -617,7 +616,7 @@ async fn a_send_racing_a_revoke_never_lands_on_a_dead_grant(pool: PgPool) {
     .unwrap()
     .unwrap();
     let sending = tokio::spawn(send(store.clone(), thread, i.id, r.id));
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    until_waiting_on_a_lock(&store).await;
     assert!(!sending.is_finished(), "the send waits for the revoke");
     revoke.commit().await.unwrap();
     assert_eq!(
@@ -669,7 +668,7 @@ async fn a_send_racing_a_revoke_never_lands_on_a_dead_grant(pool: PgPool) {
             out.is_ok()
         })
     };
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    until_waiting_on_a_lock(&store).await;
     assert!(!revoking.is_finished(), "the revoke waits for the send");
     drop(clear);
     tx.commit().await.unwrap();

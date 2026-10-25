@@ -26,7 +26,7 @@ async fn at_desk(b: &Broker) -> (Host, Receiver<String>) {
     host.hostd.presence_event(PresenceEvent::Unlocked);
     host.hostd.presence_changed().await;
     let desktop = b.part.desktop.clone().unwrap();
-    for _ in 0..200 {
+    for _ in 0..1500 {
         if desktop.present_hosts().await == vec![HOST.to_owned()] {
             break;
         }
@@ -62,7 +62,7 @@ async fn status(b: &Broker, id: agent_auth_core::RequestId) -> requests::Request
 }
 
 async fn settled(b: &Broker, id: agent_auth_core::RequestId) -> requests::RequestRow {
-    for _ in 0..750 {
+    for _ in 0..1500 {
         let r = status(b, id).await;
         if !matches!(
             r.status,
@@ -216,7 +216,7 @@ async fn allow_at_its_own_desk_approves_exactly_that_command(pool: sqlx::PgPool)
     let r = settled(&b, r.id).await;
     assert_eq!(r.status, RequestStatus::Granted, "{:?}", r.decision_reason);
     let mut job = None;
-    for _ in 0..750 {
+    for _ in 0..1500 {
         let tx = b.st.store.begin().await.unwrap();
         let j = agent_auth_store::hostexec::get(&tx, agent_auth_core::JobId::for_request(r.id))
             .await

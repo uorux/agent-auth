@@ -423,6 +423,10 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding {addr}"))?;
+    // The bound address, not the configured one: with `LISTEN_PORT=0` the
+    // kernel picks the port, and this line is how a supervisor (the e2e
+    // harness) learns it.
+    let addr = listener.local_addr().unwrap_or(addr);
     tracing::info!(%addr, "agent-auth broker listening");
     let app = crate::http::router(state.clone());
     let served = serve_until(listener, app, shutdown_signal(), DRAIN).await;

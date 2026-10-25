@@ -10,8 +10,6 @@
 
 mod common;
 
-use std::time::Duration as StdDuration;
-
 use agent_auth_core::containment::AgentKind;
 use agent_auth_core::lifecycle::state;
 use agent_auth_core::{
@@ -373,7 +371,7 @@ async fn disabling_a_delegator_waits_for_a_provisioning_instead_of_deadlocking(p
         tx2.commit().await?;
         Ok::<_, StoreError>(names)
     });
-    tokio::time::sleep(StdDuration::from_millis(300)).await;
+    until_waiting_on_a_lock(&store).await;
     assert!(
         !disabler.is_finished(),
         "the disable waits for the containment lock"

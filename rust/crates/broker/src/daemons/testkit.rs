@@ -157,11 +157,11 @@ impl Broker {
         }
     }
 
-    /// Wait (up to 5 s) for a recorded notification starting with
+    /// Wait (up to 30 s) for a recorded notification starting with
     /// `prefix`: notifications are sent after the state they report is
     /// committed, so a test that reads the state first must wait for them.
     pub async fn wait_recorded(&self, prefix: &str) -> bool {
-        for _ in 0..250 {
+        for _ in 0..1500 {
             if self.recorded().iter().any(|l| l.starts_with(prefix)) {
                 return true;
             }
@@ -337,9 +337,9 @@ impl Host {
     }
 }
 
-/// Poll until `f` holds (10 s at most).
+/// Poll until `f` holds (30 s at most).
 pub async fn wait_until(f: impl Fn() -> bool) {
-    for _ in 0..500 {
+    for _ in 0..1500 {
         if f() {
             return;
         }

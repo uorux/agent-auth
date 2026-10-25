@@ -71,6 +71,13 @@ impl A2a {
         }
     }
 
+    /// a2a long-polls parked right now (holding a slot), all agents
+    /// together (diagnostics; tests wait on it instead of sleeping).
+    #[must_use]
+    pub fn long_polls_in_progress(&self) -> u32 {
+        self.polls.in_use()
+    }
+
     /// Wake the long-polls of one side of a thread: its session (if bound)
     /// and its agent.
     pub(crate) fn wake(&self, agent: AgentId, session: Option<SessionId>) {

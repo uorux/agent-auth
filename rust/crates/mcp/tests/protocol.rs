@@ -237,7 +237,21 @@ async fn a_waiting_tool_does_not_hold_up_the_others() {
         json!({"job_id": "61e4d294-bf60-41e4-b0b7-cf9283746077", "wait_secs": 5}),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(200)).await; // the job's call is in flight
+    // The job's call is in flight (at the broker, held there).
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while fake
+        .calls(
+            "GET",
+            "/v1/hostexec/jobs/61e4d294-bf60-41e4-b0b7-cf9283746077",
+        )
+        .is_empty()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the job's call never came"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     peer.call(2, "whoami", json!({})).await;
     let first = peer.next().await;
     assert_eq!(first["id"], json!(2), "whoami answered first: {first}");

@@ -99,7 +99,7 @@ async fn lost_when_moved_by_another_transaction(pool: PgPool) {
         tx2.rollback().await.unwrap();
         out.map(|_| ())
     });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    until_waiting_on_a_lock(&store).await;
     tx1.commit().await.unwrap();
     let lost = second.await.unwrap().unwrap_err();
     assert_eq!(lost.id, id);

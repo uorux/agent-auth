@@ -32,6 +32,17 @@ impl PollSlots {
     }
 }
 
+impl PollSlots {
+    /// Slots held right now, all agents together.
+    pub(crate) fn in_use(&self) -> u32 {
+        self.held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .fold(0, |n, h| n.saturating_add(*h))
+    }
+}
+
 impl Drop for PollSlot<'_> {
     fn drop(&mut self) {
         let mut held = self

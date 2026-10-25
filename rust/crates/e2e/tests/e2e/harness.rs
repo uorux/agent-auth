@@ -120,15 +120,6 @@ pub fn database_url(opts: &PgConnectOptions) -> String {
     url.to_string()
 }
 
-/// A loopback port nobody listens on (bound, then released).
-pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// What a broker is started with.
 #[derive(Debug, Clone)]
 pub struct Setup {
@@ -164,9 +155,17 @@ impl Setup {
 
 /// A running `agent-auth-server`. Killed on drop; its log is printed when
 /// the test is failing.
+///
+/// It listens on a port the kernel picks (`LISTEN_PORT=0`) and says which
+/// in its log; the harness reads it from there. Choosing a free port here
+/// and handing it over (bind, release, let the broker bind) raced with
+/// every other test binding and connecting meanwhile: a broker could lose
+/// its port to another test's fake, and `/healthz` answered by that fake
+/// sent the test's CLI to the wrong server (two tests failed together).
 #[derive(Debug)]
 pub struct Broker {
     child: Option<Child>,
+    /// `http://127.0.0.1:<port>` once `ready` read the port.
     pub url: String,
     pub setup: Setup,
     pub encryption_key: String,
@@ -204,13 +203,13 @@ impl Broker {
 
     pub async fn start_with_key(setup: Setup, encryption_key: String) -> Broker {
         let dir = TempDir::new();
-        let mut broker = Broker::spawn(setup, encryption_key, dir, free_port());
+        let mut broker = Broker::spawn(setup, encryption_key, dir);
         broker.ready().await;
         broker
     }
 
-    /// Spawn without waiting.
-    pub fn spawn(setup: Setup, encryption_key: String, dir: TempDir, port: u16) -> Broker {
+    /// Spawn without waiting (`url` is unknown until `ready`).
+    pub fn spawn(setup: Setup, encryption_key: String, dir: TempDir) -> Broker {
         let policy = dir.path().join("policy.yaml");
         std::fs::write(&policy, &setup.policy).unwrap();
         let dotenv: String = setup
@@ -232,7 +231,7 @@ impl Broker {
             .env("ADMIN_TOKEN", ADMIN_TOKEN)
             .env("ENCRYPTION_KEY", &encryption_key)
             .env("LISTEN_HOST", "127.0.0.1")
-            .env("LISTEN_PORT", port.to_string())
+            .env("LISTEN_PORT", "0")
             .env("LOG_LEVEL", "info")
             .env("NO_COLOR", "1");
         for (k, v) in &setup.env {
@@ -247,7 +246,7 @@ impl Broker {
             .unwrap();
         Broker {
             child: Some(child),
-            url: format!("http://127.0.0.1:{port}"),
+            url: String::new(),
             setup,
             encryption_key,
             log,
@@ -256,6 +255,7 @@ impl Broker {
         }
     }
 
+    /// Wait for the broker to say where it listens, then for `/healthz`.
     async fn ready(&mut self) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -265,7 +265,13 @@ impl Broker {
                     self.log()
                 );
             }
-            if let Ok(r) = self.http.get(format!("{}/healthz", self.url)).send().await
+            if self.url.is_empty()
+                && let Some(addr) = listening_addr(&self.log())
+            {
+                self.url = format!("http://{addr}");
+            }
+            if !self.url.is_empty()
+                && let Ok(r) = self.http.get(format!("{}/healthz", self.url)).send().await
                 && r.status().is_success()
             {
                 return;
@@ -320,7 +326,6 @@ impl Broker {
             self.setup.clone(),
             self.encryption_key.clone(),
             TempDir::new(),
-            free_port(),
         );
         drop(std::mem::replace(self, new));
         self.ready().await;
@@ -404,6 +409,19 @@ impl Drop for Broker {
             let _ = child.start_kill();
         }
     }
+}
+
+/// The address in the broker's `agent-auth broker listening addr=...` line
+/// (complete lines only: the log may end mid-line).
+fn listening_addr(log: &str) -> Option<std::net::SocketAddr> {
+    let complete = &log[..log.rfind('\n')?];
+    complete
+        .lines()
+        .find(|l| l.contains("agent-auth broker listening"))?
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("addr="))?
+        .parse()
+        .ok()
 }
 
 #[derive(Debug, Clone, Copy)]

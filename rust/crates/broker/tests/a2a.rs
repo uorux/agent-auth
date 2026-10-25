@@ -323,6 +323,20 @@ impl T {
     }
 }
 
+/// Wait until `n` a2a long-polls are parked (each holds a slot): what a
+/// test that wakes a long-poll waits for, instead of a sleep that guesses
+/// how long the poll takes to get there (30 s at most).
+async fn until_parked(state: &AppState, n: u32) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while state.a2a.long_polls_in_progress() < n {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no long-poll parked in 30 s"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 fn detail(v: &Value) -> &str {
     v["detail"].as_str().unwrap_or_default()
 }
@@ -675,10 +689,10 @@ async fn responder_session_binding(pool: PgPool) {
         .map(str::to_owned)
         .unwrap_or_else(|| agent_auth_wire::timestamp::format(now()).unwrap());
     let sender = {
-        let app = t.app.clone();
+        let (app, state) = (t.app.clone(), t.state.clone());
         let (s, tid) = (s.clone(), tid.clone());
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            until_parked(&state, 1).await;
             let req = HttpRequest::builder()
                 .method(Method::POST)
                 .uri(format!("/v1/a2a/threads/{tid}/messages"))
@@ -691,13 +705,13 @@ async fn responder_session_binding(pool: PgPool) {
     let started = std::time::Instant::now();
     let (_, ev) = t
         .get(
-            &format!("/v1/a2a/events?wait=10&after={cursor}"),
+            &format!("/v1/a2a/events?wait=60&after={cursor}"),
             ses(&r, &worker),
         )
         .await;
     assert_eq!(sender.await.unwrap(), StatusCode::OK);
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(45),
         "woke on the message, not the deadline"
     );
     let ids: Vec<&str> = ev["activity"]
@@ -1051,10 +1065,10 @@ async fn message_longpoll_wakes_on_reply_and_does_not_mark_listening(pool: PgPoo
     t.grant(&s_row, "svc-poll", None).await;
     let tid = t.open_ok(&s, "svc-poll").await;
     let replier = {
-        let app = t.app.clone();
+        let (app, state) = (t.app.clone(), t.state.clone());
         let (r, tid) = (r.clone(), tid.clone());
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            until_parked(&state, 1).await;
             let req = HttpRequest::builder()
                 .method(Method::POST)
                 .uri(format!("/v1/a2a/threads/{tid}/messages"))
@@ -1067,12 +1081,12 @@ async fn message_longpoll_wakes_on_reply_and_does_not_mark_listening(pool: PgPoo
     let started = std::time::Instant::now();
     let (_, body) = t
         .get(
-            &format!("/v1/a2a/threads/{tid}/messages?after_seq=1&wait=10"),
+            &format!("/v1/a2a/threads/{tid}/messages?after_seq=1&wait=60"),
             ag(&s),
         )
         .await;
     assert_eq!(replier.await.unwrap(), StatusCode::OK);
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(started.elapsed() < Duration::from_secs(45));
     assert_eq!(body["messages"][0]["payload"], json!({"answer": 42}));
     assert_eq!(body["messages"][0]["from"], "svc-poll");
     let (_, body) = t
@@ -1102,7 +1116,9 @@ async fn message_longpoll_wakes_on_reply_and_does_not_mark_listening(pool: PgPoo
             )
             .await;
         assert_eq!(st, StatusCode::OK);
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // No wait at all; the cap (what a NaN taken as "forever" would
+        // wait) is 300 s.
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
     assert_eq!(
         t.get(&format!("/v1/a2a/threads/{tid}/messages?wait=soon"), ag(&s))
@@ -1118,11 +1134,13 @@ async fn events_longpoll_and_cursor(pool: PgPool) {
     let (s_row, s) = t.service("auto-ev").await;
     let (_, r) = t.service("svc-ev").await;
     t.grant(&s_row, "svc-ev", None).await;
+    // The open waits for the events poll to park: polling it is also
+    // what makes svc-ev reachable.
     let opener = {
-        let app = t.app.clone();
+        let (app, state) = (t.app.clone(), t.state.clone());
         let s = s.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            until_parked(&state, 1).await;
             let req = HttpRequest::builder()
                 .method(Method::POST)
                 .uri("/v1/a2a/threads")
@@ -1136,7 +1154,7 @@ async fn events_longpoll_and_cursor(pool: PgPool) {
             serde_json::from_slice::<Value>(&bytes).unwrap()
         })
     };
-    let (_, body) = t.get("/v1/a2a/events?wait=10", ag(&r)).await;
+    let (_, body) = t.get("/v1/a2a/events?wait=60", ag(&r)).await;
     let thread = opener.await.unwrap();
     assert_eq!(body["pending_opens"][0]["thread_id"], thread["thread_id"]);
     let cursor = body["cursor"].as_str().expect("cursor").to_owned();
@@ -1664,12 +1682,12 @@ async fn hook_server() -> (String, Captured) {
 }
 
 impl Captured {
+    /// The pings once `n` arrived (webhooks are sent after the commit, on
+    /// their own task), or what arrived in 30 s.
     async fn wait_for(&self, n: usize) -> Vec<(HeaderMap, Bytes)> {
-        for _ in 0..100 {
-            if self.0.lock().unwrap().len() >= n {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while self.0.lock().unwrap().len() < n && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         self.0.lock().unwrap().clone()
     }
@@ -2230,7 +2248,7 @@ async fn a_reply_wakes_the_waiting_panel(pool: PgPool) {
         json!({"payload": {"type": "message", "text": "hello"}}),
     )
     .await;
-    let got = tokio::time::timeout(Duration::from_secs(3), waiting)
+    let got = tokio::time::timeout(Duration::from_secs(30), waiting)
         .await
         .unwrap()
         .unwrap();
@@ -2590,10 +2608,10 @@ async fn concurrent_long_polls_are_capped_per_agent(pool: PgPool) {
     let tid = t.open_ok(&s, "svc-poller").await;
     let parked = spawn_get(
         &t,
-        format!("/v1/a2a/threads/{tid}/messages?after_seq=1&wait=10"),
+        format!("/v1/a2a/threads/{tid}/messages?after_seq=1&wait=60"),
         &s,
     );
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    until_parked(&t.state, 1).await;
     let (st, v) = t
         .get("/v1/a2a/events?wait=5&after=2100-01-01T00:00:00Z", ag(&s))
         .await;
@@ -2644,10 +2662,10 @@ async fn a_long_poll_stops_for_a_caller_no_longer_valid(pool: PgPool) {
     // Disabled while waiting: the next wake-up answers 401, not the message.
     let parked = spawn_get(
         &t,
-        format!("/v1/a2a/threads/{tid}/messages?after_seq=1&wait=10"),
+        format!("/v1/a2a/threads/{tid}/messages?after_seq=1&wait=60"),
         &s,
     );
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    until_parked(&t.state, 1).await;
     let tx = t.state.store.begin().await.unwrap();
     agents::set_disabled(&tx, s_row.id, true).await.unwrap();
     tx.commit().await.unwrap();
@@ -2657,7 +2675,7 @@ async fn a_long_poll_stops_for_a_caller_no_longer_valid(pool: PgPool) {
         .await;
     let (st, v) = parked.await.unwrap();
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(45),
         "on the wake-up, not the deadline"
     );
     assert_eq!(
@@ -2667,8 +2685,8 @@ async fn a_long_poll_stops_for_a_caller_no_longer_valid(pool: PgPool) {
 
     // Key rotated while waiting on events.
     let (r2_row, r2) = t.service("svc-rotated").await;
-    let parked = spawn_get(&t, "/v1/a2a/events?wait=10".to_owned(), &r2);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let parked = spawn_get(&t, "/v1/a2a/events?wait=60".to_owned(), &r2);
+    until_parked(&t.state, 1).await;
     let fresh = api_key::generate().unwrap();
     let tx = t.state.store.begin().await.unwrap();
     agents::set_key(&tx, r2_row.id, fresh.key_id.as_str(), fresh.hash.as_str())
@@ -2682,5 +2700,5 @@ async fn a_long_poll_stops_for_a_caller_no_longer_valid(pool: PgPool) {
     let started = std::time::Instant::now();
     let (st, _) = parked.await.unwrap();
     assert_eq!(st, StatusCode::UNAUTHORIZED);
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(started.elapsed() < Duration::from_secs(45));
 }

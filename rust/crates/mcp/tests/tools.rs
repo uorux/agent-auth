@@ -289,16 +289,15 @@ async fn a_minted_session_is_kept_in_use_while_the_agent_is_quiet() {
         .with_keepalive(Duration::from_millis(20));
 
     assert_eq!(tool(&caller, "a2a_threads", json!({})).await, json!([]));
-    tokio::time::sleep(Duration::from_millis(200)).await; // the agent does nothing
+    // The agent does nothing; the keep-alive touches the session.
+    until(|| fake.calls("GET", "/v1/me").len() >= 3).await;
     let touched = sessions(&fake.calls("GET", "/v1/me"));
-    assert!(touched.len() >= 3, "{touched:?}");
     assert!(touched.iter().all(|s| s.as_deref() == Some(S1)));
 
     // Closed all the same (the broker restarted, say): forgotten, and the
     // next call gets a new one, which is kept in use in its turn.
     closed.lock().unwrap().push(S1.into());
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(caller.client().session_id(), None);
+    until(|| caller.client().session_id().is_none()).await;
     let before = fake.calls("GET", "/v1/me").len();
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
@@ -308,10 +307,26 @@ async fn a_minted_session_is_kept_in_use_while_the_agent_is_quiet() {
     );
     assert_eq!(tool(&caller, "a2a_threads", json!({})).await, json!([]));
     assert_eq!(*minted.lock().unwrap(), [S1, S2]);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let last = fake.calls("GET", "/v1/me").last().cloned().unwrap();
-    assert_eq!(last.header("x-agent-session"), Some(S2));
+    until(|| {
+        fake.calls("GET", "/v1/me")
+            .last()
+            .is_some_and(|c| c.header("x-agent-session") == Some(S2))
+    })
+    .await;
     caller.client().set_session_id(None); // stops it
+}
+
+/// Poll `f` until it holds (30 s at most): for what a background task does
+/// on its own time, instead of a sleep that guesses how long it takes.
+async fn until(f: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !f() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "condition not reached in 30 s"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 fn mode(path: &std::path::Path) -> u32 {

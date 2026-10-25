@@ -124,7 +124,7 @@ impl T {
 
     async fn done(&self, job: &str) -> Map<String, Value> {
         let id = LocalId::parse(job).unwrap();
-        for _ in 0..500 {
+        for _ in 0..1500 {
             if let Some(d) = self.hostd.spool.done(&id) {
                 let mut r = d.result;
                 r.insert("output".into(), json!(String::from_utf8_lossy(&d.output)));

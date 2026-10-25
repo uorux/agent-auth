@@ -520,12 +520,12 @@ async fn a_half_made_provision_leaves_nothing_behind(pool: PgPool) {
 #[sqlx::test(migrations = "../store/migrations")]
 async fn endpoints_fail_over_and_the_answering_one_is_preferred(pool: PgPool) {
     let t = setup(pool).await;
-    let dead = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let a = l.local_addr().unwrap();
-        drop(l);
-        format!("http://{a}")
-    };
+    // A port that refuses connections for the whole test: bound (so no
+    // other test can take it) but not listening. A port bound and released
+    // could be taken meanwhile by another test's server, which would answer.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let dead = format!("http://{}", socket.local_addr().unwrap());
     let p = KubernetesProvisioner::new(
         vec![dead.clone(), t.fake.url.clone()],
         (Some(t.token_file.clone()), None),

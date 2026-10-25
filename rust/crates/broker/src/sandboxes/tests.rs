@@ -61,7 +61,7 @@ async fn ask(b: &Broker, agent: &AgentRow, body: RequestCreate) -> requests::Req
     let r = crate::service::create(&b.st, &caller(agent), body)
         .await
         .unwrap();
-    for _ in 0..500 {
+    for _ in 0..1500 {
         let r = request(b, r.id).await;
         if !matches!(
             r.status,

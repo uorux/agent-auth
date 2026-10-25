@@ -172,7 +172,7 @@ async fn humans_and_the_llm_decide(_: PgPoolOptions, opts: PgConnectOptions) {
         )
         .await;
     assert_eq!(status, 200, "{decided}");
-    let r = b.cli(a.who(), &["wait", &id, "--timeout", "10"]).await.ok();
+    let r = b.cli(a.who(), &["wait", &id, "--timeout", "60"]).await.ok();
     assert_eq!(r["status"], "granted", "{r}");
     assert_eq!(r["decision_source"], "human");
     assert_eq!(r["approved_duration_secs"], 7200);
@@ -260,7 +260,7 @@ async fn humans_and_the_llm_decide(_: PgPoolOptions, opts: PgConnectOptions) {
         .await
         .ok();
     assert_eq!(r["attempt"], 2, "{r}");
-    let r = b.cli(a.who(), &["wait", &id, "--timeout", "20"]).await.ok();
+    let r = b.cli(a.who(), &["wait", &id, "--timeout", "60"]).await.ok();
     assert_eq!(r["status"], "granted", "{r}");
     assert_eq!(w.openrouter.calls().len(), 3);
     // The reviewer saw the first verdict.
@@ -298,7 +298,20 @@ async fn humans_and_the_llm_decide(_: PgPoolOptions, opts: PgConnectOptions) {
     )
     .await;
     let id = r["id"].as_str().unwrap().to_owned();
-    let r = b.cli(a.who(), &["wait", &id, "--timeout", "2"]).await.ok();
+    // (`wait` would hold it, so poll the status until the reviewer gave
+    // up: a fixed `--timeout 2` raced the evaluation under load.)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let r = loop {
+        let r = b.cli(a.who(), &["status", &id]).await.ok();
+        if !matches!(r["status"].as_str(), Some("pending" | "llm_evaluating")) {
+            break r;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the LLM review never ended: {r}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
     assert_eq!(r["status"], "awaiting_human", "{r}");
     assert_eq!(r["decision_source"], serde_json::Value::Null, "{r}");
 }

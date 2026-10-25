@@ -28,7 +28,7 @@ async fn the_owner_approves_on_discord(_: PgPoolOptions, opts: PgConnectOptions)
     let b = Broker::start(setup).await;
 
     // The bot logged in with the token from ./.env and synced its commands.
-    eventually(Duration::from_secs(10), "the bot identifies", || {
+    eventually(Duration::from_secs(30), "the bot identifies", || {
         let identified = discord
             .received
             .lock()
@@ -38,7 +38,7 @@ async fn the_owner_approves_on_discord(_: PgPoolOptions, opts: PgConnectOptions)
         async move { identified }
     })
     .await;
-    eventually(Duration::from_secs(10), "slash commands synced", || {
+    eventually(Duration::from_secs(30), "slash commands synced", || {
         let synced = !discord
             .rest
             .calls_to("PUT", "/guilds/77/commands")
@@ -76,7 +76,7 @@ async fn the_owner_approves_on_discord(_: PgPoolOptions, opts: PgConnectOptions)
     assert_eq!(r["status"], "awaiting_human", "{r}");
     let rid = r["id"].as_str().unwrap().to_owned();
 
-    eventually(Duration::from_secs(10), "the card is posted", || {
+    eventually(Duration::from_secs(30), "the card is posted", || {
         let posted = !discord
             .rest
             .calls_to("POST", "/channels/5/messages")
@@ -102,7 +102,7 @@ async fn the_owner_approves_on_discord(_: PgPoolOptions, opts: PgConnectOptions)
 
     // Someone else's click changes nothing.
     let stranger = discord.click(7, &format!("aa:approve:{rid}"));
-    eventually(Duration::from_secs(10), "the stranger is answered", || {
+    eventually(Duration::from_secs(30), "the stranger is answered", || {
         let answered = !discord.callbacks(&stranger).is_empty();
         async move { answered }
     })
@@ -113,7 +113,7 @@ async fn the_owner_approves_on_discord(_: PgPoolOptions, opts: PgConnectOptions)
 
     // The owner's click opens the decision modal; submitting it decides.
     let click = discord.click(OWNER, &format!("aa:approve:{rid}"));
-    eventually(Duration::from_secs(10), "the modal opens", || {
+    eventually(Duration::from_secs(30), "the modal opens", || {
         let opened = !discord.callbacks(&click).is_empty();
         async move { opened }
     })
@@ -130,7 +130,7 @@ async fn the_owner_approves_on_discord(_: PgPoolOptions, opts: PgConnectOptions)
         &[("reason", "ok for today"), ("duration", "2h")],
     );
     let r = b
-        .cli(agent.who(), &["wait", &rid, "--timeout", "10"])
+        .cli(agent.who(), &["wait", &rid, "--timeout", "60"])
         .await
         .ok();
     assert_eq!(r["status"], "granted", "{r}");
@@ -145,7 +145,7 @@ async fn the_owner_approves_on_discord(_: PgPoolOptions, opts: PgConnectOptions)
     );
 
     // The card shows the outcome.
-    eventually(Duration::from_secs(10), "the card is updated", || {
+    eventually(Duration::from_secs(30), "the card is updated", || {
         let edited = !discord
             .rest
             .calls_to("PATCH", "/channels/5/messages/900")

@@ -39,6 +39,17 @@ impl Limits {
         }
     }
 
+    /// Decision long-polls holding a slot right now, all agents together
+    /// (diagnostics; tests wait on it instead of sleeping).
+    #[must_use]
+    pub fn waits_in_progress(&self) -> u32 {
+        self.waits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .fold(0, |n, w| n.saturating_add(*w))
+    }
+
     /// May `agent` file another request now? Spends one if so.
     pub fn take_request(&self, agent: AgentId, now: Instant) -> bool {
         if self.requests_per_hour == 0 {

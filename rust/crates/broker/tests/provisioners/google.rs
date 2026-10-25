@@ -3,7 +3,7 @@
 //! issued; and the stub for brokers with no account.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use agent_auth_broker::provisioners::google::{
     GoogleProvisioner, GoogleStubProvisioner, GoogleTokens, STUB_ERA, TOKEN_URLS, scope_url,
@@ -367,7 +367,7 @@ async fn a_slow_account_does_not_stall_another() {
         R(
             200,
             json!({"access_token": "slow", "scope": scope_url("calendar.readonly").unwrap()}),
-            3000,
+            10_000,
         )
     })
     .await;
@@ -397,11 +397,15 @@ async fn a_slow_account_does_not_stall_another() {
     while slow.calls().is_empty() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let started = Instant::now();
     t.token("fast", &["calendar.readonly"], true, now())
         .await
         .unwrap();
-    assert!(started.elapsed() < Duration::from_secs(2));
+    // Not stalled behind the slow one: done while it is still pending
+    // (an ordering, not a timing guess).
+    assert!(
+        !pending.is_finished(),
+        "the fast account waited for the slow one"
+    );
     assert_eq!(pending.await.unwrap().unwrap().0.expose(), "slow");
 }
 

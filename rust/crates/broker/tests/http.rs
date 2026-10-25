@@ -109,6 +109,16 @@ async fn agent(app: &Router, name: &str, extra: Value) -> String {
     format!("Bearer {}", r.body["api_key"].as_str().unwrap())
 }
 
+/// Poll `f` until it holds (30 s at most): for state another task reaches
+/// on its own time, instead of a sleep that guesses how long it takes.
+async fn eventually(f: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !f() {
+        assert!(Instant::now() < deadline, "condition not reached in 30 s");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 fn request(platform: &str, cap: &str, resource: &str, duration: Value) -> String {
     json!({"platform": platform, "capability": cap, "resource": resource,
            "justification": "a reason", "requested_duration": duration})
@@ -258,7 +268,9 @@ async fn auth_and_admin_agents(pool: sqlx::PgPool) {
 
 #[sqlx::test(migrations = "../store/migrations")]
 async fn request_flow_via_api(pool: sqlx::PgPool) {
-    let app = router(state(pool, POLICY));
+    let st = state(pool, POLICY);
+    let spine = Arc::clone(&st.spine);
+    let app = router(st);
     let key = agent(&app, "worker", json!({})).await;
     let other = agent(&app, "other", json!({})).await;
     let r = call(
@@ -307,7 +319,8 @@ async fn request_flow_via_api(pool: sqlx::PgPool) {
             .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Parked (so the decision below is a wake-up, not a first read).
+    eventually(|| spine.limits.waits_in_progress() == 1).await;
     let bad = call(
         &app,
         "POST",
@@ -334,7 +347,10 @@ async fn request_flow_via_api(pool: sqlx::PgPool) {
     .await;
     assert_eq!(d.status, StatusCode::OK, "{:?}", d.body);
     let w = waiter.await.unwrap();
-    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "woken by the decision, not the 30 s deadline"
+    );
     assert_eq!(w.body["status"], "granted");
     assert_eq!(w.body["approved_duration_secs"], 600);
     let grant = w.body["grant_id"].as_str().unwrap().to_owned();
@@ -468,7 +484,8 @@ async fn bodies_are_checked(pool: sqlx::PgPool) {
     )
     .await;
     assert_eq!(w.status, StatusCode::OK);
-    assert!(t.elapsed() < Duration::from_secs(3));
+    // (NaN waits 1 s, the minimum; a NaN taken for "forever" would be 300.)
+    assert!(t.elapsed() < Duration::from_secs(30));
 }
 
 #[sqlx::test(migrations = "../store/migrations")]
@@ -825,6 +842,7 @@ async fn per_agent_limits(pool: sqlx::PgPool) {
     let mut spine = agent_auth_broker::service::Spine::default();
     spine.limits = agent_auth_broker::limits::Limits::new(1, 2);
     st.spine = Arc::new(spine);
+    let spine = Arc::clone(&st.spine);
     let app = router(st);
     let key = agent(&app, "worker", json!({})).await;
     let other = agent(&app, "other", json!({})).await;
@@ -857,14 +875,16 @@ async fn per_agent_limits(pool: sqlx::PgPool) {
             call(
                 &app,
                 "GET",
-                &format!("/v1/requests/{id}/wait?timeout=3"),
+                &format!("/v1/requests/{id}/wait?timeout=10"),
                 Some(&key),
                 None,
             )
             .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The first wait holds its slot (not a fixed sleep: under load it may
+    // take longer than any guess to get there).
+    eventually(|| spine.limits.waits_in_progress() == 1).await;
     let r = call(
         &app,
         "GET",
@@ -880,6 +900,16 @@ async fn per_agent_limits(pool: sqlx::PgPool) {
             .unwrap()
             .starts_with("at most 1 decision waits")
     );
+    // A decision ends the parked wait; its slot is freed.
+    let d = call(
+        &app,
+        "POST",
+        &format!("/admin/requests/{id}/decide"),
+        Some(ADMIN),
+        Some(r#"{"approve": false}"#),
+    )
+    .await;
+    assert_eq!(d.status, StatusCode::OK, "{:?}", d.body);
     assert_eq!(parked.await.unwrap().status, StatusCode::OK);
     // The slot is free again.
     let r = call(

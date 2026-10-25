@@ -508,7 +508,7 @@ mod tests {
         let path = dir.join("q.sock");
         let limits = Limits {
             max_per_uid: 2,
-            idle: Duration::from_millis(300),
+            idle: Duration::from_secs(2),
             ..Limits::control()
         };
         let server = tokio::spawn(serve_with(
@@ -516,20 +516,28 @@ mod tests {
             Arc::new(Echo),
             limits,
         ));
-        let held: Vec<UnixStream> = vec![
-            UnixStream::connect(&path).await.unwrap(),
-            UnixStream::connect(&path).await.unwrap(),
-        ];
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Two connections that hold their slots: each answered once (so its
+        // slot is surely taken: slots are taken on the connection's own
+        // task, in no particular order), then silent.
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let mut s = BufReader::new(UnixStream::connect(&path).await.unwrap());
+            s.get_mut()
+                .write_all(b"{\"method\": \"echo\", \"params\": {}, \"token\": null}\n")
+                .await
+                .unwrap();
+            let line = read_line_capped(&mut s, 1000).await.unwrap().unwrap();
+            assert!(line.starts_with(b"{\"ok\":true"), "{line:?}");
+            held.push(s);
+        }
         let err = call(&path, "echo", Map::new(), None, Duration::from_secs(5))
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), "too many connections");
         // The silent ones are closed after the idle time, freeing the slots.
-        for s in held {
-            let mut r = BufReader::new(s);
+        for mut r in held {
             let closed =
-                tokio::time::timeout(Duration::from_secs(2), read_line_capped(&mut r, 100))
+                tokio::time::timeout(Duration::from_secs(30), read_line_capped(&mut r, 100))
                     .await
                     .unwrap();
             assert!(matches!(closed, Ok(None)));

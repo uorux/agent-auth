@@ -413,7 +413,7 @@ impl FakeSandbox {
 
     /// Wait until a key for `agent` arrived.
     pub async fn wait_key(&self, agent: &str) -> String {
-        for _ in 0..500 {
+        for _ in 0..1500 {
             if let Some(k) = self.key(agent) {
                 return k;
             }
@@ -431,9 +431,9 @@ impl Drop for FakeSandbox {
     }
 }
 
-/// Poll until `f` holds (10 s at most).
+/// Poll until `f` holds (30 s at most).
 pub async fn wait_until(f: impl Fn() -> bool) {
-    for _ in 0..500 {
+    for _ in 0..1500 {
         if f() {
             return;
         }
@@ -442,13 +442,13 @@ pub async fn wait_until(f: impl Fn() -> bool) {
     panic!("condition not reached");
 }
 
-/// Poll an async condition until it holds (10 s at most); false if never.
+/// Poll an async condition until it holds (30 s at most); false if never.
 pub async fn eventually<F, Fut>(f: F) -> bool
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    for _ in 0..500 {
+    for _ in 0..1500 {
         if f().await {
             return true;
         }
