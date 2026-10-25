@@ -269,7 +269,7 @@ async fn humans_and_the_llm_decide(_: PgPoolOptions, opts: PgConnectOptions) {
         prompt
             .as_str()
             .unwrap()
-            .contains("Attempt 1: verdict=deny; reasoning: too vague"),
+            .contains("Attempt 1: verdict=deny; reasoning (quoted model output): \"too vague"),
         "{prompt}"
     );
 
