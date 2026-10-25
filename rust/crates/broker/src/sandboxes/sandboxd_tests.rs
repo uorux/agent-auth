@@ -140,7 +140,6 @@ impl Vm {
 
     async fn stop(mut self) {
         self.stop_daemon().await;
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 
     fn host(&self) -> &FakeHost {
@@ -268,6 +267,17 @@ impl Vm {
 
     fn operator_api(&self) -> OperatorApi<FakeHost> {
         OperatorApi(Arc::clone(&self.sbx))
+    }
+}
+
+impl Drop for Vm {
+    fn drop(&mut self) {
+        // A failed test leaves nothing behind (its tmux servers are killed
+        // by the host double's own drop).
+        if let Some(t) = self.task.take() {
+            t.abort();
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
