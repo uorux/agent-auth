@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT g.id, t.close_reason FROM grants g\n         JOIN a2a_threads t ON t.id = g.delegation_thread_id\n         WHERE g.status = 'active' AND t.state = 'closed'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "grants",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "close_reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "a2a_threads",
+            "name": "close_reason"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "645696687b68ae2b26aab8894e1050416f3e99371a3f1a090eac98a8e660ce95"
+}

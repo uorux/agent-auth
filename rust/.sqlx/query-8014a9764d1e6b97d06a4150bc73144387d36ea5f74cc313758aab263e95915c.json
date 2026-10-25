@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE daemons SET last_seen_at = $3, last_status = $4, version = COALESCE($5, version),\n             updated_at = $3\n         WHERE id = $1 AND public_key = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Timestamptz",
+        "Jsonb",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8014a9764d1e6b97d06a4150bc73144387d36ea5f74cc313758aab263e95915c"
+}

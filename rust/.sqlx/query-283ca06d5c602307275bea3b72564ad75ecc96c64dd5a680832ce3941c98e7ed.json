@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE rules SET resource_pattern = $2 WHERE platform = 'a2a' AND resource_pattern = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "283ca06d5c602307275bea3b72564ad75ecc96c64dd5a680832ce3941c98e7ed"
+}

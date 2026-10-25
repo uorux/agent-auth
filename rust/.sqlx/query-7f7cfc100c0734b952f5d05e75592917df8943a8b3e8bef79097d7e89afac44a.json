@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE grants SET resource = $2 WHERE platform = 'a2a' AND resource = $1 AND status = 'active'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7f7cfc100c0734b952f5d05e75592917df8943a8b3e8bef79097d7e89afac44a"
+}

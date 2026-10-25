@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT delegation_thread_id AS \"thread!\", count(*) AS \"n!\"\n           FROM access_requests WHERE delegation_thread_id = ANY($1)\n           GROUP BY delegation_thread_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "thread!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "delegation_thread_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "n!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      true,
+      null
+    ]
+  },
+  "hash": "e7843a7b8a4262641daa2d60d5b54c6181c0e2de6cd9c7b54d1a5fc66323d3cc"
+}

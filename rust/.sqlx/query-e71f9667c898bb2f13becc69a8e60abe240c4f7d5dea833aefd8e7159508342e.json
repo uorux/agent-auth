@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE daemon_pairing_codes SET used_at = $2, updated_at = $2\n         WHERE id = $1 AND used_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e71f9667c898bb2f13becc69a8e60abe240c4f7d5dea833aefd8e7159508342e"
+}

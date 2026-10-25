@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE rules SET delegator_pattern = $2 WHERE delegator_pattern = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "625b2fd8d6a078a852495a1f8ab0694decfb52ae565936fded564554e4ae7589"
+}

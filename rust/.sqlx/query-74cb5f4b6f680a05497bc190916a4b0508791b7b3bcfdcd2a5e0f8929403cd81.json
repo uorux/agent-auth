@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE agents SET webhook_url = $2, webhook_secret = $3 WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "74cb5f4b6f680a05497bc190916a4b0508791b7b3bcfdcd2a5e0f8929403cd81"
+}

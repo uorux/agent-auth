@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE grants SET provisioner_state = $2 WHERE id = $1 AND status IN ('provisioning', 'active')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f4b7a2359650162b184ce9a108ca7d935aaafc364892139db29fd9162c1425a2"
+}

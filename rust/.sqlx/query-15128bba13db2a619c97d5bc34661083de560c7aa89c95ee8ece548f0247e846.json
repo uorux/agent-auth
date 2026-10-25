@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS (\n               SELECT 1 FROM broker_flags\n               WHERE key = 'lockdown' AND (value -> 'hosts' ? '*' OR value -> 'hosts' ? $1)\n           ) AS \"locked!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "locked!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "15128bba13db2a619c97d5bc34661083de560c7aa89c95ee8ece548f0247e846"
+}

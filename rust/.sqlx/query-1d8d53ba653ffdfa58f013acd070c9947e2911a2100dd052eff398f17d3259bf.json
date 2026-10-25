@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT family FROM oauth_tokens\n             WHERE token_hash = $1 AND kind = $2 AND client_id = $3\n               AND revoked_at IS NULL AND expires_at > $4 AND used_at IS NOT NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "family",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "oauth_tokens",
+            "name": "family"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1d8d53ba653ffdfa58f013acd070c9947e2911a2100dd052eff398f17d3259bf"
+}

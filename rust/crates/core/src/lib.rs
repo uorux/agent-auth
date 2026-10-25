@@ -10,6 +10,7 @@
 
 pub mod authority;
 pub mod durations;
+pub mod containment;
 pub mod glob;
 pub mod hostexec;
 pub mod ids;
