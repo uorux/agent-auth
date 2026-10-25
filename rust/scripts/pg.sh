@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # A throwaway local Postgres for development and tests: lives under
-# target/pg, listens only on a unix socket there (and 127.0.0.1:54329 for
-# tools that need TCP), trusts local connections. Never for anything real.
+# target/pg, listens on a unix socket there and on 127.0.0.1 (a port derived
+# from the checkout's path), trusts local connections. Never for anything real.
 #
 #   scripts/pg.sh start   # prints the DATABASE_URL to export
 #   scripts/pg.sh stop
@@ -9,7 +9,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 DIR="$PWD/target/pg"
-PORT=54329
+# One server per checkout (worktrees run side by side): the port is derived
+# from this directory unless PGPORT_AGENT_AUTH is set.
+PORT="${PGPORT_AGENT_AUTH:-$((54000 + $(printf '%s' "$PWD" | cksum | cut -d' ' -f1) % 900))}"
 URL="postgres://agent_auth@127.0.0.1:$PORT/agent_auth"
 
 # Sandboxes and containers may run us under a uid with no passwd entry, which
