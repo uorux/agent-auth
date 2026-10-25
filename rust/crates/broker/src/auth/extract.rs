@@ -195,9 +195,11 @@ impl FromRequestParts<AppState> for AdminCaller {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
-        // The admin panel's signed-in session (cookie + CSRF on writes) is
-        // checked here first when the panel is enabled: added with the
-        // panel (broker::webui).
+        // The admin panel's signed-in session (cookie + CSRF on writes),
+        // first, when the panel is on and no Authorization header was sent.
+        if let Some(outcome) = crate::webui::panel::admin_session(state, parts) {
+            return outcome.map(|user| AdminCaller::new(AdminIdentity::Panel { user }));
+        }
         let Some(expected) = &state.auth.admin_token else {
             return Err(ApiError::unavailable(
                 "admin API disabled: ADMIN_TOKEN not configured",

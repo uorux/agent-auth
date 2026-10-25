@@ -374,15 +374,17 @@ impl TokenIssuer {
         let claims: Map<String, Value> = b64url_decode(p64)
             .and_then(|p| serde_json::from_slice(&p).ok())
             .ok_or_else(|| token_err("Invalid payload string: must be a json object"))?;
-        validate_claims(&claims, audience, &self.issuer, now_unix)?;
+        validate_claims(&claims, audience, &[self.issuer.as_str()], now_unix)?;
         Ok(claims)
     }
 }
 
-fn validate_claims(
+/// PyJWT's claim checks: `exp, iat, sub, aud, iss` required; `iss` one of
+/// `issuers`; `aud` (a string or a list) contains `audience`; 5 s leeway.
+pub(crate) fn validate_claims(
     claims: &Map<String, Value>,
     audience: &str,
-    issuer: &str,
+    issuers: &[&str],
     now: f64,
 ) -> Result<(), TokenError> {
     for claim in ["exp", "iat", "sub", "aud", "iss"] {
@@ -418,7 +420,11 @@ fn validate_claims(
     {
         return Err(token_err("Signature has expired"));
     }
-    if claims.get("iss").and_then(Value::as_str) != Some(issuer) {
+    if !claims
+        .get("iss")
+        .and_then(Value::as_str)
+        .is_some_and(|iss| issuers.contains(&iss))
+    {
         return Err(token_err("Invalid issuer"));
     }
     let auds: Vec<&Value> = match claims.get("aud") {
@@ -694,7 +700,7 @@ mod tests {
     #[test]
     fn claim_rules() {
         let base = json!({"exp": 100, "iat": 10, "sub": "s", "aud": ["x", "y"], "iss": "i"});
-        let ok = |v: &Value, now| validate_claims(v.as_object().unwrap(), "y", "i", now);
+        let ok = |v: &Value, now| validate_claims(v.as_object().unwrap(), "y", &["i"], now);
         assert!(ok(&base, 50.0).is_ok());
         let mut m = base.clone();
         m["iss"] = json!("j");

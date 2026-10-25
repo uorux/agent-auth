@@ -4,6 +4,13 @@ use agent_auth_core::canonical_json::{CanonicalError, to_canonical_string};
 use ring::digest;
 use serde_json::Value;
 
+/// SHA-256 of `data`.
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest::digest(&digest::SHA256, data).as_ref());
+    out
+}
+
 /// Lowercase hex SHA-256 of `data`.
 pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(digest::digest(&digest::SHA256, data))

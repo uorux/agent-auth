@@ -163,6 +163,25 @@ pub async fn count_live_clients(tx: &Tx<'_>) -> Result<i64, StoreError> {
     .await?)
 }
 
+/// Deletes clients nobody authorized (unbound, unrevoked, no tokens)
+/// registered before `before` (surfaces Bug-C6: registration is open, so
+/// unused registrations must not fill the cap for good). Returns how many.
+pub async fn delete_unbound_clients(
+    tx: &Tx<'_>,
+    before: OffsetDateTime,
+) -> Result<u64, StoreError> {
+    let mut c = tx.conn().await;
+    Ok(sqlx::query!(
+        "DELETE FROM oauth_clients c
+         WHERE c.agent_id IS NULL AND c.revoked_at IS NULL AND c.created_at < $1
+           AND NOT EXISTS (SELECT 1 FROM oauth_tokens t WHERE t.client_id = c.id)",
+        before
+    )
+    .execute(&mut **c)
+    .await?
+    .rows_affected())
+}
+
 #[derive(Debug, Clone)]
 pub struct NewClient<'a> {
     pub id: &'a str,
