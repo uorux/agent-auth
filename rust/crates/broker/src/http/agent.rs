@@ -146,12 +146,17 @@ async fn wait(
             .ok_or_else(unknown_request)?
             .into_row();
         let now = tokio::time::Instant::now();
-        if !row.status.is_waiting() || now >= deadline {
+        // At shutdown: the state as it is (the agent waits again on the
+        // next broker), not a connection cut off after the drain.
+        if !row.status.is_waiting() || now >= deadline || st.shutdown.is_triggered() {
             return Ok(Json(request_out(&tx, &row).await?));
         }
         drop(tx);
         listener
-            .wait(deadline.saturating_duration_since(now).min(RECHECK))
+            .wait_or_shutdown(
+                deadline.saturating_duration_since(now).min(RECHECK),
+                &st.shutdown,
+            )
             .await;
     }
 }

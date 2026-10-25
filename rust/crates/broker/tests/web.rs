@@ -409,7 +409,7 @@ async fn setup_with(
             }
         }));
     if let Some(mcp) = &state.web.remote_mcp {
-        mcp.set_agent_api(v1.clone().with_state(state.clone()));
+        mcp.set_agent_api(v1.clone().with_state(state.clone()), state.shutdown.clone());
     }
     let app = webui::routes()
         .merge(v1)

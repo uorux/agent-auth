@@ -217,7 +217,8 @@ async fn read_once(
     id: ThreadId,
     after_seq: i64,
 ) -> ApiResult<ChatThreadView> {
-    let tx = state.store.begin().await?;
+    // One snapshot: the thread agrees with its messages (`read_messages`).
+    let tx = state.store.begin_snapshot().await?;
     let Some(t) = store_a2a::get(&tx, id)
         .await?
         .filter(|t| t.initiator_agent_id == op.id)
@@ -277,10 +278,11 @@ async fn read(
             || out.thread.state != start
             || start == WireState::Closed
             || left.is_zero()
+            || state.shutdown.is_triggered()
         {
             return Ok(Json(out));
         }
-        waiter.wait(left.min(POLL_ROUND)).await;
+        waiter.wait(left.min(POLL_ROUND), &state.shutdown).await;
         out = read_once(&state, &op, id, after_seq).await?;
     }
 }

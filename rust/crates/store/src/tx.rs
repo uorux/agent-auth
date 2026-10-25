@@ -52,6 +52,21 @@ impl Store {
             inner: Mutex::new(self.pool.begin().await?),
         })
     }
+
+    /// Open a read-only transaction on one snapshot (REPEATABLE READ):
+    /// every query in it sees the same committed state. For an answer
+    /// built from several reads that must agree (a thread and its
+    /// messages): under READ COMMITTED each statement sees the latest
+    /// commit, so a write landing between two of them showed half of it.
+    pub async fn begin_snapshot(&self) -> Result<Tx<'static>, StoreError> {
+        Ok(Tx {
+            inner: Mutex::new(
+                self.pool
+                    .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    .await?,
+            ),
+        })
+    }
 }
 
 /// One transaction. Query functions take `&Tx`; statements are serialized

@@ -2592,6 +2592,85 @@ fn spawn_get(t: &T, path: String, key: &str) -> tokio::task::JoinHandle<(StatusC
     })
 }
 
+/// A read of a thread's messages is one snapshot. Found by the e2e suite
+/// once a reply raced the poll: the reply (which accepts the thread)
+/// committed between the read of the thread and the read of its messages,
+/// and the poll answered with the message and the thread still
+/// `pending_open`, `last_seq` short of it. Here the reply is made to land
+/// exactly there: it holds the messages table until the read is blocked on
+/// it, then writes and commits.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_message_read_is_one_snapshot(pool: PgPool) {
+    let t = setup(pool);
+    let (s_row, s) = t.service("auto-snap").await;
+    t.service("svc-snap").await;
+    t.grant(&s_row, "svc-snap", None).await;
+    let tid = t.open_ok(&s, "svc-snap").await;
+    let mut reply = t.pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE a2a_messages IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *reply)
+        .await
+        .unwrap();
+    let read = spawn_get(
+        &t,
+        format!("/v1/a2a/threads/{tid}/messages?after_seq=1"),
+        &s,
+    );
+    // The read has the thread and waits for the messages table.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&t.pool)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the read never blocked"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // The reply, as `send` writes it: the thread accepted, message 2.
+    sqlx::query(
+        "UPDATE a2a_threads SET state = 'open', accepted_at = now(), last_seq = 2, \
+         last_activity_at = now() WHERE id = $1::uuid",
+    )
+    .bind(&tid)
+    .execute(&mut *reply)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO a2a_messages (id, thread_id, seq, sender_agent_id, recipient_agent_id, \
+         grant_id, payload) \
+         SELECT gen_random_uuid(), id, 2, responder_agent_id, initiator_agent_id, grant_id, \
+         '{\"answer\": 42}'::json FROM a2a_threads WHERE id = $1::uuid",
+    )
+    .bind(&tid)
+    .execute(&mut *reply)
+    .await
+    .unwrap();
+    reply.commit().await.unwrap();
+    let (st, v) = read.await.unwrap();
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // As of the read's start: before the reply, all of it.
+    assert_eq!(v["thread"]["state"], "pending_open", "{v}");
+    assert_eq!(v["messages"], json!([]), "{v}");
+    // The next read sees all of the reply.
+    let (_, v) = t
+        .get(
+            &format!("/v1/a2a/threads/{tid}/messages?after_seq=1"),
+            ag(&s),
+        )
+        .await;
+    assert_eq!(v["thread"]["state"], "open", "{v}");
+    assert_eq!(v["messages"][0]["payload"], json!({"answer": 42}), "{v}");
+}
+
 #[sqlx::test(migrations = "../store/migrations")]
 async fn concurrent_long_polls_are_capped_per_agent(pool: PgPool) {
     let t = setup_with(

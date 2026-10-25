@@ -102,7 +102,12 @@ async fn approve_needs_an_armed_tier_and_totp_works_disarmed(pool: sqlx::PgPool)
     // The job API: the agent's own job, its output once done.
     let got = b
         .hostexec()
-        .get_job(a.id, j.id, Duration::ZERO)
+        .get_job(
+            a.id,
+            j.id,
+            Duration::ZERO,
+            &crate::events::Shutdown::default(),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -111,7 +116,12 @@ async fn approve_needs_an_armed_tier_and_totp_works_disarmed(pool: sqlx::PgPool)
     let other = b.agent("claude-2").await;
     assert!(
         b.hostexec()
-            .get_job(other.id, j.id, Duration::ZERO)
+            .get_job(
+                other.id,
+                j.id,
+                Duration::ZERO,
+                &crate::events::Shutdown::default()
+            )
             .await
             .unwrap()
             .is_none()

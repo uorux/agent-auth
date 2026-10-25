@@ -775,7 +775,11 @@ pub(crate) async fn read_messages(
     after_seq: i64,
 ) -> ApiResult<ThreadMessages> {
     let a2a = enabled(state)?;
-    let tx = state.store.begin().await?;
+    // One snapshot: the thread as of the messages read. (Two READ COMMITTED
+    // reads let a reply that accepted the thread land between them: the
+    // reply came back with its thread still `pending_open`, `last_seq`
+    // short of the message.)
+    let tx = state.store.begin_snapshot().await?;
     let t = own_thread(&Actor::agent_caller(caller), store_a2a::get(&tx, id).await?)?;
     let after = i32::try_from(after_seq.max(-1)).unwrap_or(i32::MAX);
     let messages = store_a2a::messages_after(&tx, id, after)

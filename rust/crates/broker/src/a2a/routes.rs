@@ -26,7 +26,7 @@ use super::service::{self, Actor, CloseKind};
 use super::{A2a, WakeKey};
 use crate::auth::AgentCaller;
 use crate::error::{ApiError, ApiResult};
-use crate::events::{KeyedEvents, Listener, clamp_wait};
+use crate::events::{KeyedEvents, Listener, Shutdown, Wake, clamp_wait};
 use crate::state::AppState;
 
 /// A parked long-poll sleeps on its wake-up keys (no wake-up is lost: the
@@ -144,15 +144,15 @@ impl Waiter {
         }
     }
 
-    pub(super) async fn wait(&mut self, timeout: Duration) {
+    /// Until a wake-up, `timeout`, or the broker stopping (`Wake::Shutdown`:
+    /// answer with the state as it is, do not park again).
+    pub(super) async fn wait(&mut self, timeout: Duration, shutdown: &Shutdown) -> Wake {
         match &mut self.session {
-            None => {
-                self.agent.wait(timeout).await;
-            }
+            None => self.agent.wait_or_shutdown(timeout, shutdown).await,
             Some(s) => {
-                let a = Box::pin(self.agent.wait(timeout));
-                let b = Box::pin(s.wait(timeout));
-                futures::future::select(a, b).await;
+                let a = Box::pin(self.agent.wait_or_shutdown(timeout, shutdown));
+                let b = Box::pin(s.wait_or_shutdown(timeout, shutdown));
+                futures::future::select(a, b).await.factor_first().0
             }
         }
     }
@@ -325,10 +325,10 @@ async fn read_messages(
         if left.is_zero() {
             return Ok(Json(last));
         }
-        waiter.wait(left.min(POLL_ROUND)).await;
+        let wake = waiter.wait(left.min(POLL_ROUND), &state.shutdown).await;
         recheck(&state, &caller).await?;
         let r = service::read_messages(&state, &caller, id, after_seq).await?;
-        if !r.messages.is_empty() || r.thread.state != start {
+        if !r.messages.is_empty() || r.thread.state != start || wake == Wake::Shutdown {
             return Ok(Json(r));
         }
         last = r;
@@ -359,7 +359,10 @@ async fn events(
     loop {
         let (snapshot, settling) =
             service::events_snapshot_settling(&state, &caller, after).await?;
-        if !snapshot.pending_opens.is_empty() || !snapshot.activity.is_empty() {
+        if !snapshot.pending_opens.is_empty()
+            || !snapshot.activity.is_empty()
+            || state.shutdown.is_triggered()
+        {
             return Ok(Json(snapshot));
         }
         let left = remaining(deadline);
@@ -370,7 +373,7 @@ async fn events(
             slot = Some(poll_slot(a2a, &caller)?);
         }
         let round = if settling { SETTLE_ROUND } else { POLL_ROUND };
-        waiter.wait(left.min(round)).await;
+        waiter.wait(left.min(round), &state.shutdown).await;
         recheck(&state, &caller).await?;
     }
 }

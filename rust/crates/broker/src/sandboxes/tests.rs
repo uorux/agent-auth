@@ -199,7 +199,10 @@ async fn inv2_a_pending_key_is_stored_encrypted(pool: sqlx::PgPool) {
     let key = sb.wait_key(ORCH).await;
     let rows = pending(&b).await;
     assert_eq!(rows.len(), 1);
-    let secret = key.rsplit('_').next().unwrap();
+    // `aa_<key id>_<secret>`; the secret is base64url, so it may itself
+    // contain `_` (splitting at the last one left a few characters that
+    // the ciphertext contained by chance now and then).
+    let secret = key.splitn(3, '_').nth(2).unwrap();
     assert!(!rows[0].key_encrypted.contains(secret));
     assert!(!format!("{:?}", rows[0]).contains(secret));
 }
@@ -359,7 +362,10 @@ async fn inv1_inv5_a_mint_creates_a_child_whose_key_only_the_sandbox_gets(pool: 
             .unwrap()
             .starts_with("minted; lease until ")
     );
-    let secret = key.rsplit('_').next().unwrap();
+    // `aa_<key id>_<secret>`; the secret is base64url, so it may itself
+    // contain `_` (splitting at the last one left a few characters that
+    // the ciphertext contained by chance now and then).
+    let secret = key.splitn(3, '_').nth(2).unwrap();
     assert!(!cred.to_string().contains(secret));
     assert!(!g.provisioner_state.to_string().contains(secret));
     assert_eq!(g.provisioner_state["created"], json!(true));

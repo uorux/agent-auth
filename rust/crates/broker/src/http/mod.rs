@@ -89,7 +89,10 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::mail::routes::routes());
     // The remote MCP's tools call the agent API in process.
     if let Some(mcp) = &state.web.remote_mcp {
-        mcp.set_agent_api(all.clone().with_state(state.clone()));
+        mcp.set_agent_api(
+            all.clone().with_state(state.clone()),
+            state.shutdown.clone(),
+        );
     }
     let headers = [
         (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),

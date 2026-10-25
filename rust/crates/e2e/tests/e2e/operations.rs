@@ -3,11 +3,12 @@
 
 use std::time::Duration;
 
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
-use crate::harness::{Broker, TempDir, Who, eventually};
-use crate::world::World;
+use crate::fakes;
+use crate::harness::{self, Broker, TempDir, Who, eventually};
+use crate::world::{POLICY, World};
 
 const WRITE: &str = r#"{"permissions": {"contents": "write"}}"#;
 
@@ -253,13 +254,20 @@ async fn one_broker_per_database(_: PgPoolOptions, opts: PgConnectOptions) {
 }
 
 /// Scenario 9: SIGTERM stops the broker cleanly, also with an agent in a
-/// long-poll; the lock is released, so the next broker starts.
+/// long-poll, which answers with the request's state at once (not cut off
+/// by the drain); the lock is released, so the next broker starts.
 #[sqlx::test(migrations = false)]
 async fn sigterm_shuts_down_gracefully(_: PgPoolOptions, opts: PgConnectOptions) {
-    let mut w = World::start(&opts).await;
-    let a = w.broker.create_agent("auto-poller", &[]).await;
-    let pending = w
-        .broker
+    let github = fakes::github().await;
+    let openrouter = fakes::openrouter().await;
+    let files = TempDir::new();
+    // One decision wait per agent: a second one answering 429 is how the
+    // test knows the first is parked in the broker.
+    let setup =
+        World::setup(&opts, POLICY, &github, &openrouter, &files).env("MAX_WAITS_PER_AGENT", "1");
+    let mut b = Broker::start(setup).await;
+    let a = b.create_agent("auto-poller", &[]).await;
+    let pending = b
         .cli(
             a.who(),
             &[
@@ -276,33 +284,80 @@ async fn sigterm_shuts_down_gracefully(_: PgPoolOptions, opts: PgConnectOptions)
         .await
         .ok();
     let id = pending["id"].as_str().unwrap().to_owned();
+    let decided = b
+        .cli(
+            a.who(),
+            &[
+                "request",
+                "github",
+                "repo",
+                "acme/auto-probe",
+                "--why",
+                "x",
+                "-s",
+                WRITE,
+                "--wait",
+            ],
+        )
+        .await
+        .ok();
+    assert_eq!(decided["status"], "granted", "{decided}");
+    let probe_id = decided["id"].as_str().unwrap().to_owned();
+
     // An agent waiting for a decision (up to 60 s) while the broker stops.
-    let wait = ["wait", &id, "--timeout", "60"];
-    let waiting = w.broker.cli(a.who(), &wait);
+    let http = harness::http_client();
+    let wait = |rid: &str, secs: u32| {
+        http.get(format!("{}/v1/requests/{rid}/wait?timeout={secs}", b.url))
+            .bearer_auth(&a.key)
+            .send()
+    };
+    let parked = async {
+        loop {
+            let r = wait(&id, 60).await.unwrap();
+            // (429: the probe below held the slot just then.)
+            if r.status() != 429 {
+                return (r.status().as_u16(), r.json::<Value>().await.unwrap());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
     let stop = async {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        w.broker.sigterm();
+        // The probe waits on a decided request, which answers at once,
+        // unless the parked wait holds the agent's one slot: then 429.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while wait(&probe_id, 1).await.unwrap().status() != 429 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the wait never parked"
+            );
+        }
+        b.sigterm();
+        std::time::Instant::now()
     };
     let started = std::time::Instant::now();
-    let (out, ()) = tokio::join!(waiting, stop);
-    // The waiter is cut off after the drain (the broker's DRAIN, 10 s).
-    assert_eq!(out.code, 1, "{out:?}");
-    assert!(out.stderr.contains("could not reach the broker"), "{out:?}");
-    let status = w.broker.exited(Duration::from_secs(20)).await;
+    let ((status, body), signalled) = tokio::join!(parked, stop);
+    let answered_in = signalled.elapsed();
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "awaiting_human", "{body}");
+    assert!(
+        answered_in < Duration::from_secs(5),
+        "answered {answered_in:?} after the signal: the drain is 10 s"
+    );
+    let status = b.exited(Duration::from_secs(20)).await;
     assert!(
         status.is_some_and(|s| s.success()),
         "stopped cleanly within 20 s ({status:?}):\n{}",
-        w.broker.log()
+        b.log()
     );
+    let log = b.log();
+    assert!(log.contains("shutting down"), "{log}");
     assert!(
-        w.broker.log().contains("shutting down"),
-        "{}",
-        w.broker.log()
+        !log.contains("requests still open after the signal"),
+        "{log}"
     );
-    assert!(started.elapsed() < Duration::from_secs(25));
+    assert!(started.elapsed() < Duration::from_secs(45));
     // The lock went with it: a new broker starts on the database.
-    let again =
-        Broker::start_with_key(w.broker.setup.clone(), w.broker.encryption_key.clone()).await;
+    let again = Broker::start_with_key(b.setup.clone(), b.encryption_key.clone()).await;
     let r = again.cli(a.who(), &["status", &id]).await.ok();
     assert_eq!(r["status"], "awaiting_human", "{r}");
 }

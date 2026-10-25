@@ -89,7 +89,7 @@ async fn get_job(
     let unknown = || ApiError::not_found("unknown job");
     let id: JobId = job_id.parse().map_err(|_| unknown())?;
     let job = hostexec
-        .get_job(caller.id(), id, wait)
+        .get_job(caller.id(), id, wait, &st.shutdown)
         .await?
         .ok_or_else(unknown)?;
     Ok(Json(job_out(&job, true)))
@@ -117,7 +117,7 @@ async fn shell_exec(
         })?;
     let wait = clamp_wait(body.wait, 0.0, 300.0);
     let job = hostexec
-        .get_job(caller.id(), job.id, wait)
+        .get_job(caller.id(), job.id, wait, &st.shutdown)
         .await?
         .unwrap_or(job);
     Ok(Json(job_out(&job, true)))

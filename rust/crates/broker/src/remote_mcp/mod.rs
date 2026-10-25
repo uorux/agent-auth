@@ -52,6 +52,7 @@ use tower::ServiceExt as _;
 use uuid::Uuid;
 
 use crate::auth::bearer_token;
+use crate::events::Shutdown;
 use crate::state::AppState;
 use crate::webui::WebConfigError;
 
@@ -192,6 +193,8 @@ struct Minted {
 struct Shared {
     tools: Vec<&'static ToolDef>,
     api: OnceLock<Router>,
+    /// The broker's, set with `api`: waiting tools stop at shutdown.
+    shutdown: OnceLock<Shutdown>,
     sessions: Mutex<HashMap<Uuid, Minted>>,
     /// Serializes minting, so concurrent calls share one session.
     mint: tokio::sync::Mutex<()>,
@@ -235,6 +238,7 @@ impl RemoteMcp {
         let shared = Arc::new(Shared {
             tools: served,
             api: OnceLock::new(),
+            shutdown: OnceLock::new(),
             sessions: Mutex::new(HashMap::new()),
             mint: tokio::sync::Mutex::new(()),
             keep_for: config.access_ttl.as_duration(),
@@ -266,10 +270,11 @@ impl RemoteMcp {
     }
 
     /// The broker's agent API (`/v1/...`, its state applied) that the tools
-    /// call in process. `main` sets it once the routes are built; until
-    /// then tools answer 503.
-    pub fn set_agent_api(&self, api: Router) {
-        if self.shared.api.set(api).is_err() {
+    /// call in process, and its shutdown signal (a waiting tool answers
+    /// with the state as it is when the broker stops). `main` sets them
+    /// once the routes are built; until then tools answer 503.
+    pub fn set_agent_api(&self, api: Router, shutdown: Shutdown) {
+        if self.shared.api.set(api).is_err() || self.shared.shutdown.set(shutdown).is_err() {
             tracing::warn!("remote MCP: the agent API was already set");
         }
     }
@@ -690,7 +695,12 @@ impl Api<'_> {
                 .get(path, &query(left.clamp(0.0, POLL_SLICE)), sess)
                 .await?;
             let now = tokio::time::Instant::now();
-            if settled(&out) || now >= deadline {
+            let stopping = self
+                .shared
+                .shutdown
+                .get()
+                .is_some_and(Shutdown::is_triggered);
+            if settled(&out) || now >= deadline || stopping {
                 return Ok(out);
             }
             // An answer that came straight back unsettled: don't spin.

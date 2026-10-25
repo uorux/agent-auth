@@ -27,8 +27,9 @@ use crate::state::AppState;
 
 /// How long shutdown waits for background LLM evaluations.
 const SETTLE: Duration = Duration::from_secs(10);
-/// How long requests still open at a signal may run on (long-polls hold
-/// theirs up to 300 s). DRAIN + SETTLE stays inside Kubernetes' default
+/// How long requests still open at a signal may run on. Long-polls (which
+/// hold theirs up to 300 s) answer at the signal (`AppState::shutdown`);
+/// this bounds the rest. DRAIN + SETTLE stays inside Kubernetes' default
 /// 30 s grace period.
 pub const DRAIN: Duration = Duration::from_secs(10);
 
@@ -210,9 +211,9 @@ async fn shutdown_signal() {
 }
 
 /// Serve `app` until `signal`, then let open requests finish for at most
-/// `drain`; then return, leaving requests still open (long-polls) to end
-/// with the runtime when `main` returns. Without the bound, one agent's long-poll held the
-/// shutdown for up to 300 s.
+/// `drain`; then return, leaving requests still open to end with the
+/// runtime when `main` returns. (Long-polls answer at the signal, see
+/// `run`; the bound is for anything that does not.)
 pub async fn serve_until(
     listener: tokio::net::TcpListener,
     app: axum::Router,
@@ -429,7 +430,14 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
     let addr = listener.local_addr().unwrap_or(addr);
     tracing::info!(%addr, "agent-auth broker listening");
     let app = crate::http::router(state.clone());
-    let served = serve_until(listener, app, shutdown_signal(), DRAIN).await;
+    // At the signal, parked long-polls answer with their current state
+    // first; the drain then bounds whatever else is still open.
+    let stopping = state.shutdown.clone();
+    let signal = async move {
+        shutdown_signal().await;
+        stopping.trigger();
+    };
+    let served = serve_until(listener, app, signal, DRAIN).await;
 
     let _ = stop_tx.send(true);
     if let Err(e) = scheduler.await {

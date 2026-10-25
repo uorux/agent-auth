@@ -14,7 +14,7 @@ use time::OffsetDateTime;
 
 use crate::a2a::A2a;
 use crate::auth::AuthConfig;
-use crate::events::KeyedEvents;
+use crate::events::{KeyedEvents, Shutdown};
 use crate::notify::Notifier;
 use crate::provisioners::{PlatformServices, Registry};
 use crate::security_log::SecurityLog;
@@ -49,6 +49,9 @@ pub struct AppState {
     /// Agent VMs: orchestrator bootstrap, key delivery, minting and
     /// cross-project access (`sandboxes`); on with the daemon channel.
     pub sandboxes: Option<Arc<crate::sandboxes::Sandboxes>>,
+    /// Set at SIGTERM: parked long-polls answer with their current state
+    /// instead of waiting to be cut off by the drain (`events::Shutdown`).
+    pub shutdown: Shutdown,
 }
 
 impl AppState {
@@ -80,6 +83,7 @@ impl AppState {
             hostd: None,
             mail: None,
             sandboxes: None,
+            shutdown: Shutdown::default(),
         }
     }
 }

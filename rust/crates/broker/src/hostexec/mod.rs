@@ -505,12 +505,14 @@ impl HostExec {
         })
     }
 
-    /// A job of the agent's own, after waiting up to `wait` for it to end.
+    /// A job of the agent's own, after waiting up to `wait` for it to end
+    /// (or until the broker is stopping: then as it is).
     pub async fn get_job(
         &self,
         agent: agent_auth_core::AgentId,
         job: JobId,
         wait: Duration,
+        shutdown: &crate::events::Shutdown,
     ) -> Result<Option<JobRow>, StoreError> {
         let deadline = tokio::time::Instant::now()
             .checked_add(wait)
@@ -524,13 +526,13 @@ impl HostExec {
                 return Ok(None);
             };
             let now = tokio::time::Instant::now();
-            if wire_status(row.status).has_ended() || now >= deadline {
+            if wire_status(row.status).has_ended() || now >= deadline || shutdown.is_triggered() {
                 return Ok(Some(row));
             }
             let slice = deadline
                 .saturating_duration_since(now)
                 .min(Duration::from_secs(2));
-            listener.wait(slice).await;
+            listener.wait_or_shutdown(slice, shutdown).await;
         }
     }
 

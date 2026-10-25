@@ -491,6 +491,13 @@ and why. Keep entries short. Group by area.
   one broker process.
 - **The message long-poll does not mark the caller listening** (a2a B2):
   only the events poll and accept set `last_listen_at`.
+- **A message read is one snapshot** (found by the e2e suite under load).
+  `GET /v1/a2a/threads/{id}/messages` and the admin chat read the thread
+  and its messages in one REPEATABLE READ, read-only transaction
+  (`Store::begin_snapshot`). Two READ COMMITTED reads let a reply that
+  accepts the thread commit between them: the poll answered with the reply
+  and the thread still `pending_open`, `last_seq` short of the message
+  (the Python makes the same two reads: the same race on Postgres).
 - **Zones hold on open and send** (a2a B5): a zone-apart responder is
   `404 unknown agent 'X'` on open (as in the check); a send across a zone
   edge is 403 `a restricted zone separates you from this peer: no a2a
@@ -946,13 +953,16 @@ and why. Keep entries short. Group by area.
   Discord bot and the a2a settings read only the process environment at
   first, so `DISCORD_TOKEN` in `./.env`, as the README's quick start puts
   it, left the bot off (found by the e2e suite).
-- **Shutdown drains for at most 10 s** (found by the e2e suite). On SIGTERM
-  the Python's uvicorn waited for every open request, so one agent's
-  long-poll (`wait`, a2a `poll`/`events`: up to 300 s) held the shutdown
-  past Kubernetes' 30 s grace and the pod was killed. Now open requests get
-  10 s (`server::DRAIN`), then the broker stops the scheduler, settles LLM
-  evaluations (10 s), releases its lock and exits; a cut-off long-poll
-  sees its connection close and polls again.
+- **Shutdown drains for at most 10 s, and long-polls answer at once**
+  (found by the e2e suite). On SIGTERM the Python's uvicorn waited for
+  every open request, so one agent's long-poll (`wait`, a2a `poll`/`events`:
+  up to 300 s) held the shutdown past Kubernetes' 30 s grace and the pod
+  was killed. Now every parked long-poll (decision `wait`, a2a messages and
+  events, host job waits, the admin panel chat, and the remote MCP tools
+  waiting on them) answers 200 with its current state as soon as the
+  signal arrives (`AppState::shutdown`); other open requests get 10 s
+  (`server::DRAIN`). Then the broker stops the scheduler, settles LLM
+  evaluations (10 s), releases its lock and exits.
 
 ## Daemons, hostd and hostexec (`crates/daemon`, `crates/hostd`, broker `daemons`, `hostexec`, `desktop`, `attention`)
 
@@ -1640,5 +1650,3 @@ inherited from the Python; "port" what the port introduced.
   (a dedicated PKCS#8 key) in review.
 - Store lock-order doc vs. the finish phase (grant before request row):
   verify in the next review that no path locks request then grant.
-- At shutdown, end long-polls early with their current state instead of
-  cutting them off after the 10 s drain ("could not reach the broker").
