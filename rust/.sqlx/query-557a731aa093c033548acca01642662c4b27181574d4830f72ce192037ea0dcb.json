@@ -1,21 +1,10 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT state, grant_id FROM a2a_threads WHERE id = $1 FOR SHARE",
+  "query": "SELECT grant_id FROM a2a_threads WHERE id = $1",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "state",
-        "type_info": "Text",
-        "origin": {
-          "Table": {
-            "table": "a2a_threads",
-            "name": "state"
-          }
-        }
-      },
-      {
-        "ordinal": 1,
         "name": "grant_id",
         "type_info": "Uuid",
         "origin": {
@@ -32,9 +21,8 @@
       ]
     },
     "nullable": [
-      false,
       true
     ]
   },
-  "hash": "8dbb263123110cb5890f7be18d4eb55252607ba008b2c1fad15bd8af2d6446c3"
+  "hash": "557a731aa093c033548acca01642662c4b27181574d4830f72ce192037ea0dcb"
 }

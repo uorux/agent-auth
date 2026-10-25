@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE grants SET expires_at = LEAST(expires_at, $2)\n         WHERE id IN (SELECT id FROM grants WHERE agent_id = $1 AND status = 'active'\n                      ORDER BY id FOR NO KEY UPDATE)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a8c38343cdfd1973b607eef0c6ac10c901018209834b15a90fb96407ea85a97c"
+}

@@ -132,31 +132,40 @@ pub async fn disable_tree(
     root: AgentId,
     now: OffsetDateTime,
 ) -> Result<Vec<String>, StoreError> {
+    // Lock order: the containment lock (exclusive: waits for in-flight
+    // checks), then agents in id order, then their grants in id order.
+    crate::lockdown::lock_exclusive(tx).await?;
     let mut c = tx.conn().await;
-    let disabled = sqlx::query!(
-        "WITH RECURSIVE tree AS (
-             SELECT id FROM agents WHERE id = $1
-             UNION
-             SELECT a.id FROM agents a JOIN tree t ON a.parent_agent_id = t.id
-         )
-         UPDATE agents SET disabled = true WHERE id IN (SELECT id FROM tree)
-         RETURNING id, name",
+    let tree = sqlx::query_scalar!(
+        r#"WITH RECURSIVE tree AS (
+               SELECT id FROM agents WHERE id = $1
+               UNION
+               SELECT a.id FROM agents a JOIN tree t ON a.parent_agent_id = t.id
+           )
+           SELECT a.id AS "id!" FROM agents a JOIN tree t ON t.id = a.id
+           ORDER BY a.id FOR NO KEY UPDATE OF a"#,
         Uuid::from(root)
     )
     .fetch_all(&mut **c)
     .await?;
-    let ids: Vec<Uuid> = disabled.iter().map(|r| r.id).collect();
+    let disabled = sqlx::query!(
+        "UPDATE agents SET disabled = true WHERE id = ANY($1) RETURNING name",
+        &tree
+    )
+    .fetch_all(&mut **c)
+    .await?;
     sqlx::query!(
         "UPDATE grants SET expires_at = LEAST(expires_at, $2)
-         WHERE agent_id = ANY($1) AND status = 'active'",
-        &ids,
+         WHERE id IN (SELECT id FROM grants WHERE agent_id = ANY($1) AND status = 'active'
+                      ORDER BY id FOR NO KEY UPDATE)",
+        &tree,
         now
     )
     .execute(&mut **c)
     .await?;
     sqlx::query!(
         "DELETE FROM pending_key_deliveries WHERE agent_id = ANY($1)",
-        &ids
+        &tree
     )
     .execute(&mut **c)
     .await?;

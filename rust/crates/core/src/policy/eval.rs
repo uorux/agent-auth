@@ -9,11 +9,11 @@ use time::OffsetDateTime;
 use crate::authority::{Authority, HostexecAuthority, rule_covers};
 use crate::durations::DurationSecs;
 use crate::glob::Glob;
-use crate::ids::RuleId;
+use crate::ids::{RequestId, RuleId};
 use crate::lifecycle::DecisionSource;
 use crate::platform::Platform;
 use crate::pyfmt::repr;
-use crate::routing::{Downgrade, GateFacts, PolicyAction, Route, RuleStrength, route};
+use crate::routing::{Downgrade, GateFacts, PolicyAction, Route, RuleStrength, gate, route};
 use crate::zones::ZonePassed;
 
 use super::Policy;
@@ -100,7 +100,11 @@ pub enum Matched {
     Default,
 }
 
-/// `PolicyDecision`.
+/// `PolicyDecision`. Only [`Policy::evaluate`] makes one. The public fields
+/// are for reading; [`Policy::route`] uses the values evaluation sealed in
+/// (changing a field cannot widen what routing clears), and refuses to
+/// clear a request whose authority or resource differ from what was
+/// evaluated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyDecision {
     pub action: PolicyAction,
@@ -120,6 +124,40 @@ pub struct PolicyDecision {
     pub explicit: bool,
     /// A hostexec "approve all" window.
     pub window: bool,
+    sealed: Sealed,
+}
+
+/// What evaluation decided, as routing reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Sealed {
+    action: PolicyAction,
+    pinned: bool,
+    explicit: bool,
+    source: DecisionSource,
+    authority: Authority,
+    resource: String,
+}
+
+impl Sealed {
+    fn of(
+        input: &PolicyInput<'_>,
+        action: PolicyAction,
+        pinned: bool,
+        explicit: bool,
+        matched: Matched,
+    ) -> Sealed {
+        Sealed {
+            action,
+            pinned,
+            explicit,
+            source: match matched {
+                Matched::SavedRule(_) => DecisionSource::Rule,
+                Matched::PolicyRule(_) | Matched::Default => DecisionSource::Policy,
+            },
+            authority: input.authority.clone(),
+            resource: input.resource.to_owned(),
+        }
+    }
 }
 
 impl PolicyDecision {
@@ -211,6 +249,13 @@ impl Policy {
                 continue;
             }
             let c = &rule.constraints;
+            // A literal pattern (no wildcard: `tpl.*` never names `tpl.x`)
+            // equal to the capability, and only for a rule about this
+            // platform (bug B-16: `capability: use` without a platform named
+            // both mcp and models).
+            let explicit = m.platform.is_some()
+                && m.capability.is_literal()
+                && m.capability.as_str() == capability;
             return PolicyDecision {
                 action: rule.action,
                 reason: if rule.reason.is_empty() {
@@ -227,18 +272,14 @@ impl Policy {
                     .unwrap_or_else(|| self.llm().model.clone()),
                 retry_budget: c.retry_budget.unwrap_or(self.llm().retry_budget),
                 pinned: false,
-                // A literal pattern (no wildcard: `tpl.*` never names
-                // `tpl.x`) equal to the capability, and only for a rule
-                // about this platform (bug B-16: `capability: use` without
-                // a platform named both mcp and models).
-                explicit: m.platform.is_some()
-                    && m.capability.is_literal()
-                    && m.capability.as_str() == capability,
+                explicit,
                 window: false,
+                sealed: Sealed::of(input, rule.action, false, explicit, Matched::PolicyRule(i)),
             };
         }
+        let action = default_action(self.defaults().action, input.delegation.is_delegated());
         PolicyDecision {
-            action: default_action(self.defaults().action, input.delegation.is_delegated()),
+            action,
             reason: "no matching rule; policy default".to_owned(),
             matched: Matched::Default,
             max_duration: self.defaults().max_duration,
@@ -247,6 +288,7 @@ impl Policy {
             pinned: false,
             explicit: false,
             window: false,
+            sealed: Sealed::of(input, action, false, false, Matched::Default),
         }
     }
 
@@ -276,11 +318,12 @@ impl Policy {
                 && rule_covers(rule.authority.as_ref(), input.authority)
         })?;
         let pinned = rule.authority.is_some();
+        let action = match rule.action {
+            SavedRuleAction::AutoApprove => PolicyAction::Approve,
+            SavedRuleAction::AutoDeny => PolicyAction::Deny,
+        };
         Some(PolicyDecision {
-            action: match rule.action {
-                SavedRuleAction::AutoApprove => PolicyAction::Approve,
-                SavedRuleAction::AutoDeny => PolicyAction::Deny,
-            },
+            action,
             reason: if rule.notes.is_empty() {
                 "matched saved rule".to_owned()
             } else {
@@ -296,6 +339,7 @@ impl Policy {
                 rule.authority,
                 Some(Authority::Hostexec(HostexecAuthority::Window { .. }))
             ),
+            sealed: Sealed::of(input, action, pinned, pinned, Matched::SavedRule(rule.id)),
         })
     }
 
@@ -314,21 +358,37 @@ impl Policy {
         }
     }
 
-    /// Apply the gates to a decision (§4.1 step 9). Needs the zone check's
-    /// pass, so a request cannot be routed without it.
+    /// Apply the gates to a decision (§4.1 step 9) for `request`. Needs
+    /// the zone check's pass, so a request cannot be routed without it; the
+    /// facts about the authority (human-only, sensitive, needs a named rule)
+    /// are computed here, not taken from the caller. A clearance in the
+    /// result is bound to `request` and the evaluated authority. A decision
+    /// evaluated for another authority or resource clears nothing.
     #[must_use]
     pub fn route(
         &self,
+        request: RequestId,
         input: &PolicyInput<'_>,
         decision: &PolicyDecision,
         zone: &ZonePassed,
     ) -> RoutedRequest {
-        let strength = RuleStrength {
-            pinned: decision.pinned,
-            explicit: decision.explicit,
+        let sealed = &decision.sealed;
+        let same = sealed.authority == *input.authority && sealed.resource == input.resource;
+        let (proposed, strength) = if same {
+            (
+                sealed.action,
+                RuleStrength {
+                    pinned: sealed.pinned,
+                    explicit: sealed.explicit,
+                },
+            )
+        } else if sealed.action == PolicyAction::Deny {
+            (PolicyAction::Deny, RuleStrength::NONE)
+        } else {
+            (PolicyAction::Surface, RuleStrength::NONE)
         };
-        let routed = route(decision.action, strength, self.gate_facts(input, zone));
-        let notes = routed
+        let gated = gate(proposed, strength, self.gate_facts(input, zone));
+        let notes = gated
             .downgrades
             .iter()
             .map(|d| match d {
@@ -348,8 +408,8 @@ impl Policy {
             })
             .collect();
         RoutedRequest {
-            route: routed.route,
-            downgrades: routed.downgrades,
+            route: route(gated.action, request, input.authority, sealed.source),
+            downgrades: gated.downgrades,
             notes,
         }
     }
@@ -358,13 +418,14 @@ impl Policy {
     #[must_use]
     pub fn evaluate_and_route(
         &self,
+        request: RequestId,
         input: &PolicyInput<'_>,
         saved: &[SavedRule],
         zone: &ZonePassed,
         now: OffsetDateTime,
     ) -> (PolicyDecision, RoutedRequest) {
         let decision = self.evaluate(input, saved, now);
-        let routed = self.route(input, &decision, zone);
+        let routed = self.route(request, input, &decision, zone);
         (decision, routed)
     }
 }

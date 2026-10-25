@@ -3,7 +3,7 @@
 
 use crate::durations::DurationSecs;
 use crate::policy::{cap_duration, default_action, delegator_axis};
-use crate::routing::{GateFacts, PolicyAction, RuleStrength, route};
+use crate::routing::{GateFacts, PolicyAction, RuleStrength, gate};
 
 fn any_action() -> PolicyAction {
     match kani::any::<u8>() % 4 {
@@ -105,8 +105,8 @@ fn routed_decisions_only_downgrade() {
         sensitive: kani::any(),
         needs_explicit_rule: kani::any(),
     };
-    let routed = route(proposed, strength, facts);
-    let result = routed.route.action();
+    let routed = gate(proposed, strength, facts);
+    let result = routed.action;
     assert!(result == proposed || result == PolicyAction::Surface);
     assert!(routed.downgrades.len() <= 1);
     if result.is_auto() {

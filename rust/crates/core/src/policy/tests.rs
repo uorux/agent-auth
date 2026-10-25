@@ -11,7 +11,7 @@ use time::OffsetDateTime;
 use super::*;
 use crate::authority::{Authority, rule_covers};
 use crate::glob::Glob;
-use crate::ids::RuleId;
+use crate::ids::{RequestId, RuleId};
 use crate::lifecycle::DecisionSource;
 use crate::platform::Platform;
 use crate::routing::{PolicyAction, Route};
@@ -117,7 +117,13 @@ fn routed(
         resource,
         authority,
     };
-    policy.evaluate_and_route(&input, saved, &ZonePassed::for_tests(None), now())
+    policy.evaluate_and_route(
+        RequestId::new(),
+        &input,
+        saved,
+        &ZonePassed::for_tests(None),
+        now(),
+    )
 }
 
 fn saved(action: SavedRuleAction, agent: &str, platform: Platform) -> SavedRule {
@@ -1059,11 +1065,73 @@ fn a_zone_note_sends_it_to_a_human() {
         authority: &mint,
     };
     let note = "mints an agent inside restricted zone soc: always a human";
-    let (_, r) = p.evaluate_and_route(&input, &[], &ZonePassed::for_tests(Some(note)), now());
+    let (_, r) = p.evaluate_and_route(
+        RequestId::new(),
+        &input,
+        &[],
+        &ZonePassed::for_tests(Some(note)),
+        now(),
+    );
     assert_eq!(r.route, Route::Surface);
     assert_eq!(r.notes, vec![note]);
-    let (_, r) = p.evaluate_and_route(&input, &[], &ZonePassed::for_tests(None), now());
+    let (_, r) = p.evaluate_and_route(
+        RequestId::new(),
+        &input,
+        &[],
+        &ZonePassed::for_tests(None),
+        now(),
+    );
     assert!(matches!(r.route, Route::Approve(_)));
+}
+
+/// A clearance names the request and authority it was computed for; a
+/// decision cannot be widened by editing its fields, nor routed for
+/// another authority.
+#[test]
+fn clearances_are_bound_and_decisions_sealed() {
+    let p = rules_policy(
+        json!([{"match": {"platform": "agents", "capability": "mint"}, "action": "approve"}]),
+        json!({}),
+    );
+    let mint = auth(Platform::Agents, "mint", json!({"runtime": "codex"}));
+    let input = PolicyInput {
+        agent: AgentRef::named("o"),
+        delegation: Delegation::None,
+        resource: "codex-x-galaxy-sandbox",
+        authority: &mint,
+    };
+    let id = RequestId::new();
+    let zone = ZonePassed::for_tests(None);
+    let (mut decision, r) = p.evaluate_and_route(id, &input, &[], &zone, now());
+    let Route::Approve(c) = r.route else {
+        panic!("{:?}", r.route)
+    };
+    assert_eq!(c.request(), id);
+    assert_eq!(c.authority(), &mint);
+    assert_eq!(c.source(), DecisionSource::Policy);
+
+    // A sensitive authority: editing `pinned` on the decision does not
+    // make it clear.
+    let p = rules_policy(
+        json!([{"match": {"platform": "sandbox", "capability": "project.write"}, "action": "approve"}]),
+        json!({}),
+    );
+    let write = auth(Platform::Sandbox, "project.write", json!({}));
+    let input = PolicyInput {
+        agent: AgentRef::named("o"),
+        delegation: Delegation::None,
+        resource: "other",
+        authority: &write,
+    };
+    let (mut d, r) = p.evaluate_and_route(id, &input, &[], &zone, now());
+    assert_eq!(r.route, Route::Surface);
+    d.pinned = true;
+    d.explicit = true;
+    assert_eq!(p.route(id, &input, &d, &zone).route, Route::Surface);
+
+    // A decision evaluated for one authority clears nothing for another.
+    decision.action = PolicyAction::Approve;
+    assert_eq!(p.route(id, &input, &decision, &zone).route, Route::Surface);
 }
 
 // ------------------------------------------------- loading and overlays
@@ -1460,7 +1528,7 @@ proptest! {
         };
         let input = PolicyInput { agent: agent.as_ref(), delegation: delegation_ref, resource, authority };
         let zone = ZonePassed::for_tests(zone_human.then_some("zone"));
-        let (decision, routed) = policy.evaluate_and_route(&input, &saved, &zone, now());
+        let (decision, routed) = policy.evaluate_and_route(RequestId::new(), &input, &saved, &zone, now());
         let result = routed.route.action();
         let proposed = decision.action;
 

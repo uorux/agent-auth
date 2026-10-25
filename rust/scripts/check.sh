@@ -15,6 +15,22 @@ for root in $(find crates -path '*/src/lib.rs' -o -path '*/src/main.rs' -o -path
   grep -q '^#!\[forbid(unsafe_code)\]' "$root" || { echo "$root lacks #![forbid(unsafe_code)]" >&2; exit 1; }
 done
 
+echo "== human approval audit"
+# A human's approval is attested only by authenticated human surfaces (core
+# approval.rs). Allowed: the broker's auth, Discord and web-panel modules,
+# the decision service, the definition, and test code (tests/ directories,
+# tests.rs modules). Comments are ignored.
+if grep -rnE '\battest\b' --include='*.rs' crates \
+  | grep -vE '^[^:]+:[0-9]+:\s*//' \
+  | grep -vE '^crates/broker/src/(auth|discord|webui)/' \
+  | grep -vE '^crates/broker/src/service/decide[^/]*\.rs:' \
+  | grep -vE '^crates/core/src/approval\.rs:' \
+  | grep -vE '^crates/[^:]*/tests/' \
+  | grep -vE '^crates/[^:]*/tests\.rs:'; then
+  echo "!!!!!!!! HumanApproval::attest outside an authenticated human surface !!!!!!!!" >&2
+  exit 1
+fi
+
 echo "== fmt"
 cargo fmt --all --check
 

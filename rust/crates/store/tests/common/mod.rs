@@ -10,7 +10,10 @@
 
 use agent_auth_core::containment::{AgentKind, Placement};
 use agent_auth_core::lifecycle::state;
+use agent_auth_core::policy::{AgentRef, Delegation as PolicyDelegation, PolicyInput};
+use agent_auth_core::zones::{self, ZoneFacts};
 use agent_auth_core::{AgentId, Authority, GrantId, Platform, RequestId};
+use agent_auth_core::{AutoClearance, HumanApproval, LlmClearance, Policy, Route};
 use agent_auth_store::agents::{self, AgentRow, NewAgent};
 use agent_auth_store::grants::{self, GrantRow};
 use agent_auth_store::requests::{self, AnyRequest, Approval, Escalation, NewRequest, Request};
@@ -97,12 +100,42 @@ pub async fn awaiting_on(
     id
 }
 
-pub fn approval(secs: u32) -> Approval {
-    Approval {
-        source: agent_auth_core::DecisionSource::Human,
-        decided_by: "jrt".to_owned(),
-        reason: "ok".to_owned(),
-        duration_secs: secs,
+/// A human's approval of `request` (tests stand in for the human surface).
+pub fn approval(request: RequestId, secs: u32) -> Approval {
+    Approval::human(HumanApproval::attest(request, "jrt"), "ok", secs)
+}
+
+/// Route `request` under a policy whose default is `action`, for an agent
+/// named `agent`.
+pub fn routed(request: RequestId, authority: &Authority, resource: &str, action: &str) -> Route {
+    let policy = Policy::from_yaml(&format!("defaults:\n  action: {action}\n")).unwrap();
+    let agent = AgentRef::named("tester");
+    let zone = zones::check(&policy, &agent, authority, resource, &ZoneFacts::Nothing).unwrap();
+    let input = PolicyInput {
+        agent,
+        delegation: PolicyDelegation::None,
+        resource,
+        authority,
+    };
+    policy
+        .evaluate_and_route(request, &input, &[], &zone, now())
+        .1
+        .route
+}
+
+/// The clearance an `approve` default gives `request`.
+pub fn auto_clearance(request: RequestId, authority: &Authority, resource: &str) -> AutoClearance {
+    match routed(request, authority, resource, "approve") {
+        Route::Approve(c) => c,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The clearance an `llm` default gives `request`.
+pub fn llm_clearance(request: RequestId, authority: &Authority, resource: &str) -> LlmClearance {
+    match routed(request, authority, resource, "llm") {
+        Route::Llm(c) => c,
+        other => panic!("{other:?}"),
     }
 }
 
@@ -113,7 +146,7 @@ pub async fn provisioning_grant(store: &Store, request: RequestId) -> GrantRow {
     let Some(AnyRequest::AwaitingHuman(r)) = requests::get(&tx, request).await.unwrap() else {
         panic!("not awaiting");
     };
-    let r = requests::transition::<_, state::Approved>(&tx, r, approval(3600), now())
+    let r = requests::transition::<_, state::Approved>(&tx, r, approval(request, 3600), now())
         .await
         .unwrap()
         .unwrap();
@@ -128,7 +161,9 @@ pub async fn provisioning_grant(store: &Store, request: RequestId) -> GrantRow {
     let g = grants::begin(&tx, &r, &nh, GrantId::new(), now())
         .await
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .grant()
+        .clone();
     drop(nh);
     tx.commit().await.unwrap();
     g
@@ -142,7 +177,8 @@ pub async fn active_grant(store: &Store, request: RequestId) -> GrantRow {
         .await
         .unwrap()
         .unwrap();
-    let g = grants::activate(&tx, g.id, &nh, &json!({}))
+    let pg = grants::load_provisioning(&tx, g.id).await.unwrap().unwrap();
+    let g = grants::activate(&tx, pg, &nh, &json!({}))
         .await
         .unwrap()
         .unwrap();
