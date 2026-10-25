@@ -7,6 +7,7 @@
 //! The summarizer is advisory: a failure only costs the line.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use agent_auth_core::Platform;
@@ -14,13 +15,11 @@ use agent_auth_core::canonical_json::to_python_default_string;
 use agent_auth_core::durations::format_duration;
 use agent_auth_core::prompt::{inert_json, inert_text};
 use agent_auth_core::pyfmt::json_str;
-use agent_auth_crypto::Secret;
 use agent_auth_store::agents::AgentRow;
 use agent_auth_store::requests::RequestRow;
 use serde_json::{Map, Value, json};
 
-/// The largest answer read from OpenRouter.
-const MAX_ANSWER_BYTES: usize = 1 << 20;
+use crate::models::{Context, Kind, Knob, ModelClient, Recipe};
 
 /// The reasoning recorded when the reviewer could not be asked.
 pub const ERROR_REASONING: &str = "LLM evaluation failed; escalating to human review";
@@ -122,6 +121,34 @@ fn collapse(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// What the reviewer's prompt is built from.
+#[must_use]
+pub fn review_facts(
+    agent: &AgentRow,
+    request: &RequestRow,
+    max_duration_secs: u32,
+    priors: &[Prior],
+) -> Value {
+    let (capability, scope) = match &request.authority {
+        Some(a) => (a.capability(), a.scope()),
+        None => (request.requested_capability.clone(), Map::new()),
+    };
+    json!({
+        "agent": {"name": agent.name, "description": agent.description},
+        "platform": request.platform.as_str(),
+        "capability": capability,
+        "scope": Value::Object(scope),
+        "resource": request.resource,
+        "requested_duration_secs": request.requested_duration_secs,
+        "max_duration_secs": max_duration_secs,
+        "justification": request.justification,
+        "risk_notes": request.risk_notes,
+        "priors": priors.iter().map(|p| json!({
+            "attempt": p.attempt, "verdict": p.verdict, "reasoning": p.reasoning,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 /// The user message for the reviewer.
 #[must_use]
 pub fn user_prompt(
@@ -130,32 +157,64 @@ pub fn user_prompt(
     max_duration_secs: u32,
     priors: &[Prior],
 ) -> String {
-    let (capability, scope) = match &request.authority {
-        Some(a) => (a.capability(), a.scope()),
-        None => (request.requested_capability.clone(), Map::new()),
-    };
-    let notes: String = request
-        .risk_notes
-        .iter()
+    build_review(
+        &review_facts(agent, request, max_duration_secs, priors),
+        &Context::default(),
+    )
+    .unwrap_or_default()
+}
+
+fn text<'a>(facts: &'a Value, pointer: &str) -> Result<&'a str, String> {
+    facts
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("facts lack {pointer}"))
+}
+
+fn number(facts: &Value, pointer: &str) -> Result<u64, String> {
+    facts
+        .pointer(pointer)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("facts lack {pointer}"))
+}
+
+fn build_review(facts: &Value, ctx: &Context) -> Result<String, String> {
+    let notes: String = facts
+        .get("risk_notes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
         .map(|n| format!("\n- {}", quoted(&collapse(n))))
         .collect();
+    let priors: Vec<&Value> = facts
+        .get("priors")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    let shown = ctx.count("priors", Kind::RequestReview);
     let history: String = priors
         .iter()
+        .skip(priors.len().saturating_sub(shown))
         .map(|p| {
             format!(
                 "\n- Attempt {}: verdict={}; reasoning (quoted model output): {}",
-                p.attempt,
-                p.verdict,
-                quoted(&collapse(&p.reasoning))
+                p.get("attempt").and_then(Value::as_u64).unwrap_or(0),
+                p.get("verdict").and_then(Value::as_str).unwrap_or(""),
+                quoted(&collapse(
+                    p.get("reasoning").and_then(Value::as_str).unwrap_or("")
+                ))
             )
         })
         .collect();
-    let description = if agent.description.is_empty() {
+    let description = text(facts, "/agent/description")?;
+    let description = if description.is_empty() {
         "(none)".to_owned()
     } else {
-        inert_text(&collapse(&agent.description))
+        inert_text(&collapse(description))
     };
-    format!(
+    let scope = facts.get("scope").cloned().unwrap_or_else(|| json!({}));
+    Ok(format!(
         "Agent: {name}
 Agent description: {description}
 
@@ -177,113 +236,67 @@ Context notes (broker-generated):{notes}
 Prior attempts on this request:{history}
 
 Respond with your verdict.",
-        name = inert_text(&agent.name),
-        capability = inert_text(&collapse(&capability)),
-        platform = request.platform,
-        resource = quoted(&request.resource),
-        scope = inert_json(&to_python_default_string(&Value::Object(scope))),
-        requested = format_duration(u64::from(request.requested_duration_secs)),
-        max = format_duration(u64::from(max_duration_secs)),
-        justification = inert_text(&request.justification),
+        name = inert_text(text(facts, "/agent/name")?),
+        capability = inert_text(&collapse(text(facts, "/capability")?)),
+        platform = text(facts, "/platform")?,
+        resource = quoted(text(facts, "/resource")?),
+        scope = inert_json(&to_python_default_string(&scope)),
+        requested = format_duration(number(facts, "/requested_duration_secs")?),
+        max = format_duration(number(facts, "/max_duration_secs")?),
+        justification = inert_text(text(facts, "/justification")?),
         notes = if notes.is_empty() { " (none)" } else { &notes },
         history = if history.is_empty() {
             " (none — first attempt)"
         } else {
             &history
         },
-    )
+    ))
 }
 
-/// One OpenRouter endpoint and key.
-struct OpenRouter {
-    client: reqwest::Client,
-    base_url: String,
-    api_key: Secret<String>,
-}
-
-impl OpenRouter {
-    fn new(api_key: Secret<String>, base_url: &str, timeout: Duration) -> anyhow::Result<Self> {
-        let tls = agent_auth_tls::default_client_config()?;
-        let client = agent_auth_tls::reqwest_builder(tls, timeout).build()?;
-        Ok(OpenRouter {
-            client,
-            base_url: base_url.trim_end_matches('/').to_owned(),
-            api_key,
-        })
-    }
-
-    /// The `content` of the first choice, parsed as JSON.
-    async fn ask(
-        &self,
-        model: &str,
-        system: &str,
-        user: &str,
-        schema_name: &str,
-        schema: Value,
-    ) -> anyhow::Result<Map<String, Value>> {
-        let body = json!({
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {"name": schema_name, "strict": true, "schema": schema},
-            },
-        });
-        let response = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(self.api_key.expose())
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?;
-        // At most 1 MiB of answer, read in chunks (never buffered past it).
-        let mut response = response;
-        let mut bytes: Vec<u8> = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
-            anyhow::ensure!(
-                bytes.len().saturating_add(chunk.len()) <= MAX_ANSWER_BYTES,
-                "answer too large"
-            );
-            bytes.extend_from_slice(&chunk);
-        }
-        let data: Value = serde_json::from_slice(&bytes)?;
-        let content = data
-            .get("choices")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("no content in the answer"))?;
-        match serde_json::from_str(content)? {
-            Value::Object(map) => Ok(map),
-            _ => anyhow::bail!("the content is not an object"),
-        }
+fn classify_review(answer: &Map<String, Value>) -> Option<String> {
+    match parse_verdict(answer) {
+        LlmVerdict::Approve { .. } => Some("approve".to_owned()),
+        LlmVerdict::Deny { .. } => Some("deny".to_owned()),
+        LlmVerdict::Error => None,
     }
 }
+
+/// The reviewer as a decision recipe (evals).
+pub const REVIEW_RECIPE: Recipe = Recipe {
+    kind: Kind::RequestReview,
+    default_system: SYSTEM_PROMPT,
+    schema_name: "access_verdict",
+    schema: verdict_schema,
+    build: build_review,
+    classify: classify_review,
+    classes: &["approve", "deny"],
+    knobs: &[Knob {
+        name: "priors",
+        default: 20,
+        max: 100,
+        doc: "earlier verdicts on the same request shown (the newest)",
+    }],
+};
 
 /// The reviewer (`OPENROUTER_API_KEY`).
 pub struct LlmReviewer {
-    api: OpenRouter,
+    client: Arc<ModelClient>,
+    timeout: Duration,
 }
 
 impl fmt::Debug for LlmReviewer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LlmReviewer")
-            .field("base_url", &self.api.base_url)
+            .field("client", &self.client)
             .finish_non_exhaustive()
     }
 }
 
 impl LlmReviewer {
     /// `timeout`: the policy's `llm.timeout_secs`.
-    pub fn new(api_key: Secret<String>, base_url: &str, timeout: Duration) -> anyhow::Result<Self> {
-        Ok(LlmReviewer {
-            api: OpenRouter::new(api_key, base_url, timeout)?,
-        })
+    #[must_use]
+    pub fn new(client: Arc<ModelClient>, timeout: Duration) -> Self {
+        LlmReviewer { client, timeout }
     }
 
     /// One attempt, no transport retries.
@@ -295,21 +308,21 @@ impl LlmReviewer {
         max_duration_secs: u32,
         priors: &[Prior],
     ) -> LlmVerdict {
-        let user = user_prompt(agent, request, max_duration_secs, priors);
-        match self
-            .api
-            .ask(
+        let facts = review_facts(agent, request, max_duration_secs, priors);
+        let d = self
+            .client
+            .decide(
+                Kind::RequestReview,
                 model,
-                SYSTEM_PROMPT,
-                &user,
-                "access_verdict",
-                verdict_schema(),
+                facts,
+                json!({"request_id": request.id.to_string()}),
+                self.timeout,
             )
-            .await
-        {
-            Ok(parsed) => parse_verdict(&parsed),
-            Err(e) => {
-                tracing::error!(request = %request.id, error = %e, "LLM evaluation failed");
+            .await;
+        match d.answer {
+            Some(parsed) => parse_verdict(&parsed),
+            None => {
+                tracing::error!(request = %request.id, "LLM evaluation failed");
                 LlmVerdict::Error
             }
         }
@@ -342,7 +355,7 @@ pub fn parse_verdict(parsed: &Map<String, Value>) -> LlmVerdict {
 /// the daemon channel, `OPENROUTER_API_KEY` and
 /// `platforms.hostexec.risk_summary` all are.
 pub struct RiskSummarizer {
-    api: OpenRouter,
+    client: Arc<ModelClient>,
     model: String,
 }
 
@@ -400,6 +413,22 @@ fn indent_into(value: &Value, width: usize, level: usize, out: &mut String) {
     }
 }
 
+/// What the risk line's prompt is built from.
+#[must_use]
+pub fn risk_facts(request: &RequestRow, agent: &AgentRow) -> Value {
+    let (capability, scope) = match &request.authority {
+        Some(a) => (a.capability(), a.scope()),
+        None => (request.requested_capability.clone(), Map::new()),
+    };
+    json!({
+        "agent": agent.name,
+        "host": request.resource,
+        "kind": capability,
+        "scope": Value::Object(scope),
+        "justification": request.justification,
+    })
+}
+
 /// The `<request>` body the summarizer reads.
 #[must_use]
 pub fn risk_body(request: &RequestRow) -> String {
@@ -407,14 +436,21 @@ pub fn risk_body(request: &RequestRow) -> String {
         Some(a) => (a.capability(), a.scope()),
         None => (request.requested_capability.clone(), Map::new()),
     };
+    risk_body_of(&json!({
+        "host": request.resource,
+        "kind": capability,
+        "scope": Value::Object(scope),
+        "justification": request.justification,
+    }))
+}
+
+fn risk_body_of(facts: &Value) -> String {
+    let get = |k: &str| facts.get(k).cloned().unwrap_or(Value::Null);
     let fields: [(&str, Value); 4] = [
-        ("host", Value::String(request.resource.clone())),
-        ("kind", Value::String(capability)),
-        ("scope", Value::Object(scope)),
-        (
-            "justification",
-            Value::String(request.justification.clone()),
-        ),
+        ("host", get("host")),
+        ("kind", get("kind")),
+        ("scope", get("scope")),
+        ("justification", get("justification")),
     ];
     let mut out = String::from("{\n");
     for (i, (k, v)) in fields.iter().enumerate() {
@@ -430,13 +466,38 @@ pub fn risk_body(request: &RequestRow) -> String {
     inert_json(&out)
 }
 
+fn build_risk(facts: &Value, _ctx: &Context) -> Result<String, String> {
+    Ok(format!(
+        "Agent: {}\n<request>\n{}\n</request>",
+        inert_text(text(facts, "/agent")?),
+        risk_body_of(facts)
+    ))
+}
+
+fn classify_risk(answer: &Map<String, Value>) -> Option<String> {
+    match answer.get("level").and_then(Value::as_str) {
+        Some(l @ ("low" | "medium" | "high")) => Some(l.to_owned()),
+        _ => None,
+    }
+}
+
+/// The risk line as a decision recipe (evals).
+pub const RISK_RECIPE: Recipe = Recipe {
+    kind: Kind::RiskLine,
+    default_system: RISK_PROMPT,
+    schema_name: "risk",
+    schema: risk_schema,
+    build: build_risk,
+    classify: classify_risk,
+    classes: &["low", "medium", "high"],
+    knobs: &[],
+};
+
 impl RiskSummarizer {
     /// Timeout 15 s.
-    pub fn new(api_key: Secret<String>, base_url: &str, model: String) -> anyhow::Result<Self> {
-        Ok(RiskSummarizer {
-            api: OpenRouter::new(api_key, base_url, Duration::from_secs(15))?,
-            model,
-        })
+    #[must_use]
+    pub fn new(client: Arc<ModelClient>, model: String) -> Self {
+        RiskSummarizer { client, model }
     }
 
     /// A hostexec request without a risk line yet.
@@ -448,36 +509,28 @@ impl RiskSummarizer {
 
     /// `risk ({model}, advisory): {LEVEL} — {summary}`, or none.
     pub async fn summarize(&self, request: &RequestRow, agent: &AgentRow) -> Option<String> {
-        let user = format!(
-            "Agent: {}\n<request>\n{}\n</request>",
-            inert_text(&agent.name),
-            risk_body(request)
-        );
-        let parsed = match self
-            .api
-            .ask(&self.model, RISK_PROMPT, &user, "risk", risk_schema())
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(request = %request.id, error = %e, "risk summary failed");
-                return None;
-            }
-        };
-        let level = match parsed.get("level").and_then(Value::as_str) {
-            Some(l @ ("low" | "medium" | "high")) => l.to_uppercase(),
-            _ => {
-                tracing::warn!(request = %request.id, "risk summary: no level in the model's answer");
-                return None;
-            }
+        let d = self
+            .client
+            .decide(
+                Kind::RiskLine,
+                &self.model,
+                risk_facts(request, agent),
+                json!({"request_id": request.id.to_string()}),
+                Duration::from_secs(15),
+            )
+            .await;
+        let (Some(parsed), Some(level)) = (d.answer, d.class) else {
+            tracing::warn!(request = %request.id, "risk summary failed");
+            return None;
         };
         let summary: String = match parsed.get("summary") {
             Some(Value::String(s)) => collapse(s).chars().take(300).collect(),
             _ => String::new(),
         };
         Some(format!(
-            "risk ({}, advisory): {level} — {summary}",
-            self.model
+            "risk ({}, advisory): {} — {summary}",
+            self.model,
+            level.to_uppercase()
         ))
     }
 }

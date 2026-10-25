@@ -49,6 +49,9 @@ pub struct AppState {
     /// Agent VMs: orchestrator bootstrap, key delivery, minting and
     /// cross-project access (`sandboxes`); on with the daemon channel.
     pub sandboxes: Option<Arc<crate::sandboxes::Sandboxes>>,
+    /// The model client every decision goes through (and replays use);
+    /// none without `OPENROUTER_API_KEY`.
+    pub models: Option<Arc<crate::models::ModelClient>>,
     /// Set at SIGTERM: parked long-polls answer with their current state
     /// instead of waiting to be cut off by the drain (`events::Shutdown`).
     pub shutdown: Shutdown,
@@ -83,6 +86,7 @@ impl AppState {
             hostd: None,
             mail: None,
             sandboxes: None,
+            models: None,
             shutdown: Shutdown::default(),
         }
     }

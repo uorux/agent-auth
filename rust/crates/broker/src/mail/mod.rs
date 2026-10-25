@@ -810,7 +810,14 @@ impl Mail {
                     "body": chars(&m.text, self.max_body()),
                 });
                 let mut v = judge
-                    .inbound(&c.topics, purpose, &message, context, &m.hints)
+                    .inbound(
+                        &c.topics,
+                        purpose,
+                        &message,
+                        context,
+                        &m.hints,
+                        json!({"address": target.address}),
+                    )
                     .await;
                 // The worse of the two: instructions hidden from a person
                 // are held even when the model saw nothing in them.
@@ -1388,6 +1395,8 @@ impl Mail {
             references,
             thread: thread.clone(),
         };
+        // Its id first: the review's record names the item it was about.
+        let id = MailItemId::new();
         let (verdict, reason) = if self.config().send_review == SendReview::Human {
             (
                 OutboundKind::Hold,
@@ -1400,6 +1409,7 @@ impl Mail {
                     &ctx.purpose,
                     &json!({"from": target.address, "to": recipients, "subject": subject, "body": body}),
                     &context,
+                    json!({"grant_id": grant.id.to_string(), "item_id": id.to_string()}),
                 )
                 .await;
             match v.verdict {
@@ -1417,7 +1427,6 @@ impl Mail {
             OutboundKind::Refuse => ("refuse", ItemStatus::Refused),
             OutboundKind::Hold | OutboundKind::Error => ("hold", ItemStatus::Held),
         };
-        let id = MailItemId::new();
         let payload = if status == ItemStatus::Held {
             let text =
                 serde_json::to_string(&draft).map_err(|e| MailError::new(500, e.to_string()))?;
@@ -1869,6 +1878,17 @@ impl Mail {
         }
         tx.commit().await?;
         if let Some((target, draft)) = send {
+            // The operator found it fit to send: what its review should
+            // have said (evals).
+            crate::models::label_outcome(
+                &self.store,
+                crate::models::Kind::MailOutbound,
+                "item_id",
+                &id.to_string(),
+                "send",
+                by,
+            )
+            .await;
             self.deliver(id, &target, &draft).await;
         }
         self.describe(id).await

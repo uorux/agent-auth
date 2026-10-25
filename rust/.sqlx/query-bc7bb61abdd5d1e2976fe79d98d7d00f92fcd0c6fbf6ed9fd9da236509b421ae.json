@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO model_calls (id, kind, model, facts, context, system_sha256, user_message,\n             answer, class, error, latency_ms, subject, created_at)\n         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Jsonb",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Text",
+        "Text",
+        "Int4",
+        "Jsonb",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bc7bb61abdd5d1e2976fe79d98d7d00f92fcd0c6fbf6ed9fd9da236509b421ae"
+}

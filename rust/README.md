@@ -265,6 +265,52 @@ LC_*, TZ and TERM in their environment. hostd knows
 nothing of modes: an umbrella is one host shell, and its scopes live in the
 broker.
 
+### Evals
+
+Every decision a model makes for the broker is recorded: the request
+reviewer, the risk line, the mail judge (both ways), the shell guard, the
+scope check and the shell watchers. Each record keeps what the prompt was
+built from (the facts), the exact system and user messages, the model's
+answer, the decision class it means, and what it was about. Label the ones
+you have an opinion on, then replay them with another model, system prompt
+or context setting and compare:
+
+```sh
+agent-auth admin evals kinds                     # classes, context settings, current prompts
+agent-auth admin evals calls --kind shell_guard --unlabeled
+agent-auth admin evals show <call-id>            # facts, prompts, answer
+agent-auth admin evals label <call-id> odd --note "curl isn't part of a rebuild"
+agent-auth admin evals replay --kind shell_guard --labeled \
+    --model deepseek/deepseek-v4.1-flash-1017 --system-file guard.txt \
+    --context '{"history_items": 10}' --wait
+agent-auth admin evals runs
+```
+
+A replay reports, over the labelled calls, how many it got right next to
+how many the original calls did, a confusion table, and every case whose
+class changed. Labels are a class of the kind (`approve`, `odd`,
+`in_scope/none`, ...; `*` for any part between `/`, e.g. `in_scope/*`).
+Some labels come by themselves (source `outcome`): when you decide a
+request the reviewer saw, your decision labels its last review; when you
+release a held outgoing mail, its review is labelled `send`. Yours always
+win over those.
+
+Replays only read records and write their own results: no request, grant,
+command or mail is touched. They call the model gateway (cost: one call per
+replayed decision). Policy:
+
+```yaml
+evals:
+  record: true            # default
+  retention: 90d          # unlabelled calls and replays older than this are forgotten
+  replay_concurrency: 4
+  max_replay: 500         # calls one replay takes at most
+```
+
+Records hold what the models saw: agents' justifications and commands
+(with their stdin and env), mail an outsider sent, drafts. They live in the
+broker's database next to the same data; set `record: false` to keep none.
+
 ### sandboxd (`agent-auth-sandboxd`)
 
 One JSON file from the NixOS module (`/etc/agent-auth/sandboxd.json`,

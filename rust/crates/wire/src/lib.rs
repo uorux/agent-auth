@@ -29,6 +29,7 @@ pub mod containment;
 pub mod daemon;
 pub mod duration;
 pub mod error;
+pub mod evals;
 pub mod hostexec;
 pub mod json;
 pub mod literal;

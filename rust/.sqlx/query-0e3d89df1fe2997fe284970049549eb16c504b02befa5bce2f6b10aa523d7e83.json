@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE eval_runs SET status = 'failed', finished_at = $1 WHERE status = 'running'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0e3d89df1fe2997fe284970049549eb16c504b02befa5bce2f6b10aa523d7e83"
+}

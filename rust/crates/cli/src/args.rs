@@ -391,6 +391,12 @@ pub enum AdminCommand {
         #[arg(long, default_value = "admin")]
         by: String,
     },
+    /// The broker's model decisions: browse, label what they should have
+    /// been, and replay them with another model, prompt or context.
+    Evals {
+        #[command(subcommand)]
+        command: EvalsCommand,
+    },
     /// Generate BROKER_SIGNING_KEY (ed25519 seed) and print its public key,
     /// which every daemon pins as brokerPublicKey. The seed is a secret:
     /// prefer --out and move the file into the broker's env secret.
@@ -516,4 +522,83 @@ pub enum AdminCommand {
     ConnectorRevoke {
         client_id: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EvalsCommand {
+    /// The decision kinds: classes, context settings, current system prompts.
+    Kinds,
+    /// Recorded calls, newest first.
+    Calls {
+        #[arg(long)]
+        kind: Option<String>,
+        /// only labelled calls (the eval set)
+        #[arg(long, conflicts_with = "unlabeled")]
+        labeled: bool,
+        /// only unlabelled calls (to label)
+        #[arg(long)]
+        unlabeled: bool,
+        /// RFC 3339
+        #[arg(long)]
+        since: Option<String>,
+        /// a page's `next`
+        #[arg(long)]
+        before: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Everything recorded about one call: facts, prompts, answer, label.
+    Show { call_id: String },
+    /// Say what a call should have decided: a class of its kind (`*` for
+    /// any part between `/`, e.g. in_scope/*).
+    Label {
+        call_id: String,
+        expected: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Remove a call's label.
+    Unlabel { call_id: String },
+    /// Replay recorded calls of one kind under another model, system
+    /// prompt or context settings, and compare.
+    Replay {
+        #[arg(long)]
+        kind: String,
+        /// ask this model (default: each call's own)
+        #[arg(long)]
+        model: Option<String>,
+        /// a system prompt to use instead of the current one
+        #[arg(long)]
+        system_file: Option<PathBuf>,
+        /// context settings as JSON, e.g. '{"history_items": 10}'
+        #[arg(long)]
+        context: Option<String>,
+        /// only labelled calls (the eval set)
+        #[arg(long, conflicts_with = "unlabeled")]
+        labeled: bool,
+        #[arg(long)]
+        unlabeled: bool,
+        /// RFC 3339
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        until: Option<String>,
+        /// only these calls (repeat)
+        #[arg(long = "call")]
+        calls: Vec<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long)]
+        note: Option<String>,
+        /// wait for it to finish and show every case
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Replays, newest first.
+    Runs {
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    /// One replay, with every case.
+    Run { run_id: String },
 }

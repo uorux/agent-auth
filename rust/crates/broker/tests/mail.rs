@@ -482,6 +482,17 @@ impl World {
             openrouter_base_url: self.judge_url.clone(),
             extra_ca_pem: None,
             gmail_api: Some(format!("{}/gmail", self.gmail_url)),
+            // The judge's calls recorded, as the broker does (evals).
+            models: judge_on.then(|| {
+                Arc::new(
+                    agent_auth_broker::models::ModelClient::new(
+                        agent_auth_crypto::Secret::new("or-key".to_owned()),
+                        &self.judge_url,
+                        Some(self.store.clone()),
+                    )
+                    .unwrap(),
+                )
+            }),
         };
         let gateway = build(&policy, &self.store, &settings, Some(&tokens))
             .unwrap()

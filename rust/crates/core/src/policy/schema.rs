@@ -633,6 +633,44 @@ pub struct AuditConfig {
     pub readers: Vec<AgentPattern>,
 }
 
+/// Evals: recording the broker's model decisions, and replaying them.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct EvalsConfig {
+    /// Record every model call (facts, prompts, answer). Default true.
+    pub record: bool,
+    /// How long unlabelled calls (and replays) are kept. Labelled calls
+    /// are the eval set and are kept until unlabelled.
+    pub retention: DurationSecs,
+    /// Model calls a replay makes at once (1..=16).
+    pub replay_concurrency: u8,
+    /// Calls one replay may take at most (1..=2000).
+    pub max_replay: u32,
+}
+
+impl Default for EvalsConfig {
+    fn default() -> Self {
+        EvalsConfig {
+            record: true,
+            retention: secs("90d"),
+            replay_concurrency: 4,
+            max_replay: 500,
+        }
+    }
+}
+
+impl EvalsConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=16).contains(&self.replay_concurrency) {
+            return Err("evals.replay_concurrency: 1 to 16".to_owned());
+        }
+        if !(1..=2000).contains(&self.max_replay) {
+            return Err("evals.max_replay: 1 to 2000".to_owned());
+        }
+        Ok(())
+    }
+}
+
 /// The tools a web UI gets by default.
 pub const REMOTE_MCP_TOOLS: [&str; 23] = [
     "whoami",

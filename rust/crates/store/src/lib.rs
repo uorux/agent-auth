@@ -89,6 +89,7 @@ pub mod agents;
 pub mod credentials;
 pub mod daemons;
 mod error;
+pub mod evals;
 pub mod flags;
 pub mod grants;
 pub mod hostexec;

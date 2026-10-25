@@ -1,0 +1,100 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT r.call_id, c.class AS \"original?\", l.expected AS \"expected?\", r.class,\n                  r.answer, r.error, r.latency_ms\n           FROM eval_results r JOIN model_calls c ON c.id = r.call_id\n           LEFT JOIN model_call_labels l ON l.call_id = r.call_id\n           WHERE r.run_id = $1 ORDER BY c.created_at, c.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "call_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "eval_results",
+            "name": "call_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "original?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "model_calls",
+            "name": "class"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "expected?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "model_call_labels",
+            "name": "expected"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "class",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "eval_results",
+            "name": "class"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "answer",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "eval_results",
+            "name": "answer"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "error",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "eval_results",
+            "name": "error"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "latency_ms",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "eval_results",
+            "name": "latency_ms"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "b8c5f45f5fbae3cd350ddee23ef6cf9a58d64eff65114401738c744f2faffc00"
+}

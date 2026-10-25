@@ -10,7 +10,10 @@
 //! 4. the a2a sweep (when a2a is on), then revoke delegated grants of closed threads;
 //! 5. minted agents past their lease: disabled with their descendants
 //!    (their grants then expire on the next tick);
-//! 6. the hostexec and agent-VM hooks.
+//! 6. the hostexec and agent-VM hooks;
+//! 7. evals housekeeping (at boot, then about hourly): recorded model calls
+//!    past `evals.retention` forgotten unless labelled; at boot, replays
+//!    the restart cut off marked failed.
 //!
 //! The first tick ([`boot`]) runs to completion before the HTTP listener
 //! and the Discord bot start (catch-up for what lapsed while down).
@@ -71,7 +74,41 @@ pub async fn tick(st: &AppState, boot: bool) -> TickReport {
     if let Some(hook) = &st.spine.hooks.sandboxes_tick {
         hook(st.clone()).await;
     }
+    let n = TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if boot || n.is_multiple_of(EVALS_EVERY) {
+        evals_housekeeping(st, boot).await;
+    }
     report
+}
+
+/// Ticks so far (evals housekeeping runs every [`EVALS_EVERY`]th).
+static TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// About an hour of ticks.
+const EVALS_EVERY: u64 = 120;
+
+async fn evals_housekeeping(st: &AppState, boot: bool) {
+    let now = st.now();
+    let retention = Duration::seconds(i64::from(st.policy.evals().retention.get()));
+    let done = async {
+        let tx = st.store.begin().await?;
+        let before = now.checked_sub(retention).unwrap_or(now);
+        let forgotten = agent_auth_store::evals::purge(&tx, before).await?;
+        let failed = if boot {
+            agent_auth_store::evals::fail_unfinished(&tx, now).await?
+        } else {
+            0
+        };
+        tx.commit().await?;
+        Ok::<_, agent_auth_store::StoreError>((forgotten, failed))
+    }
+    .await;
+    match done {
+        Ok((0, 0)) => {}
+        Ok((forgotten, failed)) => {
+            tracing::info!(forgotten, failed, "evals housekeeping");
+        }
+        Err(e) => tracing::error!(error = %e, "evals housekeeping failed"),
+    }
 }
 
 async fn resume_llm(st: &AppState, boot: bool) -> usize {

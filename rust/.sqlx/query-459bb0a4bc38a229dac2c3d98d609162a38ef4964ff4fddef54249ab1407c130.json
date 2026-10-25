@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO eval_runs (id, kind, model, system_sha256, context, selection, status, total,\n             note, created_by, created_at)\n         VALUES ($1, $2, $3, $4, $5, $6, 'running', $7, $8, $9, $10)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Jsonb",
+        "Int4",
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "459bb0a4bc38a229dac2c3d98d609162a38ef4964ff4fddef54249ab1407c130"
+}

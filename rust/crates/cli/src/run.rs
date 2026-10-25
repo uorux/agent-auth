@@ -18,7 +18,9 @@ use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::args::{A2aCommand, AdminCommand, Cli, Command, ServeArgs, SessionCommand};
+use crate::args::{
+    A2aCommand, AdminCommand, Cli, Command, EvalsCommand, ServeArgs, SessionCommand,
+};
 use crate::serve;
 
 /// Where the command reads and writes (the terminal, or buffers in tests).
@@ -545,6 +547,7 @@ async fn admin(cmd: AdminCommand, client: &BrokerClient, io: &mut Io<'_>) -> u8 
         AdminCommand::Revoke { grant_id, reason } => {
             show(io, client.admin_revoke_grant(&grant_id, &reason).await)
         }
+        AdminCommand::Evals { command } => evals(io, client, command).await,
         AdminCommand::MailHeld => show(io, client.admin_mail_held().await),
         AdminCommand::MailRelease { item_id, by } => {
             show(io, client.admin_mail_decide(&item_id, true, &by).await)
@@ -677,6 +680,130 @@ async fn admin(cmd: AdminCommand, client: &BrokerClient, io: &mut Io<'_>) -> u8 
 /// `admin gen-signing-key`: never the seed on a non-terminal stdout without
 /// `--stdout`; `--out` makes a new 0600 file and never overwrites or
 /// follows a link (`O_CREAT|O_EXCL`).
+async fn evals(io: &mut Io<'_>, client: &BrokerClient, cmd: EvalsCommand) -> u8 {
+    match cmd {
+        EvalsCommand::Kinds => show(io, client.admin_evals_kinds().await),
+        EvalsCommand::Calls {
+            kind,
+            labeled,
+            unlabeled,
+            since,
+            before,
+            limit,
+        } => {
+            let only = match (labeled, unlabeled) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            };
+            show(
+                io,
+                client
+                    .admin_evals_calls(
+                        kind.as_deref(),
+                        only,
+                        since.as_deref(),
+                        before.as_deref(),
+                        limit,
+                    )
+                    .await,
+            )
+        }
+        EvalsCommand::Show { call_id } => show(io, client.admin_evals_call(&call_id).await),
+        EvalsCommand::Label {
+            call_id,
+            expected,
+            note,
+        } => show(
+            io,
+            client
+                .admin_evals_label(&call_id, &expected, note.as_deref())
+                .await,
+        ),
+        EvalsCommand::Unlabel { call_id } => show(io, client.admin_evals_unlabel(&call_id).await),
+        EvalsCommand::Replay {
+            kind,
+            model,
+            system_file,
+            context,
+            labeled,
+            unlabeled,
+            since,
+            until,
+            calls,
+            limit,
+            note,
+            wait,
+        } => {
+            let path = ["admin", "evals", "replay"];
+            let system = match &system_file {
+                None => None,
+                Some(f) => match std::fs::read_to_string(f) {
+                    Ok(text) => Some(text),
+                    Err(e) => {
+                        return io.bad_parameter(&path, &format!("--system-file: {e}"));
+                    }
+                },
+            };
+            let context = match &context {
+                None => Map::new(),
+                Some(text) => match json_object(io, &path, "--context", text) {
+                    Ok(m) => m,
+                    Err(code) => return code,
+                },
+            };
+            let mut body = Map::new();
+            body.insert("kind".into(), Value::from(kind));
+            body.insert("context".into(), Value::Object(context));
+            if let Some(m) = model {
+                body.insert("model".into(), Value::from(m));
+            }
+            if let Some(s) = system {
+                body.insert("system".into(), Value::from(s));
+            }
+            match (labeled, unlabeled) {
+                (true, _) => {
+                    body.insert("labeled".into(), Value::Bool(true));
+                }
+                (_, true) => {
+                    body.insert("labeled".into(), Value::Bool(false));
+                }
+                _ => {}
+            }
+            for (k, v) in [("since", since), ("until", until), ("note", note)] {
+                if let Some(v) = v {
+                    body.insert(k.into(), Value::from(v));
+                }
+            }
+            if !calls.is_empty() {
+                body.insert("call_ids".into(), Value::from(calls));
+            }
+            if let Some(n) = limit {
+                body.insert("limit".into(), Value::from(n));
+            }
+            let started = match client.admin_evals_replay(Value::Object(body)).await {
+                Ok(r) => r,
+                Err(e) => return io.failed(&e),
+            };
+            if !wait {
+                return io.json(&started);
+            }
+            // Until it is no longer running (each call takes seconds).
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                match client.admin_evals_run(&started.id).await {
+                    Ok(r) if r.status == "running" => {
+                        let _ = writeln!(io.err, "{}/{} replayed", r.summary.done, r.total);
+                    }
+                    other => return show(io, other),
+                }
+            }
+        }
+        EvalsCommand::Runs { kind } => show(io, client.admin_evals_runs(kind.as_deref()).await),
+        EvalsCommand::Run { run_id } => show(io, client.admin_evals_run(&run_id).await),
+    }
+}
+
 async fn google_consent(
     io: &mut Io<'_>,
     client_secret_file: &Path,

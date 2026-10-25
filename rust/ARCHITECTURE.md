@@ -104,6 +104,12 @@ admission function makes; a TOTP code yields a `TotpApproval { tier, digest }`
 and admission requires the job's own tier and digest (the Python fix in
 e6640af: a code approves a job of its own tier only).
 
+**Model decisions.** Every model call goes through `broker::models`
+(`ModelClient::decide` with a kind's `Recipe`): it is recorded for evals,
+and a replay rebuilds it from its facts. A model's answer only ever feeds
+the decision code of the caller that asked; a replay's answers feed
+nothing but `eval_results`.
+
 ## Errors and robustness
 
 - No `unwrap`/`expect`/`panic!`/indexing in non-test code (clippy denies

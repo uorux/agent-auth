@@ -22,6 +22,34 @@ and why. Keep entries short. Group by area.
 - **Ids parse only in canonical form**, from text and from JSON alike
   (lowercase, hyphenated).
 
+## Evals (new, 2026-10-25, Jacob's request)
+
+- **Every model decision is recorded, labelled and replayable.** All the
+  broker's model calls (reviewer, risk line, mail judge in and out, shell
+  guard, scope check, watcher and general watcher) go through one client
+  (`models::ModelClient`); each kind is a recipe: facts (a JSON object the
+  caller gathers) and a variant (model, system prompt, context settings)
+  build the prompt; a class is read from the answer. `model_calls` keeps
+  facts, context, the exact system (deduplicated in `model_prompts`) and
+  user messages, the answer, the class, the error, latency and the
+  subject; it is never updated (trigger). Labels (`model_call_labels`) are
+  a class pattern (`*` per part), from the operator or from what happened
+  next (`outcome`: a human's decision on a request the reviewer saw; the
+  release of a held outgoing mail); an outcome label never replaces an
+  operator's. Replays (`eval_runs`, `eval_results`; admin API
+  `/admin/evals/*`, CLI `agent-auth admin evals`) rebuild calls from their
+  facts under another model, system prompt or context setting (each
+  kind's knobs; unknown ones refused) and compare with labels and the
+  originals; they write only their own results. Recording is best effort
+  (a failure is logged; the decision stands), on by default
+  (`evals.record`); unlabelled calls and replays are forgotten after
+  `evals.retention` (90 d), labelled ones kept; replays a restart cut off
+  are marked failed. The reviewer's `llm_evaluations` rows are unchanged.
+  The Python had none of this. Prompts are byte-for-byte as before (the
+  existing prompt tests pass unchanged); the mail judge now uses the
+  broker's default TLS roots for OpenRouter instead of the mail ones (it
+  never needed the mail CA).
+
 ## Policy
 
 - **Default model: `deepseek/deepseek-v4.1-flash-1017`** (2026-10-25, at

@@ -23,10 +23,10 @@ use super::{CALL_TIMEOUT, HostExec};
 use crate::notify::{Notify as _, ShellEvent};
 
 /// Earlier commands of the shell the guard is shown at most (newest).
-const GUARD_HISTORY: i64 = 40;
-/// ... and at most this much of their text (older ones are left out, and
-/// the guard is told how many).
-const GUARD_HISTORY_CHARS: usize = 160_000;
+const GUARD_HISTORY: i64 = 80;
+/// ... and at most this much of their text is kept for the guard (and its
+/// record); its context settings choose what it is shown.
+const GUARD_RECORD_CHARS: usize = 320_000;
 /// Refusals after which a guarded shell is ended (an alarming one ends it
 /// at once).
 const MAX_REFUSALS: i64 = 5;
@@ -36,8 +36,10 @@ fn guarded_env_ok(key: &str) -> bool {
     matches!(key, "LANG" | "TZ" | "TERM") || key.starts_with("LC_")
 }
 
-/// The newest earlier commands that fit the guard's budget, oldest first,
-/// and how many older ones were left out.
+/// The newest earlier commands, up to what a record keeps (twice the
+/// guard's default budget, so a replay can show it more), oldest first;
+/// and how many the shell has had in all. The guard's context settings
+/// choose what it is shown of these.
 fn guard_context(history: &[shell_scopes::Earlier], total: i64) -> (Vec<EarlierCommand>, usize) {
     let mut kept = Vec::new();
     let mut used = 0usize;
@@ -48,7 +50,7 @@ fn guard_context(history: &[shell_scopes::Earlier], total: i64) -> (Vec<EarlierC
             .len()
             .saturating_add(e.error.as_ref().map_or(0, String::len))
             .saturating_add(e.scope_purpose.as_ref().map_or(0, String::len));
-        if used.saturating_add(size) > GUARD_HISTORY_CHARS {
+        if used.saturating_add(size) > GUARD_RECORD_CHARS {
             break;
         }
         used = used.saturating_add(size);
@@ -61,8 +63,7 @@ fn guard_context(history: &[shell_scopes::Earlier], total: i64) -> (Vec<EarlierC
     }
     kept.reverse();
     let total = usize::try_from(total).unwrap_or(usize::MAX);
-    let omitted = total.max(history.len()).saturating_sub(kept.len());
-    (kept, omitted)
+    (kept, total.max(history.len()))
 }
 
 fn cut(s: &str, n: usize) -> String {
@@ -268,7 +269,7 @@ impl HostExec {
         // The guard first, before anyone is shown it: it can only refuse.
         let mut guard_why = String::new();
         let outcome = if mode.guarded() {
-            let (earlier, omitted) = guard_context(&history.0, history.1);
+            let (earlier, total) = guard_context(&history.0, history.1);
             match &self.watcher {
                 None => GuardOutcome::Unavailable,
                 Some(w) => match w
@@ -279,8 +280,13 @@ impl HostExec {
                         approved_purpose: &request.justification,
                         scope_purpose: scope.as_ref().map(|s| s.purpose.as_str()),
                         earlier: &earlier,
-                        omitted,
+                        total,
                         spec: &spec_json,
+                        subject: json!({
+                            "grant_id": grant.id.to_string(),
+                            "request_id": request.id.to_string(),
+                            "job_id": job_id.to_string(),
+                        }),
                     })
                     .await
                 {
@@ -565,6 +571,7 @@ impl HostExec {
                     &request.justification,
                     &earlier,
                     purpose,
+                    json!({"grant_id": grant_id.to_string(), "request_id": request.id.to_string()}),
                 )
                 .await
             }
@@ -741,6 +748,7 @@ impl HostExec {
                 earlier: &earlier,
                 argv: &argv,
                 general,
+                subject: json!({"job_id": job.id.to_string(), "request_id": job.request_id.to_string()}),
             })
             .await;
         if let Some((Level::Alarming, summary)) = verdict {

@@ -14,10 +14,12 @@
 //! Every text the agent wrote reaches the model inside a tag with its angle
 //! brackets escaped (`agent_auth_core::prompt`).
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use agent_auth_crypto::Secret;
 use serde_json::{Value, json};
+
+use crate::models::{Context, Kind, Knob, ModelClient, Recipe};
 
 pub const WATCH_PROMPT: &str = "\
 You watch commands an autonomous AI agent runs on a person's own machine,
@@ -147,6 +149,8 @@ pub struct Watched<'a> {
     pub argv: &'a [String],
     /// A general shell: no purpose to hold it to (`GENERAL_WATCH_PROMPT`).
     pub general: bool,
+    /// What the call is about (the job), for the record.
+    pub subject: Value,
 }
 
 /// What the guard is told about one command, before it runs.
@@ -160,13 +164,16 @@ pub struct Guarded<'a> {
     pub approved_purpose: &'a str,
     /// The scope's purpose, for an umbrella's command.
     pub scope_purpose: Option<&'a str>,
-    /// Earlier commands of the shell (every scope's), oldest first.
+    /// Earlier commands of the shell (every scope's), oldest first: more
+    /// than the guard is shown (its context settings choose).
     pub earlier: &'a [EarlierCommand],
-    /// Older commands left out of `earlier`.
-    pub omitted: usize,
+    /// How many commands the shell has had in all.
+    pub total: usize,
     /// The command as it will be sent (its spec: argv, cwd, env, stdin,
     /// timeout), whole.
     pub spec: &'a Value,
+    /// What the call is about (the grant), for the record.
+    pub subject: Value,
 }
 
 /// An earlier command as the guard sees it.
@@ -189,143 +196,401 @@ pub enum GuardVerdict {
     Unavailable,
 }
 
+/// The shell models: watcher, guard and scope check.
 #[derive(Debug)]
 pub struct Watcher {
-    api_key: Secret<String>,
-    base_url: String,
+    client: Arc<ModelClient>,
     pub model: String,
-    client: reqwest::Client,
 }
 
-impl Watcher {
-    pub fn new(api_key: Secret<String>, base_url: &str, model: &str) -> Result<Watcher, String> {
-        let tls = agent_auth_tls::default_client_config().map_err(|e| e.to_string())?;
-        let client = agent_auth_tls::reqwest_builder(tls, Duration::from_secs(20))
-            .build()
-            .map_err(|e| e.to_string())?;
-        Ok(Watcher {
-            api_key,
-            base_url: base_url.trim_end_matches('/').to_owned(),
-            model: model.to_owned(),
-            client,
+/// How long a shell model may take.
+const SHELL_MODEL_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn s<'a>(facts: &'a Value, key: &str) -> &'a str {
+    facts.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+/// `"key": value` lines, in this order, as one JSON object's text.
+fn ordered(fields: &[(&str, Value)]) -> String {
+    let lines: Vec<String> = fields
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "  {}: {}",
+                serde_json::to_string(k).unwrap_or_default(),
+                serde_json::to_string(v).unwrap_or_default()
+            )
         })
+        .collect();
+    format!("{{\n{}\n}}", lines.join(",\n"))
+}
+
+// ------------------------------------------------------------- watcher
+
+/// What the watcher's prompt is built from.
+#[must_use]
+pub fn watch_facts(w: &Watched<'_>) -> Value {
+    let mut facts = json!({
+        "agent": w.agent, "host": w.host, "tier": w.tier,
+        "earlier": w.earlier, "command": w.argv,
+    });
+    if !w.general
+        && let Value::Object(m) = &mut facts
+    {
+        m.insert("purpose".into(), json!(w.purpose));
+    }
+    facts
+}
+
+fn build_watch_for(facts: &Value, ctx: &Context, kind: Kind) -> Result<String, String> {
+    let earlier: Vec<Vec<String>> = facts
+        .get("earlier")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|c| {
+            c.as_array()
+                .into_iter()
+                .flatten()
+                .take(40)
+                .filter_map(|a| a.as_str().map(str::to_owned))
+                .collect()
+        })
+        .collect();
+    let shown = ctx.count("earlier_commands", kind);
+    let earlier = earlier
+        .get(earlier.len().saturating_sub(shown)..)
+        .unwrap_or_default();
+    let command = facts.get("command").cloned().unwrap_or_else(|| json!([]));
+    let body = match facts.get("purpose").and_then(Value::as_str) {
+        Some(p) if kind == Kind::ShellWatch => json!({
+            "host": s(facts, "host"), "as": s(facts, "tier"),
+            "stated_purpose": p.chars().take(600).collect::<String>(),
+            "earlier_commands": earlier, "command": command,
+        }),
+        _ => json!({
+            "host": s(facts, "host"), "as": s(facts, "tier"),
+            "earlier_commands": earlier, "command": command,
+        }),
+    };
+    let body = agent_auth_core::prompt::inert_json(
+        &serde_json::to_string_pretty(&body).unwrap_or_default(),
+    );
+    Ok(format!(
+        "Agent: {}\n<watch>\n{body}\n</watch>",
+        agent_auth_core::prompt::inert_text(s(facts, "agent"))
+    ))
+}
+
+fn build_watch(facts: &Value, ctx: &Context) -> Result<String, String> {
+    build_watch_for(facts, ctx, Kind::ShellWatch)
+}
+
+fn build_general_watch(facts: &Value, ctx: &Context) -> Result<String, String> {
+    build_watch_for(facts, ctx, Kind::ShellWatchGeneral)
+}
+
+const WATCH_KNOBS: &[Knob] = &[Knob {
+    name: "earlier_commands",
+    default: 8,
+    max: 100,
+    doc: "earlier commands of the shell shown (the newest)",
+}];
+
+/// The watcher as a decision recipe (evals).
+pub const WATCH_RECIPE: Recipe = Recipe {
+    kind: Kind::ShellWatch,
+    default_system: WATCH_PROMPT,
+    schema_name: "watch",
+    schema: level_schema,
+    build: build_watch,
+    classify: classify_level,
+    classes: &["fine", "odd", "alarming"],
+    knobs: WATCH_KNOBS,
+};
+
+/// The watcher of a general shell as a decision recipe (evals).
+pub const GENERAL_WATCH_RECIPE: Recipe = Recipe {
+    kind: Kind::ShellWatchGeneral,
+    default_system: GENERAL_WATCH_PROMPT,
+    schema_name: "watch",
+    schema: level_schema,
+    build: build_general_watch,
+    classify: classify_level,
+    classes: &["fine", "odd", "alarming"],
+    knobs: WATCH_KNOBS,
+};
+
+// --------------------------------------------------------------- guard
+
+/// What the guard's prompt is built from.
+#[must_use]
+pub fn guard_facts(g: &Guarded<'_>) -> Value {
+    let earlier: Vec<Value> = g
+        .earlier
+        .iter()
+        .map(|e| {
+            json!({
+                "spec": e.spec, "status": e.status, "error": e.error,
+                "scope_purpose": e.scope_purpose,
+            })
+        })
+        .collect();
+    json!({
+        "agent": g.agent, "host": g.host, "tier": g.tier,
+        "approved_purpose": g.approved_purpose,
+        "scope_purpose": g.scope_purpose,
+        "earlier": earlier,
+        "total": g.total,
+        "spec": g.spec,
+    })
+}
+
+/// A spec's fields the guard reads, in order.
+fn spec_fields(spec: &Value) -> Value {
+    let mut m = serde_json::Map::new();
+    for k in ["argv", "cwd", "env", "stdin", "timeout"] {
+        if let Some(v) = spec.get(k).filter(|v| !v.is_null()) {
+            m.insert(k.to_owned(), v.clone());
+        }
+    }
+    Value::Object(m)
+}
+
+fn build_guard(facts: &Value, ctx: &Context) -> Result<String, String> {
+    let kind = Kind::ShellGuard;
+    let all: Vec<&Value> = facts
+        .get("earlier")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    let (max_items, max_chars) = (
+        ctx.count("history_items", kind),
+        ctx.count("history_chars", kind),
+    );
+    // The newest that fit, oldest first.
+    let mut kept: Vec<Value> = Vec::new();
+    let mut used = 0usize;
+    for e in all.iter().rev().take(max_items) {
+        let mut v = json!({"command": spec_fields(e.get("spec").unwrap_or(&Value::Null))});
+        if let Value::Object(m) = &mut v {
+            m.insert(
+                "status".into(),
+                e.get("status").cloned().unwrap_or(Value::Null),
+            );
+            if let Some(err) = e.get("error").filter(|x| !x.is_null()) {
+                m.insert("refused_or_failed_because".into(), err.clone());
+            }
+            if let Some(p) = e.get("scope_purpose").filter(|x| !x.is_null()) {
+                m.insert("scope_purpose".into(), p.clone());
+            }
+        }
+        let size = v.to_string().len();
+        if used.saturating_add(size) > max_chars {
+            break;
+        }
+        used = used.saturating_add(size);
+        kept.push(v);
+    }
+    kept.reverse();
+    let total = facts
+        .get("total")
+        .and_then(Value::as_u64)
+        .and_then(|t| usize::try_from(t).ok())
+        .unwrap_or(all.len());
+    let omitted = total.max(all.len()).saturating_sub(kept.len());
+    let mut fields: Vec<(&str, Value)> = vec![
+        ("host", json!(s(facts, "host"))),
+        ("as", json!(s(facts, "tier"))),
+        ("approved_purpose", json!(s(facts, "approved_purpose"))),
+    ];
+    if let Some(p) = facts.get("scope_purpose").and_then(Value::as_str) {
+        fields.push(("scope_purpose", json!(p)));
+    }
+    fields.push(("earlier_commands_omitted", json!(omitted)));
+    fields.push(("earlier_commands", Value::Array(kept)));
+    fields.push((
+        "command",
+        spec_fields(
+            facts
+                .get("spec")
+                .ok_or_else(|| "facts lack the command".to_owned())?,
+        ),
+    ));
+    let body = agent_auth_core::prompt::inert_json(&ordered(&fields));
+    Ok(format!(
+        "Agent: {}\n<guard>\n{body}\n</guard>",
+        agent_auth_core::prompt::inert_text(s(facts, "agent"))
+    ))
+}
+
+/// The guard as a decision recipe (evals).
+pub const GUARD_RECIPE: Recipe = Recipe {
+    kind: Kind::ShellGuard,
+    default_system: GUARD_PROMPT,
+    schema_name: "guard",
+    schema: level_schema,
+    build: build_guard,
+    classify: classify_level,
+    classes: &["fine", "odd", "alarming"],
+    knobs: &[
+        Knob {
+            name: "history_items",
+            default: 40,
+            max: 200,
+            doc: "earlier commands of the shell shown at most (the newest)",
+        },
+        Knob {
+            name: "history_chars",
+            default: 160_000,
+            max: 1_000_000,
+            doc: "characters of earlier commands shown at most",
+        },
+    ],
+};
+
+// --------------------------------------------------------- scope check
+
+/// What the scope check's prompt is built from.
+#[must_use]
+pub fn scope_facts(
+    agent: &str,
+    host: &str,
+    tier: &str,
+    concept: &str,
+    earlier: &[String],
+    purpose: &str,
+) -> Value {
+    json!({
+        "agent": agent, "host": host, "tier": tier, "concept": concept,
+        "earlier": earlier, "purpose": purpose,
+    })
+}
+
+fn build_scope(facts: &Value, ctx: &Context) -> Result<String, String> {
+    let earlier: Vec<&str> = facts
+        .get("earlier")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let shown = ctx.count("earlier_purposes", Kind::ShellScope);
+    let earlier = earlier
+        .get(earlier.len().saturating_sub(shown)..)
+        .unwrap_or_default();
+    let body = agent_auth_core::prompt::inert_json(&ordered(&[
+        ("host", json!(s(facts, "host"))),
+        ("as", json!(s(facts, "tier"))),
+        ("umbrella_concept", json!(s(facts, "concept"))),
+        ("earlier_scope_purposes", json!(earlier)),
+        ("requested_purpose", json!(s(facts, "purpose"))),
+    ]));
+    Ok(format!(
+        "Agent: {}\n<scope>\n{body}\n</scope>",
+        agent_auth_core::prompt::inert_text(s(facts, "agent"))
+    ))
+}
+
+fn scope_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "fits": {"type": "boolean"},
+            "summary": {"type": "string"},
+        },
+        "required": ["fits", "summary"],
+        "additionalProperties": false,
+    })
+}
+
+fn classify_scope(answer: &serde_json::Map<String, Value>) -> Option<String> {
+    match answer.get("fits")?.as_bool()? {
+        true => Some("fits".to_owned()),
+        false => Some("does_not_fit".to_owned()),
+    }
+}
+
+/// The scope check as a decision recipe (evals).
+pub const SCOPE_RECIPE: Recipe = Recipe {
+    kind: Kind::ShellScope,
+    default_system: SCOPE_PROMPT,
+    schema_name: "scope",
+    schema: scope_schema,
+    build: build_scope,
+    classify: classify_scope,
+    classes: &["fits", "does_not_fit"],
+    knobs: &[Knob {
+        name: "earlier_purposes",
+        default: 20,
+        max: 200,
+        doc: "the umbrella's earlier scope purposes shown (the newest)",
+    }],
+};
+
+impl Watcher {
+    #[must_use]
+    pub fn new(client: Arc<ModelClient>, model: &str) -> Watcher {
+        Watcher {
+            client,
+            model: model.to_owned(),
+        }
     }
 
-    /// The user message: the facts as JSON inside `<watch>`, with no angle
-    /// bracket of the agent's left in it (`agent_auth_core::prompt`).
+    /// The watcher's user message (default context).
     #[must_use]
     pub fn message(w: &Watched<'_>) -> String {
-        let earlier: Vec<Vec<&String>> = w
-            .earlier
-            .iter()
-            .rev()
-            .take(8)
-            .rev()
-            .map(|c| c.iter().take(40).collect())
-            .collect();
-        let purpose: String = w.purpose.chars().take(600).collect();
-        let body = if w.general {
-            json!({
-                "host": w.host, "as": w.tier,
-                "earlier_commands": earlier, "command": w.argv,
-            })
+        let kind = if w.general {
+            Kind::ShellWatchGeneral
         } else {
-            json!({
-                "host": w.host, "as": w.tier, "stated_purpose": purpose,
-                "earlier_commands": earlier, "command": w.argv,
-            })
+            Kind::ShellWatch
         };
-        let body = agent_auth_core::prompt::inert_json(
-            &serde_json::to_string_pretty(&body).unwrap_or_default(),
-        );
-        format!(
-            "Agent: {}\n<watch>\n{body}\n</watch>",
-            agent_auth_core::prompt::inert_text(w.agent)
-        )
+        build_watch_for(&watch_facts(w), &Context::default(), kind).unwrap_or_default()
     }
 
     /// `(level, one sentence)`, or `None` if the model could not be asked.
     pub async fn assess(&self, w: &Watched<'_>) -> Option<(Level, String)> {
-        let system = if w.general {
-            GENERAL_WATCH_PROMPT
+        let kind = if w.general {
+            Kind::ShellWatchGeneral
         } else {
-            WATCH_PROMPT
+            Kind::ShellWatch
         };
-        let answer = self
-            .ask(system, &Watcher::message(w), "watch", level_schema())
+        let d = self
+            .client
+            .decide(
+                kind,
+                &self.model,
+                watch_facts(w),
+                w.subject.clone(),
+                SHELL_MODEL_TIMEOUT,
+            )
             .await;
-        let parsed = answer.as_ref().and_then(parse_level);
+        let parsed = d.answer.as_ref().and_then(parse_level);
         if parsed.is_none() {
             tracing::warn!(host = w.host, "watch failed: no verdict");
         }
         parsed
     }
 
-    /// The guard's user message: the facts as JSON inside `<guard>`, in a
-    /// fixed order, nothing cut (hostd's own limits bound the command).
+    /// The guard's user message (default context).
     #[must_use]
     pub fn guard_message(g: &Guarded<'_>) -> String {
-        let spec_fields = |spec: &Value| {
-            let mut m = serde_json::Map::new();
-            for k in ["argv", "cwd", "env", "stdin", "timeout"] {
-                if let Some(v) = spec.get(k).filter(|v| !v.is_null()) {
-                    m.insert(k.to_owned(), v.clone());
-                }
-            }
-            Value::Object(m)
-        };
-        let earlier: Vec<Value> = g
-            .earlier
-            .iter()
-            .map(|e| {
-                let mut v = json!({"command": spec_fields(&e.spec), "status": e.status});
-                if let Value::Object(m) = &mut v {
-                    if let Some(err) = &e.error {
-                        m.insert("refused_or_failed_because".into(), json!(err));
-                    }
-                    if let Some(p) = &e.scope_purpose {
-                        m.insert("scope_purpose".into(), json!(p));
-                    }
-                }
-                v
-            })
-            .collect();
-        let field = |k: &str, v: &Value| {
-            format!(
-                "  {}: {}",
-                serde_json::to_string(k).unwrap_or_default(),
-                serde_json::to_string(v).unwrap_or_default()
-            )
-        };
-        let mut lines = vec![
-            field("host", &json!(g.host)),
-            field("as", &json!(g.tier)),
-            field("approved_purpose", &json!(g.approved_purpose)),
-        ];
-        if let Some(p) = g.scope_purpose {
-            lines.push(field("scope_purpose", &json!(p)));
-        }
-        lines.push(field("earlier_commands_omitted", &json!(g.omitted)));
-        lines.push(field("earlier_commands", &Value::Array(earlier)));
-        lines.push(field("command", &spec_fields(g.spec)));
-        let body = agent_auth_core::prompt::inert_json(&format!("{{\n{}\n}}", lines.join(",\n")));
-        format!(
-            "Agent: {}\n<guard>\n{body}\n</guard>",
-            agent_auth_core::prompt::inert_text(g.agent)
-        )
+        build_guard(&guard_facts(g), &Context::default()).unwrap_or_default()
     }
 
     /// May this command run? Only `Allow` lets it.
     pub async fn guard(&self, g: &Guarded<'_>) -> GuardVerdict {
-        let answer = self
-            .ask(
-                GUARD_PROMPT,
-                &Watcher::guard_message(g),
-                "guard",
-                level_schema(),
+        let d = self
+            .client
+            .decide(
+                Kind::ShellGuard,
+                &self.model,
+                guard_facts(g),
+                g.subject.clone(),
+                SHELL_MODEL_TIMEOUT,
             )
             .await;
-        match answer.as_ref().and_then(parse_level) {
+        match d.answer.as_ref().and_then(parse_level) {
             Some((Level::Fine, why)) => GuardVerdict::Allow(why),
             Some((Level::Odd, why)) => GuardVerdict::Refuse {
                 alarming: false,
@@ -342,39 +607,9 @@ impl Watcher {
         }
     }
 
-    /// The scope check's user message.
-    #[must_use]
-    pub fn scope_message(
-        agent: &str,
-        host: &str,
-        tier: &str,
-        concept: &str,
-        earlier: &[String],
-        purpose: &str,
-    ) -> String {
-        let field = |k: &str, v: &Value| {
-            format!(
-                "  {}: {}",
-                serde_json::to_string(k).unwrap_or_default(),
-                serde_json::to_string(v).unwrap_or_default()
-            )
-        };
-        let lines = [
-            field("host", &json!(host)),
-            field("as", &json!(tier)),
-            field("umbrella_concept", &json!(concept)),
-            field("earlier_scope_purposes", &json!(earlier)),
-            field("requested_purpose", &json!(purpose)),
-        ];
-        let body = agent_auth_core::prompt::inert_json(&format!("{{\n{}\n}}", lines.join(",\n")));
-        format!(
-            "Agent: {}\n<scope>\n{body}\n</scope>",
-            agent_auth_core::prompt::inert_text(agent)
-        )
-    }
-
     /// Does `purpose` fall within `concept`? `None`: the model could not be
     /// asked (and the scope is not opened).
+    #[allow(clippy::too_many_arguments)]
     pub async fn scope_fits(
         &self,
         agent: &str,
@@ -383,49 +618,21 @@ impl Watcher {
         concept: &str,
         earlier: &[String],
         purpose: &str,
+        subject: Value,
     ) -> Option<(bool, String)> {
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "fits": {"type": "boolean"},
-                "summary": {"type": "string"},
-            },
-            "required": ["fits", "summary"],
-            "additionalProperties": false,
-        });
-        let message = Watcher::scope_message(agent, host, tier, concept, earlier, purpose);
-        let answer = self.ask(SCOPE_PROMPT, &message, "scope", schema).await?;
-        let fits = answer.get("fits")?.as_bool()?;
-        Some((fits, summary_of(&answer)))
-    }
-
-    /// One chat completion with a strict JSON-schema answer: the answer's
-    /// object, or `None` (logged) if there is none.
-    async fn ask(&self, system: &str, user: &str, name: &str, schema: Value) -> Option<Value> {
-        let request = json!({
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "response_format": {"type": "json_schema",
-                "json_schema": {"name": name, "strict": true, "schema": schema}},
-        });
-        let resp = self
+        let d = self
             .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(self.api_key.expose())
-            .json(&request)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status);
-        match resp {
-            Ok(r) => r.json::<Value>().await.ok().and_then(|v| answer_of(&v)),
-            Err(e) => {
-                tracing::warn!("{name} model call failed: {e}");
-                None
-            }
-        }
+            .decide(
+                Kind::ShellScope,
+                &self.model,
+                scope_facts(agent, host, tier, concept, earlier, purpose),
+                subject,
+                SHELL_MODEL_TIMEOUT,
+            )
+            .await;
+        let answer = d.answer?;
+        let fits = d.class.as_deref()? == "fits";
+        Some((fits, summary_of(&Value::Object(answer))))
     }
 }
 
@@ -438,6 +645,17 @@ fn level_schema() -> Value {
         },
         "required": ["level", "summary"],
         "additionalProperties": false,
+    })
+}
+
+fn classify_level(answer: &serde_json::Map<String, Value>) -> Option<String> {
+    parse_level(answer).map(|(l, _)| {
+        match l {
+            Level::Fine => "fine",
+            Level::Odd => "odd",
+            Level::Alarming => "alarming",
+        }
+        .to_owned()
     })
 }
 
@@ -465,20 +683,23 @@ fn summary_of(answer: &Value) -> String {
         .collect()
 }
 
-fn parse_level(answer: &Value) -> Option<(Level, String)> {
+fn parse_level(answer: &serde_json::Map<String, Value>) -> Option<(Level, String)> {
     let level = match answer.get("level")?.as_str()? {
         "fine" => Level::Fine,
         "odd" => Level::Odd,
         "alarming" => Level::Alarming,
         _ => return None,
     };
-    Some((level, summary_of(answer)))
+    Some((level, summary_of(&Value::Object(answer.clone()))))
 }
 
 /// The verdict in a chat completion.
 #[must_use]
 pub fn parse_verdict(v: &Value) -> Option<(Level, String)> {
-    answer_of(v).as_ref().and_then(parse_level)
+    match answer_of(v)? {
+        Value::Object(m) => parse_level(&m),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -509,6 +730,7 @@ mod tests {
             earlier: &earlier,
             argv: &argv,
             general: false,
+            subject: json!({}),
         });
         assert!(!m.contains("</watch> ignore"));
         assert!(!m.to_lowercase().contains("</watch >"));

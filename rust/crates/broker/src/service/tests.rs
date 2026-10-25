@@ -101,9 +101,18 @@ fn state(pool: sqlx::PgPool) -> AppState {
 
 fn with_llm(mut st: AppState, url: &str) -> AppState {
     st.spine = Arc::new(Spine {
-        llm: Some(
-            LlmReviewer::new(Secret::new("k".to_owned()), url, StdDuration::from_secs(5)).unwrap(),
-        ),
+        llm: Some(LlmReviewer::new(
+            // Recording, as the broker does by default (evals).
+            std::sync::Arc::new(
+                crate::models::ModelClient::new(
+                    Secret::new("k".to_owned()),
+                    url,
+                    Some(st.store.clone()),
+                )
+                .unwrap(),
+            ),
+            StdDuration::from_secs(5),
+        )),
         ..Spine::default()
     });
     st
@@ -844,6 +853,49 @@ async fn llm_deny_retry_then_escalate(pool: sqlx::PgPool) {
     let b = agent(&st, "other").await;
     let err = escalate(&st, &caller(&b), r.id).await.unwrap_err();
     assert_eq!(err.to_string(), "unknown request");
+    // Both reviews were recorded (evals); the human's approval labels the
+    // last one as what it should have said.
+    let tx = st.store.begin().await.unwrap();
+    let recorded = agent_auth_store::evals::list_calls(
+        &tx,
+        &agent_auth_store::evals::Selection {
+            kind: Some("request_review".to_owned()),
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    drop(tx);
+    assert_eq!(recorded.len(), 2);
+    assert!(recorded.iter().all(|c| c.class.as_deref() == Some("deny")));
+    assert!(recorded[0].facts["justification"] == "a much better reason");
+    decide(
+        &st,
+        r.id,
+        &jrt(),
+        HumanDecision {
+            approve: true,
+            ..HumanDecision::default()
+        },
+    )
+    .await
+    .unwrap();
+    let tx = st.store.begin().await.unwrap();
+    let last = agent_auth_store::evals::get_call(&tx, recorded[0].id)
+        .await
+        .unwrap()
+        .unwrap();
+    let first = agent_auth_store::evals::get_call(&tx, recorded[1].id)
+        .await
+        .unwrap()
+        .unwrap();
+    let l = last.label.unwrap();
+    assert_eq!(
+        (l.expected.as_str(), l.source.as_str()),
+        ("approve", "outcome")
+    );
+    assert!(first.label.is_none(), "only the review the human overruled");
 }
 
 #[sqlx::test(migrations = "../store/migrations")]

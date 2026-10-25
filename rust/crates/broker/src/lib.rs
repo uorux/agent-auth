@@ -37,6 +37,7 @@ pub mod http;
 pub mod limits;
 pub mod llm;
 pub mod mail;
+pub mod models;
 pub mod notify;
 pub mod oauth;
 pub mod provisioners;

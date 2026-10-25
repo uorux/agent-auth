@@ -31,6 +31,9 @@ pub struct MailSettings {
     pub extra_ca_pem: Option<Vec<u8>>,
     /// `GMAIL_API_URL`.
     pub gmail_api: Option<String>,
+    /// The broker's model client (records the judge's calls); without it
+    /// the judge gets a client of its own that records nothing.
+    pub models: Option<Arc<crate::models::ModelClient>>,
 }
 
 /// The TLS config for the mail servers, SimpleLogin and Gmail.
@@ -76,12 +79,15 @@ pub fn build(
                 .judge_model
                 .clone()
                 .unwrap_or_else(|| policy.llm().model.clone());
-            Some(MailJudge::new(
-                Secret::new(key.clone()),
-                &settings.openrouter_base_url,
-                &model,
-                agent_auth_tls::default_client_config()?,
-            )?)
+            let client = match &settings.models {
+                Some(c) => Arc::clone(c),
+                None => Arc::new(crate::models::ModelClient::new(
+                    Secret::new(key.clone()),
+                    &settings.openrouter_base_url,
+                    None,
+                )?),
+            };
+            Some(MailJudge::new(client, &model))
         }
         None => {
             tracing::warn!(

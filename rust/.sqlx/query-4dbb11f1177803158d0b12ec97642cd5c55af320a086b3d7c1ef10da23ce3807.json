@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM model_calls c WHERE c.created_at < $1\n           AND NOT EXISTS (SELECT 1 FROM model_call_labels l WHERE l.call_id = c.id)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4dbb11f1177803158d0b12ec97642cd5c55af320a086b3d7c1ef10da23ce3807"
+}

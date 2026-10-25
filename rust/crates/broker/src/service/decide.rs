@@ -117,7 +117,20 @@ pub async fn decide_attested(
     if decision.approve {
         run_gate(st, id, &decision).await?;
     }
-    decide_inner(st, id, Decider::Human(decider), attested, decision).await
+    let approve = decision.approve;
+    let decided = decide_inner(st, id, Decider::Human(decider), attested, decision).await?;
+    // A human decided a request the reviewer saw: what its last review
+    // should have said (evals; a human's edit is still an approval).
+    crate::models::label_outcome(
+        &st.store,
+        crate::models::Kind::RequestReview,
+        "request_id",
+        &id.to_string(),
+        if approve { "approve" } else { "deny" },
+        decider.label(),
+    )
+    .await;
+    Ok(decided)
 }
 
 async fn run_gate(st: &AppState, id: RequestId, decision: &HumanDecision) -> ServiceResult<()> {

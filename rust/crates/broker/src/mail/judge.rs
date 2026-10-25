@@ -9,13 +9,12 @@
 //! or refuse. It fails closed: any error is [`Topic::Error`] /
 //! [`Outbound::Error`], never a pass.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use agent_auth_crypto::Secret;
 use serde_json::{Map, Value, json};
 
-/// The largest answer read.
-const MAX_ANSWER_BYTES: usize = 1 << 20;
+use crate::models::{Context, Kind, Knob, ModelClient, Recipe};
 
 pub const INBOUND_PROMPT: &str = "\
 You screen email before an autonomous AI agent may read it. The agent was
@@ -260,81 +259,208 @@ fn cut(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// What an inbound screen's prompt is built from.
+#[must_use]
+pub fn inbound_facts(
+    constraints: &[String],
+    purpose: &str,
+    message: &Value,
+    context: &[Value],
+    hints: &[String],
+) -> Value {
+    json!({
+        "constraints": constraints,
+        "purpose": purpose,
+        "message": message,
+        "context": context,
+        "hints": hints,
+    })
+}
+
+/// What an outbound review's prompt is built from.
+#[must_use]
+pub fn outbound_facts(
+    constraints: &[String],
+    purpose: &str,
+    draft: &Value,
+    context: &[Value],
+) -> Value {
+    json!({
+        "constraints": constraints,
+        "purpose": purpose,
+        "draft": draft,
+        "context": context,
+    })
+}
+
+fn strings(facts: &Value, key: &str) -> Vec<String> {
+    facts
+        .get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect()
+}
+
+fn values(facts: &Value, key: &str) -> Vec<Value> {
+    facts
+        .get(key)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn purpose_of(facts: &Value) -> &str {
+    facts.get("purpose").and_then(Value::as_str).unwrap_or("")
+}
+
+fn build_inbound(facts: &Value, ctx: &Context) -> Result<String, String> {
+    let message = facts
+        .get("message")
+        .ok_or_else(|| "facts lack the message".to_owned())?;
+    let context = values(facts, "context");
+    let kind = Kind::MailInbound;
+    Ok([
+        constraints_text(&strings(facts, "constraints")),
+        format!(
+            "The agent's stated purpose (its own words, untrusted):\n{}",
+            tagged(
+                "purpose",
+                &json!({"purpose": cut(purpose_of(facts), ctx.count("purpose_chars", kind))})
+            )
+        ),
+        format!(
+            "Context: earlier messages of this thread already found in scope:\n{}",
+            tagged(
+                "context",
+                &json!({"thread": last(&context, ctx.count("context_messages", kind))})
+            )
+        ),
+        // The hints quote the message: they stay inside its block.
+        "Heuristic hints: listed as `heuristic_hints` inside <email>".to_owned(),
+        tagged("email", &with_hints(message, &strings(facts, "hints"))),
+    ]
+    .join("\n\n"))
+}
+
+fn build_outbound(facts: &Value, ctx: &Context) -> Result<String, String> {
+    let draft = facts
+        .get("draft")
+        .ok_or_else(|| "facts lack the draft".to_owned())?;
+    let context = values(facts, "context");
+    let kind = Kind::MailOutbound;
+    Ok([
+        constraints_text(&strings(facts, "constraints")),
+        format!(
+            "The agent's stated purpose (its own words, untrusted):\n{}",
+            tagged(
+                "purpose",
+                &json!({"purpose": cut(purpose_of(facts), ctx.count("purpose_chars", kind))})
+            )
+        ),
+        format!(
+            "Context: the thread so far (subjects, who wrote):\n{}",
+            tagged(
+                "context",
+                &json!({"thread": last(&context, ctx.count("context_messages", kind))})
+            )
+        ),
+        tagged("draft", draft),
+    ]
+    .join("\n\n"))
+}
+
+fn classify_inbound(out: &Map<String, Value>) -> Option<String> {
+    let topic = match out.get("topic").and_then(Value::as_str)? {
+        t @ ("in_scope" | "out_of_scope" | "unclear") => t,
+        _ => return None,
+    };
+    let level =
+        agent_auth_mail::message::Level::parse(out.get("injection").and_then(Value::as_str)?)?;
+    Some(format!("{topic}/{}", level.as_str()))
+}
+
+fn classify_outbound(out: &Map<String, Value>) -> Option<String> {
+    match out.get("verdict").and_then(Value::as_str)? {
+        v @ ("send" | "hold" | "refuse") => Some(v.to_owned()),
+        _ => None,
+    }
+}
+
+const MAIL_KNOBS: &[Knob] = &[
+    Knob {
+        name: "context_messages",
+        default: 6,
+        max: 100,
+        doc: "earlier messages of the thread shown (the newest)",
+    },
+    Knob {
+        name: "purpose_chars",
+        default: 1500,
+        max: 20_000,
+        doc: "characters of the agent's stated purpose shown",
+    },
+];
+
+/// The inbound screen as a decision recipe (evals).
+pub const INBOUND_RECIPE: Recipe = Recipe {
+    kind: Kind::MailInbound,
+    default_system: INBOUND_PROMPT,
+    schema_name: "mail_screen",
+    schema: inbound_schema,
+    build: build_inbound,
+    classify: classify_inbound,
+    classes: &[
+        "in_scope/none",
+        "in_scope/suspected",
+        "in_scope/likely",
+        "out_of_scope/none",
+        "out_of_scope/suspected",
+        "out_of_scope/likely",
+        "unclear/none",
+        "unclear/suspected",
+        "unclear/likely",
+    ],
+    knobs: MAIL_KNOBS,
+};
+
+/// The outbound review as a decision recipe (evals).
+pub const OUTBOUND_RECIPE: Recipe = Recipe {
+    kind: Kind::MailOutbound,
+    default_system: OUTBOUND_PROMPT,
+    schema_name: "mail_send_review",
+    schema: outbound_schema,
+    build: build_outbound,
+    classify: classify_outbound,
+    classes: &["send", "hold", "refuse"],
+    knobs: MAIL_KNOBS,
+};
+
 /// The judge (`OPENROUTER_API_KEY`).
 pub struct MailJudge {
-    client: reqwest::Client,
-    base_url: String,
-    api_key: Secret<String>,
+    client: Arc<ModelClient>,
     pub model: String,
 }
 
 impl std::fmt::Debug for MailJudge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MailJudge")
-            .field("base_url", &self.base_url)
+            .field("client", &self.client)
             .field("model", &self.model)
             .finish_non_exhaustive()
     }
 }
 
-impl MailJudge {
-    pub fn new(
-        api_key: Secret<String>,
-        base_url: &str,
-        model: &str,
-        tls: rustls::ClientConfig,
-    ) -> anyhow::Result<MailJudge> {
-        let client = agent_auth_tls::reqwest_builder(tls, Duration::from_secs(45)).build()?;
-        Ok(MailJudge {
-            client,
-            base_url: base_url.trim_end_matches('/').to_owned(),
-            api_key,
-            model: model.to_owned(),
-        })
-    }
+/// How long the judge may take.
+const JUDGE_TIMEOUT: Duration = Duration::from_secs(45);
 
-    async fn ask(
-        &self,
-        system: &str,
-        user: &str,
-        name: &str,
-        schema: Value,
-    ) -> anyhow::Result<Map<String, Value>> {
-        let body = json!({
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {"name": name, "strict": true, "schema": schema},
-            },
-        });
-        let mut response = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(self.api_key.expose())
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?;
-        let mut bytes: Vec<u8> = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
-            anyhow::ensure!(
-                bytes.len().saturating_add(chunk.len()) <= MAX_ANSWER_BYTES,
-                "answer too large"
-            );
-            bytes.extend_from_slice(&chunk);
-        }
-        let data: Value = serde_json::from_slice(&bytes)?;
-        let content = data
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("no content in the answer"))?;
-        match serde_json::from_str(content)? {
-            Value::Object(map) => Ok(map),
-            _ => anyhow::bail!("the content is not an object"),
+impl MailJudge {
+    #[must_use]
+    pub fn new(client: Arc<ModelClient>, model: &str) -> MailJudge {
+        MailJudge {
+            client,
+            model: model.to_owned(),
         }
     }
 
@@ -347,23 +473,15 @@ impl MailJudge {
         context: &[Value],
         hints: &[String],
     ) -> String {
-        [
-            constraints_text(constraints),
-            format!(
-                "The agent's stated purpose (its own words, untrusted):\n{}",
-                tagged("purpose", &json!({"purpose": cut(purpose, 1500)}))
-            ),
-            format!(
-                "Context: earlier messages of this thread already found in scope:\n{}",
-                tagged("context", &json!({"thread": last(context, 6)}))
-            ),
-            // The hints quote the message: they stay inside its block.
-            "Heuristic hints: listed as `heuristic_hints` inside <email>".to_owned(),
-            tagged("email", &with_hints(message, hints)),
-        ]
-        .join("\n\n")
+        build_inbound(
+            &inbound_facts(constraints, purpose, message, context, hints),
+            &Context::default(),
+        )
+        .unwrap_or_default()
     }
 
+    /// `subject`: what the screen is about (the grant, the message).
+    #[allow(clippy::too_many_arguments)]
     pub async fn inbound(
         &self,
         constraints: &[String],
@@ -371,34 +489,34 @@ impl MailJudge {
         message: &Value,
         context: &[Value],
         hints: &[String],
+        subject: Value,
     ) -> InboundVerdict {
         use agent_auth_mail::message::Level;
-        let user = Self::inbound_prompt(constraints, purpose, message, context, hints);
-        let out = match self
-            .ask(INBOUND_PROMPT, &user, "mail_screen", inbound_schema())
-            .await
-        {
-            Ok(out) => out,
-            Err(e) => {
-                tracing::warn!(error = %e, "mail judge (inbound) failed");
-                return InboundVerdict::error();
-            }
+        let d = self
+            .client
+            .decide(
+                Kind::MailInbound,
+                &self.model,
+                inbound_facts(constraints, purpose, message, context, hints),
+                subject,
+                JUDGE_TIMEOUT,
+            )
+            .await;
+        let Some(out) = d.answer.filter(|_| d.class.is_some()) else {
+            tracing::warn!("mail judge (inbound) failed");
+            return InboundVerdict::error();
         };
         let topic = match out.get("topic").and_then(Value::as_str) {
             Some("in_scope") => Topic::InScope,
             Some("out_of_scope") => Topic::OutOfScope,
             Some("unclear") => Topic::Unclear,
-            _ => {
-                tracing::warn!("mail judge (inbound) failed: verdict outside the schema");
-                return InboundVerdict::error();
-            }
+            _ => return InboundVerdict::error(),
         };
         let Some(level) = out
             .get("injection")
             .and_then(Value::as_str)
             .and_then(Level::parse)
         else {
-            tracing::warn!("mail judge (inbound) failed: verdict outside the schema");
             return InboundVerdict::error();
         };
         InboundVerdict {
@@ -421,56 +539,45 @@ impl MailJudge {
         draft: &Value,
         context: &[Value],
     ) -> String {
-        [
-            constraints_text(constraints),
-            format!(
-                "The agent's stated purpose (its own words, untrusted):\n{}",
-                tagged("purpose", &json!({"purpose": cut(purpose, 1500)}))
-            ),
-            format!(
-                "Context: the thread so far (subjects, who wrote):\n{}",
-                tagged("context", &json!({"thread": last(context, 6)}))
-            ),
-            tagged("draft", draft),
-        ]
-        .join("\n\n")
+        build_outbound(
+            &outbound_facts(constraints, purpose, draft, context),
+            &Context::default(),
+        )
+        .unwrap_or_default()
     }
 
+    /// `subject`: what the review is about (the grant, the item).
     pub async fn outbound(
         &self,
         constraints: &[String],
         purpose: &str,
         draft: &Value,
         context: &[Value],
+        subject: Value,
     ) -> OutboundVerdict {
-        let user = Self::outbound_prompt(constraints, purpose, draft, context);
         let failed = || OutboundVerdict {
             verdict: OutboundKind::Error,
             reason: "the review could not run".to_owned(),
         };
-        let out = match self
-            .ask(
-                OUTBOUND_PROMPT,
-                &user,
-                "mail_send_review",
-                outbound_schema(),
+        let d = self
+            .client
+            .decide(
+                Kind::MailOutbound,
+                &self.model,
+                outbound_facts(constraints, purpose, draft, context),
+                subject,
+                JUDGE_TIMEOUT,
             )
-            .await
-        {
-            Ok(out) => out,
-            Err(e) => {
-                tracing::warn!(error = %e, "mail judge (outbound) failed");
-                return failed();
-            }
+            .await;
+        let (Some(out), Some(class)) = (d.answer, d.class) else {
+            tracing::warn!("mail judge (outbound) failed");
+            return failed();
         };
-        let verdict = match out.get("verdict").and_then(Value::as_str) {
-            Some("send") => OutboundKind::Send,
-            Some("hold") => OutboundKind::Hold,
-            Some("refuse") => OutboundKind::Refuse,
-            _ => {
-                tracing::warn!("mail judge (outbound) failed: verdict outside the schema");
-                return failed();
-            }
+        let verdict = match class.as_str() {
+            "send" => OutboundKind::Send,
+            "hold" => OutboundKind::Hold,
+            "refuse" => OutboundKind::Refuse,
+            _ => return failed(),
         };
         OutboundVerdict {
             verdict,

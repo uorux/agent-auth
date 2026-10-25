@@ -84,13 +84,16 @@ impl Broker {
 
     /// With the shell models (watcher, guard, scope check) asking `model`.
     pub async fn start_with_model(pool: sqlx::PgPool, policy: &str, model: &FakeModel) -> Broker {
-        let watcher = crate::hostexec::watcher::Watcher::new(
-            Secret::new("test-key".to_owned()),
-            &model.url,
-            "test-model",
-        )
-        .unwrap();
-        Broker::start_inner(pool, policy, 30, false, Some(watcher)).await
+        // Recording, as the broker does by default (evals).
+        let client = Arc::new(
+            crate::models::ModelClient::new(
+                Secret::new("test-key".to_owned()),
+                &model.url,
+                Some(Store::from_pool(pool.clone())),
+            )
+            .unwrap(),
+        );
+        Broker::start_inner(pool, policy, 30, false, Some(client)).await
     }
 
     async fn start_inner(
@@ -98,8 +101,11 @@ impl Broker {
         policy: &str,
         heartbeat_secs: u32,
         trust_x_real_ip: bool,
-        watcher: Option<crate::hostexec::watcher::Watcher>,
+        models: Option<Arc<crate::models::ModelClient>>,
     ) -> Broker {
+        let watcher = models
+            .clone()
+            .map(|c| crate::hostexec::watcher::Watcher::new(c, "test-model"));
         let store = Store::from_pool(pool);
         let policy = Policy::from_yaml(policy).unwrap();
         let key = SigningKey::generate().unwrap();
@@ -137,6 +143,7 @@ impl Broker {
         st.notifier = Arc::new(part.wrap_notifier(Notifier::Recording(Recorder::default())));
         let part = Arc::new(part);
         st.hostd = Some(Arc::clone(&part));
+        st.models = models;
         part.bind(&st);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

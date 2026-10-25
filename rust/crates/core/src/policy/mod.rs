@@ -33,11 +33,11 @@ pub use eval::{
 };
 pub use schema::{
     AgentsConfig, AuditConfig, Constraints, ContainmentConfig, Defaults, DesktopConfig,
-    GithubConfig, GoogleAccount, GoogleConfig, HomelabConfig, HostexecConfig, KubernetesConfig,
-    LlmConfig, MAX_POOL_PER_AGENT, MCP_TOOL_NAMES, Match, McpConfig, McpServer, ModelsConfig,
-    NotifyConfig, PlatformsConfig, PolicyRule, PoolConfig, PoolItem, REMOTE_MCP_REDIRECT_URIS,
-    REMOTE_MCP_TOOLS, RemoteMcpConfig, RestrictedZone, UiConfig, WikiConfig, config_name_ok,
-    email_address_ok, redirect_uri_ok,
+    EvalsConfig, GithubConfig, GoogleAccount, GoogleConfig, HomelabConfig, HostexecConfig,
+    KubernetesConfig, LlmConfig, MAX_POOL_PER_AGENT, MCP_TOOL_NAMES, Match, McpConfig, McpServer,
+    ModelsConfig, NotifyConfig, PlatformsConfig, PolicyRule, PoolConfig, PoolItem,
+    REMOTE_MCP_REDIRECT_URIS, REMOTE_MCP_TOOLS, RemoteMcpConfig, RestrictedZone, UiConfig,
+    WikiConfig, config_name_ok, email_address_ok, redirect_uri_ok,
 };
 
 /// A policy that does not load. The text says where (`rules[3]: ...`).
@@ -63,12 +63,13 @@ pub struct Policy {
     containment: ContainmentConfig,
     restricted: BTreeMap<String, RestrictedZone>,
     audit: AuditConfig,
+    evals: EvalsConfig,
     remote_mcp: RemoteMcpConfig,
     projects: BTreeMap<AttrValue, Project>,
     rules: Vec<PolicyRule>,
 }
 
-const SECTIONS: [&str; 13] = [
+const SECTIONS: [&str; 14] = [
     "defaults",
     "llm",
     "platforms",
@@ -79,6 +80,7 @@ const SECTIONS: [&str; 13] = [
     "containment",
     "restricted",
     "audit",
+    "evals",
     "remote_mcp",
     "projects",
     "rules",
@@ -258,6 +260,11 @@ impl Policy {
         }
         if let Some(v) = map.remove("audit") {
             policy.audit = parse_section("audit", v)?;
+        }
+        if let Some(v) = map.remove("evals") {
+            let evals: EvalsConfig = parse_section("evals", v)?;
+            evals.validate().map_err(PolicyError)?;
+            policy.evals = evals;
         }
         if let Some(v) = map.remove("remote_mcp") {
             policy.remote_mcp = parse_section("remote_mcp", v)?;
@@ -483,6 +490,11 @@ impl Policy {
     #[must_use]
     pub fn audit(&self) -> &AuditConfig {
         &self.audit
+    }
+
+    #[must_use]
+    pub fn evals(&self) -> &EvalsConfig {
+        &self.evals
     }
 
     #[must_use]

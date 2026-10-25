@@ -612,6 +612,117 @@ impl BrokerClient {
         .await
     }
 
+    // ----------------------------------------------------------------- evals
+
+    /// `GET /admin/evals/kinds`: the decision kinds, their classes, context
+    /// settings and current system prompts.
+    pub async fn admin_evals_kinds(
+        &self,
+    ) -> Result<Vec<agent_auth_wire::evals::KindOut>, ClientError> {
+        self.call(Call::get(&["admin", "evals", "kinds"]).admin())
+            .await
+    }
+
+    /// `GET /admin/evals/calls`: recorded model calls, newest first.
+    pub async fn admin_evals_calls(
+        &self,
+        kind: Option<&str>,
+        labeled: Option<bool>,
+        since: Option<&str>,
+        before: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<agent_auth_wire::evals::CallsPage, ClientError> {
+        let mut call = Call::get(&["admin", "evals", "calls"]).admin();
+        if let Some(k) = kind {
+            call = call.query("kind", k);
+        }
+        if let Some(l) = labeled {
+            call = call.query("labeled", l.to_string());
+        }
+        if let Some(t) = since {
+            call = call.query("since", t);
+        }
+        if let Some(b) = before {
+            call = call.query("before", b);
+        }
+        if let Some(n) = limit {
+            call = call.query("limit", n.to_string());
+        }
+        self.call(call).await
+    }
+
+    /// `GET /admin/evals/calls/{id}`: everything recorded about one call.
+    pub async fn admin_evals_call(
+        &self,
+        id: &str,
+    ) -> Result<agent_auth_wire::evals::CallDetail, ClientError> {
+        self.call(Call::get(&["admin", "evals", "calls", id]).admin())
+            .await
+    }
+
+    /// `PUT /admin/evals/calls/{id}/label`: what the call should have decided.
+    pub async fn admin_evals_label(
+        &self,
+        id: &str,
+        expected: &str,
+        note: Option<&str>,
+    ) -> Result<agent_auth_wire::evals::CallOut, ClientError> {
+        let body = checked::<agent_auth_wire::evals::LabelBody>(
+            json!({"expected": expected, "note": note}),
+        )?;
+        self.call(
+            Call::new(
+                Method::PUT,
+                &["admin", "evals", "calls", id, "label"],
+                Auth::Admin,
+            )
+            .body(body),
+        )
+        .await
+    }
+
+    /// `DELETE /admin/evals/calls/{id}/label`.
+    pub async fn admin_evals_unlabel(&self, id: &str) -> Result<Value, ClientError> {
+        self.call(Call::new(
+            Method::DELETE,
+            &["admin", "evals", "calls", id, "label"],
+            Auth::Admin,
+        ))
+        .await
+    }
+
+    /// `POST /admin/evals/runs`: replay recorded calls (`body` as
+    /// [`agent_auth_wire::evals::RunCreate`]).
+    pub async fn admin_evals_replay(
+        &self,
+        body: Value,
+    ) -> Result<agent_auth_wire::evals::RunOut, ClientError> {
+        let body = checked::<agent_auth_wire::evals::RunCreate>(body)?;
+        self.call(Call::post(&["admin", "evals", "runs"]).admin().body(body))
+            .await
+    }
+
+    /// `GET /admin/evals/runs`.
+    pub async fn admin_evals_runs(
+        &self,
+        kind: Option<&str>,
+    ) -> Result<Vec<agent_auth_wire::evals::RunOut>, ClientError> {
+        let mut call = Call::get(&["admin", "evals", "runs"]).admin();
+        if let Some(k) = kind {
+            call = call.query("kind", k);
+        }
+        self.call(call).await
+    }
+
+    /// `GET /admin/evals/runs/{id}`: a replay with every case.
+    pub async fn admin_evals_run(
+        &self,
+        id: &str,
+    ) -> Result<agent_auth_wire::evals::RunOut, ClientError> {
+        self.call(Call::get(&["admin", "evals", "runs", id]).admin())
+            .await
+    }
+
     // -------------------------------------------------------------- sessions
 
     /// `POST /v1/sessions`; the new session is this client's (and its

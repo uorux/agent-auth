@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM model_call_labels WHERE call_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5f1aafcecca4086cc2efb51a9b2e2419cf54eee0a11b5f53713debf8f023614d"
+}

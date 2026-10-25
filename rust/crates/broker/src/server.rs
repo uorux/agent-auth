@@ -79,6 +79,7 @@ fn mail_gateway(
     policy: &Arc<Policy>,
     store: &Store,
     services: &PlatformServices,
+    models: Option<Arc<crate::models::ModelClient>>,
 ) -> anyhow::Result<Option<Arc<crate::mail::Mail>>> {
     let secret_box = match &config.encryption_key {
         Some(k) => Some(Arc::new(
@@ -100,20 +101,24 @@ fn mail_gateway(
         openrouter_base_url: config.openrouter_base_url.clone(),
         extra_ca_pem,
         gmail_api: env.get("GMAIL_API_URL").map(str::to_owned),
+        models,
     };
     crate::mail::setup::build(policy, store, &settings, services.google_tokens.as_ref())
 }
 
 /// The spine's own state: the LLM reviewer and the risk summarizer.
-pub fn spine(config: &Config, policy: &Policy) -> anyhow::Result<Spine> {
+pub fn spine(
+    config: &Config,
+    policy: &Policy,
+    models: Option<Arc<crate::models::ModelClient>>,
+) -> Spine {
     let mut spine = Spine::default();
     spine.limits = crate::limits::Limits::new(config.max_waits_per_agent, config.requests_per_hour);
-    if let Some(key) = &config.openrouter_api_key {
+    if let Some(models) = models {
         spine.llm = Some(LlmReviewer::new(
-            agent_auth_crypto::Secret::new(key.expose().clone()),
-            &config.openrouter_base_url,
+            Arc::clone(&models),
             Duration::from_secs(u64::from(policy.llm().timeout_secs)),
-        )?);
+        ));
         if config.daemons_enabled && policy.platforms().hostexec.risk_summary {
             let model = policy
                 .platforms()
@@ -121,45 +126,34 @@ pub fn spine(config: &Config, policy: &Policy) -> anyhow::Result<Spine> {
                 .risk_model
                 .clone()
                 .unwrap_or_else(|| policy.llm().model.clone());
-            spine.risk = Some(RiskSummarizer::new(
-                agent_auth_crypto::Secret::new(key.expose().clone()),
-                &config.openrouter_base_url,
-                model,
-            )?);
+            spine.risk = Some(RiskSummarizer::new(models, model));
         }
     } else {
         tracing::warn!("OPENROUTER_API_KEY not set: llm-routed requests go to a human");
     }
-    Ok(spine)
+    spine
 }
 
 /// Paired daemons, commands on hosts, desk prompts and attention
 /// (`BROKER_SIGNING_KEY`, `DAEMON_*`; the watcher with OpenRouter and
 /// `platforms.hostexec.watch`).
 fn hostd_part(
-    config: &Config,
     store: &Store,
     policy: &Arc<Policy>,
+    models: Option<Arc<crate::models::ModelClient>>,
 ) -> anyhow::Result<crate::daemons::HostdPart> {
     let daemons = crate::daemons::DaemonsConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
     let hx = &policy.platforms().hostexec;
     // One model client for the shell models: the watcher (only with
     // `platforms.hostexec.watch`), and the guard and scope check of guarded
     // and umbrella shells (which cannot be granted without it).
-    let watcher = match &config.openrouter_api_key {
-        Some(key) if daemons.signing_key.is_some() => {
+    let watcher = match models {
+        Some(models) if daemons.signing_key.is_some() => {
             let model = hx
                 .risk_model
                 .clone()
                 .unwrap_or_else(|| policy.llm().model.clone());
-            Some(
-                crate::hostexec::watcher::Watcher::new(
-                    agent_auth_crypto::Secret::new(key.expose().clone()),
-                    &config.openrouter_base_url,
-                    &model,
-                )
-                .map_err(|e| anyhow::anyhow!("watcher: {e}"))?,
-            )
+            Some(crate::hostexec::watcher::Watcher::new(models, &model))
         }
         _ => None,
     };
@@ -359,8 +353,25 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
     warn_stub_era_google_rules(&store, &policy).await?;
 
     let policy = Arc::new(policy);
+    // One model client for every decision a model makes, recording each
+    // (evals) unless `evals.record` is off.
+    let models = match &config.openrouter_api_key {
+        Some(key) => Some(Arc::new(crate::models::ModelClient::new(
+            agent_auth_crypto::Secret::new(key.expose().clone()),
+            &config.openrouter_base_url,
+            policy.evals().record.then(|| store.clone()),
+        )?)),
+        None => None,
+    };
     let (mut registry, platform_services) = register_provisioners(&env, &config, &policy)?;
-    let mail = mail_gateway(&env, &config, &policy, &store, &platform_services)?;
+    let mail = mail_gateway(
+        &env,
+        &config,
+        &policy,
+        &store,
+        &platform_services,
+        models.clone(),
+    )?;
     if let Some(m) = &mail {
         registry.register(AnyProvisioner::Mail(
             crate::mail::provisioner::MailProvisioner {
@@ -368,8 +379,8 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
             },
         ));
     }
-    let mut spine = spine(&config, &policy)?;
-    let hostd = hostd_part(&config, &store, &policy)?;
+    let mut spine = spine(&config, &policy, models.clone());
+    let hostd = hostd_part(&store, &policy, models.clone())?;
     if let Some(p) = hostd.provisioner() {
         registry.register(p);
     }
@@ -447,6 +458,7 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
     let hostd = Arc::new(hostd);
     state.hostd = Some(Arc::clone(&hostd));
     state.sandboxes = sandboxes.clone();
+    state.models = models.clone();
     let state = crate::webui::install(state, web);
     hostd.bind(&state);
     if let Some(s) = &sandboxes {
