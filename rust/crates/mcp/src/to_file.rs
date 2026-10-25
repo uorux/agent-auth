@@ -18,14 +18,25 @@ use agent_auth_core::pyfmt::{repr, shlex_quote};
 use agent_auth_wire::agent::{CredentialKind, CredentialOut};
 use serde::Serialize;
 
-/// Kinds whose `value` is a secret a program consumes. A created repo's URL,
-/// a group membership and the like stay in the reply.
-pub const SECRET_KINDS: &[CredentialKind] = &[
-    CredentialKind::GithubInstallationToken,
-    CredentialKind::KubernetesToken,
-    CredentialKind::McpToken,
-    CredentialKind::LldapAccount,
+/// Kinds whose `value` is not a secret, so it stays in the reply: a
+/// created repo's URL, a group membership, a minted identity's name, a
+/// shell's grant id, a job's summary, nothing at all. Every other kind,
+/// including any added later, is a secret and goes to the file.
+pub const NOT_SECRET_KINDS: &[CredentialKind] = &[
+    CredentialKind::GithubRepo,
+    CredentialKind::LldapGroup,
+    CredentialKind::A2aGrant,
+    CredentialKind::AgentIdentity,
+    CredentialKind::ProjectAccess,
+    CredentialKind::HostexecShell,
+    CredentialKind::HostexecJob,
 ];
+
+/// Whether `kind`'s value is a secret (secret unless known otherwise).
+#[must_use]
+pub fn is_secret(kind: CredentialKind) -> bool {
+    !NOT_SECRET_KINDS.contains(&kind)
+}
 
 /// `$XDG_RUNTIME_DIR/agent-auth/credentials`, else
 /// `~/.cache/agent-auth/credentials`.
@@ -71,7 +82,7 @@ pub enum Delivered {
 /// Put `credential`'s secret into `dir`/`<grant id>` when it is a secret
 /// kind with a value; otherwise hand it back unchanged.
 pub fn deliver(dir: &Path, grant_id: &str, mut credential: CredentialOut) -> io::Result<Delivered> {
-    let secret = SECRET_KINDS.contains(&credential.kind)
+    let secret = is_secret(credential.kind)
         && credential
             .value
             .as_ref()
@@ -195,4 +206,88 @@ fn temp_file(dir: &Path, name: &str) -> io::Result<(PathBuf, fs::File)> {
         }
     }
     Err(last.unwrap_or_else(|| io::Error::other("no temporary file name")))
+}
+
+#[cfg(test)]
+mod tests {
+    use agent_auth_wire::secret::WireSecret;
+
+    use super::*;
+
+    /// Every kind there is (the match makes a new one a compile error here).
+    fn all_kinds() -> Vec<CredentialKind> {
+        use CredentialKind as K;
+        let all = [
+            K::GithubInstallationToken,
+            K::GithubRepo,
+            K::KubernetesToken,
+            K::LldapAccount,
+            K::LldapGroup,
+            K::McpToken,
+            K::ModelGatewayKey,
+            K::A2aGrant,
+            K::AgentIdentity,
+            K::ProjectAccess,
+            K::HostexecShell,
+            K::HostexecJob,
+        ];
+        for k in all {
+            match k {
+                K::GithubInstallationToken
+                | K::GithubRepo
+                | K::KubernetesToken
+                | K::LldapAccount
+                | K::LldapGroup
+                | K::McpToken
+                | K::ModelGatewayKey
+                | K::A2aGrant
+                | K::AgentIdentity
+                | K::ProjectAccess
+                | K::HostexecShell
+                | K::HostexecJob => {}
+            }
+        }
+        all.to_vec()
+    }
+
+    #[test]
+    fn every_kind_is_decided_and_secrets_go_to_the_file() {
+        use CredentialKind as K;
+        let dir = std::env::temp_dir().join(format!("agent-auth-kinds-{}", std::process::id()));
+        let secrets = [
+            K::GithubInstallationToken,
+            K::KubernetesToken,
+            K::LldapAccount,
+            K::McpToken,
+            K::ModelGatewayKey,
+        ];
+        for (i, kind) in all_kinds().into_iter().enumerate() {
+            let credential = CredentialOut {
+                kind,
+                value: Some(WireSecret::new("the-value").unwrap()),
+                username: None,
+                url: None,
+                expires_at: None,
+                note: None,
+            };
+            let grant = format!("g-{i}");
+            let delivered = deliver(&dir, &grant, credential).unwrap();
+            let text = serde_json::to_string(&delivered).unwrap();
+            if secrets.contains(&kind) {
+                assert!(is_secret(kind), "{kind:?}");
+                assert!(matches!(delivered, Delivered::InFile(_)), "{kind:?}");
+                assert!(!text.contains("the-value"), "{kind:?}: {text}");
+                assert_eq!(
+                    std::fs::read_to_string(dir.join(&grant)).unwrap(),
+                    "the-value"
+                );
+            } else {
+                assert!(!is_secret(kind), "{kind:?}");
+                assert!(matches!(delivered, Delivered::Inline(_)), "{kind:?}");
+                assert!(text.contains("the-value"), "{kind:?}");
+                assert!(!dir.join(&grant).exists(), "{kind:?}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -512,6 +512,11 @@ and why. Keep entries short. Group by area.
 - **`create_session`/`close_session` use the caller's credentials** (Bug-C3):
   the tools run for a `Caller`; neither builds a client from the
   environment.
+- **`get_credential(to_file=True)` writes every kind not known to be
+  harmless** (`to_file::NOT_SECRET_KINDS`: github_repo, lldap_group,
+  a2a_grant, agent_identity, project_access, hostexec_shell, hostexec_job);
+  a new kind is a secret by default. The Python listed the secret kinds and
+  missed `model_gateway_key`, whose LiteLLM key went into the conversation.
 - **`get_credential(to_file=True)`** (Bug-D1): an existing symlink at the
   file's name is refused; the value goes to a new `O_CREAT|O_EXCL` 0600 file
   that is renamed into place; the directory must be a real directory (not a
