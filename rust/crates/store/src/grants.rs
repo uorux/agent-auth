@@ -158,7 +158,9 @@ pub async fn begin<'t>(
         .ok_or_else(|| StoreError::OutOfRange(format!("{secs} s from now")))?;
     if let Some(d) = row.delegation {
         match delegation_backing(tx, d, now).await? {
-            Ok(backing_expiry) => expires_at = expires_at.min(backing_expiry),
+            Ok(Some(backing_expiry)) => expires_at = expires_at.min(backing_expiry),
+            // An operator thread: no backing grant to outlive.
+            Ok(None) => {}
             Err(refused) => return Ok(Err(refused)),
         }
     }
@@ -199,15 +201,18 @@ pub async fn begin<'t>(
 }
 
 /// The delegation thread must be open, its backing grant active and
-/// unexpired, and the delegator enabled. Returns the backing grant's expiry.
-/// Locks in the crate's order: delegator (agents), backing grant (grants),
-/// thread (threads); the thread's backing grant id is immutable, so it is
-/// read once without a lock to know what to lock.
+/// unexpired, and the delegator enabled. Returns the backing grant's expiry,
+/// or `None` for an operator thread (the admin panel's chat): it has no
+/// backing grant by design, so the thread being open is the whole test and
+/// the delegated grant is capped only by its own duration (it still ends
+/// when the thread closes). Locks in the crate's order: delegator (agents),
+/// backing grant (grants), thread (threads); the thread's backing grant id
+/// is immutable, so it is read once without a lock to know what to lock.
 async fn delegation_backing(
     tx: &Tx<'_>,
     d: Delegation,
     now: OffsetDateTime,
-) -> Outcome<OffsetDateTime, BeginRefused> {
+) -> Outcome<Option<OffsetDateTime>, BeginRefused> {
     let mut c = tx.conn().await;
     let backing = sqlx::query_scalar!(
         "SELECT grant_id FROM a2a_threads WHERE id = $1",
@@ -215,20 +220,38 @@ async fn delegation_backing(
     )
     .fetch_optional(&mut **c)
     .await?;
-    // An operator thread has no backing grant; as in the Python, it cannot
-    // carry a delegated grant (a2a B1, an open question).
-    let Some(Some(backing)) = backing else {
+    let Some(backing) = backing else {
         return Ok(Err(BeginRefused::DelegationClosed));
     };
-    let delegator_ok = sqlx::query_scalar!(
-        r#"SELECT NOT disabled AS "ok!" FROM agents WHERE id = $1 FOR SHARE"#,
+    let delegator = sqlx::query!(
+        r#"SELECT NOT disabled AS "ok!", kind = 'operator' AS "operator!"
+           FROM agents WHERE id = $1 FOR SHARE"#,
         Uuid::from(d.delegator_agent_id)
     )
     .fetch_optional(&mut **c)
     .await?;
-    if delegator_ok != Some(true) {
+    let Some(delegator) = delegator.filter(|r| r.ok) else {
         return Ok(Err(BeginRefused::DelegatorDisabled));
-    }
+    };
+    let Some(backing) = backing else {
+        // No backing grant: only the operator's own threads are like that.
+        if !delegator.operator {
+            return Ok(Err(BeginRefused::DelegationClosed));
+        }
+        let open = sqlx::query_scalar!(
+            r#"SELECT state = 'open' AS "open!" FROM a2a_threads
+               WHERE id = $1 AND grant_id IS NULL AND initiator_agent_id = $2 FOR SHARE"#,
+            Uuid::from(d.thread_id),
+            Uuid::from(d.delegator_agent_id)
+        )
+        .fetch_optional(&mut **c)
+        .await?;
+        return Ok(if open == Some(true) {
+            Ok(None)
+        } else {
+            Err(BeginRefused::DelegationClosed)
+        });
+    };
     let backing = sqlx::query!(
         "SELECT expires_at FROM grants
          WHERE id = $1 AND status = 'active' AND expires_at > $2 FOR SHARE",
@@ -249,7 +272,7 @@ async fn delegation_backing(
     if open != Some(true) {
         return Ok(Err(BeginRefused::DelegationClosed));
     }
-    Ok(Ok(backing.expires_at))
+    Ok(Ok(Some(backing.expires_at)))
 }
 
 /// A grant being provisioned, locked in the transaction it borrows: made
@@ -572,7 +595,10 @@ pub async fn issuable<'t>(
         let mut c = tx.conn().await;
         let open = sqlx::query_scalar!(
             r#"SELECT (t.state = 'open'
-                       AND (t.grant_id IS NULL
+                       AND ((t.grant_id IS NULL
+                             AND EXISTS (SELECT 1 FROM agents o
+                                         WHERE o.id = t.initiator_agent_id
+                                           AND o.kind = 'operator'))
                             OR EXISTS (SELECT 1 FROM grants b
                                        WHERE b.id = t.grant_id AND b.status = 'active'
                                          AND b.expires_at > $2))) AS "open!"

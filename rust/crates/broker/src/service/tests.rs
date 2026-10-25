@@ -1405,6 +1405,87 @@ async fn closing_the_thread_ends_delegated_grants(pool: sqlx::PgPool) {
     assert!(d.decision_reason.unwrap().contains("no longer open"));
 }
 
+/// An operator (admin panel chat) thread backs a delegated request
+/// (upstream review 2026-10: "operator threads need no backing grant"):
+/// provisioned, capped only by its own duration, ended with the thread.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_delegated_request_on_an_operator_thread_is_provisioned(pool: sqlx::PgPool) {
+    let st = state(pool);
+    let responder = agent(&st, "hermes-homelab-x").await;
+    let now = OffsetDateTime::now_utc();
+    let tx = st.store.begin().await.unwrap();
+    let operator = agent_auth_store::agents::ensure_operator(
+        &tx,
+        agent_auth_core::AgentId::new(),
+        "opkeyid00000",
+        now,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let clear = lockdown::check_pair(&tx, operator.id, responder.id, now)
+        .await
+        .unwrap()
+        .unwrap();
+    let (thread, _) = a2a::open(
+        &tx,
+        &clear,
+        &a2a::NewThread {
+            id: ThreadId::new(),
+            initiator: operator.id,
+            initiator_session: None,
+            responder: responder.id,
+            topic: Some("t"),
+            grant_id: None,
+            message_id: MessageId::new(),
+            payload: "{\"type\": \"message\", \"text\": \"deploy\"}",
+            now,
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    a2a::accept(&tx, &clear, thread.id, None, now)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(clear);
+    tx.commit().await.unwrap();
+
+    let r = create(&st, &caller(&responder), delegated("svc-gitea", thread.id))
+        .await
+        .unwrap();
+    assert_eq!(r.status, RequestStatus::AwaitingHuman, "{:?}", r.decision_reason);
+    assert!(r.risk_notes[0].starts_with("on behalf of operator (a2a thread topic \"t\")"));
+    let done = decide(&st, r.id, &jrt(), approve(None)).await.unwrap();
+    assert_eq!(done.status, RequestStatus::Granted, "{:?}", done.decision_reason);
+    let g = grant_of(&st, r.id).await.unwrap();
+    // No backing grant: the grant's own hour is its only cap.
+    let hour = g.expires_at - g.granted_at;
+    assert_eq!(hour, time::Duration::hours(1));
+    let tx = st.store.begin().await.unwrap();
+    assert!(
+        grants::issuable(&tx, responder.id, g.id, now)
+            .await
+            .unwrap()
+            .is_ok()
+    );
+    a2a::close(&tx, thread.id, a2a::CloseReason::Closed, Some(operator.id), None, now)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let tx = st.store.begin().await.unwrap();
+    assert!(
+        grants::issuable(&tx, responder.id, g.id, now)
+            .await
+            .unwrap()
+            .is_err()
+    );
+    drop(tx);
+    assert_eq!(revoke_delegated_for_closed_threads(&st).await, 1);
+    assert_eq!(grant_of(&st, r.id).await.unwrap().status, GrantStatus::Revoked);
+}
+
 // ----------------------------------------------------------- containment
 
 #[sqlx::test(migrations = "../store/migrations")]

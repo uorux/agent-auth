@@ -6,13 +6,12 @@
 //! thread, only an open one, only from the bound session if its side is
 //! bound (a2a INV-13), and a2a access itself is never delegable.
 //!
-//! Threads opened by the operator from the admin panel cannot back a
-//! delegated request: they have no backing grant, so in the Python every
-//! such request failed at provisioning with a misleading reason (a2a B1).
-//! Whether to support it is an open question (DEVIATIONS.md); until then it
-//! is refused here, up front, with a reason that says so.
+//! Threads the operator opened from the admin panel back delegated
+//! requests too (as the Python now does): they have no backing grant, so
+//! the thread being open is the whole test, and the delegated grant is
+//! capped only by its own duration; it still ends when the thread closes
+//! (`store::grants::begin`).
 
-use agent_auth_core::containment::AgentKind;
 use agent_auth_core::{Platform, ThreadId, canonical_json};
 use agent_auth_store::a2a::{self, ThreadState};
 use agent_auth_store::{Delegation, Outcome, Tx, agents};
@@ -27,10 +26,6 @@ pub struct Resolved {
     /// `on behalf of <delegator> (a2a thread topic <json or "(none)">)`.
     pub risk_note: String,
 }
-
-/// The refusal for an operator thread (a2a B1, see the module docs).
-pub const OPERATOR_THREAD: &str = "a thread with the operator cannot back a delegated request \
-     (not supported yet); request the access on your own behalf";
 
 /// Resolve `thread` (as the client sent it) for a request on `platform`.
 /// `Ok(Err(reason))`: the request is denied (source policy) with reason
@@ -83,9 +78,6 @@ pub async fn resolve(
     else {
         return Ok(Err("delegator agent is disabled".to_owned()));
     };
-    if delegator.kind == AgentKind::Operator || t.grant_id.is_none() {
-        return Ok(Err(OPERATOR_THREAD.to_owned()));
-    }
     let topic = t.topic.as_ref().map_or_else(
         || "(none)".to_owned(),
         |s| canonical_json::to_python_default_string(&Value::String(s.clone())),

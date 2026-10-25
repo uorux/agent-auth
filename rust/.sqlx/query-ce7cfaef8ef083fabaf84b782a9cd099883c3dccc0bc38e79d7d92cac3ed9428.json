@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT (t.state = 'open'\n                       AND ((t.grant_id IS NULL\n                             AND EXISTS (SELECT 1 FROM agents o\n                                         WHERE o.id = t.initiator_agent_id\n                                           AND o.kind = 'operator'))\n                            OR EXISTS (SELECT 1 FROM grants b\n                                       WHERE b.id = t.grant_id AND b.status = 'active'\n                                         AND b.expires_at > $2))) AS \"open!\"\n               FROM a2a_threads t WHERE t.id = $1 FOR SHARE OF t",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "open!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "ce7cfaef8ef083fabaf84b782a9cd099883c3dccc0bc38e79d7d92cac3ed9428"
+}

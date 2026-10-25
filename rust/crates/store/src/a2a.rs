@@ -690,7 +690,10 @@ pub async fn list(
 }
 
 /// Events feed: the viewer's threads with activity after `after` (strict),
-/// or, without a cursor, its non-closed threads; oldest activity first.
+/// or, without a cursor, its non-closed threads; oldest activity first. A
+/// session sees its own side's threads; a sessionless caller (the
+/// dispatcher) only those no session has claimed on its side (a2a B8: a
+/// claimed thread is the worker's, and every read of it 403s here).
 pub async fn activity(
     tx: &Tx<'_>,
     viewer: Viewer,
@@ -701,8 +704,8 @@ pub async fn activity(
     let raw = sqlx::query_as!(
         RawThread,
         "SELECT * FROM a2a_threads
-         WHERE ((initiator_agent_id = $1 AND ($2::uuid IS NULL OR initiator_session_id = $2))
-             OR (responder_agent_id = $1 AND ($2::uuid IS NULL OR responder_session_id = $2)))
+         WHERE ((initiator_agent_id = $1 AND initiator_session_id IS NOT DISTINCT FROM $2::uuid)
+             OR (responder_agent_id = $1 AND responder_session_id IS NOT DISTINCT FROM $2::uuid))
            AND (CASE WHEN $3::timestamptz IS NULL THEN state <> 'closed'
                      ELSE last_activity_at > $3 END)
          ORDER BY last_activity_at, id
@@ -717,7 +720,8 @@ pub async fn activity(
     threads(raw)
 }
 
-/// Events feed with an upper bound: the viewer's threads whose activity is
+/// Events feed with an upper bound (sessions as in [`activity`]): the
+/// viewer's threads whose activity is
 /// after `after` (strict; without a cursor: its non-closed threads) and
 /// strictly before `before` (activity at or after it may still be
 /// uncommitted: a2a B3). Oldest activity first, ties by id.
@@ -732,8 +736,8 @@ pub async fn activity_before(
     let raw = sqlx::query_as!(
         RawThread,
         "SELECT * FROM a2a_threads
-         WHERE ((initiator_agent_id = $1 AND ($2::uuid IS NULL OR initiator_session_id = $2))
-             OR (responder_agent_id = $1 AND ($2::uuid IS NULL OR responder_session_id = $2)))
+         WHERE ((initiator_agent_id = $1 AND initiator_session_id IS NOT DISTINCT FROM $2::uuid)
+             OR (responder_agent_id = $1 AND responder_session_id IS NOT DISTINCT FROM $2::uuid))
            AND (CASE WHEN $3::timestamptz IS NULL THEN state <> 'closed'
                      ELSE last_activity_at > $3 END)
            AND last_activity_at < $4

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT * FROM a2a_threads\n         WHERE ((initiator_agent_id = $1 AND ($2::uuid IS NULL OR initiator_session_id = $2))\n             OR (responder_agent_id = $1 AND ($2::uuid IS NULL OR responder_session_id = $2)))\n           AND (CASE WHEN $3::timestamptz IS NULL THEN state <> 'closed'\n                     ELSE last_activity_at > $3 END)\n           AND last_activity_at < $4\n         ORDER BY last_activity_at, id\n         LIMIT $5",
+  "query": "SELECT * FROM a2a_threads\n         WHERE ((initiator_agent_id = $1 AND initiator_session_id IS NOT DISTINCT FROM $2::uuid)\n             OR (responder_agent_id = $1 AND responder_session_id IS NOT DISTINCT FROM $2::uuid))\n           AND (CASE WHEN $3::timestamptz IS NULL THEN state <> 'closed'\n                     ELSE last_activity_at > $3 END)\n           AND last_activity_at < $4\n         ORDER BY last_activity_at, id\n         LIMIT $5",
   "describe": {
     "columns": [
       {
@@ -208,5 +208,5 @@
       false
     ]
   },
-  "hash": "f18339a2b2999efa5fc513cf97afcbf921dee4419cef8487bacb30c5e7bf6d7b"
+  "hash": "083c494935718eb7fbc9516547217858c04a2bb421610d862963f8c6b253c62c"
 }

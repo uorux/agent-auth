@@ -1,17 +1,18 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT NOT disabled AS \"ok!\" FROM agents WHERE id = $1 FOR SHARE",
+  "query": "SELECT state = 'open' AS \"open!\" FROM a2a_threads\n               WHERE id = $1 AND grant_id IS NULL AND initiator_agent_id = $2 FOR SHARE",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "ok!",
+        "name": "open!",
         "type_info": "Bool",
         "origin": "Expression"
       }
     ],
     "parameters": {
       "Left": [
+        "Uuid",
         "Uuid"
       ]
     },
@@ -19,5 +20,5 @@
       null
     ]
   },
-  "hash": "e7801cfe8850a840ba792644d9b94da34c0fc8e13e055615d5d7c483b4f62284"
+  "hash": "3dfbd80bf05fd34f369c5d8f54cfc972513f305d8f85789957b1854c28e47db9"
 }

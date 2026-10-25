@@ -506,10 +506,12 @@ and why. Keep entries short. Group by area.
   `core::canonical_json::python_dumps_len`.
 - **Panel attribution** (a2a B18): a chat message's `operator` field is
   shown only on the operator's own messages.
-- **Operator-thread delegation is refused up front** (a2a B1, open
-  question below): `a2a::delegation::resolve` answers `a thread with the
-  operator cannot back a delegated request (not supported yet); request
-  the access on your own behalf`.
+- **Operator-thread delegation** (not a change: the Python's later fix, a2a
+  B1, "operator threads need no backing grant"). A request may cite an open
+  admin-panel chat thread; the delegator is the operator. With no backing
+  grant, the open thread is the whole test (`store::grants::begin`,
+  `issuable`: initiator of kind operator and no grant), the grant is capped
+  only by its own duration, and it ends when the thread closes.
 - **Legacy thread-less messages** do not exist (`a2a_messages.thread_id` is
   NOT NULL), so `test_legacy_null_thread_messages_invisible` is not ported.
 - **Resource caps** (security review #2; the Python had none):
@@ -527,9 +529,11 @@ and why. Keep entries short. Group by area.
   caller is re-checked (agent enabled, API key not rotated or OAuth token
   still live, session still open): a caller that is no longer valid gets
   the extractor's 401 mid-wait instead of further data.
-- **Not changed**: a sessionless caller still lists, and gets activity for,
-  its agent's session-bound threads (a2a B8, metadata only; every read is
-  403).
+- **The dispatcher's events skip claimed threads** (not a change: the
+  Python's later fix, a2a B8). A sessionless `/v1/a2a/events` caller gets
+  activity only for threads no session has claimed on its side (each read
+  of a claimed one is 403). `/v1/a2a/threads` still lists them (metadata
+  only), as in the Python.
 ## Agent-side programs (client, `agent-auth` CLI, stdio MCP, bridge)
 
 - **One MCP tool table** (surfaces §D.5): names, descriptions, parameters
@@ -983,14 +987,6 @@ Upstream fixes of review 2026-10, adopted:
   passes on an auto pattern** (bug 13): kept as in the Python.
 - **TOTP hard-lock thresholds** (20 wrong codes in 30 days) are a guess at
   the right balance between typos and relayed guessing; tune?
-
-- **Operator-thread delegation** (a2a B1). The README says an agent can
-  request access on the operator's behalf from an admin-panel chat thread,
-  but the Python refuses it at provisioning (such a thread has no backing
-  grant, and provisioning requires one), so it never worked. The port keeps
-  that refusal (it now fails up front with a clear reason). Allowing it
-  would mean a delegated grant capped only by its own duration and revoked
-  when the chat thread closes.
 
 - **Panel logout is client-side only** (Bug-B1, unchanged): a copied
   session cookie stays valid until its `exp` (8 h). A server-side session

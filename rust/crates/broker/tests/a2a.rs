@@ -660,6 +660,13 @@ async fn responder_session_binding(pool: PgPool) {
 
     let (_, mine) = t.get("/v1/a2a/threads", ses(&r, &worker)).await;
     assert_eq!(mine.as_array().unwrap().len(), 1);
+    // a2a B8: the dispatcher's events leave out a thread a worker claimed
+    // (every read of it would 403); the initiator, sessionless on its own
+    // side, still sees it.
+    let (_, disp) = t.get("/v1/a2a/events", ag(&r)).await;
+    assert_eq!(disp["activity"], json!([]));
+    let (_, init) = t.get("/v1/a2a/events", ag(&s)).await;
+    assert_eq!(init["activity"][0]["thread_id"], tid.as_str());
     assert_eq!(t.get("/v1/a2a/threads", ses(&r, &other)).await.1, json!([]));
 
     // The worker's parked events poll wakes on the initiator's message.
@@ -2355,8 +2362,8 @@ async fn an_agent_named_operator_blocks_the_chat_until_renamed(pool: PgPool) {
     );
 }
 
-/// a2a B1 (open question): an operator thread cannot back a delegated
-/// request; the refusal says so up front.
+/// An operator thread backs a delegated request (as the Python now does):
+/// the operator is the delegator.
 #[sqlx::test(migrations = "../store/migrations")]
 async fn delegation_rules(pool: PgPool) {
     use agent_auth_broker::a2a::delegation;
@@ -2430,7 +2437,7 @@ async fn delegation_rules(pool: PgPool) {
     };
     assert_eq!(
         call(h.clone(), format!("/r/homelab/{op_tid}")).await,
-        json!({"err": delegation::OPERATOR_THREAD})
+        json!({"ok": "on behalf of operator (a2a thread topic (none))"})
     );
     assert_eq!(
         call(h.clone(), format!("/r/homelab/{tid}")).await,
