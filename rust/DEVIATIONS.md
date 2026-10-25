@@ -363,6 +363,73 @@ and why. Keep entries short. Group by area.
 - **`/mcp` answers on the SDK's terms**: rmcp in stateless JSON mode; a
   request needs a `Host` header (every HTTP/1.1 client sends one).
 
+## a2a (broker::a2a)
+
+- **Row locks on every transition** (a2a B4). Accept, reply-accept, send,
+  reject and close load the thread `FOR UPDATE` after both participants
+  passed `lockdown::check_pair`, and re-check participant, binding and
+  state on the locked row (store lock order: agents, the backing grant,
+  then the thread). Two racing accepts: one 200, the other 409 (or 403
+  once the winner's session is bound); a send racing a close lands before
+  it or gets 409.
+- **The backing grant is checked where the message is written** (a2a
+  INV-5/6): `store::a2a::open` share-locks the grant and requires the
+  initiator's own live a2a grant for that responder name; `append`
+  share-locks the backing grant before bumping the thread. A revoke
+  either waits for the send or is seen by it; the Python checked the
+  grant before writing, without a lock.
+- **Events cursor is exact** (a2a B3). Instead of an overlap window (which
+  a timestamp-only cursor cannot dedupe without the client spinning on
+  repeats), every write of `last_activity_at` takes a stamp from an
+  in-process monotonic clock and holds it until commit; the events reader
+  only returns activity strictly below the oldest stamp still in flight
+  (`a2a::clock`). A late commit is held back for milliseconds instead of
+  being skipped; nothing is returned twice. A page of 200 never ends in
+  the middle of a run of equal timestamps. Like the wake-ups, this assumes
+  one broker process.
+- **The message long-poll does not mark the caller listening** (a2a B2):
+  only the events poll and accept set `last_listen_at`.
+- **Zones hold on open and send** (a2a B5): a zone-apart responder is
+  `404 unknown agent 'X'` on open (as in the check); a send across a zone
+  edge is 403 `a restricted zone separates you from this peer: no a2a
+  across a zone's edge`. Opening a thread to yourself is 403 `an agent
+  cannot open a thread to itself`.
+- **`/v1/a2a/check` treats a disabled peer as unknown** (a2a B6).
+- **Disabling an agent closes its threads** (a2a B7): the disable paths
+  must call `a2a::on_agent_disabled`, which closes every non-closed thread
+  on either side `peer_gone`.
+- **Held agents**: a disabled or lease-lapsed participant (core B-15) is
+  refused like a contained one: 403 `<name> is disabled: no a2a while it
+  is held` (containment keeps the Python text).
+- **Webhooks** (a2a B9, spec §4): delivered from a background task after
+  commit, failures logged (never a 500 after the state changed). URLs must
+  be `https` with a host; plain `http` only to hosts listed in
+  `A2A_WEBHOOK_HTTP_HOSTS` (Python: any http(s)). The admin routes that
+  set a URL must call `a2a::webhook::check_url` (422 `webhook_url must be
+  an https URL with a host (plain http only to the hosts in
+  A2A_WEBHOOK_HTTP_HOSTS)`); delivery re-checks. No redirects, no proxy,
+  5 s timeout, one shared client.
+- **Long-poll rounds touch liveness throttled** (a2a B10), at 20 s like the
+  extractor. Waiters with a session wake on their session key or their
+  agent key; senders wake the peer's session (if bound) and agent.
+- **Payloads**: keys come back sorted (the workspace's serde_json has no
+  `preserve_order`; the stored text is the re-serialized object). An
+  integer literal outside `-2^63..=2^64-1` is 422 `payload integers must
+  be between -2^63 and 2^64-1` (Python kept it; serde_json would round it
+  to a float). The 16 KiB cap is checked by `Payload`'s deserializer with
+  `core::canonical_json::python_dumps_len`.
+- **Panel attribution** (a2a B18): a chat message's `operator` field is
+  shown only on the operator's own messages.
+- **Operator-thread delegation is refused up front** (a2a B1, open
+  question below): `a2a::delegation::resolve` answers `a thread with the
+  operator cannot back a delegated request (not supported yet); request
+  the access on your own behalf`.
+- **Legacy thread-less messages** do not exist (`a2a_messages.thread_id` is
+  NOT NULL), so `test_legacy_null_thread_messages_invisible` is not ported.
+- **Not changed**: a sessionless caller still lists, and gets activity for,
+  its agent's session-bound threads (a2a B8, metadata only; every read is
+  403).
+
 ## Open questions
 
 (for Jacob; nothing here is implemented until decided)
@@ -383,12 +450,6 @@ and why. Keep entries short. Group by area.
 
 ## To do (engineering, tracked here until done)
 
-- Events cursor (a2a B3): `last_activity_at` from the application clock can
-  commit out of order; the reader will use an overlap window and dedupe.
-- a2a payload cap: move the `python_dumps_len` check into `wire::payload`'s
-  deserializer now that `core::canonical_json` is merged. (`float_roundtrip`
-  is now on for the workspace's serde_json, so floats count exactly;
-  integers beyond ±2^64 still become floats — refuse them in payloads.)
 - Local unix-socket protocols (hostctl, hostd-user, sandboxd local API) are
   typed in the daemon crate, not wire.
 - Python client bug to not port: `host_shell_exec` keeps waiting only if

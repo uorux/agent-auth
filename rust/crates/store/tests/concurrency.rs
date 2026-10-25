@@ -197,6 +197,7 @@ async fn concurrent_messages_get_contiguous_seqs(pool: PgPool) {
         },
     )
     .await
+    .unwrap()
     .unwrap();
     // The initiator cannot add to a pending thread.
     assert!(
@@ -214,7 +215,7 @@ async fn concurrent_messages_get_contiguous_seqs(pool: PgPool) {
         )
         .await
         .unwrap()
-        .is_none()
+        .is_err()
     );
     drop(clear);
     tx.commit().await.unwrap();
@@ -321,7 +322,7 @@ async fn concurrent_messages_get_contiguous_seqs(pool: PgPool) {
         )
         .await
         .unwrap()
-        .is_none()
+        .is_err()
     );
     assert!(
         a2a::close(&tx, thread, a2a::CloseReason::Closed, None, None, now())
@@ -508,4 +509,223 @@ async fn unpairing_cascades_and_disabling_walks_the_tree(pool: PgPool) {
         None
     );
     let _ = json!({});
+}
+
+/// An open (accepted) thread from `asker` to `doer` on a fresh grant.
+async fn accepted_thread(
+    store: &Store,
+    initiator: &agents::AgentRow,
+    responder: &agents::AgentRow,
+) -> (ThreadId, agent_auth_core::GrantId) {
+    let rid = awaiting_on(store, initiator.id, &a2a(), &responder.name, None).await;
+    let backing = active_grant(store, rid).await;
+    let thread = ThreadId::new();
+    let tx = store.begin().await.unwrap();
+    let clear = lockdown::check_pair(&tx, initiator.id, responder.id, now())
+        .await
+        .unwrap()
+        .unwrap();
+    a2a::open(
+        &tx,
+        &clear,
+        &NewThread {
+            id: thread,
+            initiator: initiator.id,
+            initiator_session: None,
+            responder: responder.id,
+            topic: None,
+            grant_id: Some(backing.id),
+            message_id: MessageId::new(),
+            payload: "{}",
+            now: now(),
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        a2a::accept(&tx, &clear, thread, None, now())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    drop(clear);
+    tx.commit().await.unwrap();
+    (thread, backing.id)
+}
+
+async fn send(
+    store: Store,
+    thread: ThreadId,
+    from: AgentId,
+    to: AgentId,
+) -> Result<a2a::MessageRow, a2a::AppendRefused> {
+    let tx = store.begin().await.unwrap();
+    let clear = lockdown::check_pair(&tx, from, to, now())
+        .await
+        .unwrap()
+        .unwrap();
+    let out = a2a::append(
+        &tx,
+        &clear,
+        &NewMessage {
+            thread_id: thread,
+            id: MessageId::new(),
+            sender: from,
+            sender_session: None,
+            payload: r#"{"n": 1}"#,
+            now: now(),
+        },
+    )
+    .await
+    .unwrap();
+    drop(clear);
+    tx.commit().await.unwrap();
+    out
+}
+
+/// a2a INV-6 under concurrency: a send racing a revoke of the backing grant
+/// either waits for the revoke and stores nothing, or stores its message
+/// while the grant is still active and makes the revoke wait.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_send_racing_a_revoke_never_lands_on_a_dead_grant(pool: PgPool) {
+    use agent_auth_store::grants::{self, GrantEnd};
+    use std::time::Duration;
+    let store = Store::from_pool(pool);
+    let i = agent(&store, "asker", AgentKind::Service).await;
+    let r = agent(&store, "doer", AgentKind::Service).await;
+
+    // The revoke takes the grant row first: the send waits, then refuses.
+    let (thread, grant) = accepted_thread(&store, &i, &r).await;
+    let revoke = store.begin().await.unwrap();
+    grants::end(
+        &revoke,
+        grant,
+        GrantEnd::Revoked {
+            reason: "test".to_owned(),
+        },
+        now(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let sending = tokio::spawn(send(store.clone(), thread, i.id, r.id));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!sending.is_finished(), "the send waits for the revoke");
+    revoke.commit().await.unwrap();
+    assert_eq!(
+        sending.await.unwrap().unwrap_err(),
+        a2a::AppendRefused::GrantNotLive
+    );
+    let tx = store.begin().await.unwrap();
+    assert_eq!(a2a::messages_after(&tx, thread, 0).await.unwrap().len(), 1);
+    drop(tx);
+
+    // The send takes it first: the revoke waits until the message is in.
+    let (thread, grant) = accepted_thread(&store, &i, &r).await;
+    let tx = store.begin().await.unwrap();
+    let clear = lockdown::check_pair(&tx, r.id, i.id, now())
+        .await
+        .unwrap()
+        .unwrap();
+    let m = a2a::append(
+        &tx,
+        &clear,
+        &NewMessage {
+            thread_id: thread,
+            id: MessageId::new(),
+            sender: r.id,
+            sender_session: None,
+            payload: "{}",
+            now: now(),
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(m.seq, 2);
+    let revoking = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            let tx = store.begin().await.unwrap();
+            let out = grants::end(
+                &tx,
+                grant,
+                GrantEnd::Revoked {
+                    reason: "test".to_owned(),
+                },
+                now(),
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+            out.is_ok()
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!revoking.is_finished(), "the revoke waits for the send");
+    drop(clear);
+    tx.commit().await.unwrap();
+    assert!(revoking.await.unwrap());
+    // And after it, nothing more lands.
+    assert_eq!(
+        send(store.clone(), thread, i.id, r.id).await.unwrap_err(),
+        a2a::AppendRefused::GrantNotLive
+    );
+}
+
+/// Opening on a grant that is not the initiator's live grant for that
+/// responder writes nothing (a2a INV-5).
+#[sqlx::test(migrations = "./migrations")]
+async fn open_refuses_a_grant_that_does_not_back_it(pool: PgPool) {
+    use agent_auth_store::grants::{self, GrantEnd};
+    let store = Store::from_pool(pool);
+    let i = agent(&store, "asker", AgentKind::Service).await;
+    let r = agent(&store, "doer", AgentKind::Service).await;
+    let other = agent(&store, "other", AgentKind::Service).await;
+    // A live grant, but for another responder.
+    let rid = awaiting_on(&store, i.id, &a2a(), "other", None).await;
+    let elsewhere = active_grant(&store, rid).await;
+    // A grant for this responder, revoked.
+    let rid = awaiting_on(&store, i.id, &a2a(), "doer", None).await;
+    let revoked = active_grant(&store, rid).await;
+    let tx = store.begin().await.unwrap();
+    grants::end(
+        &tx,
+        revoked.id,
+        GrantEnd::Revoked {
+            reason: "x".to_owned(),
+        },
+        now(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tx.commit().await.unwrap();
+    let _ = other;
+    for g in [elsewhere.id, revoked.id] {
+        let tx = store.begin().await.unwrap();
+        let clear = lockdown::check_pair(&tx, i.id, r.id, now())
+            .await
+            .unwrap()
+            .unwrap();
+        let out = a2a::open(
+            &tx,
+            &clear,
+            &NewThread {
+                id: ThreadId::new(),
+                initiator: i.id,
+                initiator_session: None,
+                responder: r.id,
+                topic: None,
+                grant_id: Some(g),
+                message_id: MessageId::new(),
+                payload: "{}",
+                now: now(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.unwrap_err(), a2a::GrantNotLive);
+    }
 }

@@ -161,12 +161,15 @@ impl Registry {
 pub enum AnyProvisioner {
     /// Test double: accepts everything, records nothing external.
     Fake(FakeProvisioner),
+    /// Check-based agent-to-agent grants (`crate::a2a::provisioner`).
+    A2a(crate::a2a::provisioner::A2aProvisioner),
 }
 
 macro_rules! dispatch {
     ($self:ident, $p:ident => $e:expr) => {
         match $self {
             AnyProvisioner::Fake($p) => $e,
+            AnyProvisioner::A2a($p) => $e,
         }
     };
 }
