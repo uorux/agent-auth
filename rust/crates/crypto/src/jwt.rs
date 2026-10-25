@@ -9,6 +9,15 @@
 //!   signing key v1 (ES256)", 48 bytes)`, `d = int(okm) mod (n − 1) + 1`.
 //! - [`GitHubAppKey`]: the RS256 JWT a GitHub App authenticates with
 //!   (`iat` = now − 60, `exp` = now + 540, `iss` = the app id).
+//!
+//! # A token's identity is its `jti`
+//!
+//! ECDSA signatures are malleable: `(r, s)` and `(r, n − s)` both verify,
+//! so the same claims can be presented as two different strings. This
+//! module signs with low `s` only and refuses high `s`, which removes that
+//! particular variant, but anything that remembers tokens (a cache, a
+//! revocation or replay set, a log join) must key on the verified `jti`
+//! (or the grant), never on the token text.
 
 use std::fmt;
 
@@ -118,6 +127,61 @@ fn p256_scalar_from_okm(okm: &[u8; 48]) -> [u8; 32] {
     }
     r.zeroize();
     out
+}
+
+/// P-256's group order n, little-endian limbs.
+const N: [u64; 4] = [
+    0xF3B9_CAC2_FC63_2551,
+    0xBCE6_FAAD_A717_9E84,
+    0xFFFF_FFFF_FFFF_FFFF,
+    0xFFFF_FFFF_0000_0000,
+];
+
+/// ⌊n / 2⌋: an `s` above this is "high".
+const N_HALF: [u64; 4] = [
+    0x79DC_E561_7E31_92A8,
+    0xDE73_7D56_D38B_CF42,
+    0x7FFF_FFFF_FFFF_FFFF,
+    0x7FFF_FFFF_8000_0000,
+];
+
+fn limbs_from_be(bytes: &[u8; 32]) -> [u64; 4] {
+    let (chunks, _) = bytes.as_chunks::<8>();
+    let mut out = [0u64; 4];
+    for (limb, chunk) in out.iter_mut().zip(chunks.iter().rev()) {
+        *limb = u64::from_be_bytes(*chunk);
+    }
+    out
+}
+
+fn be_from_limbs(limbs: &[u64; 4]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let (chunks, _) = out.as_chunks_mut::<8>();
+    for (chunk, limb) in chunks.iter_mut().zip(limbs.iter().rev()) {
+        *chunk = limb.to_be_bytes();
+    }
+    out
+}
+
+/// Whether the `s` half of a fixed-length (r ‖ s) signature exceeds n / 2.
+fn is_high_s(sig: &[u8]) -> bool {
+    let Some(s) = sig.get(32..64).and_then(|s| <&[u8; 32]>::try_from(s).ok()) else {
+        return false;
+    };
+    sub_256(&N_HALF, &limbs_from_be(s)).1 == 1
+}
+
+/// Replaces a high `s` by n − s (the same signature, canonical form).
+fn to_low_s(sig: &mut [u8]) {
+    if !is_high_s(sig) {
+        return;
+    }
+    if let Some(s) = sig
+        .get_mut(32..64)
+        .and_then(|s| <&mut [u8; 32]>::try_from(s).ok())
+    {
+        *s = be_from_limbs(&sub_256(&N, &limbs_from_be(s)).0);
+    }
 }
 
 /// `a − b` mod 2²⁵⁶ and the final borrow (1 if `a < b`).
@@ -257,12 +321,15 @@ impl TokenIssuer {
             b64url_encode(header.to_string().as_bytes()),
             b64url_encode(Value::Object(payload).to_string().as_bytes())
         );
-        let sig = self
+        let mut sig = self
             .pair
             .sign(&SystemRandom::new(), signing_input.as_bytes())
-            .map_err(|_| JwtError::Sign)?;
+            .map_err(|_| JwtError::Sign)?
+            .as_ref()
+            .to_vec();
+        to_low_s(&mut sig);
         Ok((
-            Secret::new(format!("{signing_input}.{}", b64url_encode(sig.as_ref()))),
+            Secret::new(format!("{signing_input}.{}", b64url_encode(&sig))),
             expires,
         ))
     }
@@ -292,6 +359,9 @@ impl TokenIssuer {
             return Err(token_err("The specified alg value is not allowed"));
         }
         let sig = b64url_decode(s64).ok_or_else(|| token_err("Invalid crypto padding"))?;
+        if is_high_s(&sig) {
+            return Err(token_err("Signature verification failed"));
+        }
         let signing_input = token
             .get(..h64.len().saturating_add(1).saturating_add(p64.len()))
             .ok_or_else(|| token_err("Not enough segments"))?;
@@ -506,6 +576,20 @@ mod tests {
                 .0,
             "The token is not yet valid (iat)"
         );
+        // The same signature with s → n − s verifies under plain ECDSA but
+        // is refused here.
+        let parts: Vec<&str> = s(&v["python_token"]).split('.').collect();
+        let mut sig = crate::b64url_decode(parts[2]).unwrap();
+        let flipped = be_from_limbs(&sub_256(&N, &limbs_from_be(sig[32..].try_into().unwrap())).0);
+        sig[32..].copy_from_slice(&flipped);
+        assert!(is_high_s(&sig));
+        let malleated = format!("{}.{}.{}", parts[0], parts[1], b64url_encode(&sig));
+        assert_eq!(
+            t.verify(&malleated, s(&v["audience"]), now).unwrap_err().0,
+            "Signature verification failed"
+        );
+        to_low_s(&mut sig);
+        assert_eq!(b64url_encode(&sig), parts[2]);
         // Also the token this crate minted once, which the Python verified.
         let rust = include_str!("../tests/vectors/rust_es256_token.txt").trim();
         assert!(t.verify(rust, s(&v["audience"]), now).is_ok());
@@ -532,6 +616,28 @@ mod tests {
             "/tests/vectors/rust_es256_token.txt"
         );
         std::fs::write(path, token.expose().clone() + "\n").unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn mints_low_s_only() {
+        let t = issuer();
+        for _ in 0..32 {
+            let (token, _) = t.mint("a", "b", 60, &Map::new(), 1_000).unwrap();
+            let sig = crate::b64url_decode(token.expose().rsplit('.').next().unwrap()).unwrap();
+            assert!(!is_high_s(&sig));
+        }
+    }
+
+    #[test]
+    fn low_s_boundary() {
+        let mut sig = [0u8; 64];
+        sig[32..].copy_from_slice(&be_from_limbs(&N_HALF));
+        assert!(!is_high_s(&sig));
+        sig[63] += 1;
+        assert!(is_high_s(&sig));
+        to_low_s(&mut sig);
+        assert_eq!(&sig[32..], &be_from_limbs(&N_HALF));
     }
 
     #[test]

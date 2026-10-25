@@ -100,16 +100,58 @@ fn write_new(tmp: &Path, text: &str) -> io::Result<()> {
     f.sync_all()
 }
 
+/// `open(2)` flags std has no names for (values from each OS's headers;
+/// no libc). `O_NOFOLLOW` refuses a symlink at the last component;
+/// `O_NONBLOCK` keeps a FIFO swapped in for the key from hanging the open.
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "s390x"
+    )
+))]
+mod oflags {
+    pub const O_NOFOLLOW: i32 = 0o400_000;
+    pub const O_NONBLOCK: i32 = 0o4_000;
+}
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "powerpc64",
+        target_arch = "powerpc"
+    )
+))]
+mod oflags {
+    pub const O_NOFOLLOW: i32 = 0o100_000;
+    pub const O_NONBLOCK: i32 = 0o4_000;
+}
+#[cfg(target_os = "macos")]
+mod oflags {
+    pub const O_NOFOLLOW: i32 = 0x0100;
+    pub const O_NONBLOCK: i32 = 0x0004;
+}
+
 fn load(path: &Path, parent: &Path) -> Result<SigningKey, KeyFileError> {
-    // No O_NOFOLLOW without libc: refuse a symlink by lstat, then make sure
-    // the file opened is that same inode (a swap in between is caught).
-    let link = fs::symlink_metadata(path).map_err(io_err(path))?;
-    if !link.file_type().is_file() {
-        return Err(KeyFileError::NotRegular(path.to_owned()));
-    }
-    let mut file = File::open(path).map_err(io_err(path))?;
+    let opened = OpenOptions::new()
+        .read(true)
+        .custom_flags(oflags::O_NOFOLLOW | oflags::O_NONBLOCK)
+        .open(path);
+    let mut file = match opened {
+        Ok(f) => f,
+        // ELOOP from O_NOFOLLOW: say what it means.
+        Err(_) if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) => {
+            return Err(KeyFileError::NotRegular(path.to_owned()));
+        }
+        Err(e) => return Err(io_err(path)(e)),
+    };
+    // Everything is decided on the opened file, not the path.
     let meta = file.metadata().map_err(io_err(path))?;
-    if !meta.file_type().is_file() || meta.dev() != link.dev() || meta.ino() != link.ino() {
+    if !meta.file_type().is_file() {
         return Err(KeyFileError::NotRegular(path.to_owned()));
     }
     let euid = effective_uid(parent)?;
@@ -229,6 +271,18 @@ mod tests {
         std::os::unix::fs::symlink(dir.join("nowhere"), &dangling).unwrap();
         assert!(load_or_create_key(&dangling).is_err());
         assert!(!dir.join("nowhere").exists());
+        // A FIFO in place of the key is refused at once (no hang on open).
+        let fifo = dir.join("fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        fs::set_permissions(&fifo, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            load_or_create_key(&fifo),
+            Err(KeyFileError::NotRegular(_))
+        ));
         fs::remove_dir_all(dir).unwrap();
     }
 
