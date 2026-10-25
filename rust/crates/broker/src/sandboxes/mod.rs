@@ -21,6 +21,8 @@
 pub mod agents;
 pub mod project;
 #[cfg(test)]
+mod sandboxd_tests;
+#[cfg(test)]
 pub(crate) mod testkit;
 #[cfg(test)]
 mod tests;

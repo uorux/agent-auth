@@ -407,7 +407,7 @@ impl<H: Host> Sandboxd<H> {
 
     /// What queued up, delivered as one text (after a hold is lifted, a
     /// TUI ended, or a retry is due).
-    pub(crate) async fn deliver_queued(&self, conv_id: &ConvId) {
+    pub async fn deliver_queued(&self, conv_id: &ConvId) {
         let Some(conv) = self.store.conversation(conv_id) else {
             return;
         };
@@ -564,6 +564,23 @@ impl<H: Host> Sandboxd<H> {
             }
         }
         tracing::info!("parked conversation {conv_id}");
+    }
+
+    /// Stop the conversation's process (it holds a broker session that is
+    /// gone); the next message starts a new one with the new session.
+    pub(crate) async fn retire_run(&self, conv_id: &ConvId) {
+        let lv = self.live(conv_id);
+        let _op = lv.op.lock().await;
+        lv.cancel_park();
+        let taken = locked(&lv.run).take();
+        if let Some((run, _slot)) = taken {
+            run.stop(&self.host).await;
+            let _ = self.store.update_conversation(conv_id, |c| {
+                if c.state == ConvState::Running {
+                    c.state = ConvState::Parked;
+                }
+            });
+        }
     }
 
     /// End a conversation: its TUI and process stop, its broker session

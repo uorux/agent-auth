@@ -20,7 +20,7 @@
 mod conversations;
 mod gateway;
 mod projects;
-mod routing;
+pub mod routing;
 pub mod slots;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -71,6 +71,9 @@ pub enum SbxError {
     Runtime(String),
     #[error("{0}")]
     Internal(String),
+    /// The broker refused the agent's key (401).
+    #[error("{0}")]
+    Unauthorized(String),
 }
 
 impl SbxError {
@@ -78,7 +81,7 @@ impl SbxError {
     #[must_use]
     pub fn api_text(&self) -> String {
         match self {
-            SbxError::Internal(m) => format!("internal error: {m}"),
+            SbxError::Internal(m) | SbxError::Unauthorized(m) => format!("internal error: {m}"),
             SbxError::Lookup(m) | SbxError::Value(m) | SbxError::Runtime(m) => m.clone(),
         }
     }
@@ -87,7 +90,7 @@ impl SbxError {
     /// thread instead of retrying)?
     #[must_use]
     pub fn refuses(&self) -> bool {
-        !matches!(self, SbxError::Internal(_))
+        !matches!(self, SbxError::Internal(_) | SbxError::Unauthorized(_))
     }
 }
 
@@ -105,7 +108,11 @@ impl From<HostError> for SbxError {
 
 impl From<agent_auth_client::ClientError> for SbxError {
     fn from(e: agent_auth_client::ClientError) -> Self {
-        SbxError::Internal(e.to_string())
+        if e.status() == Some(401) && !e.is_stale_session() {
+            SbxError::Unauthorized(e.to_string())
+        } else {
+            SbxError::Internal(e.to_string())
+        }
     }
 }
 

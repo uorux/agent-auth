@@ -205,7 +205,7 @@ impl<H: Host> Sandboxd<H> {
     /// read back); the owner keeps its own unless the operator replaced
     /// the shared login since the last sync. Nothing trusts the project's
     /// mtimes.
-    pub(crate) async fn codex_sync_into(&self, project: Option<&str>, uid: u32) {
+    pub async fn codex_sync_into(&self, project: Option<&str>, uid: u32) {
         let Some(shared) = self.shared_codex_auth() else {
             return;
         };
@@ -257,7 +257,7 @@ impl<H: Host> Sandboxd<H> {
 
     /// After a codex process parked: only the designated owner project's
     /// login (a refreshed token) goes back to the shared one.
-    pub(crate) async fn codex_sync_back(&self, project: Option<&str>, uid: u32) {
+    pub async fn codex_sync_back(&self, project: Option<&str>, uid: u32) {
         if !self.is_codex_owner(project) {
             return;
         }

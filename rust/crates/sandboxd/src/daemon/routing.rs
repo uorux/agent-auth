@@ -164,6 +164,13 @@ impl<H: Host> Sandboxd<H> {
                 let thread = ThreadView::from(t);
                 match self.route_open(&rec, &thread).await {
                     Ok(()) => {}
+                    Err(SbxError::Unauthorized(_)) => {
+                        // This agent's key is refused: the open waits for
+                        // the new key (this task restarts with it).
+                        self.key_lost(&agent).await;
+                        self.wait_for_a_key(KEY_WAIT).await;
+                        break;
+                    }
                     Err(e) if e.refuses() => {
                         // Can't be served here (no runtime for this agent,
                         // …): tell the initiator now rather than retrying.
@@ -238,10 +245,28 @@ impl<H: Host> Sandboxd<H> {
     /// text waits in the conversation's queue and is tried again.
     async fn claim(&self, conv: &Conversation, thread: &ThreadView) -> SbxResult<()> {
         let rec = self.agent_record(&conv.agent)?;
-        let sid = self.ensure_session(conv).await?;
-        self.client(&rec, Some(&sid))
+        let mut sid = self.ensure_session(conv).await?;
+        let accepted = self
+            .client(&rec, Some(&sid))
             .a2a_accept(&thread.thread_id)
-            .await?;
+            .await;
+        match accepted {
+            Ok(_) => {}
+            // The broker ended the session and the watcher has not seen it
+            // yet: a new one (B-9).
+            Err(e) if e.is_stale_session() => {
+                self.forget_session(&conv.id, &sid);
+                // Its process talks to the broker with the dead session.
+                self.retire_run(&conv.id).await;
+                let mut fresh = conv.clone();
+                fresh.broker_session_id = None;
+                sid = self.ensure_session(&fresh).await?;
+                self.client(&rec, Some(&sid))
+                    .a2a_accept(&thread.thread_id)
+                    .await?;
+            }
+            Err(e) => return Err(e.into()),
+        }
         self.store.bind_thread(
             &thread.thread_id,
             &conv.id,
@@ -263,6 +288,15 @@ impl<H: Host> Sandboxd<H> {
             );
         }
         Ok(())
+    }
+
+    /// The conversation's session `sid` is gone at the broker.
+    pub(crate) fn forget_session(&self, conv: &ConvId, sid: &str) {
+        let _ = self.store.update_conversation(conv, |c| {
+            if c.broker_session_id.as_deref() == Some(sid) {
+                c.broker_session_id = None;
+            }
+        });
     }
 
     /// The agent's open conversations that already talk to this peer, or
@@ -504,11 +538,8 @@ impl<H: Host> Sandboxd<H> {
                     // threads are gone with it. A new one is made when the
                     // conversation is next used (B-9).
                     tracing::info!("conversation {conv_id} lost its broker session");
-                    let _ = self.store.update_conversation(&conv_id, |c| {
-                        if c.broker_session_id.as_deref() == Some(&sid) {
-                            c.broker_session_id = None;
-                        }
-                    });
+                    self.forget_session(&conv_id, &sid);
+                    self.retire_run(&conv_id).await;
                     return;
                 }
                 Err(e) if is_unauthorized(&e) => {

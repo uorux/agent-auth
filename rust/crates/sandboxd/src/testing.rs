@@ -49,6 +49,10 @@ pub struct FakeHost {
     pub frozen: Mutex<Vec<(String, bool)>>,
     /// What triage answers (`new` if unset).
     pub triage_answer: Mutex<Option<String>>,
+    /// Starting a headless process fails with this, while set.
+    pub fail_start: Mutex<Option<String>>,
+    /// The next headless start waits for this before it returns.
+    pub start_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     units: Mutex<HashMap<String, Unit>>,
 }
 
@@ -115,6 +119,8 @@ impl FakeHost {
             chowns: Mutex::new(Vec::new()),
             frozen: Mutex::new(Vec::new()),
             triage_answer: Mutex::new(None),
+            fail_start: Mutex::new(None),
+            start_gate: Mutex::new(None),
             units: Mutex::new(HashMap::new()),
         }
     }
@@ -293,6 +299,9 @@ impl Host for FakeHost {
     }
 
     async fn start_piped(&self, spec: &UnitSpec) -> Result<Piped, HostError> {
+        if let Some(why) = lock(&self.fail_start).clone() {
+            return Err(HostError(why));
+        }
         let (stdin_w, stdin_r) = tokio::io::duplex(1 << 20);
         let (stdout_w, stdout_r) = tokio::io::duplex(1 << 20);
         let (exit, reporter) = ProcExit::channel();
@@ -308,6 +317,10 @@ impl Host for FakeHost {
             reporter.exited(Some(0));
         });
         lock(&self.units).insert(spec.name.clone(), Unit::Fake(task.abort_handle()));
+        let gate = lock(&self.start_gate).take();
+        if let Some(gate) = gate {
+            let _ = gate.await;
+        }
         Ok(Piped {
             stdin: Box::pin(stdin_w),
             stdout: Box::pin(stdout_r),
@@ -395,6 +408,21 @@ impl Host for FakeHost {
                 (out.status.code().unwrap_or(-1), text)
             }
             Err(e) => (-1, e.to_string()),
+        }
+    }
+}
+
+impl Drop for FakeHost {
+    fn drop(&mut self) {
+        // Real processes (tmux servers) must not outlive a failed test.
+        for unit in lock(&self.units).values() {
+            if let Unit::Process(_, pid) = unit
+                && *pid != 0
+            {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", "--", &format!("-{pid}")])
+                    .status();
+            }
         }
     }
 }

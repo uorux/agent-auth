@@ -58,4 +58,5 @@ ring.workspace = true
 proptest.workspace = true
 agent-auth-daemon.workspace = true
 agent-auth-hostd.workspace = true
+agent-auth-sandboxd = { workspace = true, features = ["testing"] }
 tokio-tungstenite.workspace = true
