@@ -300,6 +300,69 @@ and why. Keep entries short. Group by area.
   exclusively, so it waits for in-flight checks rather than deadlocking
   with a provisioning (reproduced with psql and in a test).
 
+## Admin panel, OAuth server, remote MCP (broker `webui`, `oauth`, `remote_mcp`)
+
+- **Cookies are sealed with ChaCha20-Poly1305, not Fernet** (surfaces §B.2).
+  `SecretBox` under an HKDF-derived key (same info string), with the kind
+  bound into the associated data and the issue time inside; the age is
+  checked as Fernet's TTL was. The panel's cookies are `__Host-aa_ui` and
+  `__Host-aa_ui_login` (Path=/), the OAuth ones `__Secure-aa_oauth_login`
+  and `__Secure-aa_oauth_consent` (Path=/oauth), so a browser refuses them
+  unless Secure and (for `__Host-`) host-only. Python-issued cookies are not
+  read (they expire within 8 h).
+- **Default ports in `Host`** (Bug-B2): `Host: panel.example:443` is the
+  panel's own address; any other port still is not.
+- **CSRF compares bytes** (Bug-B3): a non-ASCII `X-CSRF-Token` is a 403,
+  not a 500.
+- **The session cookie is looked at only without an `Authorization`
+  header** (§B.6). The Python also took it with a non-Bearer
+  `Authorization` header.
+- **An ID token signed with a key the provider does not publish** is
+  "the provider's ID token did not check out", as the spec says (the Python
+  actually showed "...signed with a key the provider does not publish").
+  The key's type must fit the token's `alg`, and a key naming an `alg`
+  must name the token's.
+- **Provider replies are bounded** (1 MiB) and a user name is cut at 128
+  characters.
+- **Registration refuses redirect URIs over 512 characters** (Bug-C7:
+  400 `invalid_redirect_uri`, "redirect_uris: at most 512 characters each";
+  the Python stored them and Postgres answered 500), and `/oauth/authorize`
+  refuses a `state` over 1024 characters (a page: "state: at most 1024
+  characters"; it is sealed into a cookie, which browsers drop past ~4 KiB).
+- **Clients nobody authorized expire** (Bug-C6): an unbound client is
+  "unknown client" one hour after registering, and such clients (with no
+  tokens) are deleted at the next registration, so they no longer fill
+  `max_clients` for good. No rate limit yet.
+- **Codes and refresh tokens are consumed atomically** (Bug-C2,
+  `store::oauth::consume`): of concurrent exchanges of one code exactly one
+  succeeds; the others see a replay and revoke the family (including what
+  the winner got), durably.
+- **A code exchange checks the agent is enabled** too ("the connector's
+  agent is disabled"; the Python checked only at refresh).
+- **`get_credential` is never served on `/mcp`**, even if listed in
+  `remote_mcp.tools` (a warning at startup). The agent API must also refuse
+  a connector's token on the credential route (spine; Bug-C1).
+- **Tools call the agent API in process** (the `/v1` router through
+  `tower::oneshot`) with the connector's own token, instead of over HTTP on
+  `REMOTE_MCP_LOOPBACK_URL` (no longer read). `create_session` and
+  `close_session` act as the connector (Bug-C3).
+- **Remote sessions are kept per OAuth family** (Bug-C4), not per access
+  token: a refresh keeps the conversation's session and its threads. Kept
+  sessions are touched every 240 s while the connector has called within
+  one `access_ttl`; at most 1000 are kept (least recently used dropped, not
+  all cleared). A stale-session retry happens only for a session minted
+  here, never one the caller named.
+- **Only real waits are capped at 50 s**: `timeout_secs` of
+  `wait_for_decision`, `wait` of `a2a_poll`/`a2a_events`, `wait_secs` of
+  the host tools. The Python also capped `host_run`'s `timeout_secs` (the
+  command's own timeout) to 50 and always added the rerun note there.
+- **The OAuth pages' CSP allows their one style block by hash**
+  (`style-src 'sha256-…'`) instead of any inline style.
+- **Tool results** are pretty-printed by serde (non-ASCII is not escaped)
+  and a broker error with an empty body reports the status's reason phrase.
+- **`/mcp` answers on the SDK's terms**: rmcp in stateless JSON mode; a
+  request needs a `Host` header (every HTTP/1.1 client sends one).
+
 ## Open questions
 
 (for Jacob; nothing here is implemented until decided)
@@ -311,6 +374,12 @@ and why. Keep entries short. Group by area.
   that refusal (it now fails up front with a clear reason). Allowing it
   would mean a delegated grant capped only by its own duration and revoked
   when the chat thread closes.
+
+- **Panel logout is client-side only** (Bug-B1, unchanged): a copied
+  session cookie stays valid until its `exp` (8 h). A server-side session
+  table or a per-user generation would allow "sign out everywhere".
+- **Consent can merge identities** (Bug-C5, unchanged): a new connector
+  whose name normalizes to an existing `web-*` agent binds to it silently.
 
 ## To do (engineering, tracked here until done)
 

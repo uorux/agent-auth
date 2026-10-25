@@ -10,11 +10,16 @@
 //! - `events`: subscribe-first wake-ups for long-polls.
 //! - `notify`: the human surface (`Notifier`).
 //! - `provisioners`: the contract, the registry, one module per platform.
+//! - `webui`: the admin panel (`/ui`) and its OpenID sign-in; `oauth`: the
+//!   OAuth server for web-UI connectors; `remote_mcp`: `/mcp` for them.
 
 pub mod auth;
 pub mod error;
 pub mod events;
 pub mod notify;
+pub mod oauth;
 pub mod provisioners;
+pub mod remote_mcp;
 pub mod security_log;
 pub mod state;
+pub mod webui;

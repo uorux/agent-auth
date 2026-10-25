@@ -111,6 +111,30 @@ impl SecretBox {
         })
     }
 
+    /// A key of its own for another purpose, derived from the base64 key
+    /// text: HKDF-SHA256 (no salt, `info`, 32 bytes) over the 32 key bytes.
+    /// The admin panel seals its cookies with one, so a cookie is never a
+    /// stored credential's ciphertext, nor the other way round.
+    pub fn derived(master: &str, info: &[u8]) -> Result<Self, KeyError> {
+        struct Len32;
+        impl ring::hkdf::KeyType for Len32 {
+            fn len(&self) -> usize {
+                32
+            }
+        }
+        let mut raw = decode_key32(master).ok_or(KeyError)?;
+        let prk = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, &[]).extract(&raw);
+        raw.zeroize();
+        let mut okm = [0u8; 32];
+        let infos = [info];
+        prk.expand(&infos, Len32)
+            .and_then(|o| o.fill(&mut okm))
+            .map_err(|_| KeyError)?;
+        let made = Self::from_bytes(&okm);
+        okm.zeroize();
+        made
+    }
+
     /// A new key as text for `ENCRYPTION_KEY` (URL-safe base64 with
     /// padding, 44 characters: the `gen-key` command).
     pub fn generate_key() -> Result<Secret<String>, RandomError> {
@@ -204,6 +228,24 @@ mod tests {
 
     fn boxed() -> SecretBox {
         SecretBox::from_bytes(&[42u8; 32]).unwrap()
+    }
+
+    /// HKDF-SHA256 as Python's `cryptography` computes it (salt none).
+    #[test]
+    fn derived_key_is_hkdf() {
+        let master = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
+        let derived = SecretBox::derived(master, b"agent-auth admin panel session").unwrap();
+        let okm: [u8; 32] =
+            hex::decode("edd675abe2f7dbc33464f17ae5081b0778b04fd3325be185ab61a766d5b0c9e6")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let expected = SecretBox::from_bytes(&okm).unwrap();
+        let sealed = derived.seal(b"x", &B).unwrap();
+        assert_eq!(expected.open(&sealed, &B).unwrap().expose(), b"x");
+        let master_box = SecretBox::from_base64(master).unwrap();
+        assert!(master_box.open(&sealed, &B).is_err());
+        assert!(SecretBox::derived("short", b"i").is_err());
     }
 
     const B: Binding<'static> = Binding {

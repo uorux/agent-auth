@@ -9,6 +9,8 @@
 //! - [`webhook`]: the `X-Agent-Auth-Signature` HMAC on outbound webhooks.
 //! - [`jwt`]: the broker's own ES256 tokens (derived from its Ed25519 key)
 //!   and GitHub App RS256 JWTs.
+//! - [`oidc`]: verifying an OpenID provider's ID token against its JWKS
+//!   (RS256, ES256), for the admin panel's sign-in.
 //! - [`daemon`]: the broker/daemon channel (keys, pairing, hello, signed
 //!   envelopes), wire-compatible with the Python daemons.
 //! - [`totp`]: RFC 6238 codes as hostd checks them.
@@ -21,6 +23,7 @@ pub mod daemon;
 pub mod digest;
 mod encoding;
 pub mod jwt;
+pub mod oidc;
 pub mod pem;
 mod rng;
 mod secret;
@@ -29,7 +32,7 @@ pub mod totp;
 pub mod webhook;
 
 pub use encoding::{b64url_decode, b64url_encode};
-pub use rng::RandomError;
+pub use rng::{RandomError, token_urlsafe};
 pub use secret::{Secret, ct_eq, ct_eq_hashed};
 
 /// Known-answer vectors produced by the Python implementation

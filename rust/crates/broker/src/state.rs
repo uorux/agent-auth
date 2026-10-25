@@ -17,6 +17,7 @@ use crate::events::KeyedEvents;
 use crate::notify::Notifier;
 use crate::provisioners::Registry;
 use crate::security_log::SecurityLog;
+use crate::webui::Web;
 
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -28,6 +29,8 @@ pub struct AppState {
     pub request_events: Arc<KeyedEvents<RequestId>>,
     pub auth: Arc<AuthConfig>,
     pub security_log: Arc<SecurityLog>,
+    /// The admin panel, the OAuth server and `/mcp` (`webui::install`).
+    pub web: Arc<Web>,
 }
 
 impl AppState {
@@ -52,6 +55,7 @@ impl AppState {
             request_events: Arc::default(),
             auth: Arc::new(auth),
             security_log: Arc::default(),
+            web: Arc::default(),
         }
     }
 }

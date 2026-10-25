@@ -18,6 +18,14 @@ pub(crate) fn array<const N: usize>() -> Result<[u8; N], RandomError> {
     Ok(out)
 }
 
+/// `secrets.token_urlsafe(nbytes)`: `nbytes` random bytes in URL-safe
+/// base64 without padding (state, nonces, OAuth tokens, CSRF tokens).
+pub fn token_urlsafe(nbytes: usize) -> Result<String, RandomError> {
+    let mut buf = vec![0u8; nbytes];
+    fill(&mut buf)?;
+    Ok(crate::encoding::b64url_encode(&buf))
+}
+
 /// A random version-4 UUID, as 16 bytes.
 pub(crate) fn uuid4() -> Result<[u8; 16], RandomError> {
     let mut b: [u8; 16] = array()?;
