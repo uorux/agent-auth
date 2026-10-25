@@ -46,7 +46,9 @@ impl HostExec {
         .map_err(|r| GateRefusal(format!("rejected by validator: {}", r.0)))?;
         let host = validated.resource;
         let Authority::Hostexec(h) = &validated.authority else {
-            return Err(GateRefusal("rejected by validator: not a host command".into()));
+            return Err(GateRefusal(
+                "rejected by validator: not a host command".into(),
+            ));
         };
         match h {
             HostexecAuthority::Shell { tier } => {
@@ -120,4 +122,55 @@ impl HostExec {
         }
         Ok(())
     }
+}
+
+/// The spine's approval gate for platform hostexec: the final resource and
+/// authority as `decide` will validate them (the human's edits applied),
+/// the duration it will approve, and the TOTP code to relay.
+#[must_use]
+pub fn approval_gate_hook(hostexec: std::sync::Arc<HostExec>) -> crate::service::ApprovalGate {
+    std::sync::Arc::new(move |st, request, _agent, decision| {
+        let hostexec = std::sync::Arc::clone(&hostexec);
+        Box::pin(async move {
+            let current = request
+                .authority
+                .clone()
+                .ok_or_else(|| "request has no authority".to_owned())?;
+            let resource = decision
+                .resource_override
+                .clone()
+                .unwrap_or_else(|| request.resource.clone());
+            let authority = match &decision.scope_override {
+                Some(scope) => Authority::from_wire(request.platform, &current.capability(), scope)
+                    .map_err(|e| format!("edited approval rejected by validator: {e}"))?,
+                None => current,
+            };
+            // As `decide` computes the approved duration.
+            let max = agent_auth_core::DurationSecs::MAX.get();
+            let duration = match decision.duration_secs {
+                Some(d) => d,
+                None => st
+                    .policy
+                    .cap_duration(
+                        agent_auth_core::DurationSecs::from_secs(i64::from(
+                            request.requested_duration_secs.clamp(1, max),
+                        ))
+                        .unwrap_or(agent_auth_core::DurationSecs::MAX),
+                        None,
+                    )
+                    .get(),
+            }
+            .clamp(1, HUMAN_MAX_DURATION_SECS);
+            hostexec
+                .approval_gate(
+                    request.id,
+                    &resource,
+                    &authority,
+                    duration,
+                    decision.totp.as_deref(),
+                )
+                .await
+                .map_err(|e| e.0)
+        })
+    })
 }

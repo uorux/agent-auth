@@ -23,8 +23,11 @@ impl HostExec {
         if peer.role() != Role::Host {
             return;
         }
-        let Incoming::Message(HostToBroker::JobOutput(JobOutput { job_id, chunk, data })) =
-            parse::<HostToBroker>(body)
+        let Incoming::Message(HostToBroker::JobOutput(JobOutput {
+            job_id,
+            chunk,
+            data,
+        })) = parse::<HostToBroker>(body)
         else {
             return;
         };
@@ -148,9 +151,11 @@ impl HostExec {
         }
         .await;
         match request {
-            Ok(Some(r)) => self.notifier.job_finished(r.row(), job).await,
+            Ok(Some(r)) => self.notifier().job_finished(r.row(), job).await,
             Ok(None) => {}
-            Err(e) => tracing::error!(job = %job.id, error = %e, "job_finished: request not loaded"),
+            Err(e) => {
+                tracing::error!(job = %job.id, error = %e, "job_finished: request not loaded")
+            }
         }
     }
 

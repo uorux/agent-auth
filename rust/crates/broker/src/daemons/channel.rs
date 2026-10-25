@@ -6,15 +6,14 @@ use std::time::Duration;
 
 use agent_auth_core::DaemonId;
 use agent_auth_crypto::daemon::{
-    DaemonId as ChannelId, DaemonName, EnvelopeVerifier, Handshake, Nonce, PublicKey, Role,
-    Speaker,
+    DaemonId as ChannelId, DaemonName, EnvelopeVerifier, Handshake, Nonce, PublicKey, Role, Speaker,
 };
 use agent_auth_store::daemons::{self, DaemonRole};
 use agent_auth_wire::daemon::channel::{Heartbeat, Reply};
 use agent_auth_wire::daemon::handshake::{HelloParams, version_ok};
 use axum::extract::ws::{Message, WebSocket};
-use futures::stream::{SplitStream, StreamExt as _};
 use futures::SinkExt as _;
+use futures::stream::{SplitStream, StreamExt as _};
 use serde_json::{Map, Value, json};
 use tokio::sync::watch;
 
@@ -91,7 +90,10 @@ impl DaemonHub {
             let mut out = live.out.lock().await;
             let _ = out
                 .sink
-                .send(close_frame(CLOSE_REPLACED, "re-paired or unpaired during handshake"))
+                .send(close_frame(
+                    CLOSE_REPLACED,
+                    "re-paired or unpaired during handshake",
+                ))
                 .await;
             return;
         };
@@ -177,14 +179,20 @@ impl DaemonHub {
         for key in agent_auth_wire::daemon::channel::ENVELOPE_KEYS {
             body.remove(key);
         }
-        let kind = body.get("type").and_then(Value::as_str).unwrap_or("").to_owned();
+        let kind = body
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
         match kind.as_str() {
             "heartbeat" => return self.heartbeat(live, body).await,
             "reply" => {
                 body.remove("type");
                 match serde_json::from_value::<Reply>(Value::Object(body)) {
                     Ok(reply) => self.resolve(&live.peer, reply),
-                    Err(e) => tracing::warn!(daemon = %live.peer.principal(), "malformed reply: {e}"),
+                    Err(e) => {
+                        tracing::warn!(daemon = %live.peer.principal(), "malformed reply: {e}")
+                    }
                 }
             }
             _ => {
@@ -202,7 +210,9 @@ impl DaemonHub {
         // Envelopes already prove the sender; this only bounds how often a
         // chatty (or hostile) daemon makes us write.
         let now = tokio::time::Instant::now();
-        let min_gap = Duration::from_secs(u64::from(self.config.heartbeat_secs)) / 2;
+        let min_gap = Duration::from_secs(u64::from(self.config.heartbeat_secs))
+            .checked_div(2)
+            .unwrap_or_default();
         {
             let mut last = live
                 .last_status_write
@@ -260,11 +270,16 @@ impl DaemonHub {
                 let mut out = live.out.lock().await;
                 let _ = out
                     .sink
-                    .send(close_frame(CLOSE_UNAUTHORIZED, "no longer paired with this key"))
+                    .send(close_frame(
+                        CLOSE_UNAUTHORIZED,
+                        "no longer paired with this key",
+                    ))
                     .await;
                 return false;
             }
-            Err(e) => tracing::error!(daemon = %peer.principal(), error = %e, "heartbeat not stored"),
+            Err(e) => {
+                tracing::error!(daemon = %peer.principal(), error = %e, "heartbeat not stored")
+            }
         }
         let hooks: Vec<_> = self.hooks().on_heartbeat.clone();
         for hook in hooks {
@@ -290,7 +305,9 @@ impl DaemonHub {
             return None;
         };
         let generation = self.generation(id.role, id.name.as_str());
-        let verified = self.verify_hello(&id, broker_nonce, daemon_nonce, &params, &sig).await;
+        let verified = self
+            .verify_hello(&id, broker_nonce, daemon_nonce, &params, &sig)
+            .await;
         let Some((row, public_key, verified)) = verified else {
             tracing::warn!(daemon = %id.principal(), "rejected hello: not paired or bad signature");
             close_quietly(ws, CLOSE_UNAUTHORIZED, "not paired or bad signature").await;
@@ -308,7 +325,6 @@ impl DaemonHub {
                 row,
                 id,
                 public_key,
-                conn: self.conn_id(),
             },
             verifier,
             sealer,
@@ -323,7 +339,11 @@ impl DaemonHub {
         daemon_nonce: Nonce,
         params: &str,
         sig: &str,
-    ) -> Option<(DaemonId, PublicKey, agent_auth_crypto::daemon::VerifiedHello)> {
+    ) -> Option<(
+        DaemonId,
+        PublicKey,
+        agent_auth_crypto::daemon::VerifiedHello,
+    )> {
         let tx = self.store.begin().await.ok()?;
         let row = daemons::by_name(&tx, store_role(id.role), id.name.as_str())
             .await
@@ -333,9 +353,14 @@ impl DaemonHub {
             .verify(&public_key, Speaker::Daemon, params, sig)
             .ok()?;
         let version = HelloParams::from_text(params);
-        daemons::hello(&tx, row.id, time::OffsetDateTime::now_utc(), version.as_deref())
-            .await
-            .ok()?;
+        daemons::hello(
+            &tx,
+            row.id,
+            time::OffsetDateTime::now_utc(),
+            version.as_deref(),
+        )
+        .await
+        .ok()?;
         tx.commit().await.ok()?;
         Some((row.id, public_key, verified))
     }

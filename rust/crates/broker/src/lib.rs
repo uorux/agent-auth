@@ -19,14 +19,20 @@
 //!   `containment`, `scheduler`.
 //! - `http`: the router (every part's routes) and the spine's routes.
 //! - `config`, `server`: the environment and startup.
+//! - `daemons` (paired daemons: pairing, the channel hub), `hostexec`
+//!   (commands on hosts), `desktop` (desk prompts), `attention`.
 
 pub mod a2a;
+pub mod attention;
 pub mod auth;
 pub mod config;
 pub mod containment;
+pub mod daemons;
+pub mod desktop;
 pub mod discord;
 pub mod error;
 pub mod events;
+pub mod hostexec;
 pub mod http;
 pub mod limits;
 pub mod llm;

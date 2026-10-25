@@ -27,7 +27,6 @@ mod tests;
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -108,9 +107,9 @@ impl DaemonsConfig {
         };
         let signing_key = match var("BROKER_SIGNING_KEY") {
             None => None,
-            Some(k) => Some(
-                SigningKey::from_text(&k).map_err(|e| format!("BROKER_SIGNING_KEY: {e}"))?,
-            ),
+            Some(k) => {
+                Some(SigningKey::from_text(&k).map_err(|e| format!("BROKER_SIGNING_KEY: {e}"))?)
+            }
         };
         Ok(DaemonsConfig {
             signing_key,
@@ -130,7 +129,6 @@ pub struct DaemonPeer {
     id: ChannelId,
     /// The key the hello was verified against.
     public_key: PublicKey,
-    conn: u64,
 }
 
 impl DaemonPeer {
@@ -224,7 +222,6 @@ pub struct DaemonHub {
     pending: Arc<Semaphore>,
     calls: Mutex<HashMap<String, (Key, oneshot::Sender<Reply>)>>,
     hooks: RwLock<Hooks>,
-    next_conn: AtomicU64,
 }
 
 impl fmt::Debug for DaemonHub {
@@ -253,17 +250,12 @@ impl DaemonHub {
             pending: Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES)),
             calls: Mutex::new(HashMap::new()),
             hooks: RwLock::new(Hooks::default()),
-            next_conn: AtomicU64::new(1),
         }
     }
 
     #[must_use]
     pub fn config(&self) -> &DaemonsConfig {
         &self.config
-    }
-
-    pub(crate) fn store(&self) -> &Store {
-        &self.store
     }
 
     /// Whether `BROKER_SIGNING_KEY` is configured.
@@ -354,7 +346,13 @@ impl DaemonHub {
 
     /// Seal and send one message to a connected daemon (sealing and
     /// sending under one lock). False: offline, or the send failed.
-    pub async fn send(&self, role: Role, name: &str, payload: &Map<String, Value>, ttl_secs: f64) -> bool {
+    pub async fn send(
+        &self,
+        role: Role,
+        name: &str,
+        payload: &Map<String, Value>,
+        ttl_secs: f64,
+    ) -> bool {
         let Some(live) = self.live(role, name) else {
             return false;
         };
@@ -377,8 +375,13 @@ impl DaemonHub {
 
     /// Send with the default lifetime (60 s).
     pub async fn send_default(&self, role: Role, name: &str, payload: &Map<String, Value>) -> bool {
-        self.send(role, name, payload, agent_auth_crypto::daemon::DEFAULT_ENVELOPE_TTL_SECS)
-            .await
+        self.send(
+            role,
+            name,
+            payload,
+            agent_auth_crypto::daemon::DEFAULT_ENVELOPE_TTL_SECS,
+        )
+        .await
     }
 
     /// Send a request and wait for the daemon's reply. Its `data` (an
@@ -400,7 +403,9 @@ impl DaemonHub {
             .insert(call_id.as_str().to_owned(), (key_of(role, name), tx));
         let mut msg = payload;
         msg.insert("call_id".into(), json!(call_id.as_str()));
-        let ttl = timeout.as_secs_f64().clamp(1.0, agent_auth_crypto::daemon::MAX_ENVELOPE_TTL_SECS);
+        let ttl = timeout
+            .as_secs_f64()
+            .clamp(1.0, agent_auth_crypto::daemon::MAX_ENVELOPE_TTL_SECS);
         let result = if self.send(role, name, &msg, ttl).await {
             match tokio::time::timeout(timeout, rx).await {
                 Ok(Ok(reply)) => Ok(reply),
@@ -414,7 +419,10 @@ impl DaemonHub {
                 )),
             }
         } else {
-            Err(CallError::new(format!("{} is offline", principal(role, name)), false))
+            Err(CallError::new(
+                format!("{} is offline", principal(role, name)),
+                false,
+            ))
         };
         self.calls
             .lock()
@@ -470,9 +478,100 @@ pub fn daemon_name(text: &str) -> Option<DaemonName> {
     DaemonName::parse(text)
 }
 
-/// The next connection number.
-impl DaemonHub {
-    fn conn_id(&self) -> u64 {
-        self.next_conn.fetch_add(1, Ordering::Relaxed)
+// ------------------------------------------------------------- the part
+
+/// This part's state in `AppState` (`hostd`): the hub, commands on hosts,
+/// desk prompts and attention.
+#[derive(Debug)]
+pub struct HostdPart {
+    pub hub: Arc<DaemonHub>,
+    /// On when the daemon channel is (`BROKER_SIGNING_KEY`).
+    pub hostexec: Option<Arc<crate::hostexec::HostExec>>,
+    /// On when the policy's `desktop.enabled` is, and hostexec is.
+    pub desktop: Option<Arc<crate::desktop::Desktop>>,
+    pub attention: crate::attention::Attention,
+}
+
+impl HostdPart {
+    /// Build the part. `watcher`: the hostexec watcher (OpenRouter
+    /// configured and `platforms.hostexec.watch`).
+    pub fn build(
+        store: Store,
+        config: DaemonsConfig,
+        policy: Arc<agent_auth_core::policy::Policy>,
+        watcher: Option<crate::hostexec::watcher::Watcher>,
+    ) -> Result<HostdPart, String> {
+        let enabled = config.signing_key.is_some();
+        let hub = Arc::new(DaemonHub::new(store.clone(), config));
+        let hostexec = if enabled {
+            Some(crate::hostexec::HostExec::new(
+                Arc::clone(&hub),
+                store,
+                Arc::clone(&policy),
+                watcher,
+            )?)
+        } else {
+            None
+        };
+        let desktop = match &hostexec {
+            Some(h) if policy.desktop().enabled => Some(crate::desktop::Desktop::new(
+                Arc::clone(&hub),
+                Some(Arc::clone(h)),
+            )?),
+            _ => None,
+        };
+        Ok(HostdPart {
+            hub,
+            hostexec,
+            desktop,
+            attention: crate::attention::Attention::default(),
+        })
+    }
+
+    /// The notifier to install: `primary`, with desk prompts alongside when
+    /// the desktop is on.
+    #[must_use]
+    pub fn wrap_notifier(&self, primary: crate::notify::Notifier) -> crate::notify::Notifier {
+        match &self.desktop {
+            Some(d) => crate::notify::Notifier::Fanout(crate::desktop::Fanout {
+                primary: crate::desktop::Primary::from_notifier(primary),
+                desktop: Arc::clone(d),
+            }),
+            None => primary,
+        }
+    }
+
+    /// The hostexec provisioner, to register (when on).
+    #[must_use]
+    pub fn provisioner(&self) -> Option<crate::provisioners::AnyProvisioner> {
+        self.hostexec.as_ref().map(|h| {
+            crate::provisioners::AnyProvisioner::Hostexec(
+                crate::hostexec::provisioner::HostexecProvisioner {
+                    hostexec: Arc::clone(h),
+                },
+            )
+        })
+    }
+
+    /// Plug into the spine: hostexec's approval gate and scheduler step.
+    pub fn install_hooks(&self, hooks: &mut crate::service::Hooks) {
+        if let Some(h) = &self.hostexec {
+            hooks.approval_gates.insert(
+                agent_auth_core::Platform::Hostexec,
+                crate::hostexec::approval_gate_hook(Arc::clone(h)),
+            );
+            hooks.hostexec_tick = Some(crate::hostexec::tick_hook(Arc::clone(h)));
+        }
+    }
+
+    /// After `AppState` is built (once): the services reach the notifier
+    /// and the request service through it.
+    pub fn bind(&self, st: &crate::state::AppState) {
+        if let Some(h) = &self.hostexec {
+            h.bind(st.clone());
+        }
+        if let Some(d) = &self.desktop {
+            d.bind(st.clone());
+        }
     }
 }

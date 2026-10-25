@@ -75,6 +75,8 @@ pub enum Notifier {
     Recording(Recorder),
     /// The Discord bot (spec A.4).
     Discord(crate::discord::DiscordNotifier),
+    /// Another notifier with desk prompts alongside (`crate::desktop`).
+    Fanout(crate::desktop::Fanout),
 }
 
 macro_rules! dispatch {
@@ -83,6 +85,7 @@ macro_rules! dispatch {
             Notifier::Null => $null,
             Notifier::Recording($n) => $e,
             Notifier::Discord($n) => $e,
+            Notifier::Fanout($n) => $e,
         }
     };
 }

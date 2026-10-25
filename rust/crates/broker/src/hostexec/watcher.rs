@@ -127,7 +127,10 @@ impl Watcher {
             }
         };
         if parsed.is_none() {
-            tracing::warn!(host = w.host, "watch failed: no verdict in the model's answer");
+            tracing::warn!(
+                host = w.host,
+                "watch failed: no verdict in the model's answer"
+            );
         }
         parsed
     }
@@ -167,7 +170,10 @@ mod tests {
     #[test]
     fn verdicts_and_messages() {
         let v = json!({"choices": [{"message": {"content": "{\"level\": \"alarming\", \"summary\": \"reads\\n ssh keys\"}"}}]});
-        assert_eq!(parse_verdict(&v), Some((Level::Alarming, "reads ssh keys".to_owned())));
+        assert_eq!(
+            parse_verdict(&v),
+            Some((Level::Alarming, "reads ssh keys".to_owned()))
+        );
         assert_eq!(parse_verdict(&json!({"choices": []})), None);
         let bad = json!({"choices": [{"message": {"content": "{\"level\": \"meh\"}"}}]});
         assert_eq!(parse_verdict(&bad), None);

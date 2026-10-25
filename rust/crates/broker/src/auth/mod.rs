@@ -156,6 +156,32 @@ impl From<&AdminCaller> for HumanDecider {
     }
 }
 
+/// The person at a paired host's desk who answered a prompt the broker
+/// sent there: hostd checked the answering helper's uid against its
+/// configured user, and the desktop service checked that the answer came
+/// over that host's verified channel for a prompt sent to that host. Made
+/// only by `crate::desktop`. `decided_by`: `desktop:<host>`.
+#[derive(Debug)]
+pub struct DeskAnswer {
+    label: String,
+}
+
+impl DeskAnswer {
+    pub(crate) fn new(host: &str) -> DeskAnswer {
+        DeskAnswer {
+            label: format!("desktop:{host}"),
+        }
+    }
+}
+
+impl From<&DeskAnswer> for HumanDecider {
+    fn from(desk: &DeskAnswer) -> HumanDecider {
+        HumanDecider {
+            label: desk.label.clone(),
+        }
+    }
+}
+
 impl From<&DiscordOwner> for HumanDecider {
     fn from(owner: &DiscordOwner) -> HumanDecider {
         HumanDecider {

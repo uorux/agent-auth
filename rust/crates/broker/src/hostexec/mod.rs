@@ -32,14 +32,14 @@ mod tests;
 pub mod watcher;
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use agent_auth_core::authority::{CommandOptions, HostexecAuthority, Tier};
 use agent_auth_core::hostexec::{Command, CommandSpec};
 use agent_auth_core::policy::Policy;
 use agent_auth_core::pyfmt::{escape_unprintable, repr, shlex_join};
-use agent_auth_core::{Authority, DecisionSource, GrantId, JobId, RequestId, RuleId};
+use agent_auth_core::{Authority, DecisionSource, JobId, RequestId, RuleId};
 use agent_auth_crypto::daemon::Role;
 use agent_auth_store::daemons::{self, DaemonRole};
 use agent_auth_store::hostexec::JobRow;
@@ -52,7 +52,7 @@ use agent_auth_wire::hostexec::{JobCommand, JobOut, JobStatus as WireJobStatus};
 use futures::future::BoxFuture;
 use serde_json::{Map, Value, json};
 
-pub use gate::GateRefusal;
+pub use gate::{GateRefusal, HUMAN_MAX_DURATION_SECS, approval_gate_hook};
 pub use routes::routes;
 pub use shells::ShellExecError;
 
@@ -85,34 +85,15 @@ impl From<CallError> for HostExecError {
     }
 }
 
-/// What hostexec needs from the request service (spine), as a narrow
-/// interface `main` attaches: ending a grant through its provisioner (and
-/// updating its card), and applying an approve-all window to waiting
-/// requests.
-pub trait HostexecOps: Send + Sync {
-    /// `RequestService::revoke_grant(grant, reason)`, by `by`.
-    fn revoke_grant<'a>(
-        &'a self,
-        grant: GrantId,
-        reason: &'a str,
-        by: &'a str,
-    ) -> BoxFuture<'a, Result<(), String>>;
-
-    /// `RequestService::apply_rule_to_pending(rule)`: the requests it
-    /// approved.
-    fn apply_rule_to_pending(&self, rule: RuleId) -> BoxFuture<'_, Result<Vec<RequestId>, String>>;
-}
-
 /// The hostexec part's state.
 pub struct HostExec {
     pub(crate) hub: Arc<DaemonHub>,
     pub(crate) store: Store,
-    pub(crate) notifier: Arc<Notifier>,
     pub(crate) policy: Arc<Policy>,
     /// Wakes `GET /v1/hostexec/jobs/{id}?wait=` when a job ends.
     pub(crate) job_events: Arc<KeyedEvents<JobId>>,
     buffers: Mutex<HashMap<(String, JobId), Vec<u8>>>,
-    ops: OnceLock<Arc<dyn HostexecOps>>,
+    st: OnceLock<crate::state::AppState>,
     pub(crate) watcher: Option<watcher::Watcher>,
     me: std::sync::Weak<HostExec>,
 }
@@ -120,13 +101,6 @@ pub struct HostExec {
 impl std::fmt::Debug for HostExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostExec").finish_non_exhaustive()
-    }
-}
-
-fn store_role(role: Role) -> DaemonRole {
-    match role {
-        Role::Host => DaemonRole::Host,
-        Role::Sandbox => DaemonRole::Sandbox,
     }
 }
 
@@ -157,15 +131,21 @@ fn wire_status(s: agent_auth_store::hostexec::JobStatus) -> WireJobStatus {
 pub fn job_out(job: &JobRow, full: bool) -> JobOut {
     let command = match (job.spec.get("argv"), job.spec.get("template")) {
         (Some(Value::Array(argv)), _) if !argv.is_empty() => Some(JobCommand::Argv(
-            argv.iter().filter_map(|a| a.as_str().map(str::to_owned)).collect(),
+            argv.iter()
+                .filter_map(|a| a.as_str().map(str::to_owned))
+                .collect(),
         )),
         (_, Some(Value::String(t))) => Some(JobCommand::Template(t.clone())),
         _ => None,
     };
     let status = wire_status(job.status);
-    let output = status
-        .has_ended()
-        .then(|| if full { job.output.clone().unwrap_or_default() } else { tail(job.output.as_deref()) });
+    let output = status.has_ended().then(|| {
+        if full {
+            job.output.clone().unwrap_or_default()
+        } else {
+            tail(job.output.as_deref())
+        }
+    });
     JobOut {
         job_id: job.id,
         host: job.host.clone(),
@@ -245,18 +225,16 @@ impl HostExec {
     pub fn new(
         hub: Arc<DaemonHub>,
         store: Store,
-        notifier: Arc<Notifier>,
         policy: Arc<Policy>,
         watcher: Option<watcher::Watcher>,
     ) -> Result<Arc<HostExec>, String> {
         let me = Arc::new_cyclic(|weak| HostExec {
             hub: Arc::clone(&hub),
             store,
-            notifier,
             policy,
             job_events: Arc::default(),
             buffers: Mutex::new(HashMap::new()),
-            ops: OnceLock::new(),
+            st: OnceLock::new(),
             watcher,
             me: weak.clone(),
         });
@@ -284,17 +262,24 @@ impl HostExec {
         Ok(me)
     }
 
-    /// Attach the request service's operations (once, by `main`).
-    pub fn bind(&self, ops: Arc<dyn HostexecOps>) {
-        let _ = self.ops.set(ops);
+    /// Attach the broker's state (once, by `main`, after `AppState` is
+    /// built): the notifier and the request service are reached through it.
+    pub fn bind(&self, st: crate::state::AppState) {
+        let _ = self.st.set(st);
+    }
+
+    pub(crate) fn app(&self) -> Option<&crate::state::AppState> {
+        self.st.get()
+    }
+
+    /// The notifier (a headless one until bound).
+    pub(crate) fn notifier(&self) -> &Notifier {
+        static NULL: Notifier = Notifier::Null;
+        self.st.get().map_or(&NULL, |s| s.notifier.as_ref())
     }
 
     pub(crate) fn self_arc(&self) -> Option<Arc<HostExec>> {
         self.me.upgrade()
-    }
-
-    pub(crate) fn ops(&self) -> Option<&Arc<dyn HostexecOps>> {
-        self.ops.get()
     }
 
     #[must_use]
@@ -368,7 +353,10 @@ impl HostExec {
             return refuse("resource is the host's name".into());
         }
         let Some(row) = daemons::by_name(tx, DaemonRole::Host, &host).await? else {
-            return refuse(format!("no host {} is paired with this broker", repr(&host)));
+            return refuse(format!(
+                "no host {} is paired with this broker",
+                repr(&host)
+            ));
         };
         if !self.hub.is_online(Role::Host, &host) {
             return refuse(format!("host {host} is offline"));
@@ -410,7 +398,11 @@ impl HostExec {
                     Command::Run { argv } => {
                         notes.push(format!(
                             "runs as {} on {host}: {}",
-                            if spec.tier() == Tier::Root { "ROOT" } else { "your user" },
+                            if spec.tier() == Tier::Root {
+                                "ROOT"
+                            } else {
+                                "your user"
+                            },
                             escape_unprintable(&shlex_join(argv))
                         ));
                         HostexecAuthority::Run {
@@ -466,7 +458,7 @@ impl HostExec {
     ) -> Result<String, String> {
         let mirror = self
             .policy
-            .platforms
+            .platforms()
             .hostexec
             .templates
             .iter()
@@ -640,18 +632,16 @@ impl HostExec {
                     id: RuleId::new(),
                     action: agent_auth_store::rules::RuleAction::AutoApprove,
                     agent_pattern: &agent_auth_core::glob::escape(agent_name),
-                    delegator_pattern: delegator_name
-                        .map(agent_auth_core::glob::escape)
-                        .as_deref(),
+                    delegator_pattern: delegator_name.map(agent_auth_core::glob::escape).as_deref(),
                     platform: agent_auth_core::Platform::Hostexec,
                     resource_pattern: &agent_auth_core::glob::escape(&host),
                     authority: Some(&authority),
                     max_duration_secs: None,
                     created_by,
                     notes: &notes,
-                    expires_at: Some(now.saturating_add(time::Duration::seconds(i64::from(
-                        duration_secs,
-                    )))),
+                    expires_at: Some(
+                        now.saturating_add(time::Duration::seconds(i64::from(duration_secs))),
+                    ),
                     now,
                 },
             )
@@ -661,11 +651,10 @@ impl HostExec {
         }
         .await
         .map_err(|e| HostExecError(format!("could not save the window: {e}")))?;
-        let approved = match self.ops() {
-            Some(ops) => ops
-                .apply_rule_to_pending(rule.id)
+        let approved = match self.app() {
+            Some(st) => crate::service::apply_rule_to_pending(st, rule.id)
                 .await
-                .map_err(HostExecError)?,
+                .map_err(|e| HostExecError(e.to_string()))?,
             None => Vec::new(),
         };
         Ok((rule, approved))
@@ -683,7 +672,8 @@ impl HostExec {
             let mut held = None;
             match peer.role() {
                 Role::Host => {
-                    let since = time::OffsetDateTime::now_utc().saturating_sub(time::Duration::days(1));
+                    let since =
+                        time::OffsetDateTime::now_utc().saturating_sub(time::Duration::days(1));
                     for g in agent_auth_store::grants::ended_on(
                         &tx,
                         agent_auth_core::Platform::Hostexec,
@@ -692,7 +682,10 @@ impl HostExec {
                     )
                     .await?
                     {
-                        if matches!(g.authority, Authority::Hostexec(HostexecAuthority::Shell { .. })) {
+                        if matches!(
+                            g.authority,
+                            Authority::Hostexec(HostexecAuthority::Shell { .. })
+                        ) {
                             stale.push(g.request_id);
                         }
                     }
@@ -732,7 +725,10 @@ impl HostExec {
 /// The scheduler's hostexec step (call it every tick): jobs with no
 /// result long after their timeout become `lost` (daemons bug 3). Returns
 /// how many.
-pub async fn scheduler_tick(hostexec: &HostExec, now: time::OffsetDateTime) -> Result<usize, StoreError> {
+pub async fn scheduler_tick(
+    hostexec: &HostExec,
+    now: time::OffsetDateTime,
+) -> Result<usize, StoreError> {
     let tx = hostexec.store.begin().await?;
     let cutoff = now.saturating_sub(time::Duration::seconds(LOST_GRACE_SECS));
     let candidates = agent_auth_store::hostexec::unfinished_before(&tx, cutoff).await?;
@@ -743,9 +739,9 @@ pub async fn scheduler_tick(hostexec: &HostExec, now: time::OffsetDateTime) -> R
             .get("timeout")
             .and_then(Value::as_i64)
             .unwrap_or(i64::from(agent_auth_core::hostexec::DEFAULT_TIMEOUT_SECS));
-        let due = job
-            .created_at
-            .saturating_add(time::Duration::seconds(timeout.saturating_add(LOST_GRACE_SECS)));
+        let due = job.created_at.saturating_add(time::Duration::seconds(
+            timeout.saturating_add(LOST_GRACE_SECS),
+        ));
         if due < now
             && let Some(row) = agent_auth_store::hostexec::mark_lost(
                 &tx,
@@ -781,7 +777,17 @@ impl crate::discord::ops::HostsOps for HostExec {
     }
 }
 
-/// `store_role` for other modules.
-pub(crate) fn daemon_role(role: Role) -> DaemonRole {
-    store_role(role)
+/// The spine's scheduler hook: [`scheduler_tick`].
+#[must_use]
+pub fn tick_hook(hostexec: Arc<HostExec>) -> crate::service::TickHook {
+    Arc::new(move |st| {
+        let hostexec = Arc::clone(&hostexec);
+        Box::pin(async move {
+            match scheduler_tick(&hostexec, st.now()).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(lost = n, "hostexec: jobs marked lost"),
+                Err(e) => tracing::error!(error = %e, "hostexec tick failed"),
+            }
+        })
+    })
 }

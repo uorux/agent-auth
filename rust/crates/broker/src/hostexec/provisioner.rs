@@ -17,14 +17,16 @@ use agent_auth_core::authority::HostexecAuthority;
 use agent_auth_core::hostexec::{CommandSpec, ShellSpec};
 use agent_auth_core::{Authority, DecisionSource, JobId, Platform};
 use agent_auth_store::agents::AgentRow;
-use agent_auth_store::grants::{GrantRow, IssuableGrant};
+use agent_auth_store::grants::{GrantRow, IssuableGrant, ProvisioningGrant};
 use agent_auth_store::hostexec::{self as store, JobStatus, NewJob};
 use agent_auth_store::{StoreError, Tx};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
 use super::{CALL_TIMEOUT, HostExec, SHORT_CALL_TIMEOUT, job_out, tail};
-use crate::provisioners::{Credential, ProvisionError, Provisioner, RequestSpec, Refused, Validated};
+use crate::provisioners::{
+    Credential, ProvisionError, Provisioner, Refused, RequestSpec, Validated,
+};
 
 /// The hostexec provisioner (an `AnyProvisioner` variant).
 #[derive(Debug, Clone)]
@@ -107,8 +109,9 @@ impl HostExec {
         match started {
             Ok(data) => {
                 let via = data.get("via").and_then(Value::as_str);
-                self.set_status(job_id, &host, JobStatus::Running, None, via).await;
-                let window = evidence["window"].as_bool() == Some(true);
+                self.set_status(job_id, &host, JobStatus::Running, None, via)
+                    .await;
+                let window = evidence.get("window").and_then(Value::as_bool) == Some(true);
                 if request.decision_source != Some(DecisionSource::Human) || window {
                     // Nobody looked at this one command: a rule, a window or
                     // the reviewer let it through.
@@ -129,7 +132,12 @@ impl HostExec {
                     kill.insert("type".into(), json!("job.kill"));
                     kill.insert("job_id".into(), json!(job_id.to_string()));
                     let _ = hub
-                        .call(agent_auth_crypto::daemon::Role::Host, &me_host, kill, SHORT_CALL_TIMEOUT)
+                        .call(
+                            agent_auth_crypto::daemon::Role::Host,
+                            &me_host,
+                            kill,
+                            SHORT_CALL_TIMEOUT,
+                        )
                         .await;
                 });
                 Err(failed(
@@ -149,7 +157,10 @@ impl HostExec {
     /// shell is closed. Never blocks long on an unreachable host: it ends
     /// the shell at its own expiry, and is told again when it reconnects.
     pub async fn stop(&self, grant: &GrantRow) -> Result<(), ProvisionError> {
-        if matches!(grant.authority, Authority::Hostexec(HostexecAuthority::Shell { .. })) {
+        if matches!(
+            grant.authority,
+            Authority::Hostexec(HostexecAuthority::Shell { .. })
+        ) {
             if let Err(e) = self
                 .call(
                     &grant.resource,
@@ -193,13 +204,13 @@ impl Provisioner for HostexecProvisioner {
             .await
     }
 
-    async fn provision(
+    async fn provision<'t>(
         &self,
-        _tx: &Tx<'_>,
-        grant: &GrantRow,
+        _tx: &'t Tx<'_>,
+        grant: &ProvisioningGrant<'t>,
         _now: OffsetDateTime,
     ) -> Result<Value, ProvisionError> {
-        self.hostexec.start(grant).await
+        self.hostexec.start(grant.grant()).await
     }
 
     async fn revoke(
@@ -211,17 +222,17 @@ impl Provisioner for HostexecProvisioner {
         self.hostexec.stop(grant).await
     }
 
-    async fn credential(
+    async fn credential<'t>(
         &self,
-        tx: &Tx<'_>,
-        grant: &IssuableGrant<'_>,
+        tx: &'t Tx<'_>,
+        grant: &IssuableGrant<'t>,
         _now: OffsetDateTime,
     ) -> Result<Credential, ProvisionError> {
         let g = grant.grant();
         if let Authority::Hostexec(HostexecAuthority::Shell { tier }) = &g.authority {
             return Ok(Credential {
                 kind: "hostexec_shell".into(),
-                value: Some(g.id.to_string()),
+                value: Some(agent_auth_crypto::Secret::new(g.id.to_string())),
                 expires_at: Some(g.expires_at),
                 note: Some(format!(
                     "A {tier} shell on {}. Run commands with host_shell_exec(grant_id, argv) — one \
@@ -244,7 +255,7 @@ impl Provisioner for HostexecProvisioner {
         }
         Ok(Credential {
             kind: "hostexec_job".into(),
-            value: Some(summary.to_string()),
+            value: Some(agent_auth_crypto::Secret::new(summary.to_string())),
             note: Some(format!(
                 "The command ran once; this grant does not run it again. Full output: \
                  host_job(\"{}\") / GET /v1/hostexec/jobs/{} (which also waits while it runs).",

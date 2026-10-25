@@ -126,7 +126,9 @@ impl DaemonHub {
             return Err(PairingRefused.into());
         };
         let Some(key) = PairingKey::from_hex(&code.pairing_key) else {
-            return Err(PairingError::Internal("stored pairing key is not hex".into()));
+            return Err(PairingError::Internal(
+                "stored pairing key is not hex".into(),
+            ));
         };
         // Without the code there is no matching selector, so attempts that
         // don't have it can't burn it.
@@ -148,8 +150,9 @@ impl DaemonHub {
         if !daemons::claim_code(&tx, code.id, now).await? {
             return Err(PairingRefused.into());
         }
-        let row = daemons::upsert_paired(&tx, DaemonId::new(), role, name, &daemon_key.to_text(), now)
-            .await?;
+        let row =
+            daemons::upsert_paired(&tx, DaemonId::new(), role, name, &daemon_key.to_text(), now)
+                .await?;
         tx.commit().await?;
 
         // A connection authenticated with the old key must not outlive it.

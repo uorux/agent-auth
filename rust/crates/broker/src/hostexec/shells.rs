@@ -116,7 +116,7 @@ impl HostExec {
         tx.commit().await?;
         // Before dispatch, and failing closed: a command nobody was shown
         // does not run.
-        if !self.notifier.shell_command(&request, &job).await {
+        if !self.notifier().shell_command(&request, &job).await {
             self.set_status(
                 job_id,
                 &host,
@@ -221,7 +221,7 @@ impl HostExec {
             .await;
         if let Some((Level::Alarming, summary)) = verdict {
             tracing::warn!(job = %job.id, host = %job.host, "watch: {summary}");
-            self.notifier
+            self.notifier()
                 .watch_alert(
                     &request,
                     &job,

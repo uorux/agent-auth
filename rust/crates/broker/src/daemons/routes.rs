@@ -108,7 +108,10 @@ async fn create_code(
     }))
 }
 
-async fn list(_admin: AdminCaller, State(state): State<AppState>) -> ApiResult<Json<Vec<DaemonOut>>> {
+async fn list(
+    _admin: AdminCaller,
+    State(state): State<AppState>,
+) -> ApiResult<Json<Vec<DaemonOut>>> {
     let Some(part) = state.hostd.as_ref() else {
         return Ok(Json(Vec::new()));
     };
@@ -119,13 +122,10 @@ async fn list(_admin: AdminCaller, State(state): State<AppState>) -> ApiResult<J
             let fingerprint = agent_auth_crypto::daemon::PublicKey::parse(&row.public_key)
                 .map(|k| k.fingerprint())
                 .unwrap_or_default();
-            let status = row
-                .last_status
-                .clone()
-                .and_then(|s| match s {
-                    Value::Object(m) => StatusObject::new(m).ok(),
-                    _ => None,
-                });
+            let status = row.last_status.clone().and_then(|s| match s {
+                Value::Object(m) => StatusObject::new(m).ok(),
+                _ => None,
+            });
             DaemonOut {
                 id: row.id,
                 role: match row.role {
@@ -160,7 +160,10 @@ async fn unpair(
     Ok(Json(json!({"ok": true})))
 }
 
-async fn broker_key(_admin: AdminCaller, State(state): State<AppState>) -> ApiResult<Json<BrokerKey>> {
+async fn broker_key(
+    _admin: AdminCaller,
+    State(state): State<AppState>,
+) -> ApiResult<Json<BrokerKey>> {
     let key = hub(&state)?
         .public_key()
         .ok_or_else(|| ApiError::unavailable(DISABLED))?;

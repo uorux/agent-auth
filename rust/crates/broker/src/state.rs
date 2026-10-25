@@ -41,6 +41,9 @@ pub struct AppState {
     /// The request lifecycle's own state: LLM reviewer, risk summarizer,
     /// approval gates and the hooks other parts plug in (`service`).
     pub spine: Arc<Spine>,
+    /// Paired daemons, commands on hosts, desk prompts, attention
+    /// (`daemons::HostdPart`); none: those routes answer 503/501.
+    pub hostd: Option<Arc<crate::daemons::HostdPart>>,
 }
 
 impl AppState {
@@ -69,6 +72,7 @@ impl AppState {
             a2a: Arc::default(),
             platform_services: Arc::default(),
             spine: Arc::default(),
+            hostd: None,
         }
     }
 }

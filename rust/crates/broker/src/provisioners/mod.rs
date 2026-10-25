@@ -188,6 +188,8 @@ pub enum AnyProvisioner {
     Models(models::ModelsProvisioner),
     Mcp(mcp::McpProvisioner),
     Google(google::GoogleProvisioner),
+    /// Commands on hosts (`crate::hostexec::provisioner`).
+    Hostexec(crate::hostexec::provisioner::HostexecProvisioner),
 }
 
 macro_rules! dispatch {
@@ -201,6 +203,7 @@ macro_rules! dispatch {
             AnyProvisioner::Models($p) => $e,
             AnyProvisioner::Mcp($p) => $e,
             AnyProvisioner::Google($p) => $e,
+            AnyProvisioner::Hostexec($p) => $e,
         }
     };
 }
