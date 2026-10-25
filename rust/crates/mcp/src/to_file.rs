@@ -69,6 +69,9 @@ pub struct InFile {
     pub git_helper: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_example: Option<String>,
+    /// Kubernetes: `file` is a whole kubeconfig; how to use it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kubectl_example: Option<String>,
 }
 
 /// What `get_credential` answers.
@@ -91,6 +94,27 @@ pub fn deliver(dir: &Path, grant_id: &str, mut credential: CredentialOut) -> io:
     if !secret {
         return Ok(Delivered::Inline(credential));
     }
+    if credential.kind == CredentialKind::KubernetesToken
+        && let Some(config) = kubeconfig(&credential)
+    {
+        credential.value = None;
+        let path = write_private(
+            dir,
+            &format!("{}.kubeconfig", file_name(grant_id)?),
+            config.as_bytes(),
+        )?;
+        let file = path.to_string_lossy().into_owned();
+        return Ok(Delivered::InFile(InFile {
+            credential,
+            kubectl_example: Some(format!(
+                "KUBECONFIG={} kubectl get pods",
+                shlex_quote(&file)
+            )),
+            file,
+            git_helper: None,
+            git_example: None,
+        }));
+    }
     let Some(value) = credential.value.take() else {
         return Ok(Delivered::Inline(credential));
     };
@@ -111,7 +135,80 @@ pub fn deliver(dir: &Path, grant_id: &str, mut credential: CredentialOut) -> io:
         file,
         git_helper,
         git_example,
+        kubectl_example: None,
     }))
+}
+
+/// A Kubernetes credential as a kubeconfig (JSON, which kubectl reads): a
+/// cluster and context per API server (the preferred one current), the
+/// cluster CA when the broker has one (never `insecure-skip-tls-verify`),
+/// the grant's namespace, the token. `None` without a server or token (a
+/// broker that sends neither: the token goes to a plain file).
+#[must_use]
+pub fn kubeconfig(credential: &CredentialOut) -> Option<String> {
+    let token = credential.value.as_ref()?.expose();
+    let props = credential.properties.as_ref();
+    let mut servers: Vec<String> = props
+        .and_then(|p| p.get("servers"))
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    if servers.is_empty() {
+        servers.extend(credential.url.clone());
+    }
+    if token.is_empty() || servers.is_empty() {
+        return None;
+    }
+    let ca = props
+        .and_then(|p| p.get("certificate_authority_data"))
+        .and_then(serde_json::Value::as_str);
+    let namespace = props
+        .and_then(|p| p.get("namespace"))
+        .and_then(serde_json::Value::as_str);
+    let name = |i: usize| {
+        if i == 0 {
+            "agent-auth".to_owned()
+        } else {
+            format!("agent-auth-{}", i.saturating_add(1))
+        }
+    };
+    let clusters: Vec<serde_json::Value> = servers
+        .iter()
+        .enumerate()
+        .map(|(i, server)| {
+            let mut cluster = serde_json::Map::new();
+            cluster.insert("server".into(), server.as_str().into());
+            if let Some(ca) = ca {
+                cluster.insert("certificate-authority-data".into(), ca.into());
+            }
+            serde_json::json!({"name": name(i), "cluster": cluster})
+        })
+        .collect();
+    let contexts: Vec<serde_json::Value> = (0..servers.len())
+        .map(|i| {
+            let mut context = serde_json::Map::new();
+            context.insert("cluster".into(), name(i).into());
+            context.insert("user".into(), "agent-auth".into());
+            if let Some(ns) = namespace {
+                context.insert("namespace".into(), ns.into());
+            }
+            serde_json::json!({"name": name(i), "context": context})
+        })
+        .collect();
+    let config = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Config",
+        "clusters": clusters,
+        "contexts": contexts,
+        "current-context": "agent-auth",
+        "users": [{"name": "agent-auth", "user": {"token": token}}],
+        "preferences": {},
+    });
+    serde_json::to_string_pretty(&config).ok()
 }
 
 /// A git `credential.helper` that answers with the token in `path` (the
@@ -131,6 +228,11 @@ fn refuse(what: String) -> io::Error {
 /// Write `value` to `dir`/`<grant id, alphanumerics and '-' only>`, mode
 /// 0600, without following a link; the file's path.
 pub fn write_secret(dir: &Path, grant_id: &str, value: &str) -> io::Result<PathBuf> {
+    write_private(dir, &file_name(grant_id)?, value.as_bytes())
+}
+
+/// A grant id as a file name: alphanumerics and '-' only.
+fn file_name(grant_id: &str) -> io::Result<String> {
     let name: String = grant_id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
@@ -141,7 +243,7 @@ pub fn write_secret(dir: &Path, grant_id: &str, value: &str) -> io::Result<PathB
             format!("not a grant id: {grant_id:?}"),
         ));
     }
-    write_private(dir, &name, value.as_bytes())
+    Ok(name)
 }
 
 /// Write `value` to `dir`/`name` (a plain file name), mode 0600, in a
@@ -268,6 +370,111 @@ mod tests {
             }
         }
         all.to_vec()
+    }
+
+    fn k8s(properties: serde_json::Value) -> CredentialOut {
+        CredentialOut {
+            kind: CredentialKind::KubernetesToken,
+            value: Some(WireSecret::new("k8s-token").unwrap()),
+            username: None,
+            url: Some("https://100.126.30.73:6443".to_owned()),
+            expires_at: None,
+            note: Some("bearer token".to_owned()),
+            properties: properties.as_object().cloned(),
+        }
+    }
+
+    /// to_file for Kubernetes: a whole kubeconfig, 0600, the token in it
+    /// and nowhere in the reply; the CA when the broker has one.
+    #[test]
+    fn kubernetes_goes_to_a_kubeconfig() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("agent-auth-kube-{}", std::process::id()));
+        let credential = k8s(serde_json::json!({
+            "server": "https://100.126.30.73:6443",
+            "servers": ["https://100.126.30.73:6443", "https://100.126.30.74:6443"],
+            "namespace": "apps-a",
+            "tls": "ca",
+            "certificate_authority_pem": "PEM",
+            "certificate_authority_data": "UEVN",
+        }));
+        let delivered = deliver(&dir, "g-1", credential).unwrap();
+        let reply = serde_json::to_value(&delivered).unwrap();
+        assert!(!reply.to_string().contains("k8s-token"), "{reply}");
+        assert_eq!(reply["value"], serde_json::Value::Null);
+        let file = reply["file"].as_str().unwrap();
+        assert!(file.ends_with("/g-1.kubeconfig"), "{file}");
+        assert_eq!(
+            reply["kubectl_example"],
+            format!("KUBECONFIG={file} kubectl get pods")
+        );
+        assert_eq!(reply["properties"]["certificate_authority_pem"], "PEM");
+        let meta = std::fs::metadata(file).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        let text = std::fs::read_to_string(file).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(config["current-context"], "agent-auth");
+        assert_eq!(config["users"][0]["user"]["token"], "k8s-token");
+        assert_eq!(
+            config["clusters"],
+            serde_json::json!([
+                {"name": "agent-auth", "cluster": {"server": "https://100.126.30.73:6443", "certificate-authority-data": "UEVN"}},
+                {"name": "agent-auth-2", "cluster": {"server": "https://100.126.30.74:6443", "certificate-authority-data": "UEVN"}},
+            ])
+        );
+        assert_eq!(
+            config["contexts"][0],
+            serde_json::json!({"name": "agent-auth", "context": {"cluster": "agent-auth", "user": "agent-auth", "namespace": "apps-a"}})
+        );
+        assert!(!text.contains("insecure"));
+        // kubectl reads it, where kubectl is installed.
+        if let Ok(out) = std::process::Command::new("kubectl")
+            .args(["config", "view", "--raw", "-o", "json"])
+            .env("KUBECONFIG", file)
+            .output()
+        {
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let seen: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(
+                seen["clusters"][0]["cluster"]["server"],
+                "https://100.126.30.73:6443"
+            );
+            assert_eq!(seen["users"][0]["user"]["token"], "k8s-token");
+            assert_eq!(
+                seen["clusters"][0]["cluster"]["certificate-authority-data"],
+                "UEVN"
+            );
+        }
+
+        // No CA (an insecure broker): none in the file, and no skipping
+        // verification either. Cluster-wide: no namespace.
+        let credential = k8s(serde_json::json!({
+            "servers": ["https://h:6443"], "namespace": null, "tls": "insecure",
+        }));
+        let Delivered::InFile(f) = deliver(&dir, "g-2", credential).unwrap() else {
+            panic!("a file")
+        };
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&f.file).unwrap()).unwrap();
+        assert_eq!(
+            config["clusters"][0]["cluster"],
+            serde_json::json!({"server": "https://h:6443"})
+        );
+        assert!(config["contexts"][0]["context"].get("namespace").is_none());
+        // An older broker (no server at all): the token in a plain file.
+        let mut old = k8s(serde_json::json!({}));
+        old.url = None;
+        old.properties = None;
+        let Delivered::InFile(f) = deliver(&dir, "g-3", old).unwrap() else {
+            panic!("a file")
+        };
+        assert!(f.kubectl_example.is_none());
+        assert_eq!(std::fs::read_to_string(&f.file).unwrap(), "k8s-token");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

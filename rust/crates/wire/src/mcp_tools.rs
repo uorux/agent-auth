@@ -465,7 +465,8 @@ platform/capability/resource conventions:
   traefik-patcher; list_capabilities lists the roles that exist, with what
   each grants). resource="*" asks for it cluster-wide (always a human). Grants a
   ServiceAccount bound to that role in the namespace; get_credential returns
-  a short-lived bearer token for kubectl (--token) or the API. Request the
+  a short-lived bearer token with the API server and its CA (to_file=True
+  writes a kubeconfig). Request the
   narrowest role that does the job — broad roles (edit/admin) get surfaced
   to a human, narrow ones are often auto-approved.
 - a2a: capability="talk", resource=<agent name>, scope={"topic": "deploy/*"}
@@ -634,7 +635,11 @@ requesting access you might already have."##,
 - github_repo (github "create"): `value` is the new repo's URL and `note`
   says whether it was created now or by an earlier attempt of this
   broker's. Then request a "repo" grant on it for access.
-- kubernetes_token: a short-lived bearer token (kubectl --token=…).
+- kubernetes_token: a short-lived bearer token; `url` is the API server
+  and `properties` has every server, the namespace and the cluster CA
+  (certificate_authority_pem / _data; `tls` says if there is none). Use
+  to_file=True: it writes a kubeconfig with all of it. Never skip TLS
+  verification with it.
 - lldap_account (homelab): your service account's username + password, for
   Authelia-protected services. lldap_group: a hand-registered account was
   added to the group; you already have its password.
@@ -648,8 +653,9 @@ to_file=True keeps a secret out of your conversation and out of the
 commands you run: the value is written to a file only you can read and
 the reply carries `file` (its path) instead of `value`. Prefer it for
 anything you only hand to a program — commands then name the file, not
-the secret: kubectl --token="$(cat <file>)", and for git `git_helper`
-in the reply is a credential.helper that reads the file. Call again to
+the secret: for kubernetes the file is a kubeconfig (KUBECONFIG=<file>
+kubectl …, as `kubectl_example` says), and for git `git_helper` in the
+reply is a credential.helper that reads the file. Call again to
 refresh the file once the token has expired.
 
 Credentials are for your own use: never pass one to another agent (in an

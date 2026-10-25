@@ -154,7 +154,18 @@ Managed accounts need `ENCRYPTION_KEY`, `LLDAP_LDAP_URL` and `LLDAP_BASE_DN`.
 | `KUBERNETES_TOKEN` | (none) | a fixed token; the file wins |
 | `KUBERNETES_CA_FILE` | in-cluster: the pod's CA | the only CA trusted for the API server (the public roots are not); unset outside the cluster: the shared root store |
 | `KUBERNETES_INSECURE_SKIP_VERIFY` | `false` | only for an API on localhost (refused otherwise) |
+| `KUBERNETES_AGENT_API_URL` | the API URLs above | comma-separated `https://` API servers as agents reach them (in-cluster, the broker's own are not) |
 | `KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT` | `kubernetes.default.svc`, `443` | in-cluster only (the kubelet sets them) |
+
+A `kubernetes_token` credential carries what a client needs to verify the
+API server: `url` (the preferred server), and in `properties` every server
+(`servers`), the grant's `namespace`, `tls` (`ca`, `public_roots` or
+`insecure`) and, with a CA, `certificate_authority_pem` and
+`certificate_authority_data` (base64, as kubeconfig takes it). An insecure
+broker has no CA to give and says so. The CA is not secret. With
+`to_file=True` the MCP server writes a whole kubeconfig (0600: servers, CA,
+namespace, token) and answers with its path and
+`KUBECONFIG=<file> kubectl …`, so the token stays off command lines.
 
 Every grant's ServiceAccount is made in the policy's
 `platforms.kubernetes.grant_namespace` (default `agent-auth-grants`), which

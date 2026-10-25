@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use agent_auth_broker::provisioners::Provisioner;
 use agent_auth_broker::provisioners::http::Http;
-use agent_auth_broker::provisioners::kubernetes::{KubernetesProvisioner, sa_name};
+use agent_auth_broker::provisioners::kubernetes::{ApiTrust, KubernetesProvisioner, sa_name};
 use agent_auth_core::authority::KubernetesAuthority;
 use agent_auth_core::policy::Policy;
 use agent_auth_core::policy::schema::KubernetesConfig;
@@ -575,4 +575,85 @@ async fn the_credential_route_serves_a_service_account_token(pool: PgPool) {
     assert_eq!(out[0].0, axum::http::StatusCode::OK, "{}", out[0].1);
     assert_eq!(out[0].1["kind"], "kubernetes_token");
     assert_eq!(out[0].1["value"], "k8s-tok");
+}
+
+/// A credential carries what a client needs to verify the API server: the
+/// server(s), the namespace and the cluster CA; without a CA it says why.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn the_credential_carries_the_server_and_its_ca(pool: PgPool) {
+    let t = setup(pool).await;
+    let a = agent(&t.store, "k8s-agent").await;
+    let ca = agent_auth_mail::testing::TestCa::new().ca_pem;
+    let trust = ApiTrust::from_pem(ca.as_bytes()).unwrap();
+    let ApiTrust::Ca(pem) = trust.clone() else {
+        panic!("a CA")
+    };
+    let p = KubernetesProvisioner::new(
+        vec![t.fake.url.clone()],
+        (Some(t.token_file.clone()), None),
+        config(),
+        Arc::new(Policy::default()),
+        Http::new().unwrap(),
+    )
+    .trusting(
+        trust,
+        vec![
+            "https://100.126.30.73:6443/".into(),
+            "https://100.126.30.74:6443".into(),
+        ],
+    );
+    let g = granted(&t.store, &p, a.id, &role("view", false), "apps-a").await;
+    let c = credential(&t.store, &p, &g).await.unwrap();
+    assert_eq!(c.url.as_deref(), Some("https://100.126.30.73:6443"));
+    let props = c.properties.clone().unwrap();
+    assert_eq!(props["server"], "https://100.126.30.73:6443");
+    assert_eq!(
+        props["servers"],
+        json!(["https://100.126.30.73:6443", "https://100.126.30.74:6443"])
+    );
+    assert_eq!(props["namespace"], "apps-a");
+    assert_eq!(props["tls"], "ca");
+    assert_eq!(props["certificate_authority_pem"], pem.as_str());
+    use base64::Engine as _;
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(props["certificate_authority_data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(String::from_utf8(data).unwrap(), pem);
+    let note = c.note.clone().unwrap();
+    assert!(
+        note.contains("against https://100.126.30.73:6443"),
+        "{note}"
+    );
+    assert!(note.contains("certificate_authority_pem"), "{note}");
+
+    // Over HTTP, the CA comes with the token (no file needed).
+    let out = credentials_over_http(
+        &t.store,
+        agent_auth_broker::provisioners::AnyProvisioner::Kubernetes(p),
+        &[&g],
+    )
+    .await;
+    assert_eq!(out[0].1["url"], "https://100.126.30.73:6443");
+    assert_eq!(
+        out[0].1["properties"]["certificate_authority_pem"],
+        pem.as_str()
+    );
+
+    // Cluster-wide: no namespace. An insecure broker has no CA, and says so.
+    let insecure = KubernetesProvisioner::new(
+        vec![t.fake.url.clone()],
+        (Some(t.token_file.clone()), None),
+        config(),
+        Arc::new(Policy::default()),
+        Http::new().unwrap(),
+    )
+    .trusting(ApiTrust::Insecure, Vec::new());
+    let g = granted(&t.store, &insecure, a.id, &role("view", true), "*").await;
+    let c = credential(&t.store, &insecure, &g).await.unwrap();
+    let props = c.properties.clone().unwrap();
+    assert_eq!(props["namespace"], Value::Null);
+    assert_eq!(props["tls"], "insecure");
+    assert_eq!(props["servers"], json!([t.fake.url]));
+    assert!(props.get("certificate_authority_pem").is_none());
+    assert!(c.note.unwrap().contains("does not verify"));
 }

@@ -69,6 +69,12 @@ spec:
               value: /etc/agent-auth/policy-private/policy-private.yaml
             - name: KUBERNETES_API_URL
               value: in-cluster
+            # The API server as agents reach it (credentials name it, with
+            # the cluster CA): not the in-cluster name. A node's tailnet
+            # address (the API certificate has them as SANs); more,
+            # comma-separated, for failover.
+            - name: KUBERNETES_AGENT_API_URL
+              value: "https://100.126.30.73:6443"
             - name: GITHUB_APP_PRIVATE_KEY_FILE
               value: /etc/agent-auth/github/app.pem
             # Traefik sets X-Real-IP: the security log and the per-address

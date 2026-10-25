@@ -76,8 +76,63 @@ fn namespace_ok(ns: &str) -> bool {
     }
 }
 
+/// A comma-separated list, trimmed, empties dropped.
+fn list(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// How the broker trusts the API server, which is what an agent is told
+/// to trust it by (a credential carries the CA, or says why it has none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiTrust {
+    /// Only this CA (`KUBERNETES_CA_FILE`, or the in-cluster `ca.crt`):
+    /// its certificates, as PEM.
+    Ca(String),
+    /// The public roots (no CA file).
+    PublicRoots,
+    /// Not checked at all (`KUBERNETES_INSECURE_SKIP_VERIFY`): no CA to
+    /// give.
+    Insecure,
+}
+
+impl ApiTrust {
+    /// From a CA file's contents: its certificates, re-encoded (anything
+    /// else in the file is left out).
+    pub fn from_pem(pem: &[u8]) -> Result<ApiTrust, String> {
+        use base64::Engine as _;
+        use rustls::pki_types::pem::PemObject as _;
+        let mut out = String::new();
+        for cert in rustls::pki_types::CertificateDer::pem_slice_iter(pem) {
+            let cert = cert.map_err(|e| e.to_string())?;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(cert.as_ref());
+            out.push_str("-----BEGIN CERTIFICATE-----\n");
+            for line in b64.as_bytes().chunks(64) {
+                out.push_str(&String::from_utf8_lossy(line));
+                out.push('\n');
+            }
+            out.push_str("-----END CERTIFICATE-----\n");
+        }
+        if out.is_empty() {
+            return Err("no certificate in it".to_owned());
+        }
+        Ok(ApiTrust::Ca(out))
+    }
+
+    fn word(&self) -> &'static str {
+        match self {
+            ApiTrust::Ca(_) => "ca",
+            ApiTrust::PublicRoots => "public_roots",
+            ApiTrust::Insecure => "insecure",
+        }
+    }
 }
 
 /// Accepts any server certificate (`KUBERNETES_INSECURE_SKIP_VERIFY`).
@@ -156,13 +211,21 @@ pub struct KubernetesProvisioner {
     config: KubernetesConfig,
     /// For the restricted zones (namespaces a cluster-wide grant leaves out).
     policy: Arc<Policy>,
+    /// How the API server is trusted, for the credential.
+    trust: ApiTrust,
+    /// The API server URLs agents are told (`KUBERNETES_AGENT_API_URL`;
+    /// empty: the broker's own endpoints).
+    agent_urls: Vec<String>,
 }
 
 impl KubernetesProvisioner {
     /// `KUBERNETES_API_URL` (`in-cluster` or a comma-separated list; none:
     /// off), `KUBERNETES_TOKEN`, `KUBERNETES_TOKEN_FILE`,
     /// `KUBERNETES_CA_FILE` (the only CA trusted for the API server: the
-    /// public roots are not), `KUBERNETES_INSECURE_SKIP_VERIFY`.
+    /// public roots are not), `KUBERNETES_INSECURE_SKIP_VERIFY`,
+    /// `KUBERNETES_AGENT_API_URL` (a comma-separated list: the API server
+    /// as agents reach it, when that is not how the broker does, e.g.
+    /// in-cluster).
     pub fn from_env(
         env: &Env<'_>,
         config: &KubernetesConfig,
@@ -185,31 +248,41 @@ impl KubernetesProvisioner {
             }
             vec![format!("https://{host}:{port}")]
         } else {
-            api.split(',')
-                .map(str::trim)
-                .filter(|u| !u.is_empty())
-                .map(str::to_owned)
-                .collect()
+            list(&api)
         };
         if urls.is_empty() {
             return Err(ConfigError("kubernetes api_url is empty".to_owned()));
         }
-        let tls = if env.flag("KUBERNETES_INSECURE_SKIP_VERIFY")? {
+        let (tls, trust) = if env.flag("KUBERNETES_INSECURE_SKIP_VERIFY")? {
             tracing::warn!(
                 "KUBERNETES_INSECURE_SKIP_VERIFY: the API server's certificate is not checked"
             );
-            insecure_tls()?
+            (insecure_tls()?, ApiTrust::Insecure)
         } else if ca_file.is_empty() {
-            agent_auth_tls::default_client_config()
-                .map_err(|e| ConfigError(format!("kubernetes TLS: {e}")))?
+            (
+                agent_auth_tls::default_client_config()
+                    .map_err(|e| ConfigError(format!("kubernetes TLS: {e}")))?,
+                ApiTrust::PublicRoots,
+            )
         } else {
             let pem = std::fs::read(&ca_file)
                 .map_err(|e| ConfigError(format!("KUBERNETES_CA_FILE {ca_file}: {e}")))?;
             let roots = agent_auth_tls::private_root_store(&pem)
                 .map_err(|e| ConfigError(format!("KUBERNETES_CA_FILE {ca_file}: {e}")))?;
-            agent_auth_tls::client_config(roots)
-                .map_err(|e| ConfigError(format!("kubernetes TLS: {e}")))?
+            let trust = ApiTrust::from_pem(&pem)
+                .map_err(|e| ConfigError(format!("KUBERNETES_CA_FILE {ca_file}: {e}")))?;
+            (
+                agent_auth_tls::client_config(roots)
+                    .map_err(|e| ConfigError(format!("kubernetes TLS: {e}")))?,
+                trust,
+            )
         };
+        let agent_urls = list(&env.get("KUBERNETES_AGENT_API_URL"));
+        if let Some(bad) = agent_urls.iter().find(|u| !u.starts_with("https://")) {
+            return Err(ConfigError(format!(
+                "KUBERNETES_AGENT_API_URL: {bad} is not an https:// URL"
+            )));
+        }
         let token = env.get("KUBERNETES_TOKEN");
         let bearer = if !token_file.is_empty() {
             Bearer::File(PathBuf::from(token_file))
@@ -218,13 +291,16 @@ impl KubernetesProvisioner {
         } else {
             Bearer::None
         };
-        Ok(Some(KubernetesProvisioner::new(
-            urls,
-            bearer_parts(bearer),
-            config.clone(),
-            policy,
-            Http::with_tls(tls)?,
-        )))
+        Ok(Some(
+            KubernetesProvisioner::new(
+                urls,
+                bearer_parts(bearer),
+                config.clone(),
+                policy,
+                Http::with_tls(tls)?,
+            )
+            .trusting(trust, agent_urls),
+        ))
     }
 
     /// `token_file` wins over `token`.
@@ -251,6 +327,37 @@ impl KubernetesProvisioner {
             http,
             config,
             policy,
+            trust: ApiTrust::PublicRoots,
+            agent_urls: Vec::new(),
+        }
+    }
+
+    /// How the API server is trusted, and the URLs agents reach it by
+    /// (empty: the broker's own), for credentials.
+    #[must_use]
+    pub fn trusting(mut self, trust: ApiTrust, agent_urls: Vec<String>) -> KubernetesProvisioner {
+        self.trust = trust;
+        self.agent_urls = agent_urls
+            .into_iter()
+            .map(|u| u.trim_end_matches('/').to_owned())
+            .collect();
+        self
+    }
+
+    /// How the API server is trusted.
+    #[must_use]
+    pub fn trust(&self) -> &ApiTrust {
+        &self.trust
+    }
+
+    /// The API server as an agent should reach it: every URL, the
+    /// preferred first.
+    #[must_use]
+    pub fn agent_api_urls(&self) -> Vec<String> {
+        if self.agent_urls.is_empty() {
+            lock(&self.endpoints).clone()
+        } else {
+            self.agent_urls.clone()
         }
     }
 
@@ -657,14 +764,49 @@ impl KubernetesProvisioner {
             Some(Value::String(s)) => s.clone(),
             _ => "None".to_owned(),
         };
-        let bound = if state.get("cluster").and_then(Value::as_bool) == Some(true) {
+        let cluster_wide = state.get("cluster").and_then(Value::as_bool) == Some(true);
+        let target = state
+            .get("binding_namespace")
+            .and_then(Value::as_str)
+            .unwrap_or(ns);
+        let bound = if cluster_wide {
             "cluster-wide".to_owned()
         } else {
-            let target = state
-                .get("binding_namespace")
-                .and_then(Value::as_str)
-                .unwrap_or(ns);
             format!("in namespace {target}")
+        };
+        let servers = self.agent_api_urls();
+        let server = servers.first().cloned().unwrap_or_default();
+        let mut properties = Map::new();
+        properties.insert("server".into(), json!(server));
+        properties.insert("servers".into(), json!(servers));
+        properties.insert(
+            "namespace".into(),
+            if cluster_wide {
+                Value::Null
+            } else {
+                json!(target)
+            },
+        );
+        properties.insert("tls".into(), json!(self.trust.word()));
+        let trust_note = match &self.trust {
+            ApiTrust::Ca(pem) => {
+                use base64::Engine as _;
+                properties.insert("certificate_authority_pem".into(), json!(pem));
+                properties.insert(
+                    "certificate_authority_data".into(),
+                    json!(base64::engine::general_purpose::STANDARD.encode(pem)),
+                );
+                "verify the server with certificate_authority_pem (kubeconfig: \
+                 certificate-authority-data)"
+            }
+            ApiTrust::PublicRoots => {
+                "the server's certificate is from a public CA (no private CA to pin)"
+            }
+            ApiTrust::Insecure => {
+                "WARNING: the broker does not verify this API server's certificate \
+                 (KUBERNETES_INSECURE_SKIP_VERIFY), so it has no CA to give you; do not \
+                 send this token without verifying the server — ask the operator"
+            }
         };
         Ok(Credential {
             value: at(status, &["token"])
@@ -674,9 +816,10 @@ impl KubernetesProvisioner {
                 .as_str()
                 .and_then(parse_time),
             note: Some(format!(
-                "bearer token for ServiceAccount {ns}/{name} ({role} {bound}) against {}; re-fetch rather than caching — the account is deleted when the grant ends",
-                self.api_url()
+                "bearer token for ServiceAccount {ns}/{name} ({role} {bound}) against {server}; {trust_note}; re-fetch rather than caching — the account is deleted when the grant ends"
             )),
+            url: Some(server),
+            properties: Some(properties),
             ..Credential::of(CredentialKind::KubernetesToken)
         })
     }
@@ -902,6 +1045,91 @@ impl Provisioner for KubernetesProvisioner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn from_vars(vars: &[(&str, &str)]) -> Result<Option<KubernetesProvisioner>, ConfigError> {
+        let map: std::collections::BTreeMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        let lookup = super::super::setup::map_lookup(map);
+        KubernetesProvisioner::from_env(
+            &Env::new(&lookup),
+            &KubernetesConfig::default(),
+            Arc::new(Policy::default()),
+        )
+    }
+
+    #[test]
+    fn the_ca_is_its_certificates_only() {
+        let ca = agent_auth_mail::testing::TestCa::new().ca_pem;
+        let noisy = format!("# the cluster CA\n{ca}\ntrailing words\n");
+        let ApiTrust::Ca(pem) = ApiTrust::from_pem(noisy.as_bytes()).unwrap() else {
+            panic!("a CA")
+        };
+        assert!(pem.starts_with("-----BEGIN CERTIFICATE-----\n"));
+        assert!(!pem.contains('#') && !pem.contains("trailing"));
+        use rustls::pki_types::pem::PemObject as _;
+        let der = |p: &str| {
+            rustls::pki_types::CertificateDer::pem_slice_iter(p.as_bytes())
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(der(&pem), der(&ca));
+        assert!(ApiTrust::from_pem(b"not a certificate").is_err());
+    }
+
+    #[test]
+    fn trust_from_the_environment() {
+        let dir = std::env::temp_dir().join(format!("aa-k8s-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("ca.crt");
+        let ca = agent_auth_mail::testing::TestCa::new().ca_pem;
+        std::fs::write(&file, &ca).unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let p = from_vars(&[
+            ("KUBERNETES_API_URL", "https://10.0.0.1:6443"),
+            ("KUBERNETES_CA_FILE", &path),
+            (
+                "KUBERNETES_AGENT_API_URL",
+                "https://100.126.30.73:6443/, https://100.126.30.74:6443",
+            ),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(p.trust(), &ApiTrust::from_pem(ca.as_bytes()).unwrap());
+        assert_eq!(
+            p.agent_api_urls(),
+            ["https://100.126.30.73:6443", "https://100.126.30.74:6443"]
+        );
+        // Without an agent URL: the broker's own.
+        let p = from_vars(&[
+            ("KUBERNETES_API_URL", "https://a:6443,https://b:6443"),
+            ("KUBERNETES_CA_FILE", &path),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(p.agent_api_urls(), ["https://a:6443", "https://b:6443"]);
+        let p = from_vars(&[("KUBERNETES_API_URL", "https://a:6443")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.trust(), &ApiTrust::PublicRoots);
+        let p = from_vars(&[
+            ("KUBERNETES_API_URL", "https://127.0.0.1:6443"),
+            ("KUBERNETES_INSECURE_SKIP_VERIFY", "1"),
+            ("KUBERNETES_CA_FILE", &path),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(p.trust(), &ApiTrust::Insecure);
+        let err = from_vars(&[
+            ("KUBERNETES_API_URL", "https://a:6443"),
+            ("KUBERNETES_AGENT_API_URL", "http://100.126.30.73:6443"),
+        ])
+        .err()
+        .unwrap();
+        assert!(err.0.contains("not an https:// URL"), "{}", err.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn sa_names() {

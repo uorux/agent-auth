@@ -882,6 +882,25 @@ and why. Keep entries short. Group by area.
   from the grant (`aa-<agent>-<grant id>` in its namespace; cluster-wide:
   the ClusterRoleBinding, and per-namespace RoleBindings when the agent has
   zone exclusions) and deletes them (404 is fine).
+- **A Kubernetes credential carries the API server and its CA**
+  (2026-10-25, from an agent's report; Python unchanged). The Python's
+  `kubernetes_token` named the server only in `note` and gave no CA, so an
+  agent without a kubeconfig could only skip TLS verification (a MITM gets
+  a live token). Now `url` is the preferred server and `properties` holds
+  `server`, `servers` (every one, for failover), `namespace` (null
+  cluster-wide), `tls` (`ca` | `public_roots` | `insecure`) and, with a CA,
+  `certificate_authority_pem` (the CA file's certificates, re-encoded) and
+  `certificate_authority_data` (its base64, as kubeconfig takes it). An
+  insecure broker has no CA and the note says so. `KUBERNETES_AGENT_API_URL`
+  (new, https only) names the servers as agents reach them, for a broker
+  that reaches its API in-cluster (the k8s deployment sets a node's tailnet
+  address). The MCP server's `to_file=True` writes a kubeconfig
+  (`<grant>.kubeconfig`, 0600, JSON: a cluster and context per server, the
+  CA, the namespace, the token; never `insecure-skip-tls-verify`) and
+  answers with `kubectl_example` (`KUBECONFIG=<file> kubectl get pods`),
+  so the token stays off command lines; from a broker without a server it
+  writes the plain token file as before. The web UI's MCP never serves
+  credentials, so there is no CA-only reply there.
 - **Models reuses only its own gateway user** (B12): an existing LiteLLM
   user named like the agent is reused only if its `user_role` is
   `internal_user_viewer` and `metadata.agent` is the agent's name;
