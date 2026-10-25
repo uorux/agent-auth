@@ -22,7 +22,7 @@ use crate::executor::direct::DirectExecutor;
 use crate::fsutil::testdir::TestDir;
 
 const HOST: &str = "excelsior";
-const KEY: &str = "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const KEY: &str = "ed25519:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 const USER_UID: u32 = 4242;
 
 fn find(program: &str) -> String {

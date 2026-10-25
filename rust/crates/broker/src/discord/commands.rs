@@ -88,7 +88,7 @@ pub fn definitions() -> Value {
             "description": "Lift a lockdown (a host needs its own root arm code)",
             "options": [
                 {"type": STRING, "name": "host", "description": "the host", "autocomplete": true},
-                {"type": STRING, "name": "code", "description": "the host's root-arm code"},
+                {"type": STRING, "name": "code", "description": "the host's root-unlock code"},
             ],
         },
         {

@@ -727,7 +727,7 @@ async fn codes_are_prompted_for_hidden() {
     );
 
     let r = agent_auth(&fake.url, &["admin", "arm", "excelsior", "--tier", "root"]).await;
-    assert_eq!(r.prompts, ["excelsior root-unlock code: "]);
+    assert_eq!(r.prompts, ["excelsior root-arm code: "]);
     assert_eq!(
         fake.calls("POST", "/admin/hosts/*/arm")[0].json(),
         json!({"tier": "root", "duration": "1h", "totp": "123456"})

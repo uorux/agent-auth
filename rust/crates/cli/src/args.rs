@@ -425,10 +425,10 @@ pub enum AdminCommand {
         kill_vm: bool,
     },
     /// Lift a lockdown on the broker. Each host stays locked until it gets
-    /// its own root arm code (--host), or `sudo agent-auth-hostctl unlock`
+    /// its own root-unlock code (--host), or `sudo agent-auth-hostctl unlock`
     /// there.
     Unlock {
-        /// also unlock this host's hostd (asks for its root arm code)
+        /// also unlock this host's hostd (asks for its root-unlock code)
         #[arg(long)]
         host: Option<String>,
     },

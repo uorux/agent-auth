@@ -493,7 +493,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const KEY: &str = "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const KEY: &str = "ed25519:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 
     fn module_json() -> Value {
         json!({
@@ -554,12 +554,8 @@ mod tests {
         no_user["user"] = Value::Null;
         no_user["desktop"]["enable"] = json!(false);
         no_user["desktop"]["approve"] = json!({});
-        assert!(
-            HostConfig::from_json(&no_user, false)
-                .unwrap_err()
-                .0
-                .contains("the user tier needs `user`")
-        );
+        let e = HostConfig::from_json(&no_user, false).unwrap_err().0;
+        assert!(e.contains("the user tier needs `user`"), "{e}");
         let mut typo = module_json();
         typo["deny_comands"] = json!([["rm"]]);
         assert!(

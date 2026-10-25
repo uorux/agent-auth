@@ -196,7 +196,7 @@ pub fn lockdown_embed(scope: LockdownScope, host: Option<&str>, out: &LockdownRe
     e.description = Some(cut(
         &format!(
             "{} grant(s) revoked, {} thread(s) closed.\n{}\n\n`/unlock` lifts the broker's side. \
-             Each host stays locked until `/unlock host:<h> code:<root-arm code>` or \
+             Each host stays locked until `/unlock host:<h> code:<root-unlock code>` or \
              `sudo agent-auth-hostctl unlock` on it.",
             out.grants_revoked,
             out.threads_closed,

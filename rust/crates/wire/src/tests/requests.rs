@@ -58,7 +58,7 @@ fn every_request_body_refuses_unknown_fields() {
         ChatSend => json!({"text": "thanks"}),
         ChatClose => json!({}),
         PairBody => json!({"role": "host", "name": "excelsior",
-                           "public_key": "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                           "public_key": "ed25519:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
                            "selector": "0123456789abcdef0123456789abcdef",
                            "proof": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}),
     }
