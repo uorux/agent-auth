@@ -19,6 +19,7 @@ dependencies = [
  "hex",
  "http-body-util",
  "proptest",
+ "regex",
  "reqwest",
  "ring",
  "rmcp",

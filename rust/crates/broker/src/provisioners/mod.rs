@@ -23,7 +23,22 @@
 //! Every error text may reach the agent (it is appended to the request's
 //! decision reason), so it never contains secrets or upstream bodies.
 
+pub(crate) mod common;
+pub mod github;
+pub mod google;
+pub mod http;
+pub mod kubernetes;
+pub mod ldap;
+pub mod lldap;
+pub mod mcp;
+pub mod models;
+pub mod setup;
+pub mod tokens;
+
+pub use setup::{ConfigError, PlatformServices};
+
 use agent_auth_core::{Authority, Platform};
+use agent_auth_crypto::Secret;
 use agent_auth_store::Tx;
 use agent_auth_store::agents::AgentRow;
 use agent_auth_store::grants::{GrantRow, IssuableGrant};
@@ -74,9 +89,9 @@ impl ProvisionError {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Credential {
     pub kind: String,
-    /// The secret itself, when there is one. (Becomes `crypto::Secret` once
-    /// that crate is merged.)
-    pub value: Option<String>,
+    /// The secret itself, when there is one (or a non-secret value such as
+    /// a repo URL); never printed.
+    pub value: Option<Secret<String>>,
     pub username: Option<String>,
     pub url: Option<String>,
     pub expires_at: Option<OffsetDateTime>,
@@ -163,6 +178,12 @@ pub enum AnyProvisioner {
     Fake(FakeProvisioner),
     /// Check-based agent-to-agent grants (`crate::a2a::provisioner`).
     A2a(crate::a2a::provisioner::A2aProvisioner),
+    Github(github::GithubProvisioner),
+    Homelab(lldap::LldapProvisioner),
+    Kubernetes(kubernetes::KubernetesProvisioner),
+    Models(models::ModelsProvisioner),
+    Mcp(mcp::McpProvisioner),
+    Google(google::GoogleProvisioner),
 }
 
 macro_rules! dispatch {
@@ -170,6 +191,12 @@ macro_rules! dispatch {
         match $self {
             AnyProvisioner::Fake($p) => $e,
             AnyProvisioner::A2a($p) => $e,
+            AnyProvisioner::Github($p) => $e,
+            AnyProvisioner::Homelab($p) => $e,
+            AnyProvisioner::Kubernetes($p) => $e,
+            AnyProvisioner::Models($p) => $e,
+            AnyProvisioner::Mcp($p) => $e,
+            AnyProvisioner::Google($p) => $e,
         }
     };
 }

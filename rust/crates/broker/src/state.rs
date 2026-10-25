@@ -16,7 +16,7 @@ use crate::a2a::A2a;
 use crate::auth::AuthConfig;
 use crate::events::KeyedEvents;
 use crate::notify::Notifier;
-use crate::provisioners::Registry;
+use crate::provisioners::{PlatformServices, Registry};
 use crate::security_log::SecurityLog;
 use crate::webui::Web;
 
@@ -35,6 +35,8 @@ pub struct AppState {
     /// a2a threads and sessions: config, wake-ups, the activity clock,
     /// webhook delivery.
     pub a2a: Arc<A2a>,
+    /// The provisioners' part: MCP token issuer, wiki, GitHub App.
+    pub platform_services: Arc<PlatformServices>,
 }
 
 impl AppState {
@@ -61,6 +63,7 @@ impl AppState {
             security_log: Arc::default(),
             web: Arc::default(),
             a2a: Arc::default(),
+            platform_services: Arc::default(),
         }
     }
 }
