@@ -34,6 +34,23 @@
 //! // Handles are made by the store only.
 //! fn forge() -> Request<state::Approved> { Request { row: todo!(), state: std::marker::PhantomData } }
 //! ```
+//!
+//! An approval needs a proof (a clearance from routing, or a human's
+//! attestation); there is no other way to build one:
+//!
+//! ```compile_fail
+//! use agent_auth_store::requests::Approval;
+//! fn forge() -> Approval {
+//!     Approval { basis: todo!(), decided_by: String::new(), reason: String::new(), duration_secs: 60 }
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use agent_auth_core::AutoClearance;
+//! use agent_auth_store::requests::Approval;
+//! // `Route::Approve`'s clearance is not `Route::Llm`'s.
+//! fn swap(c: AutoClearance) -> Approval { Approval::llm(c, "model", "why", 60) }
+//! ```
 
 use std::marker::PhantomData;
 
@@ -41,6 +58,7 @@ use agent_auth_core::lifecycle::{CanMoveTo, State, state};
 use agent_auth_core::{
     AgentId, Authority, DecisionSource, Platform, RequestId, RequestStatus, SessionId, ThreadId,
 };
+use agent_auth_core::{AutoClearance, HumanApproval, LlmClearance};
 use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -317,6 +335,7 @@ impl AnyRequest {
 /// hold after every transition.
 #[derive(Debug, Default)]
 pub struct Changes {
+    proof: Option<Proof>,
     bump_attempt: bool,
     justification: Option<String>,
     source: Option<DecisionSource>,
@@ -328,6 +347,16 @@ pub struct Changes {
     note: Option<String>,
 }
 
+/// What a proof-carrying entry (an approval, an LLM round) was made for:
+/// the request, the authority (clearances), and the states it may come
+/// from. `transition` refuses a mismatch with `StoreError::WrongProof`.
+#[derive(Debug)]
+struct Proof {
+    request: RequestId,
+    authority: Option<Authority>,
+    from: &'static [RequestStatus],
+}
+
 /// A state a request can be moved into, and the data that takes.
 pub trait Enter: State {
     type Data;
@@ -335,11 +364,14 @@ pub trait Enter: State {
     fn changes(data: Self::Data) -> Changes;
 }
 
-/// Entering LLM_EVALUATING starts an evaluation round (`attempt += 1`); a
-/// retry replaces the justification (core B-17: the old one is lost; the
-/// LLM evaluation rows keep their reasoning).
-#[derive(Debug, Clone, Default)]
+/// Entering LLM_EVALUATING starts an evaluation round (`attempt += 1`).
+/// It needs the [`LlmClearance`] routing gave this request (`Route::Llm`;
+/// a retry re-routes with the current facts, core B-4). A retry replaces
+/// the justification (core B-17: the old one is lost; the LLM evaluation
+/// rows keep their reasoning).
+#[derive(Debug)]
 pub struct LlmRound {
+    pub clearance: LlmClearance,
     pub justification: Option<String>,
 }
 
@@ -347,6 +379,11 @@ impl Enter for state::LlmEvaluating {
     type Data = LlmRound;
     fn changes(d: LlmRound) -> Changes {
         Changes {
+            proof: Some(Proof {
+                request: d.clearance.request(),
+                authority: Some(d.clearance.authority().clone()),
+                from: &[RequestStatus::Pending, RequestStatus::LlmDenied],
+            }),
             bump_attempt: true,
             justification: d.justification,
             ..Changes::default()
@@ -389,20 +426,136 @@ impl Enter for state::AwaitingHuman {
     }
 }
 
-/// An approval: who, why, and for how long.
-#[derive(Debug, Clone)]
+/// An approval: on what grounds, who, why, and for how long. Built only
+/// from a proof:
+/// - [`Approval::auto`]: an [`AutoClearance`] (`Route::Approve`; source
+///   `policy` or `rule`), from PENDING (creation) or AWAITING_HUMAN (a new
+///   window rule);
+/// - [`Approval::llm`]: an [`LlmClearance`] (`Route::Llm`, re-routed when
+///   the verdict comes), from LLM_EVALUATING;
+/// - [`Approval::human`]: a [`HumanApproval`], from AWAITING_HUMAN.
+///
+/// The proof names its request (and, for clearances, the authority);
+/// `transition` refuses an approval for another request, authority or
+/// starting state.
+#[derive(Debug)]
 pub struct Approval {
-    pub source: DecisionSource,
-    pub decided_by: String,
-    pub reason: String,
-    pub duration_secs: u32,
+    basis: Basis,
+    decided_by: String,
+    reason: String,
+    duration_secs: u32,
+}
+
+#[derive(Debug)]
+enum Basis {
+    Auto(AutoClearance),
+    Llm(LlmClearance),
+    Human(HumanApproval),
+}
+
+impl Approval {
+    /// Policy or a saved rule cleared it (`decided_by`: `policy`, `rule` or
+    /// `window:<rule id>`).
+    #[must_use]
+    pub fn auto(
+        clearance: AutoClearance,
+        decided_by: impl Into<String>,
+        reason: impl Into<String>,
+        duration_secs: u32,
+    ) -> Approval {
+        Approval {
+            basis: Basis::Auto(clearance),
+            decided_by: decided_by.into(),
+            reason: reason.into(),
+            duration_secs,
+        }
+    }
+
+    /// The LLM reviewer approved it (`model` is recorded as the decider).
+    #[must_use]
+    pub fn llm(
+        clearance: LlmClearance,
+        model: impl Into<String>,
+        reason: impl Into<String>,
+        duration_secs: u32,
+    ) -> Approval {
+        Approval {
+            basis: Basis::Llm(clearance),
+            decided_by: model.into(),
+            reason: reason.into(),
+            duration_secs,
+        }
+    }
+
+    /// A human approved it (the attestation's `decided_by` is recorded).
+    #[must_use]
+    pub fn human(
+        approval: HumanApproval,
+        reason: impl Into<String>,
+        duration_secs: u32,
+    ) -> Approval {
+        Approval {
+            decided_by: approval.decided_by().to_owned(),
+            basis: Basis::Human(approval),
+            reason: reason.into(),
+            duration_secs,
+        }
+    }
+
+    #[must_use]
+    pub fn source(&self) -> DecisionSource {
+        match &self.basis {
+            Basis::Auto(c) => c.source(),
+            Basis::Llm(_) => DecisionSource::Llm,
+            Basis::Human(_) => DecisionSource::Human,
+        }
+    }
+
+    #[must_use]
+    pub fn decided_by(&self) -> &str {
+        &self.decided_by
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    #[must_use]
+    pub fn duration_secs(&self) -> u32 {
+        self.duration_secs
+    }
 }
 
 impl Enter for state::Approved {
     type Data = Approval;
     fn changes(d: Approval) -> Changes {
+        let source = d.source();
+        let proof = match &d.basis {
+            Basis::Auto(c) => Proof {
+                request: c.request(),
+                authority: Some(c.authority().clone()),
+                // A clearance never says "human"; refuse one that would.
+                from: if c.source() == DecisionSource::Human {
+                    &[]
+                } else {
+                    &[RequestStatus::Pending, RequestStatus::AwaitingHuman]
+                },
+            },
+            Basis::Llm(c) => Proof {
+                request: c.request(),
+                authority: Some(c.authority().clone()),
+                from: &[RequestStatus::LlmEvaluating],
+            },
+            Basis::Human(h) => Proof {
+                request: h.request(),
+                authority: None,
+                from: &[RequestStatus::AwaitingHuman],
+            },
+        };
         Changes {
-            source: Some(d.source),
+            proof: Some(proof),
+            source: Some(source),
             decided_by: Some(d.decided_by),
             reason: Some(d.reason),
             approved_duration_secs: Some(d.duration_secs),
@@ -488,6 +641,16 @@ where
 {
     let id = request.id();
     let ch = To::changes(data);
+    if let Some(proof) = &ch.proof {
+        let row = request.row();
+        let authority_ok = proof
+            .authority
+            .as_ref()
+            .is_none_or(|a| row.authority.as_ref() == Some(a));
+        if proof.request != id || !authority_ok || !proof.from.contains(&From::STATUS) {
+            return Err(StoreError::WrongProof);
+        }
+    }
     let decided_at = ch.decided.then_some(now);
     let mut c = tx.conn().await;
     let raw = sqlx::query_as!(
@@ -609,14 +772,14 @@ pub async fn set_approved_edit(
     tx: &Tx<'_>,
     request: &mut Request<state::Approved>,
     edit: ApprovedEdit,
-) -> Result<(), StoreError> {
+) -> Outcome<(), Lost> {
     if edit.authority.platform() != request.row.platform {
         return Err(StoreError::OutOfRange(
             "an approved authority of another platform".to_owned(),
         ));
     }
     let mut c = tx.conn().await;
-    sqlx::query!(
+    let n = sqlx::query!(
         "UPDATE access_requests SET approved_resource = $2, approved_authority = $3, updated_at = now()
          WHERE id = $1 AND status = 'approved'",
         Uuid::from(request.id()),
@@ -624,9 +787,13 @@ pub async fn set_approved_edit(
         edit.authority.to_json()
     )
     .execute(&mut **c)
-    .await?;
+    .await?
+    .rows_affected();
+    if n != 1 {
+        return Ok(Err(Lost { id: request.id() }));
+    }
     request.row.approved_edit = Some(edit);
-    Ok(())
+    Ok(Ok(()))
 }
 
 /// Append one risk note atomically (no lost append between concurrent

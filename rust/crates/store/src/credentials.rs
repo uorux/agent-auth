@@ -2,6 +2,8 @@
 //! installation tokens), newest wins.
 
 use agent_auth_core::{CredentialId, GrantId};
+
+use crate::grants::IssuableGrant;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -49,16 +51,21 @@ pub async fn latest(tx: &Tx<'_>, grant: GrantId) -> Result<Option<CredentialRow>
     }))
 }
 
-/// Replace a grant's cached credentials with one.
+/// Replace a grant's cached credentials with one, while issuing for it
+/// (the [`IssuableGrant`] must come from this transaction).
 pub async fn replace(
     tx: &Tx<'_>,
     id: CredentialId,
-    grant: GrantId,
+    issuing: &IssuableGrant<'_>,
     kind: &str,
     value_encrypted: &str,
     expires_at: OffsetDateTime,
     now: OffsetDateTime,
 ) -> Result<(), StoreError> {
+    if !issuing.belongs_to(tx) {
+        return Err(StoreError::WrongProof);
+    }
+    let grant = issuing.grant().id;
     let mut c = tx.conn().await;
     sqlx::query!(
         "DELETE FROM credentials WHERE grant_id = $1",

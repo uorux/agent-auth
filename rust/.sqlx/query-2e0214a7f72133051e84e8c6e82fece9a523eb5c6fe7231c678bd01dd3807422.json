@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE host_jobs SET status = $3, error = COALESCE($4, error),\n             via = COALESCE($5, via), updated_at = now()\n         WHERE id = $1 AND host = $2 AND status = 'starting'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2e0214a7f72133051e84e8c6e82fece9a523eb5c6fe7231c678bd01dd3807422"
+}

@@ -247,6 +247,27 @@ and why. Keep entries short. Group by area.
   `ensure_ascii` escapes DEL (0x7f) as `\u007f`; the spec said raw. The Rust
   canonical JSON (`core::canonical_json`) matches the Python, checked
   against a vector from Python's `json.dumps`.
+- **Approvals carry proofs** (security review). Routing clearances
+  (`AutoClearance` for `approve`, `LlmClearance` for `llm`, distinct types)
+  name the request and the authority they were computed for; only
+  `Policy::route`/`evaluate_and_route` make them, from a sealed decision (a
+  decision whose fields were edited, or that was evaluated for another
+  authority or resource, clears nothing). A human approval is a
+  `HumanApproval` attested by an authenticated human surface (grep audit in
+  `scripts/check.sh`). The store's `Approval` is built only from one of the
+  three, and `transition` refuses one for another request, authority or
+  starting state (auto: PENDING/AWAITING_HUMAN; LLM: LLM_EVALUATING; human:
+  AWAITING_HUMAN). Entering LLM review needs the `LlmClearance`, so a retry
+  re-routes with current facts (B-4).
+- **Provisioning carries a proof**: `ProvisioningGrant` (from `begin` or
+  `load_provisioning`, `FOR UPDATE`) is consumed by `activate` /
+  `fail_provisioning`. A grant row can only be inserted for a PROVISIONING
+  request (trigger), and a request's spec (authority, resource, what was
+  asked) is immutable once stored (trigger).
+- **One lock order** (store `lib.rs`): requests → containment advisory lock
+  → agents → grants → threads. Disabling takes the containment lock
+  exclusively, so it waits for in-flight checks rather than deadlocking
+  with a provisioning (reproduced with psql and in a test).
 
 ## Open questions
 

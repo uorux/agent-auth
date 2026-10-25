@@ -216,6 +216,21 @@ pub async fn get_for_share(tx: &Tx<'_>, id: AgentId) -> Result<Option<AgentRow>,
     opt(raw)
 }
 
+/// Several rows, share-locked in ascending id order (the crate's lock
+/// order for agents).
+pub async fn get_many_for_share(tx: &Tx<'_>, ids: &[AgentId]) -> Result<Vec<AgentRow>, StoreError> {
+    let ids: Vec<Uuid> = ids.iter().copied().map(Uuid::from).collect();
+    let mut c = tx.conn().await;
+    let raw = sqlx::query_as!(
+        RawAgent,
+        "SELECT * FROM agents WHERE id = ANY($1) ORDER BY id FOR SHARE",
+        &ids
+    )
+    .fetch_all(&mut **c)
+    .await?;
+    rows(raw)
+}
+
 pub async fn get_for_update(tx: &Tx<'_>, id: AgentId) -> Result<Option<AgentRow>, StoreError> {
     let mut c = tx.conn().await;
     let raw = sqlx::query_as!(
@@ -569,7 +584,13 @@ pub async fn set_kind(tx: &Tx<'_>, id: AgentId, kind: AgentKind) -> Result<bool,
     Ok(n == 1)
 }
 
+/// Disabling takes the containment lock exclusively first (the crate's
+/// lock order), so it waits for in-flight checks instead of deadlocking
+/// with them.
 pub async fn set_disabled(tx: &Tx<'_>, id: AgentId, disabled: bool) -> Result<bool, StoreError> {
+    if disabled {
+        crate::lockdown::lock_exclusive(tx).await?;
+    }
     let mut c = tx.conn().await;
     let n = sqlx::query!(
         "UPDATE agents SET disabled = $2 WHERE id = $1",

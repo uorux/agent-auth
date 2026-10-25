@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "UPDATE grants SET status = 'active', provisioner_state = $3\n         WHERE id = $1 AND agent_id = $2 AND status = 'provisioning'\n         RETURNING *",
+  "query": "SELECT * FROM grants WHERE id = $1 AND status = 'provisioning' FOR UPDATE",
   "describe": {
     "columns": [
       {
@@ -182,9 +182,7 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Uuid",
-        "Jsonb"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -206,5 +204,5 @@
       false
     ]
   },
-  "hash": "976e73fce031aa4cf344a86784e0138787aa4a45d222f42cc4004c77b9226a8f"
+  "hash": "4aea59f4421576ed21d1cec3fe415a278e8e6d6d1ba840f6fe0b66cc01275957"
 }

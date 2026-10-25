@@ -4,8 +4,11 @@
 //!   PROVISIONING and a [`NotHeld`] proof from the same transaction, and
 //!   inserts it PROVISIONING: the durable record that an external change
 //!   may exist, before the provisioner runs.
-//! - [`activate`] (PROVISIONING → ACTIVE) needs a fresh `NotHeld` from the
-//!   activating transaction.
+//! - What `begin` returns, and what [`load_provisioning`] returns in the
+//!   finishing transaction (locked `FOR UPDATE`, still PROVISIONING), is a
+//!   [`ProvisioningGrant`] borrowing its transaction. [`activate`]
+//!   (PROVISIONING → ACTIVE, which also needs a `NotHeld` from that
+//!   transaction) and [`fail_provisioning`] consume it.
 //! - Every status change is a compare-and-swap on the current status (core
 //!   B-9: the Python assigned blindly), so a reaped grant is never
 //!   re-activated and a revoke racing an expiry ends the grant once.
@@ -29,7 +32,10 @@ use crate::{Outcome, StoreError, Tx};
 
 const T: &str = "grants";
 
+/// A grant row. Made only by this crate (`#[non_exhaustive]`): a value of
+/// this type was read from the database.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct GrantRow {
     pub id: GrantId,
     pub request_id: RequestId,
@@ -130,14 +136,15 @@ pub enum BeginRefused {
 /// agent proven not held in this transaction. Resource and authority are
 /// the human's edit if any, else the request's; `expires_at = now +
 /// approved duration`, and a delegated grant never outlives its thread's
-/// backing grant (thread and backing grant are share-locked until commit).
-pub async fn begin(
-    tx: &Tx<'_>,
+/// backing grant (delegator, backing grant and thread are share-locked
+/// until commit, in the crate's lock order).
+pub async fn begin<'t>(
+    tx: &'t Tx<'_>,
     request: &Request<state::Provisioning>,
     not_held: &NotHeld<'_>,
     id: GrantId,
     now: OffsetDateTime,
-) -> Outcome<GrantRow, BeginRefused> {
+) -> Outcome<ProvisioningGrant<'t>, BeginRefused> {
     let row = request.row();
     not_held.verify(tx, row.agent_id)?;
     let authority = row
@@ -184,40 +191,33 @@ pub async fn begin(
     )
     .fetch_one(&mut **c)
     .await?;
-    Ok(Ok(raw.try_into()?))
+    Ok(Ok(ProvisioningGrant {
+        tx: tx.addr(),
+        grant: raw.try_into()?,
+        borrow: PhantomData,
+    }))
 }
 
 /// The delegation thread must be open, its backing grant active and
 /// unexpired, and the delegator enabled. Returns the backing grant's expiry.
+/// Locks in the crate's order: delegator (agents), backing grant (grants),
+/// thread (threads); the thread's backing grant id is immutable, so it is
+/// read once without a lock to know what to lock.
 async fn delegation_backing(
     tx: &Tx<'_>,
     d: Delegation,
     now: OffsetDateTime,
 ) -> Outcome<OffsetDateTime, BeginRefused> {
     let mut c = tx.conn().await;
-    let thread = sqlx::query!(
-        "SELECT state, grant_id FROM a2a_threads WHERE id = $1 FOR SHARE",
+    let backing = sqlx::query_scalar!(
+        "SELECT grant_id FROM a2a_threads WHERE id = $1",
         Uuid::from(d.thread_id)
     )
     .fetch_optional(&mut **c)
     .await?;
-    let Some(thread) = thread.filter(|t| t.state == "open") else {
-        return Ok(Err(BeginRefused::DelegationClosed));
-    };
     // An operator thread has no backing grant; as in the Python, it cannot
     // carry a delegated grant (a2a B1, an open question).
-    let Some(backing) = thread.grant_id else {
-        return Ok(Err(BeginRefused::DelegationClosed));
-    };
-    let backing = sqlx::query!(
-        "SELECT expires_at FROM grants
-         WHERE id = $1 AND status = 'active' AND expires_at > $2 FOR SHARE",
-        backing,
-        now
-    )
-    .fetch_optional(&mut **c)
-    .await?;
-    let Some(backing) = backing else {
+    let Some(Some(backing)) = backing else {
         return Ok(Err(BeginRefused::DelegationClosed));
     };
     let delegator_ok = sqlx::query_scalar!(
@@ -229,7 +229,76 @@ async fn delegation_backing(
     if delegator_ok != Some(true) {
         return Ok(Err(BeginRefused::DelegatorDisabled));
     }
+    let backing = sqlx::query!(
+        "SELECT expires_at FROM grants
+         WHERE id = $1 AND status = 'active' AND expires_at > $2 FOR SHARE",
+        backing,
+        now
+    )
+    .fetch_optional(&mut **c)
+    .await?;
+    let Some(backing) = backing else {
+        return Ok(Err(BeginRefused::DelegationClosed));
+    };
+    let open = sqlx::query_scalar!(
+        r#"SELECT state = 'open' AS "open!" FROM a2a_threads WHERE id = $1 FOR SHARE"#,
+        Uuid::from(d.thread_id)
+    )
+    .fetch_optional(&mut **c)
+    .await?;
+    if open != Some(true) {
+        return Ok(Err(BeginRefused::DelegationClosed));
+    }
     Ok(Ok(backing.expires_at))
+}
+
+/// A grant being provisioned, locked in the transaction it borrows: made
+/// by [`begin`] (just inserted) or [`load_provisioning`] (`FOR UPDATE`,
+/// still PROVISIONING). [`activate`] and [`fail_provisioning`] consume it.
+#[derive(Debug)]
+pub struct ProvisioningGrant<'t> {
+    tx: usize,
+    grant: GrantRow,
+    borrow: PhantomData<&'t ()>,
+}
+
+impl ProvisioningGrant<'_> {
+    #[must_use]
+    pub fn grant(&self) -> &GrantRow {
+        &self.grant
+    }
+
+    fn verify(&self, tx: &Tx<'_>) -> Result<(), StoreError> {
+        if self.tx == tx.addr() {
+            Ok(())
+        } else {
+            Err(StoreError::WrongProof)
+        }
+    }
+}
+
+/// The finishing phase's (or the reaper's) grant: locked `FOR UPDATE` and
+/// still PROVISIONING (`None` otherwise). Lock order: call
+/// `lockdown::check` for the grant's agent first.
+pub async fn load_provisioning<'t>(
+    tx: &'t Tx<'_>,
+    id: GrantId,
+) -> Result<Option<ProvisioningGrant<'t>>, StoreError> {
+    let raw = {
+        let mut c = tx.conn().await;
+        sqlx::query_as!(
+            RawGrant,
+            "SELECT * FROM grants WHERE id = $1 AND status = 'provisioning' FOR UPDATE",
+            Uuid::from(id)
+        )
+        .fetch_optional(&mut **c)
+        .await?
+    };
+    Ok(opt(raw)?.map(|grant| ProvisioningGrant {
+        tx: tx.addr(),
+        grant,
+        borrow: PhantomData,
+    }))
 }
 
 /// The grant was not in the expected status (someone else moved it, or it
@@ -244,20 +313,20 @@ pub struct GrantLost {
 /// proven not held in this transaction.
 pub async fn activate(
     tx: &Tx<'_>,
-    id: GrantId,
+    grant: ProvisioningGrant<'_>,
     not_held: &NotHeld<'_>,
     provisioner_state: &Value,
 ) -> Outcome<GrantRow, GrantLost> {
-    let agent = not_held.agent().id;
-    not_held.verify(tx, agent)?;
+    grant.verify(tx)?;
+    let id = grant.grant.id;
+    not_held.verify(tx, grant.grant.agent_id)?;
     let mut c = tx.conn().await;
     let raw = sqlx::query_as!(
         RawGrant,
-        "UPDATE grants SET status = 'active', provisioner_state = $3
-         WHERE id = $1 AND agent_id = $2 AND status = 'provisioning'
+        "UPDATE grants SET status = 'active', provisioner_state = $2
+         WHERE id = $1 AND status = 'provisioning'
          RETURNING *",
         Uuid::from(id),
-        Uuid::from(agent),
         provisioner_state
     )
     .fetch_optional(&mut **c)
@@ -272,10 +341,12 @@ pub async fn activate(
 /// external state (sets `revoked_at`).
 pub async fn fail_provisioning(
     tx: &Tx<'_>,
-    id: GrantId,
+    grant: ProvisioningGrant<'_>,
     reason: &str,
     reverted_at: Option<OffsetDateTime>,
 ) -> Outcome<GrantRow, GrantLost> {
+    grant.verify(tx)?;
+    let id = grant.grant.id;
     let mut c = tx.conn().await;
     let raw = sqlx::query_as!(
         RawGrant,
@@ -358,7 +429,9 @@ pub async fn expire_now_of_agent(
 ) -> Result<u64, StoreError> {
     let mut c = tx.conn().await;
     Ok(sqlx::query!(
-        "UPDATE grants SET expires_at = LEAST(expires_at, $2) WHERE agent_id = $1 AND status = 'active'",
+        "UPDATE grants SET expires_at = LEAST(expires_at, $2)
+         WHERE id IN (SELECT id FROM grants WHERE agent_id = $1 AND status = 'active'
+                      ORDER BY id FOR NO KEY UPDATE)",
         Uuid::from(agent),
         now
     )
@@ -445,6 +518,7 @@ impl NotIssuable {
 /// ```
 #[derive(Debug)]
 pub struct IssuableGrant<'t> {
+    tx: usize,
     grant: GrantRow,
     borrow: PhantomData<&'t ()>,
 }
@@ -453,6 +527,13 @@ impl IssuableGrant<'_> {
     #[must_use]
     pub fn grant(&self) -> &GrantRow {
         &self.grant
+    }
+
+    /// Was this decided in `tx`? (Writes made on its behalf, such as
+    /// `credentials::replace`, check it.)
+    #[must_use]
+    pub fn belongs_to(&self, tx: &Tx<'_>) -> bool {
+        self.tx == tx.addr()
     }
 }
 
@@ -511,6 +592,7 @@ pub async fn issuable<'t>(
         }));
     }
     Ok(Ok(IssuableGrant {
+        tx: tx.addr(),
         grant: row,
         borrow: PhantomData,
     }))
@@ -687,7 +769,10 @@ pub async fn active_a2a_targeting(tx: &Tx<'_>, target: &str) -> Result<Vec<Grant
 pub async fn rename_a2a_target(tx: &Tx<'_>, old: &str, new: &str) -> Result<u64, StoreError> {
     let mut c = tx.conn().await;
     Ok(sqlx::query!(
-        "UPDATE grants SET resource = $2 WHERE platform = 'a2a' AND resource = $1 AND status = 'active'",
+        "UPDATE grants SET resource = $2
+         WHERE id IN (SELECT id FROM grants
+                      WHERE platform = 'a2a' AND resource = $1 AND status = 'active'
+                      ORDER BY id FOR NO KEY UPDATE)",
         old,
         new
     )

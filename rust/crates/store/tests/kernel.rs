@@ -167,7 +167,7 @@ async fn a_proof_from_another_transaction_or_agent_is_refused(pool: PgPool) {
     let Some(AnyRequest::AwaitingHuman(r)) = requests::get(&tx, id).await.unwrap() else {
         panic!()
     };
-    let r = requests::transition::<_, state::Approved>(&tx, r, approval(60), now())
+    let r = requests::transition::<_, state::Approved>(&tx, r, approval(id, 60), now())
         .await
         .unwrap()
         .unwrap();
@@ -185,12 +185,18 @@ async fn a_proof_from_another_transaction_or_agent_is_refused(pool: PgPool) {
         .unwrap_err();
     assert!(matches!(err, StoreError::WrongProof));
     let right = lockdown::check(&tx, a.id, now()).await.unwrap().unwrap();
-    let g = grants::begin(&tx, &r, &right, GrantId::new(), now())
+    let pg = grants::begin(&tx, &r, &right, GrantId::new(), now())
         .await
         .unwrap()
         .unwrap();
+    let g = pg.grant();
     assert_eq!(g.status, GrantStatus::Provisioning);
     assert_eq!(g.resource, "svc-gitea");
+    // The provisioning proof is bound to its transaction.
+    let err = grants::activate(&other, pg, &foreign, &json!({}))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::WrongProof));
     // One grant per request.
     let err = grants::begin(&tx, &r, &right, GrantId::new(), now())
         .await
@@ -207,19 +213,21 @@ async fn grant_status_changes_are_compare_and_swap(pool: PgPool) {
 
     // The reaper fails it; a late activation then loses (core B-9).
     let tx = store.begin().await.unwrap();
-    grants::fail_provisioning(&tx, g.id, "interrupted", Some(now()))
+    let pg = grants::load_provisioning(&tx, g.id).await.unwrap().unwrap();
+    grants::fail_provisioning(&tx, pg, "interrupted", Some(now()))
         .await
         .unwrap()
         .unwrap();
-    let nh = lockdown::check(&tx, a.id, now()).await.unwrap().unwrap();
+    tx.commit().await.unwrap();
+    // A late finisher finds nothing to activate.
+    let tx = store.begin().await.unwrap();
     assert!(
-        grants::activate(&tx, g.id, &nh, &json!({}))
+        grants::load_provisioning(&tx, g.id)
             .await
             .unwrap()
-            .is_err()
+            .is_none()
     );
-    drop(nh);
-    tx.commit().await.unwrap();
+    drop(tx);
 
     // A revoke racing an expiry ends the grant once.
     let id2 = awaiting(&store, a.id, &homelab()).await;
@@ -380,7 +388,7 @@ async fn delegated_grants_live_and_die_with_their_thread(pool: PgPool) {
     let Some(AnyRequest::AwaitingHuman(r)) = requests::get(&tx, rid).await.unwrap() else {
         panic!()
     };
-    let r = requests::transition::<_, state::Approved>(&tx, r, approval(30 * 86400), now())
+    let r = requests::transition::<_, state::Approved>(&tx, r, approval(rid, 30 * 86400), now())
         .await
         .unwrap()
         .unwrap();
@@ -392,13 +400,13 @@ async fn delegated_grants_live_and_die_with_their_thread(pool: PgPool) {
         .await
         .unwrap()
         .unwrap();
-    let g = grants::begin(&tx, &r, &nh, GrantId::new(), now())
+    let pg = grants::begin(&tx, &r, &nh, GrantId::new(), now())
         .await
         .unwrap()
         .unwrap();
     let b = grants::get(&tx, backing).await.unwrap().unwrap();
-    assert_eq!(g.expires_at, b.expires_at);
-    let g = grants::activate(&tx, g.id, &nh, &json!({}))
+    assert_eq!(pg.grant().expires_at, b.expires_at);
+    let g = grants::activate(&tx, pg, &nh, &json!({}))
         .await
         .unwrap()
         .unwrap();
@@ -448,7 +456,7 @@ async fn delegated_grants_live_and_die_with_their_thread(pool: PgPool) {
     let Some(AnyRequest::AwaitingHuman(r)) = requests::get(&tx, rid).await.unwrap() else {
         panic!()
     };
-    let r = requests::transition::<_, state::Approved>(&tx, r, approval(60), now())
+    let r = requests::transition::<_, state::Approved>(&tx, r, approval(rid, 60), now())
         .await
         .unwrap()
         .unwrap();

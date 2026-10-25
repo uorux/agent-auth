@@ -167,7 +167,9 @@ pub async fn held_in(tx: &Tx<'_>, sandbox: DaemonId) -> Result<Vec<String>, Stor
     Ok(names)
 }
 
-async fn lock_exclusive(tx: &Tx<'_>) -> Result<(), StoreError> {
+/// Take the containment lock exclusively (containment changes, agent
+/// disabling): waits for every in-flight `check` to commit.
+pub(crate) async fn lock_exclusive(tx: &Tx<'_>) -> Result<(), StoreError> {
     let mut c = tx.conn().await;
     sqlx::query!(
         r#"SELECT 1 AS "one!" FROM pg_advisory_xact_lock($1)"#,
@@ -381,9 +383,14 @@ pub async fn check_pair<'t>(
     now: OffsetDateTime,
 ) -> Outcome<PairClear<'t>, (AgentId, Held)> {
     lock_shared(tx).await?;
-    let ra = agents::get_for_share(tx, a).await?;
-    let rb = agents::get_for_share(tx, b).await?;
-    let (Some(ra), Some(rb)) = (ra, rb) else {
+    // Both rows in one statement, in id order (the crate's lock order).
+    let mut rows = agents::get_many_for_share(tx, &[a, b]).await?;
+    let take = |rows: &mut Vec<AgentRow>, id: AgentId| {
+        rows.iter()
+            .position(|r| r.id == id)
+            .map(|i| rows.swap_remove(i))
+    };
+    let (Some(ra), Some(rb)) = (take(&mut rows, a), take(&mut rows, b)) else {
         return Ok(Err((a, Held::Unknown)));
     };
     let operator = ra.kind == AgentKind::Operator || rb.kind == AgentKind::Operator;

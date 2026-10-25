@@ -4,7 +4,7 @@
 //! proof over its whole input space (bounded where noted), not a test.
 
 use crate::lifecycle::RequestStatus;
-use crate::routing::{GateFacts, PolicyAction, RuleStrength, may_auto_clear, route};
+use crate::routing::{GateFacts, PolicyAction, RuleStrength, gate, may_auto_clear};
 
 fn any_action() -> PolicyAction {
     match kani::any::<u8>() % 4 {
@@ -37,7 +37,7 @@ fn gates_only_downgrade_and_match_spec() {
         sensitive: kani::any(),
         needs_explicit_rule: kani::any(),
     };
-    let result = route(proposed, strength, facts).route.action();
+    let result = gate(proposed, strength, facts).action;
     assert!(result == proposed || result == PolicyAction::Surface);
     if !proposed.is_auto() {
         assert!(result == proposed);

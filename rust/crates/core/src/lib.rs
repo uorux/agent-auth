@@ -8,6 +8,7 @@
 //! Everything here is deterministic and pure so it can be property-tested,
 //! fuzzed, run under Miri, and model-checked with Kani (`cargo kani`).
 
+pub mod approval;
 pub mod authority;
 pub mod canonical_json;
 pub mod containment;
@@ -27,6 +28,7 @@ pub mod pyfmt;
 pub mod routing;
 pub mod zones;
 
+pub use approval::HumanApproval;
 pub use authority::{Authority, AuthorityError, Tier, rule_covers};
 pub use durations::DurationSecs;
 pub use glob::{Glob, fnmatch};
@@ -35,4 +37,4 @@ pub use lifecycle::{DecisionSource, GrantStatus, RequestStatus};
 pub use names::{AgentName, AttrValue, DaemonName, HostName, NameError};
 pub use platform::Platform;
 pub use policy::{Policy, PolicyDecision, PolicyError, PolicyInput, SavedRule};
-pub use routing::{AutoClearance, PolicyAction, Route, route};
+pub use routing::{AutoClearance, LlmClearance, PolicyAction, Route};

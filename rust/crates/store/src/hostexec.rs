@@ -179,31 +179,41 @@ pub async fn get_owned(
     opt(raw)
 }
 
-/// The host's answer to a start: move a job that is still `starting` to
-/// `running` or `refused` (never over a result that already arrived);
-/// `via` is recorded in any case. Returns whether the status moved.
+/// The answer of `host` to a start: move a job of that host that is still
+/// `starting` to `running` or `refused` (never over a result that already
+/// arrived), recording `via` with it. `via` is also recorded on a job that
+/// is still running (a late answer), never on a finished one. Returns
+/// whether the status moved.
 pub async fn set_status(
     tx: &Tx<'_>,
     id: JobId,
+    host: &str,
     status: JobStatus,
     error: Option<&str>,
     via: Option<&str>,
 ) -> Result<bool, StoreError> {
     let mut c = tx.conn().await;
     let n = sqlx::query!(
-        "UPDATE host_jobs SET status = $2, error = COALESCE($3, error), updated_at = now()
-         WHERE id = $1 AND status = 'starting'",
+        "UPDATE host_jobs SET status = $3, error = COALESCE($4, error),
+             via = COALESCE($5, via), updated_at = now()
+         WHERE id = $1 AND host = $2 AND status = 'starting'",
         Uuid::from(id),
+        host,
         status.as_str(),
-        error
+        error,
+        via
     )
     .execute(&mut **c)
     .await?
     .rows_affected();
-    if let Some(via) = via {
+    if n == 0
+        && let Some(via) = via
+    {
         sqlx::query!(
-            "UPDATE host_jobs SET via = $2, updated_at = now() WHERE id = $1",
+            "UPDATE host_jobs SET via = $3, updated_at = now()
+             WHERE id = $1 AND host = $2 AND status IN ('starting', 'running')",
             Uuid::from(id),
+            host,
             via
         )
         .execute(&mut **c)

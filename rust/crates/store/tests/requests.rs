@@ -38,7 +38,7 @@ async fn exactly_one_racing_transition_wins(pool: PgPool) {
             // Hold the snapshot for a moment so the racers overlap.
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             let won = if i % 2 == 0 {
-                requests::transition::<_, state::Approved>(&tx, r, approval(60), now())
+                requests::transition::<_, state::Approved>(&tx, r, approval(id, 60), now())
                     .await
                     .unwrap()
                     .map(|_| RequestStatus::Approved)
@@ -87,13 +87,13 @@ async fn lost_when_moved_by_another_transaction(pool: PgPool) {
     let Some(AnyRequest::AwaitingHuman(r2)) = requests::get(&tx2, id).await.unwrap() else {
         panic!()
     };
-    requests::transition::<_, state::Approved>(&tx1, r1, approval(60), now())
+    requests::transition::<_, state::Approved>(&tx1, r1, approval(id, 60), now())
         .await
         .unwrap()
         .unwrap();
     // tx2's UPDATE waits for tx1's row lock, then re-checks the status.
     let second = tokio::spawn(async move {
-        let out = requests::transition::<_, state::Approved>(&tx2, r2, approval(60), now())
+        let out = requests::transition::<_, state::Approved>(&tx2, r2, approval(id, 60), now())
             .await
             .unwrap();
         tx2.rollback().await.unwrap();
@@ -131,7 +131,12 @@ async fn transitions_write_what_their_state_requires(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(r.row().attempt, 0);
-    let r = requests::transition::<_, state::LlmEvaluating>(&tx, r, LlmRound::default(), now())
+    let rid = r.id();
+    let round = |justification: Option<&str>| LlmRound {
+        clearance: llm_clearance(rid, &homelab(), "svc-gitea"),
+        justification: justification.map(str::to_owned),
+    };
+    let r = requests::transition::<_, state::LlmEvaluating>(&tx, r, round(None), now())
         .await
         .unwrap()
         .unwrap();
@@ -150,17 +155,10 @@ async fn transitions_write_what_their_state_requires(pool: PgPool) {
     .unwrap();
     assert_eq!(r.row().decision_source, Some(DecisionSource::Llm));
     assert_eq!(r.row().decided_by.as_deref(), Some("test/judge"));
-    let r = requests::transition::<_, state::LlmEvaluating>(
-        &tx,
-        r,
-        LlmRound {
-            justification: Some("second".into()),
-        },
-        now(),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    let r = requests::transition::<_, state::LlmEvaluating>(&tx, r, round(Some("second")), now())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(r.row().attempt, 2);
     assert_eq!(r.row().justification, "second");
     let r = requests::transition::<_, state::AwaitingHuman>(
@@ -181,7 +179,7 @@ async fn transitions_write_what_their_state_requires(pool: PgPool) {
             "LLM evaluation failed; escalating to human review".to_owned()
         ]
     );
-    let r = requests::transition::<_, state::Approved>(&tx, r, approval(1800), now())
+    let r = requests::transition::<_, state::Approved>(&tx, r, approval(rid, 1800), now())
         .await
         .unwrap()
         .unwrap();
@@ -258,7 +256,12 @@ async fn a_corrupt_row_is_an_error_not_a_default(pool: PgPool) {
     let store = Store::from_pool(pool.clone());
     let a = agent(&store, "corrupt", AgentKind::Service).await;
     let id = awaiting(&store, a.id, &homelab()).await;
-    // An authority this version would not have written.
+    // An authority this version would not have written (the spec guard
+    // forbids the edit, so it is switched off to simulate corruption).
+    sqlx::query("ALTER TABLE access_requests DISABLE TRIGGER access_requests_spec_guard")
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query("UPDATE access_requests SET authority = '{\"role\": \"admin\"}' WHERE id = $1")
         .bind(uuid::Uuid::from(id))
         .execute(&pool)

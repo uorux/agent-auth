@@ -3,8 +3,20 @@
 //!
 //! The policy engine proposes an action; the gates may only ever *downgrade*
 //! `approve`/`llm` to `surface` (a human decides). An auto-approval in the
-//! broker requires an [`AutoClearance`], which only [`route`] constructs, so
-//! nothing can approve a request without having passed every gate.
+//! broker requires an [`AutoClearance`] (and an LLM review an
+//! [`LlmClearance`]), which only this crate constructs, from
+//! [`crate::Policy::route`] / [`crate::Policy::evaluate_and_route`]: those
+//! need the zone check's pass and compute every gate fact about the
+//! authority themselves. A clearance names the request and the authority it
+//! was computed for, so it cannot be spent on another request (the store
+//! checks both). Nothing outside this crate can make one:
+//!
+//! ```compile_fail
+//! use agent_auth_core::{AutoClearance, DecisionSource, RequestId, Authority};
+//! fn forge(request: RequestId) -> AutoClearance {
+//!     AutoClearance { request, authority: Authority::Models, source: DecisionSource::Policy }
+//! }
+//! ```
 //!
 //! Invariants (numbered as in rust/spec/core-lifecycle-policy.md §5.4), all
 //! checked exhaustively in the tests below and by the Kani harnesses in
@@ -17,6 +29,10 @@
 //!   to (covering) its exact authority.
 //! - INV-8  an explicit-only authority auto-clears only via a rule naming it.
 //! - INV-9  a restricted zone requiring a human never auto-clears.
+
+use crate::authority::Authority;
+use crate::ids::RequestId;
+use crate::lifecycle::DecisionSource;
 
 /// What a policy layer proposes for a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -61,7 +77,7 @@ impl PolicyAction {
 }
 
 /// How strongly the matched rule names the request's privilege.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuleStrength {
     /// A saved rule pinned to an authority covering this one. The only thing
     /// that lets a sensitive authority through without a human.
@@ -71,9 +87,17 @@ pub struct RuleStrength {
     pub explicit: bool,
 }
 
-/// Facts about the request the gates look at. Every field is computed by
-/// the broker before routing; none comes from the requesting agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+impl RuleStrength {
+    pub(crate) const NONE: RuleStrength = RuleStrength {
+        pinned: false,
+        explicit: false,
+    };
+}
+
+/// Facts about the request the gates look at, all computed by
+/// [`crate::Policy::gate_facts`] from the request (the authority's own
+/// predicates) and the zone check; none comes from the requesting agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GateFacts {
     /// A restricted zone owns the resource and wants a human.
     pub zone_requires_human: bool,
@@ -98,12 +122,56 @@ pub enum Downgrade {
     NotNamed,
 }
 
-/// Proof that a request passed every gate with an auto action. Only
-/// [`route`] makes one; the broker's auto-approve and LLM-approve paths take
-/// it by value.
+/// Proof that a request passed every gate with `approve`: what the broker's
+/// auto-approve path needs (the store's `Approval::auto`). Made only by
+/// [`crate::Policy::route`]; not `Clone`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct AutoClearance {
-    _private: (),
+    request: RequestId,
+    authority: Authority,
+    source: DecisionSource,
+}
+
+impl AutoClearance {
+    /// The request it was computed for.
+    #[must_use]
+    pub fn request(&self) -> RequestId {
+        self.request
+    }
+
+    /// The authority it was computed for.
+    #[must_use]
+    pub fn authority(&self) -> &Authority {
+        &self.authority
+    }
+
+    /// `rule` (a saved rule matched) or `policy` (the file or the default).
+    #[must_use]
+    pub fn source(&self) -> DecisionSource {
+        self.source
+    }
+}
+
+/// Proof that a request passed every gate with `llm`: what entering LLM
+/// review and an LLM approval need. Made only by [`crate::Policy::route`];
+/// not `Clone`, and a different type from [`AutoClearance`] so one cannot
+/// stand in for the other.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LlmClearance {
+    request: RequestId,
+    authority: Authority,
+}
+
+impl LlmClearance {
+    #[must_use]
+    pub fn request(&self) -> RequestId {
+        self.request
+    }
+
+    #[must_use]
+    pub fn authority(&self) -> &Authority {
+        &self.authority
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -111,7 +179,7 @@ pub enum Route {
     Deny,
     Surface,
     Approve(AutoClearance),
-    Llm(AutoClearance),
+    Llm(LlmClearance),
 }
 
 impl Route {
@@ -126,12 +194,11 @@ impl Route {
     }
 }
 
-/// The outcome of the gates: the route, the first gate that downgraded (if
-/// any) and every gate that would have.
+/// The outcome of the gates: the action, and every gate that downgraded.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Routed {
-    pub route: Route,
-    pub downgrades: Vec<Downgrade>,
+pub(crate) struct Gated {
+    pub(crate) action: PolicyAction,
+    pub(crate) downgrades: Vec<Downgrade>,
 }
 
 /// Apply the gates to a policy proposal, in the Python's order. Each gate
@@ -139,7 +206,7 @@ pub struct Routed {
 /// web gates also strip the rule's strength, so a later gate cannot be
 /// satisfied by a rule that an earlier gate already overruled.
 #[must_use]
-pub fn route(proposed: PolicyAction, strength: RuleStrength, facts: GateFacts) -> Routed {
+pub(crate) fn gate(proposed: PolicyAction, strength: RuleStrength, facts: GateFacts) -> Gated {
     let mut action = proposed;
     let mut strength = strength;
     let mut downgrades = Vec::new();
@@ -153,7 +220,7 @@ pub fn route(proposed: PolicyAction, strength: RuleStrength, facts: GateFacts) -
             *action = PolicyAction::Surface;
             downgrades.push(why);
             if strip {
-                *strength = RuleStrength::default();
+                *strength = RuleStrength::NONE;
             }
         }
     };
@@ -195,14 +262,31 @@ pub fn route(proposed: PolicyAction, strength: RuleStrength, facts: GateFacts) -
         &mut action,
         &mut strength,
     );
+    Gated { action, downgrades }
+}
 
-    let route = match action {
+/// The route for a gated action, with its clearance bound to the request
+/// and authority.
+#[must_use]
+pub(crate) fn route(
+    action: PolicyAction,
+    request: RequestId,
+    authority: &Authority,
+    source: DecisionSource,
+) -> Route {
+    match action {
         PolicyAction::Deny => Route::Deny,
         PolicyAction::Surface => Route::Surface,
-        PolicyAction::Approve => Route::Approve(AutoClearance { _private: () }),
-        PolicyAction::Llm => Route::Llm(AutoClearance { _private: () }),
-    };
-    Routed { route, downgrades }
+        PolicyAction::Approve => Route::Approve(AutoClearance {
+            request,
+            authority: authority.clone(),
+            source,
+        }),
+        PolicyAction::Llm => Route::Llm(LlmClearance {
+            request,
+            authority: authority.clone(),
+        }),
+    }
 }
 
 /// The predicate the invariants promise: may this combination auto-clear?
@@ -241,6 +325,14 @@ pub(crate) fn all_inputs() -> impl Iterator<Item = (PolicyAction, RuleStrength, 
 mod tests {
     use super::*;
 
+    const NO_FACTS: GateFacts = GateFacts {
+        zone_requires_human: false,
+        human_only: false,
+        web_connector: false,
+        sensitive: false,
+        needs_explicit_rule: false,
+    };
+
     /// Exhaustive over all 512 inputs: this is a complete proof for the
     /// finite domain, not a sample.
     #[test]
@@ -248,7 +340,7 @@ mod tests {
         let mut count = 0;
         for (proposed, strength, facts) in all_inputs() {
             count += 1;
-            let result = route(proposed, strength, facts).route.action();
+            let result = gate(proposed, strength, facts).action;
             // INV-4: only the proposal itself or surface; deny/surface fixed.
             assert!(result == proposed || result == PolicyAction::Surface);
             if proposed == PolicyAction::Deny {
@@ -277,9 +369,9 @@ mod tests {
             human_only: true,
             sensitive: true,
             needs_explicit_rule: true,
-            ..GateFacts::default()
+            ..NO_FACTS
         };
-        let routed = route(
+        let routed = gate(
             PolicyAction::Approve,
             RuleStrength {
                 pinned: true,
@@ -287,7 +379,7 @@ mod tests {
             },
             facts,
         );
-        assert_eq!(routed.route, Route::Surface);
+        assert_eq!(routed.action, PolicyAction::Surface);
         // Once surfaced, later gates do not fire (Python checks `action in
         // (APPROVE, LLM)` before each).
         assert_eq!(routed.downgrades, vec![Downgrade::HumanOnly]);
@@ -297,9 +389,9 @@ mod tests {
     fn pinned_rule_clears_sensitive() {
         let facts = GateFacts {
             sensitive: true,
-            ..GateFacts::default()
+            ..NO_FACTS
         };
-        let routed = route(
+        let routed = gate(
             PolicyAction::Approve,
             RuleStrength {
                 pinned: true,
@@ -307,8 +399,8 @@ mod tests {
             },
             facts,
         );
-        assert!(matches!(routed.route, Route::Approve(_)));
-        let routed = route(
+        assert_eq!(routed.action, PolicyAction::Approve);
+        let routed = gate(
             PolicyAction::Approve,
             RuleStrength {
                 pinned: false,
@@ -316,6 +408,6 @@ mod tests {
             },
             facts,
         );
-        assert_eq!(routed.route, Route::Surface);
+        assert_eq!(routed.action, PolicyAction::Surface);
     }
 }
