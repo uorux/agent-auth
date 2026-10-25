@@ -18,14 +18,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_auth_core::containment::{AgentKind, Placement};
 use agent_auth_core::AgentId;
+use agent_auth_core::containment::{AgentKind, Placement};
 use agent_auth_daemon::channel::Channel;
 use agent_auth_sandboxd::api::{AgentApi, OperatorApi};
 use agent_auth_sandboxd::config::Config;
 use agent_auth_sandboxd::daemon::Sandboxd;
-use agent_auth_sandboxd::names::ConvId;
 use agent_auth_sandboxd::daemon::routing::ThreadView;
+use agent_auth_sandboxd::names::ConvId;
 use agent_auth_sandboxd::store::ConvState;
 use agent_auth_sandboxd::testing::{AclCall, FAKE_TUI, FakeHost, read_log};
 use agent_auth_store::agents::{self, AgentRow, NewAgent};
@@ -97,7 +97,9 @@ impl Vm {
         let config = Config::from_json(&vm.cfg.to_string()).unwrap();
         let identity = agent_auth_sandboxd::identity(&config).unwrap();
         let tls = Arc::new(agent_auth_tls::default_client_config().unwrap());
-        agent_auth_daemon::pair::pair(&identity, &code, tls).await.unwrap();
+        agent_auth_daemon::pair::pair(&identity, &code, tls)
+            .await
+            .unwrap();
         vm.run();
         let sbx = Arc::clone(&vm.sbx);
         assert!(eventually(|| async { sbx.store.agent(ORCH).is_some() }).await);
@@ -157,7 +159,10 @@ impl Vm {
     }
 
     fn starts(&self) -> Vec<Value> {
-        self.log().into_iter().filter(|e| e.get("start").is_some()).collect()
+        self.log()
+            .into_iter()
+            .filter(|e| e.get("start").is_some())
+            .collect()
     }
 
     async fn saw_turn(&self, text: &str) -> bool {
@@ -212,7 +217,11 @@ impl Vm {
         assert_eq!(grant["status"], "granted", "{grant}");
         let (status, t) = self
             .b
-            .post_as(key, "/v1/a2a/threads", json!({"to": to, "payload": payload}))
+            .post_as(
+                key,
+                "/v1/a2a/threads",
+                json!({"to": to, "payload": payload}),
+            )
             .await;
         assert_eq!(status, 200, "{t}");
         t["thread_id"].as_str().unwrap().to_owned()
@@ -269,8 +278,16 @@ fn obj(v: Value) -> Map<String, Value> {
     }
 }
 
-async fn agent_call(vm: &Vm, method: &str, params: Value, token: &str, uid: u32) -> Result<Value, String> {
-    vm.agent_api().handle(method, &obj(params), Some(token), uid).await
+async fn agent_call(
+    vm: &Vm,
+    method: &str,
+    params: Value,
+    token: &str,
+    uid: u32,
+) -> Result<Value, String> {
+    vm.agent_api()
+        .handle(method, &obj(params), Some(token), uid)
+        .await
 }
 
 fn tmux() -> bool {
@@ -286,14 +303,21 @@ fn tmux() -> bool {
 /// own session), answered by its process (as the orchestrator, in its
 /// workspace), parked when idle, and resumed on the same runtime session.
 #[sqlx::test(migrations = "../store/migrations")]
-async fn inv19_an_open_is_answered_by_a_routed_conversation_that_parks_and_resumes(pool: sqlx::PgPool) {
+async fn inv19_an_open_is_answered_by_a_routed_conversation_that_parks_and_resumes(
+    pool: sqlx::PgPool,
+) {
     let vm = Vm::start(pool).await;
     let (_, hermes) = vm.peer("hermes-test").await;
     let tid = vm.open_thread(&hermes, ORCH, json!({"task": "ping"})).await;
     let msgs = vm.reply_on(&hermes, &tid, 1).await;
     assert!(!msgs.is_empty());
     assert_eq!(msgs[0]["payload"]["status"], "done");
-    assert!(msgs[0]["payload"]["summary"].as_str().unwrap().contains("ping"));
+    assert!(
+        msgs[0]["payload"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("ping")
+    );
     let convs = vm.sbx.store.conversations(Some(ORCH), false);
     assert_eq!(convs.len(), 1);
     let conv = &convs[0];
@@ -309,17 +333,22 @@ async fn inv19_an_open_is_answered_by_a_routed_conversation_that_parks_and_resum
     let sbx = Arc::clone(&vm.sbx);
     let id = conv.id.clone();
     assert!(
-        eventually(|| async { sbx.store.conversation(&id).unwrap().state == ConvState::Parked }).await
+        eventually(|| async { sbx.store.conversation(&id).unwrap().state == ConvState::Parked })
+            .await
     );
-    vm.b
-        .post_as(
-            &hermes,
-            &format!("/v1/a2a/threads/{tid}/messages"),
-            json!({"payload": {"task": "again"}}),
-        )
-        .await;
+    vm.b.post_as(
+        &hermes,
+        &format!("/v1/a2a/threads/{tid}/messages"),
+        json!({"payload": {"task": "again"}}),
+    )
+    .await;
     let msgs = vm.reply_on(&hermes, &tid, 3).await;
-    assert!(msgs[0]["payload"]["summary"].as_str().unwrap().contains("again"));
+    assert!(
+        msgs[0]["payload"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("again")
+    );
     let starts = vm.starts();
     assert_eq!(starts.len(), 2);
     assert!(starts[1]["resumed"].as_bool().unwrap());
@@ -337,14 +366,22 @@ async fn inv21_a_hint_routes_into_an_existing_open_conversation_only(pool: sqlx:
     vm.reply_on(&hermes, &first, 1).await;
     let conv = vm.conv_of(&first).await;
     let second = vm
-        .open_thread(&hermes, ORCH, json!({"task": "two", "_sandbox": {"conversation": conv.as_str()}}))
+        .open_thread(
+            &hermes,
+            ORCH,
+            json!({"task": "two", "_sandbox": {"conversation": conv.as_str()}}),
+        )
         .await;
     vm.reply_on(&hermes, &second, 1).await;
     assert_eq!(vm.conv_of(&second).await, conv);
     assert_eq!(vm.sbx.store.conversations(Some(ORCH), false).len(), 1);
     vm.sbx.close(&conv).await.unwrap();
     let third = vm
-        .open_thread(&hermes, ORCH, json!({"task": "three", "_sandbox": {"conversation": conv.as_str()}}))
+        .open_thread(
+            &hermes,
+            ORCH,
+            json!({"task": "three", "_sandbox": {"conversation": conv.as_str()}}),
+        )
         .await;
     vm.reply_on(&hermes, &third, 1).await;
     assert_ne!(vm.conv_of(&third).await, conv);
@@ -381,12 +418,19 @@ async fn b17_an_accepted_thread_is_not_rejected_when_its_process_fails(pool: sql
     let sbx = Arc::clone(&vm.sbx);
     let c2 = conv.clone();
     assert!(eventually(|| async { !sbx.store.peek(&c2).unwrap().is_empty() }).await);
-    let (_, t) = vm.b.get_as(&hermes, &format!("/v1/a2a/threads/{tid}")).await;
+    let (_, t) =
+        vm.b.get_as(&hermes, &format!("/v1/a2a/threads/{tid}"))
+            .await;
     assert_eq!(t["state"], "open", "{t}");
     *vm.host().fail_start.lock().unwrap() = None;
     vm.sbx.deliver_queued(&conv).await;
     let msgs = vm.reply_on(&hermes, &tid, 1).await;
-    assert!(msgs[0]["payload"]["summary"].as_str().unwrap().contains("ping"));
+    assert!(
+        msgs[0]["payload"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("ping")
+    );
     vm.stop().await;
 }
 
@@ -399,27 +443,47 @@ async fn b9_a_conversation_that_lost_its_session_gets_a_new_one(pool: sqlx::PgPo
     let first = vm.open_thread(&hermes, ORCH, json!({"task": "one"})).await;
     vm.reply_on(&hermes, &first, 1).await;
     let conv = vm.conv_of(&first).await;
-    let old = vm.sbx.store.conversation(&conv).unwrap().broker_session_id.unwrap();
+    let old = vm
+        .sbx
+        .store
+        .conversation(&conv)
+        .unwrap()
+        .broker_session_id
+        .unwrap();
     // The broker ends the session (as the agent closing it would).
     let key = vm.sbx.store.agent(ORCH).unwrap().api_key.expose().clone();
-    let resp = vm
-        .b
-        .http()
-        .post(format!("{}/v1/sessions/close", vm.b.url()))
-        .bearer_auth(&key)
-        .header("X-Agent-Session", &old)
-        .send()
-        .await
-        .unwrap();
+    let resp =
+        vm.b.http()
+            .post(format!("{}/v1/sessions/close", vm.b.url()))
+            .bearer_auth(&key)
+            .header("X-Agent-Session", &old)
+            .send()
+            .await
+            .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     // Routed to it at once, before its watcher noticed: the claim finds
     // the session gone and makes a new one.
     let second = vm
-        .open_thread(&hermes, ORCH, json!({"task": "two", "_sandbox": {"conversation": conv.as_str()}}))
+        .open_thread(
+            &hermes,
+            ORCH,
+            json!({"task": "two", "_sandbox": {"conversation": conv.as_str()}}),
+        )
         .await;
     let msgs = vm.reply_on(&hermes, &second, 1).await;
-    assert!(msgs[0]["payload"]["summary"].as_str().unwrap().contains("two"));
-    let now = vm.sbx.store.conversation(&conv).unwrap().broker_session_id.unwrap();
+    assert!(
+        msgs[0]["payload"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("two")
+    );
+    let now = vm
+        .sbx
+        .store
+        .conversation(&conv)
+        .unwrap()
+        .broker_session_id
+        .unwrap();
     assert_ne!(now, old);
     vm.stop().await;
 }
@@ -442,22 +506,39 @@ async fn inv20_triage(pool: sqlx::PgPool) {
         .await;
     vm.reply_on(&hermes, &second, 1).await;
     assert_eq!(vm.conv_of(&second).await, conv);
-    let triage = vm.log().into_iter().rev().find(|e| e.get("triage").is_some()).unwrap();
+    let triage = vm
+        .log()
+        .into_iter()
+        .rev()
+        .find(|e| e.get("triage").is_some())
+        .unwrap();
     assert_eq!(triage["tools"], "");
     let prompt = triage["triage"].as_str().unwrap();
     assert!(prompt.contains(conv.as_str()));
     assert_eq!(prompt.matches("</request>").count(), 1);
     for answer in ["new", "0123456789ab"] {
         *vm.host().triage_answer.lock().unwrap() = Some(answer.to_owned());
-        let other = vm.open_thread(&hermes, ORCH, json!({"task": "three"})).await;
+        let other = vm
+            .open_thread(&hermes, ORCH, json!({"task": "three"}))
+            .await;
         vm.reply_on(&hermes, &other, 1).await;
         assert_ne!(vm.conv_of(&other).await, conv);
     }
-    let before = vm.log().iter().filter(|e| e.get("triage").is_some()).count();
+    let before = vm
+        .log()
+        .iter()
+        .filter(|e| e.get("triage").is_some())
+        .count();
     let (_, stranger) = vm.peer("stranger").await;
     let tid = vm.open_thread(&stranger, ORCH, json!({"task": "hi"})).await;
     vm.reply_on(&stranger, &tid, 1).await;
-    assert_eq!(vm.log().iter().filter(|e| e.get("triage").is_some()).count(), before);
+    assert_eq!(
+        vm.log()
+            .iter()
+            .filter(|e| e.get("triage").is_some())
+            .count(),
+        before
+    );
     vm.stop().await;
 }
 
@@ -471,20 +552,38 @@ async fn inv20_triage(pool: sqlx::PgPool) {
 async fn inv23_the_orchestrator_sets_up_a_project_and_its_agent(pool: sqlx::PgPool) {
     let vm = Vm::start(pool).await;
     let (_, token) = vm.orch_conv().await;
-    let who = agent_call(&vm, "whoami", json!({}), &token, me()).await.unwrap();
+    let who = agent_call(&vm, "whoami", json!({}), &token, me())
+        .await
+        .unwrap();
     assert_eq!(who["orchestrator"], true);
     assert_eq!(who["agent"], ORCH);
     assert_eq!(who["project"], Value::Null);
-    let created = agent_call(&vm, "project_create", json!({"name": "larder"}), &token, me())
-        .await
-        .unwrap();
-    let uid = created["uid"].as_u64().unwrap() as u32;
+    let created = agent_call(
+        &vm,
+        "project_create",
+        json!({"name": "larder"}),
+        &token,
+        me(),
+    )
+    .await
+    .unwrap();
+    let uid = u32::try_from(created["uid"].as_u64().unwrap()).unwrap();
     let path = PathBuf::from(created["path"].as_str().unwrap());
     assert_eq!(vm.host().user("p-larder"), Some(uid));
-    assert!(vm.host().acls().contains(&AclCall::Grant { path: path.clone(), uid: me(), write: true }));
-    let minted = agent_call(&vm, "agent_mint", json!({"runtime": "claude", "project": "larder"}), &token, me())
-        .await
-        .unwrap();
+    assert!(vm.host().acls().contains(&AclCall::Grant {
+        path: path.clone(),
+        uid: me(),
+        write: true
+    }));
+    let minted = agent_call(
+        &vm,
+        "agent_mint",
+        json!({"runtime": "claude", "project": "larder"}),
+        &token,
+        me(),
+    )
+    .await
+    .unwrap();
     assert_eq!(minted["status"], "granted", "{minted}");
     assert_eq!(minted["key_received"], true);
     let spawned = agent_call(
@@ -498,8 +597,15 @@ async fn inv23_the_orchestrator_sets_up_a_project_and_its_agent(pool: sqlx::PgPo
     .unwrap();
     assert_eq!(spawned["agent"], "claude-larder-excelsior-sandbox");
     assert!(spawned.get("broker_session_id").is_none(), "INV-16");
-    assert!(vm.host().chowns().contains(&(path.clone(), uid, vec![me()])));
-    assert!(vm.host().acls().contains(&AclCall::Revoke { path: path.clone(), uid: me() }));
+    assert!(
+        vm.host()
+            .chowns()
+            .contains(&(path.clone(), uid, vec![me()]))
+    );
+    assert!(vm.host().acls().contains(&AclCall::Revoke {
+        path: path.clone(),
+        uid: me()
+    }));
     assert!(vm.sbx.store.project("larder").unwrap().sealed);
     assert!(vm.saw_turn("hello").await);
     let start = vm.starts().last().cloned().unwrap();
@@ -515,11 +621,19 @@ async fn inv23_the_orchestrator_sets_up_a_project_and_its_agent(pool: sqlx::PgPo
 async fn inv14_the_agent_api_checks_token_uid_and_orchestrator(pool: sqlx::PgPool) {
     let vm = Vm::start(pool).await;
     let (_, token) = vm.orch_conv().await;
-    let e = agent_call(&vm, "whoami", json!({}), &token, me() + 12345).await.unwrap_err();
+    let e = agent_call(&vm, "whoami", json!({}), &token, me() + 12345)
+        .await
+        .unwrap_err();
     assert!(e.contains("another user"), "{e}");
-    let e = agent_call(&vm, "whoami", json!({}), "forged", me()).await.unwrap_err();
+    let e = agent_call(&vm, "whoami", json!({}), "forged", me())
+        .await
+        .unwrap_err();
     assert!(e.contains("unknown conversation"), "{e}");
-    let e = vm.agent_api().handle("whoami", &Map::new(), None, me()).await.unwrap_err();
+    let e = vm
+        .agent_api()
+        .handle("whoami", &Map::new(), None, me())
+        .await
+        .unwrap_err();
     assert!(e.contains("unknown conversation"), "{e}");
     vm.sbx.create_project("site").unwrap();
     let minted = vm.sbx.mint("claude", "site", "test", 120.0).await.unwrap();
@@ -531,22 +645,40 @@ async fn inv14_the_agent_api_checks_token_uid_and_orchestrator(pool: sqlx::PgPoo
         .unwrap();
     let ptoken = vm.sbx.live(&pconv.id).token().to_owned();
     let puid = vm.sbx.project_uid(Some("site")).unwrap();
-    let e = agent_call(&vm, "project_create", json!({"name": "evil"}), &ptoken, puid)
-        .await
-        .unwrap_err();
+    let e = agent_call(
+        &vm,
+        "project_create",
+        json!({"name": "evil"}),
+        &ptoken,
+        puid,
+    )
+    .await
+    .unwrap_err();
     assert!(e.contains("for the orchestrator"), "{e}");
-    let who = agent_call(&vm, "whoami", json!({}), &ptoken, puid).await.unwrap();
+    let who = agent_call(&vm, "whoami", json!({}), &ptoken, puid)
+        .await
+        .unwrap();
     assert_eq!(who["project"], "site");
     // The orchestrator's token does not work for the project's user.
-    assert!(agent_call(&vm, "whoami", json!({}), &token, puid).await.is_err());
-    let convs = agent_call(&vm, "conversations", json!({}), &ptoken, puid).await.unwrap();
+    assert!(
+        agent_call(&vm, "whoami", json!({}), &token, puid)
+            .await
+            .is_err()
+    );
+    let convs = agent_call(&vm, "conversations", json!({}), &ptoken, puid)
+        .await
+        .unwrap();
     let text = convs.to_string();
     assert!(!text.contains("broker_session_id"));
     let key = vm.sbx.store.agent("claude-site-excelsior-sandbox").unwrap();
     assert!(!text.contains(key.api_key.expose().as_str()));
     // A closed conversation's token stops working (B-18).
     vm.sbx.close(&pconv.id).await.unwrap();
-    assert!(agent_call(&vm, "whoami", json!({}), &ptoken, puid).await.is_err());
+    assert!(
+        agent_call(&vm, "whoami", json!({}), &ptoken, puid)
+            .await
+            .is_err()
+    );
     vm.stop().await;
 }
 
@@ -562,8 +694,15 @@ async fn inv22_project_grants_are_applied_and_revoked(pool: sqlx::PgPool) {
     }
     // Two projects, no grant: no ACL between them (INV-13).
     assert!(vm.host().acls().is_empty());
-    vm.sbx.mint("claude", "larder", "test", 120.0).await.unwrap();
-    let rec = vm.sbx.store.agent("claude-larder-excelsior-sandbox").unwrap();
+    vm.sbx
+        .mint("claude", "larder", "test", 120.0)
+        .await
+        .unwrap();
+    let rec = vm
+        .sbx
+        .store
+        .agent("claude-larder-excelsior-sandbox")
+        .unwrap();
     let (status, req) = vm
         .b
         .post_as(
@@ -577,29 +716,76 @@ async fn inv22_project_grants_are_applied_and_revoked(pool: sqlx::PgPool) {
     assert_eq!(req["status"], "granted", "{req}");
     let site = vm.sbx.paths(Some("site")).0;
     let larder_uid = vm.sbx.project_uid(Some("larder")).unwrap();
-    assert!(vm.host().acls().contains(&AclCall::Grant { path: site.clone(), uid: larder_uid, write: false }));
+    assert!(vm.host().acls().contains(&AclCall::Grant {
+        path: site.clone(),
+        uid: larder_uid,
+        write: false
+    }));
     let grant_id = req["grant_id"].as_str().unwrap().to_owned();
-    let (status, _) = vm
-        .b
-        .post_as(super::testkit::ADMIN_TOKEN, &format!("/admin/grants/{grant_id}/revoke"), json!({}))
+    let (status, _) =
+        vm.b.post_as(
+            super::testkit::ADMIN_TOKEN,
+            &format!("/admin/grants/{grant_id}/revoke"),
+            json!({}),
+        )
         .await;
     assert_eq!(status, 200);
-    assert!(vm.host().acls().contains(&AclCall::Revoke { path: site.clone(), uid: larder_uid }));
+    assert!(vm.host().acls().contains(&AclCall::Revoke {
+        path: site.clone(),
+        uid: larder_uid
+    }));
     // An unknown grant id revokes fine (idempotent).
-    vm.sbx.remove_project_grant("0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9").await.unwrap();
+    vm.sbx
+        .remove_project_grant("0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9")
+        .await
+        .unwrap();
     // Read + write of one pair; revoking the write keeps the read and hands
     // the grantee's files back; a read grant never takes write away.
     let site_uid = vm.sbx.project_uid(Some("site")).unwrap();
-    vm.sbx.apply_project_grant("g-w", "larder", "site", "project.write").await.unwrap();
-    vm.sbx.apply_project_grant("g-r", "larder", "site", "project.read").await.unwrap();
+    vm.sbx
+        .apply_project_grant("g-w", "larder", "site", "project.write")
+        .await
+        .unwrap();
+    vm.sbx
+        .apply_project_grant("g-r", "larder", "site", "project.read")
+        .await
+        .unwrap();
     let last = vm.host().acls().last().cloned().unwrap();
-    assert_eq!(last, AclCall::Grant { path: site.clone(), uid: larder_uid, write: true });
+    assert_eq!(
+        last,
+        AclCall::Grant {
+            path: site.clone(),
+            uid: larder_uid,
+            write: true
+        }
+    );
     vm.sbx.remove_project_grant("g-w").await.unwrap();
     let acls = vm.host().acls();
-    assert_eq!(acls.last().unwrap(), &AclCall::Grant { path: site.clone(), uid: larder_uid, write: false });
-    assert!(vm.host().chowns().contains(&(site.clone(), site_uid, vec![larder_uid])));
-    assert!(vm.sbx.apply_project_grant("g-x", "larder", "site", "project.admin").await.is_err());
-    assert!(vm.sbx.apply_project_grant("g-y", "larder", "nope", "project.read").await.is_err());
+    assert_eq!(
+        acls.last().unwrap(),
+        &AclCall::Grant {
+            path: site.clone(),
+            uid: larder_uid,
+            write: false
+        }
+    );
+    assert!(
+        vm.host()
+            .chowns()
+            .contains(&(site.clone(), site_uid, vec![larder_uid]))
+    );
+    assert!(
+        vm.sbx
+            .apply_project_grant("g-x", "larder", "site", "project.admin")
+            .await
+            .is_err()
+    );
+    assert!(
+        vm.sbx
+            .apply_project_grant("g-y", "larder", "nope", "project.read")
+            .await
+            .is_err()
+    );
     vm.stop().await;
 }
 
@@ -615,16 +801,23 @@ async fn inv15_the_operator_api(pool: sqlx::PgPool) {
         let op = &op;
         async move { op.handle(m, &obj(p), uid).await }
     };
-    assert_eq!(call("status", json!({}), 1000).await.unwrap_err(), "operators only");
+    assert_eq!(
+        call("status", json!({}), 1000).await.unwrap_err(),
+        "operators only"
+    );
     let status = call("status", json!({}), 0).await.unwrap();
     assert_eq!(status["host"], HOST);
     assert_eq!(status["agents"], 1);
     assert_eq!(status["role"], "sandbox");
     let agents = call("agents", json!({}), 0).await.unwrap();
     assert!(!agents.to_string().contains("aa_"), "no key in the listing");
-    call("project_create", json!({"name": "larder"}), 0).await.unwrap();
+    call("project_create", json!({"name": "larder"}), 0)
+        .await
+        .unwrap();
     assert!(vm.sbx.store.project("larder").unwrap().sealed);
-    let minted = call("mint", json!({"runtime": "claude", "project": "larder"}), 0).await.unwrap();
+    let minted = call("mint", json!({"runtime": "claude", "project": "larder"}), 0)
+        .await
+        .unwrap();
     assert_eq!(minted["status"], "granted", "{minted}");
     let out = call(
         "new",
@@ -635,28 +828,56 @@ async fn inv15_the_operator_api(pool: sqlx::PgPool) {
     .unwrap();
     let id = out["conversation"]["id"].as_str().unwrap().to_owned();
     assert!(vm.saw_turn("hi").await);
-    call("send", json!({"conversation": id, "text": "more"}), 0).await.unwrap();
+    call("send", json!({"conversation": id, "text": "more"}), 0)
+        .await
+        .unwrap();
     assert!(vm.saw_turn("more").await);
-    let log_path = call("log_path", json!({"conversation": id}), 0).await.unwrap();
+    let log_path = call("log_path", json!({"conversation": id}), 0)
+        .await
+        .unwrap();
     let text = std::fs::read_to_string(log_path.as_str().unwrap()).unwrap();
     let dirs: Vec<String> = text
         .lines()
-        .map(|l| serde_json::from_str::<Value>(l).unwrap()["dir"].as_str().unwrap().to_owned())
+        .map(|l| {
+            serde_json::from_str::<Value>(l).unwrap()["dir"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
         .collect();
     assert!(dirs.contains(&"in".to_owned()) && dirs.contains(&"out".to_owned()));
     call("close", json!({"conversation": id}), 0).await.unwrap();
     assert_eq!(
-        vm.sbx.store.conversation(&ConvId::parse(&id).unwrap()).unwrap().state,
+        vm.sbx
+            .store
+            .conversation(&ConvId::parse(&id).unwrap())
+            .unwrap()
+            .state,
         ConvState::Closed
     );
-    let e = call("secret_set", json!({"name": "../../etc/passwd", "value": "x"}), 0)
+    let e = call(
+        "secret_set",
+        json!({"name": "../../etc/passwd", "value": "x"}),
+        0,
+    )
+    .await
+    .unwrap_err();
+    assert!(e.starts_with("secrets:"), "{e}");
+    call(
+        "secret_set",
+        json!({"name": "claude-oauth-token", "value": "tok"}),
+        0,
+    )
+    .await
+    .unwrap();
+    let secret = vm.dir.join("state/secrets/claude-oauth-token");
+    assert_eq!(
+        std::fs::metadata(&secret).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let e = call("new", json!({"agent": "nobody", "attach": false}), 0)
         .await
         .unwrap_err();
-    assert!(e.starts_with("secrets:"), "{e}");
-    call("secret_set", json!({"name": "claude-oauth-token", "value": "tok"}), 0).await.unwrap();
-    let secret = vm.dir.join("state/secrets/claude-oauth-token");
-    assert_eq!(std::fs::metadata(&secret).unwrap().permissions().mode() & 0o777, 0o600);
-    let e = call("new", json!({"agent": "nobody", "attach": false}), 0).await.unwrap_err();
     assert!(e.contains("mint it first"), "{e}");
     vm.stop().await;
 }
@@ -667,7 +888,11 @@ async fn inv15_the_operator_api(pool: sqlx::PgPool) {
 async fn inv11_secrets_stay_out_of_argv_and_configs(pool: sqlx::PgPool) {
     let vm = Vm::start(pool).await;
     vm.operator_api()
-        .handle("secret_set", &obj(json!({"name": "claude-oauth-token", "value": "oauth-secret"})), 0)
+        .handle(
+            "secret_set",
+            &obj(json!({"name": "claude-oauth-token", "value": "oauth-secret"})),
+            0,
+        )
         .await
         .unwrap();
     let (conv, token) = vm.orch_conv().await;
@@ -685,14 +910,28 @@ async fn inv11_secrets_stay_out_of_argv_and_configs(pool: sqlx::PgPool) {
         .iter()
         .map(|v| v.as_str().unwrap().to_owned())
         .collect();
-    for k in ["AGENT_AUTH_API_KEY", "AGENT_AUTH_SESSION", "AGENT_AUTH_SANDBOX_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"] {
+    for k in [
+        "AGENT_AUTH_API_KEY",
+        "AGENT_AUTH_SESSION",
+        "AGENT_AUTH_SANDBOX_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ] {
         assert!(keys.contains(&k.to_owned()), "{k}");
     }
     // The state files are private.
-    for f in ["agents.json", "flags.json", "conversations.json", "projects.json"] {
+    for f in [
+        "agents.json",
+        "flags.json",
+        "conversations.json",
+        "projects.json",
+    ] {
         let p = vm.dir.join("state").join(f);
         if p.exists() {
-            assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600, "{f}");
+            assert_eq!(
+                std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "{f}"
+            );
         }
     }
     vm.stop().await;
@@ -711,7 +950,9 @@ async fn a_message_for_a_busy_claude_waits_for_its_hook_or_the_next_turn(pool: s
     assert!(vm.sbx.live(&conv).run().unwrap().busy());
     vm.sbx.deliver(&conv, "[a2a] mid-turn").await.unwrap();
     assert_eq!(vm.sbx.store.peek(&conv).unwrap(), vec!["[a2a] mid-turn"]);
-    let drained = agent_call(&vm, "inbox", json!({"drain": true}), &token, me()).await.unwrap();
+    let drained = agent_call(&vm, "inbox", json!({"drain": true}), &token, me())
+        .await
+        .unwrap();
     assert_eq!(drained, json!(["[a2a] mid-turn"]));
     let sbx = Arc::clone(&vm.sbx);
     let c2 = conv.clone();
@@ -741,7 +982,12 @@ async fn inv17_lockdown_freezes_and_holds_work_until_it_is_lifted(pool: sqlx::Pg
     msg.insert("kill_vm".into(), json!(false));
     vm.b.part
         .hub
-        .call(agent_auth_crypto::daemon::Role::Sandbox, HOST, msg, Duration::from_secs(5))
+        .call(
+            agent_auth_crypto::daemon::Role::Sandbox,
+            HOST,
+            msg,
+            Duration::from_secs(5),
+        )
         .await
         .unwrap();
     assert!(vm.sbx.locked());
@@ -749,13 +995,22 @@ async fn inv17_lockdown_freezes_and_holds_work_until_it_is_lifted(pool: sqlx::Pg
     vm.sbx.deliver(&conv, "while locked").await.unwrap();
     assert_eq!(vm.sbx.store.peek(&conv).unwrap(), vec!["while locked"]);
     vm.sbx.create_project("larder").unwrap();
-    let e = vm.sbx.mint("claude", "larder", "test", 1.0).await.unwrap_err();
+    let e = vm
+        .sbx
+        .mint("claude", "larder", "test", 1.0)
+        .await
+        .unwrap_err();
     assert!(e.to_string().contains("locked down"));
     let e = vm.sbx.attach(&conv, true).await.unwrap_err();
     assert!(e.to_string().contains("locked down"));
     let mut msg = Map::new();
     msg.insert("type".into(), json!("unlock"));
-    assert!(vm.b.part.hub.send_default(agent_auth_crypto::daemon::Role::Sandbox, HOST, &msg).await);
+    assert!(
+        vm.b.part
+            .hub
+            .send_default(agent_auth_crypto::daemon::Role::Sandbox, HOST, &msg)
+            .await
+    );
     let sbx = Arc::clone(&vm.sbx);
     assert!(eventually(|| async { !sbx.locked() }).await);
     let host_frozen = || vm.host().frozen();
@@ -777,7 +1032,12 @@ async fn inv17_a_contained_agent_is_frozen_and_held_until_released(pool: sqlx::P
     msg.insert("agents".into(), json!([ORCH]));
     vm.b.part
         .hub
-        .call(agent_auth_crypto::daemon::Role::Sandbox, HOST, msg, Duration::from_secs(5))
+        .call(
+            agent_auth_crypto::daemon::Role::Sandbox,
+            HOST,
+            msg,
+            Duration::from_secs(5),
+        )
         .await
         .unwrap();
     assert!(vm.sbx.contained(ORCH) && !vm.sbx.locked());
@@ -787,7 +1047,10 @@ async fn inv17_a_contained_agent_is_frozen_and_held_until_released(pool: sqlx::P
     let mut msg = Map::new();
     msg.insert("type".into(), json!("agents.contained"));
     msg.insert("agents".into(), json!([]));
-    vm.b.part.hub.send_default(agent_auth_crypto::daemon::Role::Sandbox, HOST, &msg).await;
+    vm.b.part
+        .hub
+        .send_default(agent_auth_crypto::daemon::Role::Sandbox, HOST, &msg)
+        .await;
     let sbx = Arc::clone(&vm.sbx);
     assert!(eventually(|| async { !sbx.contained(ORCH) }).await);
     let host_frozen = || vm.host().frozen();
@@ -873,7 +1136,9 @@ async fn inv17_a_conversation_held_while_it_starts_is_frozen_and_sent_nothing(po
 #[sqlx::test(migrations = "../store/migrations")]
 async fn inv17_holds_persist_across_a_restart(pool: sqlx::PgPool) {
     let mut vm = Vm::start(pool).await;
-    vm.sbx.contain(&["claude-x-excelsior-sandbox".to_owned()]).await;
+    vm.sbx
+        .contain(&["claude-x-excelsior-sandbox".to_owned()])
+        .await;
     vm.sbx.lockdown().await;
     // The broker is not locked: on reconnect it sends `unlock` (B-3) and
     // the held list. Without a broker connection, both stay.
@@ -885,7 +1150,10 @@ async fn inv17_holds_persist_across_a_restart(pool: sqlx::PgPool) {
     // B-3: connected again, the broker's state wins: unlocked, nothing held.
     vm.restart().await;
     let sbx = Arc::clone(&vm.sbx);
-    assert!(eventually(|| async { !sbx.locked() && !sbx.contained("claude-x-excelsior-sandbox") }).await);
+    assert!(
+        eventually(|| async { !sbx.locked() && !sbx.contained("claude-x-excelsior-sandbox") })
+            .await
+    );
     vm.stop().await;
 }
 
@@ -896,9 +1164,12 @@ async fn inv18_a_refused_agent_does_not_start_on_the_vms_logins(pool: sqlx::PgPo
     let vm = Vm::start(pool).await;
     let (conv, _) = vm.orch_conv().await;
     let orch = vm.b.agent(ORCH).await;
-    let (status, _) = vm
-        .b
-        .post_as(super::testkit::ADMIN_TOKEN, &format!("/admin/agents/{}/disable", orch.id), json!({}))
+    let (status, _) =
+        vm.b.post_as(
+            super::testkit::ADMIN_TOKEN,
+            &format!("/admin/agents/{}/disable", orch.id),
+            json!({}),
+        )
         .await;
     assert_eq!(status, 200);
     let e = vm.sbx.deliver(&conv, "hello").await.unwrap_err();
@@ -918,11 +1189,18 @@ async fn b6_the_daemons_ack_clears_the_pending_key(pool: sqlx::PgPool) {
     let b = &vm.b;
     let gone = eventually(|| async {
         let tx = b.st.store.begin().await.unwrap();
-        let d = agent_auth_store::daemons::by_name(&tx, agent_auth_store::daemons::DaemonRole::Sandbox, HOST)
+        let d = agent_auth_store::daemons::by_name(
+            &tx,
+            agent_auth_store::daemons::DaemonRole::Sandbox,
+            HOST,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        agent_auth_store::sandboxes::pending_for(&tx, d.id)
             .await
             .unwrap()
-            .unwrap();
-        agent_auth_store::sandboxes::pending_for(&tx, d.id).await.unwrap().is_empty()
+            .is_empty()
     })
     .await;
     assert!(gone);
@@ -945,7 +1223,9 @@ async fn a_lost_key_is_rotated_and_dispatch_resumes(pool: sqlx::PgPool) {
     {
         let k = agent_auth_crypto::api_key::generate().unwrap();
         let tx = vm.b.st.store.begin().await.unwrap();
-        agents::set_key(&tx, orch.id, k.key_id.as_str(), k.hash.as_str()).await.unwrap();
+        agents::set_key(&tx, orch.id, k.key_id.as_str(), k.hash.as_str())
+            .await
+            .unwrap();
         tx.commit().await.unwrap();
     }
     // The next thread wakes the dispatcher: its key is refused, it asks
@@ -953,7 +1233,12 @@ async fn a_lost_key_is_rotated_and_dispatch_resumes(pool: sqlx::PgPool) {
     let (_, hermes) = vm.peer("hermes-test").await;
     let tid = vm.open_thread(&hermes, ORCH, json!({"task": "ping"})).await;
     let msgs = vm.reply_on(&hermes, &tid, 1).await;
-    assert!(msgs[0]["payload"]["summary"].as_str().unwrap().contains("ping"));
+    assert!(
+        msgs[0]["payload"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("ping")
+    );
     assert_ne!(vm.sbx.store.agent(ORCH).unwrap().key_id, old);
     vm.stop().await;
 }
@@ -964,28 +1249,45 @@ async fn a_lost_key_is_rotated_and_dispatch_resumes(pool: sqlx::PgPool) {
 async fn b8_a_lapsed_agent_reminted_answers_again(pool: sqlx::PgPool) {
     let vm = Vm::start(pool).await;
     vm.sbx.create_project("larder").unwrap();
-    let minted = vm.sbx.mint("claude", "larder", "test", 120.0).await.unwrap();
+    let minted = vm
+        .sbx
+        .mint("claude", "larder", "test", 120.0)
+        .await
+        .unwrap();
     assert_eq!(minted["key_received"], true, "{minted}");
     let name = "claude-larder-excelsior-sandbox";
     let child = vm.b.agent(name).await;
     {
         let tx = vm.b.st.store.begin().await.unwrap();
-        agents::set_lease(&tx, child.id, Some(OffsetDateTime::now_utc() - time::Duration::seconds(1)))
-            .await
-            .unwrap();
+        agents::set_lease(
+            &tx,
+            child.id,
+            Some(OffsetDateTime::now_utc() - time::Duration::seconds(1)),
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
     }
     crate::scheduler::sweep_leases(&vm.b.st).await;
     assert!(vm.b.agent(name).await.disabled);
     let old = vm.sbx.store.agent(name).unwrap().key_id.clone();
-    let again = vm.sbx.mint("claude", "larder", "renew", 120.0).await.unwrap();
+    let again = vm
+        .sbx
+        .mint("claude", "larder", "renew", 120.0)
+        .await
+        .unwrap();
     assert_eq!(again["status"], "granted", "{again}");
     let sbx = Arc::clone(&vm.sbx);
     assert!(eventually(|| async { sbx.store.agent(name).unwrap().key_id != old }).await);
     let (_, hermes) = vm.peer("hermes-test").await;
     let tid = vm.open_thread(&hermes, name, json!({"task": "ping"})).await;
     let msgs = vm.reply_on(&hermes, &tid, 1).await;
-    assert!(msgs[0]["payload"]["summary"].as_str().unwrap().contains("ping"));
+    assert!(
+        msgs[0]["payload"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("ping")
+    );
     vm.stop().await;
 }
 
@@ -1032,18 +1334,34 @@ async fn interactive_attach_hands_the_session_to_a_tui(pool: sqlx::PgPool) {
     let argv: Vec<String> = serde_json::from_value(info["argv"].clone()).unwrap();
     assert_eq!(&argv[argv.len() - 3..], ["attach", "-t", "conv"]);
     assert!(vm.sbx.live(&conv).run().is_none());
-    assert_eq!(vm.sbx.store.conversation(&conv).unwrap().state, ConvState::Attached);
+    assert_eq!(
+        vm.sbx.store.conversation(&conv).unwrap().state,
+        ConvState::Attached
+    );
     let tui_started = eventually(|| async {
-        vm.log().iter().any(|e| e.get("tui").and_then(Value::as_bool) == Some(true))
+        vm.log()
+            .iter()
+            .any(|e| e.get("tui").and_then(Value::as_bool) == Some(true))
     })
     .await;
     assert!(tui_started);
-    let tui = vm.log().into_iter().rev().find(|e| e["tui"] == true).unwrap();
+    let tui = vm
+        .log()
+        .into_iter()
+        .rev()
+        .find(|e| e["tui"] == true)
+        .unwrap();
     let first = vm.starts()[0].clone();
     assert_eq!(tui["start"], first["start"]);
     assert_eq!(tui["resumed"], true);
-    vm.sbx.deliver(&conv, "[a2a] queued while attached").await.unwrap();
-    assert_eq!(vm.sbx.store.peek(&conv).unwrap(), vec!["[a2a] queued while attached"]);
+    vm.sbx
+        .deliver(&conv, "[a2a] queued while attached")
+        .await
+        .unwrap();
+    assert_eq!(
+        vm.sbx.store.peek(&conv).unwrap(),
+        vec!["[a2a] queued while attached"]
+    );
     vm.sbx.stop_tui(&conv).await;
     assert!(vm.saw_turn("[a2a] queued while attached").await);
     vm.stop().await;
@@ -1085,7 +1403,10 @@ async fn b5_an_idle_tui_is_reaped(pool: sqlx::PgPool) {
     tokio::time::sleep(Duration::from_millis(2200)).await;
     vm.sbx.reap_once().await;
     assert!(!vm.sbx.live(&conv).tui());
-    assert_eq!(vm.sbx.store.conversation(&conv).unwrap().state, ConvState::Parked);
+    assert_eq!(
+        vm.sbx.store.conversation(&conv).unwrap().state,
+        ConvState::Parked
+    );
     vm.stop().await;
 }
 
@@ -1101,18 +1422,33 @@ async fn the_shared_codex_login_is_written_back_by_its_owner_only(pool: sqlx::Pg
         vm.sbx.create_project(p).unwrap();
     }
     vm.operator_api()
-        .handle("secret_set", &obj(json!({"name": "codex-auth.json", "value": "{\"v\": 1}"})), 0)
+        .handle(
+            "secret_set",
+            &obj(json!({"name": "codex-auth.json", "value": "{\"v\": 1}"})),
+            0,
+        )
         .await
         .unwrap();
     let shared = vm.dir.join("state/secrets/codex-auth.json");
     let home = |p: &str| vm.dir.join("sb/homes").join(p).join(".codex/auth.json");
     vm.sbx.codex_sync_into(Some("other"), 1).await;
-    assert_eq!(std::fs::read_to_string(home("other")).unwrap(), "{\"v\": 1}");
+    assert_eq!(
+        std::fs::read_to_string(home("other")).unwrap(),
+        "{\"v\": 1}"
+    );
     std::fs::write(home("other"), "{\"v\": \"theirs\"}").unwrap();
     vm.sbx.codex_sync_back(Some("other"), 1).await;
-    assert_eq!(std::fs::read_to_string(&shared).unwrap(), "{\"v\": 1}", "never written back");
+    assert_eq!(
+        std::fs::read_to_string(&shared).unwrap(),
+        "{\"v\": 1}",
+        "never written back"
+    );
     vm.sbx.codex_sync_into(Some("other"), 1).await;
-    assert_eq!(std::fs::read_to_string(home("other")).unwrap(), "{\"v\": 1}", "the shared copy wins");
+    assert_eq!(
+        std::fs::read_to_string(home("other")).unwrap(),
+        "{\"v\": 1}",
+        "the shared copy wins"
+    );
     vm.sbx.codex_sync_into(Some("owner"), 1).await;
     std::fs::write(home("owner"), "{\"v\": 2}").unwrap();
     vm.sbx.codex_sync_back(Some("owner"), 1).await;

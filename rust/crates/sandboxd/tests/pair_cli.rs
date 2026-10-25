@@ -35,7 +35,9 @@ fn the_other_binaries_start() {
     {
         use std::io::Write as _;
         let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(br#"{"hook_event_name": "PostToolUse"}"#).unwrap();
+        stdin
+            .write_all(br#"{"hook_event_name": "PostToolUse"}"#)
+            .unwrap();
     }
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success());

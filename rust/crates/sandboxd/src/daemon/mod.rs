@@ -649,6 +649,23 @@ impl<H: Host> Sandboxd<H> {
             api_key: Secret::new(k.api_key.expose().to_owned()),
             updated_at: crate::store::now(),
         };
+        // The same key again (pushed again before the broker saw the ack):
+        // acknowledged, nothing restarted.
+        let same = self.store.agent(&rec.name).is_some_and(|old| {
+            old.key_id == rec.key_id
+                && agent_auth_crypto::ct_eq(
+                    old.api_key.expose().as_bytes(),
+                    rec.api_key.expose().as_bytes(),
+                )
+                && old.agent_id == rec.agent_id
+                && old.runtime == rec.runtime
+                && old.project == rec.project
+        });
+        if same {
+            self.send(json!({"type": "key.ack", "agent_id": rec.agent_id, "key_id": rec.key_id}))
+                .await;
+            return;
+        }
         if let Err(e) = self.store.put_agent(rec.clone()) {
             // Not acknowledged: the broker sends it again.
             tracing::error!(agent = %rec.name, "could not store a key: {e}");

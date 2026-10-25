@@ -630,7 +630,7 @@ mod tests {
     fn unit_argv_keeps_secrets_out_and_escapes_dollars() {
         let cfg = Config::from_json(
             &serde_json::json!({"broker_url": "https://b.example",
-                "broker_public_key": "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "broker_public_key": crate::config::tests::key(),
                 "name": "excelsior"})
             .to_string(),
         )

@@ -370,13 +370,20 @@ impl Config {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    const KEY: &str = "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    /// A real broker key (small-order points, the all-zero one among them,
+    /// are refused).
+    pub(crate) fn key() -> String {
+        agent_auth_crypto::daemon::SigningKey::generate()
+            .unwrap()
+            .public_key()
+            .to_text()
+    }
 
     fn base() -> serde_json::Value {
-        serde_json::json!({"broker_url": "https://broker.example", "broker_public_key": KEY,
+        serde_json::json!({"broker_url": "https://broker.example", "broker_public_key": key(),
                            "name": "excelsior"})
     }
 
