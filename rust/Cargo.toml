@@ -37,6 +37,9 @@ ring = { version = "0.17.14", default-features = false, features = ["alloc", "st
 serde = { version = "1.0.229", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1.0.152", default-features = false, features = ["std"] }
 serde-saphyr = { version = "1.3.0", default-features = false, features = ["deserialize"] }
+# hostexec template parameter patterns (linear-time, no backreferences or
+# lookaround); Unicode classes and case folding as Python's `re` has them.
+regex = { version = "1.13.1", default-features = false, features = ["std", "unicode-perl", "unicode-case"] }
 time = { version = "0.3.55", default-features = false, features = ["std", "formatting", "parsing", "serde", "macros"] }
 uuid = { version = "1.28.0", default-features = false, features = ["std", "v4", "serde"] }
 base64 = { version = "0.23.1", default-features = false, features = ["std"] }

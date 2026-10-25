@@ -1,0 +1,51 @@
+# Fuzz targets (cargo-fuzz). Its own workspace, outside the main one: it
+# needs libfuzzer-sys and a nightly toolchain.
+#   nix develop ..#nightly -c cargo fuzz run policy_yaml -- -max_total_time=60
+[package]
+name = "agent-auth-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+agent-auth-core = { path = "../crates/core" }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+time = { version = "=0.3.55", default-features = false }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[[bin]]
+name = "policy_yaml"
+path = "fuzz_targets/policy_yaml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "glob_match"
+path = "fuzz_targets/glob_match.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "job_spec"
+path = "fuzz_targets/job_spec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "duration_parse"
+path = "fuzz_targets/duration_parse.rs"
+test = false
+doc = false
+bench = false

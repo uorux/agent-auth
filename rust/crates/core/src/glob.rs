@@ -84,6 +84,33 @@ impl Glob {
         let text: Vec<char> = text.chars().collect();
         match_tokens(&self.tokens, &text)
     }
+
+    /// Does this pattern match every non-empty string made of `alphabet`'s
+    /// characters? Exact, not a heuristic: a literal or a set that misses
+    /// some character `d` of the alphabet fails on `"d"` repeated; what is
+    /// left (stars, `?`, sets covering the alphabet) matches every length
+    /// from 1 up exactly when there is a star and at most one
+    /// single-character token. (With a one-character alphabet a literal
+    /// behaves like `?`; that case is handled too.)
+    #[must_use]
+    pub fn matches_every_nonempty_over(&self, alphabet: &[char]) -> bool {
+        if alphabet.is_empty() {
+            return false;
+        }
+        let covers_alphabet = |token: &Token| alphabet.iter().all(|&c| token_matches_one(token, c));
+        let mut stars = 0usize;
+        let mut singles = 0usize;
+        for token in &self.tokens {
+            if *token == Token::Star {
+                stars = stars.saturating_add(1);
+            } else if covers_alphabet(token) {
+                singles = singles.saturating_add(1);
+            } else {
+                return false;
+            }
+        }
+        stars > 0 && singles <= 1
+    }
 }
 
 impl PartialEq for Glob {
@@ -286,6 +313,101 @@ mod tests {
         assert!(Glob::new("[").is_literal());
     }
 
+    /// Differential test against CPython's `fnmatch.fnmatchcase` on a
+    /// generated corpus of ordinary patterns (stars, `?`, sets with `!`,
+    /// `]`, ranges and `-` in every position, backslashes, `^`). Needs
+    /// `python3` on PATH (the dev shell has it); without it the test says
+    /// so and passes.
+    #[test]
+    fn agrees_with_cpython() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        // A small LCG: deterministic, no dependency.
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = |n: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            usize::try_from(state >> 33).unwrap() % n
+        };
+        let pattern_chars: Vec<char> = "ab-]![*?^\\cz".chars().collect();
+        let text_chars: Vec<char> = "ab-]![\\^cz*?".chars().collect();
+        let mut corpus = Vec::new();
+        for _ in 0..30_000 {
+            let plen = next(9);
+            let pattern: String = (0..plen)
+                .map(|_| pattern_chars[next(pattern_chars.len())])
+                .collect();
+            let tlen = next(7);
+            let text: String = (0..tlen)
+                .map(|_| text_chars[next(text_chars.len())])
+                .collect();
+            corpus.push((pattern, text));
+        }
+        let script = "import sys, json, fnmatch\n\
+                      out = []\n\
+                      for line in sys.stdin:\n    p, t = json.loads(line)\n    out.append('1' if fnmatch.fnmatchcase(t, p) else '0')\n\
+                      sys.stdout.write(''.join(out))\n";
+        let child = Command::new("python3")
+            .args(["-I", "-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn();
+        let Ok(mut child) = child else {
+            eprintln!("python3 not found: skipping the CPython differential test");
+            return;
+        };
+        let mut input = String::new();
+        for (p, t) in &corpus {
+            input.push_str(&serde_json::to_string(&(p, t)).unwrap());
+            input.push('\n');
+        }
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let answers = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(answers.len(), corpus.len());
+        // A reversed range (`[z-a]`) is the one deliberate difference
+        // (DEVIATIONS.md): CPython merges it with its neighbours, which can
+        // even turn `[z-?!]` into "any character".
+        let reversed = |p: &str| {
+            Glob::new(p).tokens.iter().any(|t| match t {
+                Token::Class { items, .. } => items
+                    .iter()
+                    .any(|i| matches!(i, ClassItem::Range(lo, hi) if lo > hi)),
+                _ => false,
+            })
+        };
+        let mut mismatches = Vec::new();
+        let mut compared = 0usize;
+        for ((p, t), python) in corpus.iter().zip(answers.chars()) {
+            if reversed(p) {
+                continue;
+            }
+            compared = compared.saturating_add(1);
+            if fnmatch(t, p) != (python == '1') {
+                mismatches.push(format!("pattern {p:?} text {t:?}: python {python}"));
+            }
+        }
+        assert!(compared > 25_000, "{compared}");
+        assert!(
+            mismatches.is_empty(),
+            "{} mismatches, e.g. {:?}",
+            mismatches.len(),
+            &mismatches[..mismatches.len().min(10)]
+        );
+    }
+
     #[test]
     fn pathological_is_fast() {
         let text = "a".repeat(5000);
@@ -300,6 +422,29 @@ mod tests {
             let glob = Glob::new(&pattern);
             let chars: Vec<char> = text.chars().collect();
             prop_assert_eq!(glob.matches(&text), reference(&glob.tokens, &chars));
+        }
+
+        /// `matches_every_nonempty_over` against brute force over every
+        /// string of length 1..=5 on a 3-letter alphabet. (A pattern that
+        /// matches all of those but not some longer string would need more
+        /// than 5 single-character tokens without a star, which the brute
+        /// force sees fail at length 1 anyway.)
+        #[test]
+        fn matches_every_agrees_with_brute_force(pattern in "[ab*?\\[\\]!-]{0,8}") {
+            let alphabet = ['a', 'b', '-'];
+            let glob = Glob::new(&pattern);
+            let mut all = true;
+            let mut words: Vec<String> = vec![String::new()];
+            for _ in 0..5 {
+                words = words
+                    .iter()
+                    .flat_map(|w| alphabet.iter().map(move |c| format!("{w}{c}")))
+                    .collect();
+                if !words.iter().all(|w| glob.matches(w)) {
+                    all = false;
+                }
+            }
+            prop_assert_eq!(glob.matches_every_nonempty_over(&alphabet), all, "{}", pattern);
         }
 
         #[test]

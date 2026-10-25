@@ -19,7 +19,8 @@
 //! - INV-9  a restricted zone requiring a human never auto-clears.
 
 /// What a policy layer proposes for a request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PolicyAction {
     Deny,
     Approve,
