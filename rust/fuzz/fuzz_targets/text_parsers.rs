@@ -30,7 +30,7 @@ fuzz_target!(|data: &[u8]| {
         assert!(text.len() <= 63);
     }
     let _ = Role::parse(text);
-    if let Some(s) = TotpSecret::from_base32(text) {
+    if let Ok(s) = TotpSecret::from_base32(text) {
         let _ = totp::verify(&s, text, 1_761_400_000, None);
     }
     if let Ok(p) = pem::parse(text) {

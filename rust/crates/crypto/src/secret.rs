@@ -77,6 +77,15 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     black_box(diff) == 0
 }
 
+/// Compares two secrets in time independent of both their contents and
+/// their lengths: SHA-256 of each, then [`ct_eq`] on the digests. For
+/// presented tokens of arbitrary length (the admin token).
+pub fn ct_eq_hashed(a: &[u8], b: &[u8]) -> bool {
+    let da = ring::digest::digest(&ring::digest::SHA256, a);
+    let db = ring::digest::digest(&ring::digest::SHA256, b);
+    ct_eq(da.as_ref(), db.as_ref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,6 +95,16 @@ mod tests {
         let s = Secret::new(String::from("hunter2"));
         assert_eq!(format!("{s:?}"), "Secret(..)");
         assert_eq!(s.expose(), "hunter2");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn hashed_eq() {
+        assert!(ct_eq_hashed(b"admin-token", b"admin-token"));
+        assert!(!ct_eq_hashed(b"admin-token", b"admin-tokem"));
+        assert!(!ct_eq_hashed(b"admin-token", b"admin"));
+        assert!(!ct_eq_hashed(b"", b"x"));
+        assert!(ct_eq_hashed(b"", b""));
     }
 
     #[test]

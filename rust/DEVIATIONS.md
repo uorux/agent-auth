@@ -226,16 +226,24 @@ and why. Keep entries short. Group by area.
   broker MACed the key text as received; the Rust re-encodes the parsed key,
   so a peer sending a padded or otherwise non-canonical text fails the
   proof. Honest peers send the canonical form.
-- **Key file symlink check without `O_NOFOLLOW`** (§2.3): `lstat` must show
-  a regular file and the opened file must be that inode (no libc, so no
-  `O_NOFOLLOW`). A symlinked key is refused with "is not a regular file"
-  (the Python failed with the OS's ELOOP error). The effective uid comes
-  from `/proc/self/status` on Linux (other systems: the owner of a probe
-  file created next to the key).
+- **Key file opened with `O_NOFOLLOW | O_NONBLOCK`** (§2.3): the flags
+  are defined per OS/architecture without libc; the checks (regular file,
+  owner, mode) are made on the opened file, and a FIFO swapped in is
+  refused instead of hanging the open. A symlinked key is reported as "is
+  not a regular file" (the Python surfaced the OS's ELOOP error). The
+  effective uid comes from `/proc/self/status` on Linux (other systems:
+  the owner of a probe file created next to the key).
+- **TOTP secrets must be at least 16 bytes** (daemons-hostd §7). The
+  Python accepted any base32, including an empty secret, which gives
+  predictable codes; such a secret is now refused with "TOTP secret is N
+  bytes; at least 16 are required". Generated secrets are 20 bytes.
 - **Broker JWT verification** (§10.4) takes the time as an argument and
   reports PyJWT's messages; `iat`/`nbf`/`exp` must be JSON numbers (PyJWT's
   `int()` also took numeric strings). Tokens and the JWKS (`kid`, `x`, `y`)
-  are the Python's for the same `BROKER_SIGNING_KEY`.
+  are the Python's for the same `BROKER_SIGNING_KEY`. ES256 signatures are
+  minted with low `s` and a high-`s` signature is refused (the Python
+  accepted both forms of a malleated signature). A token's identity is its
+  `jti`; nothing may key on token text.
 - **Note, not a change: ES256 key derivation uses a deprecated ring helper.** ring has no
   "P-256 scalar → key pair" constructor and its PKCS#8 parser needs the
   public key, so `jwt::TokenIssuer` feeds the derived scalar to ring's own

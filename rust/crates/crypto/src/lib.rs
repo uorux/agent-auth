@@ -30,7 +30,7 @@ pub mod webhook;
 
 pub use encoding::{b64url_decode, b64url_encode};
 pub use rng::RandomError;
-pub use secret::{Secret, ct_eq};
+pub use secret::{Secret, ct_eq, ct_eq_hashed};
 
 /// Known-answer vectors produced by the Python implementation
 /// (`tests/vectors/generate.py`).

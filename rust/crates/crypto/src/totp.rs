@@ -23,7 +23,22 @@ pub const DIGITS: usize = 6;
 /// Steps accepted on either side of the current one.
 pub const WINDOW_STEPS: u64 = 1;
 
-/// A TOTP shared secret (the raw key bytes).
+/// The shortest secret accepted, in bytes (128 bits; RFC 4226 §4 asks for
+/// at least that). Generated secrets are 20 bytes.
+pub const MIN_SECRET_BYTES: usize = 16;
+
+/// A TOTP secret could not be used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TotpSecretError {
+    #[error("TOTP secret is not base32")]
+    NotBase32,
+    /// An empty or short secret makes predictable codes.
+    #[error("TOTP secret is {0} bytes; at least 16 are required")]
+    TooShort(usize),
+}
+
+/// A TOTP shared secret (the raw key bytes, at least
+/// [`MIN_SECRET_BYTES`]).
 #[derive(Clone)]
 pub struct TotpSecret(Secret<Vec<u8>>);
 
@@ -41,8 +56,19 @@ impl TotpSecret {
 
     /// Parses the base32 text (what authenticator apps take): case
     /// insensitive, padding optional, surrounding whitespace ignored.
-    pub fn from_base32(text: &str) -> Option<Self> {
-        base32_decode(text.trim()).map(|raw| Self(Secret::new(raw)))
+    /// Refuses secrets shorter than [`MIN_SECRET_BYTES`].
+    pub fn from_base32(text: &str) -> Result<Self, TotpSecretError> {
+        let raw = base32_decode(text.trim()).ok_or(TotpSecretError::NotBase32)?;
+        Self::from_bytes(raw)
+    }
+
+    /// The secret from its raw bytes (at least [`MIN_SECRET_BYTES`]).
+    pub fn from_bytes(raw: Vec<u8>) -> Result<Self, TotpSecretError> {
+        let raw = Secret::new(raw);
+        if raw.expose().len() < MIN_SECRET_BYTES {
+            return Err(TotpSecretError::TooShort(raw.expose().len()));
+        }
+        Ok(Self(raw))
     }
 
     /// Base32 without padding (32 characters for a generated secret).
@@ -301,6 +327,32 @@ mod tests {
             Err(TotpError::WrongCode)
         );
         assert_eq!(verify(&secret, "", now, None), Err(TotpError::WrongCode));
+    }
+
+    #[test]
+    fn short_secrets_refused() {
+        for (text, len) in [
+            ("", 0),
+            ("AA", 1),
+            ("MZXW6", 3),
+            ("GEZDGNBVGY3TQOJQGEZDGNBV", 15),
+        ] {
+            assert_eq!(
+                TotpSecret::from_base32(text).unwrap_err(),
+                TotpSecretError::TooShort(len),
+                "{text:?}"
+            );
+        }
+        assert_eq!(
+            TotpSecret::from_bytes(vec![0; 15]).unwrap_err(),
+            TotpSecretError::TooShort(15)
+        );
+        assert!(TotpSecret::from_bytes(vec![0; 16]).is_ok());
+        assert!(TotpSecret::from_base32("GEZDGNBVGY3TQOJQGEZDGNBVGY").is_ok());
+        assert_eq!(
+            TotpSecret::from_base32("not base32!").unwrap_err(),
+            TotpSecretError::NotBase32
+        );
     }
 
     #[test]
