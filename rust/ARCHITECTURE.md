@@ -42,7 +42,7 @@ change in `DEVIATIONS.md`.
 | `agent-auth-mcp` | binaries `agent-auth-mcp` (stdio) and `agent-auth-mcp-bridge`. | client, rmcp |
 | `agent-auth-daemon` | what hostd and sandboxd share: the broker channel client, local unix-socket server with peer-credential checks, key files. | crypto, wire |
 | `agent-auth-hostd` | binaries `agent-auth-hostd`, `agent-auth-hostctl`. | daemon, core |
-| `agent-auth-sandboxd` | binaries `agent-auth-sandboxd`, `agent-auth-sandboxctl`, `agent-auth-sandbox-mcp`. | daemon, client |
+| `agent-auth-sandboxd` | binaries `agent-auth-sandboxd`, `agent-auth-sandboxctl`, `agent-auth-sandbox-mcp`; its state is local to the VM (atomic JSON documents, no SQLite). | daemon, client, mcp, core |
 
 All SQL lives in `agent-auth-store`, one module per domain
 (`store/src/requests.rs`, `a2a.rs`, `hostexec.rs`, ...), so feature work in

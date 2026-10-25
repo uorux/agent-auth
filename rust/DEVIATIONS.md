@@ -145,7 +145,10 @@ and why. Keep entries short. Group by area.
 - **Key acks name the key** (sandboxd B-6): `pending_key_deliveries.key_id`;
   an ack deletes only the delivery of that key.
 - **Lease renewal does not clear a disable** (sandboxd B-1):
-  `agents::set_lease` only moves the lease; re-enabling is explicit.
+  `agents::set_lease` only moves the lease; re-enabling is explicit, and
+  `agents.disabled_reason` (`operator` | `lease` | `unpaired`, migration
+  0013) records why an agent was disabled; an `operator` reason is never
+  replaced by a later one.
 - **OAuth one-time use is one UPDATE** (Bug-C2): `oauth::consume` marks a
   code/refresh token used with `used_at IS NULL` in the WHERE; a replay
   revokes the family in the same transaction.
@@ -1184,6 +1187,143 @@ characters stripped; `mail_attachment` never served remotely). Beyond it:
 - **CLI `mail-send`** reads the body from `--body-file` or stdin, as the
   Python; `mail-list --limit` is an integer (clap usage error otherwise).
 
+## Agent VMs (`crates/sandboxd`, broker `sandboxes`)
+
+Broker side:
+- **Only the VM's orchestrator mints** (B-14): `agents:mint` from any
+  other agent is refused (`only an agent VM's orchestrator can mint
+  identities`), and the catalog lists `agents` to the orchestrator only.
+  The Python let any VM agent ask and left it to policy.
+- **Re-minting never undoes an operator's disable** (B-1, B-8). Renewing a
+  live agent extends its lease only (as before). A lease-expired agent is
+  re-enabled with a NEW key queued for its sandbox (the daemon restarts its
+  dispatcher on it; the old key stays dead). An agent the operator
+  disabled is refused at validation and at provisioning: `<name> was
+  disabled by the operator; minting it again does not re-enable it`. The
+  Python re-enabled any disabled agent with its old key. Re-pairing still
+  re-enables the orchestrator (an operator act, with a new key).
+- **Key acks name the key** (B-6): `key` carries `key_id`, and `key.ack`
+  must name it (one without is malformed and ignored); an ack for a key
+  since replaced deletes nothing.
+- **Unpairing a sandbox disables its agents** (B-10), with their
+  descendants (reason `unpaired`): their keys stop working at once. The
+  Python left them enabled until their leases (the orchestrator: never).
+- **`rotate-key` refuses a VM agent** (409 `<name> was minted in an agent
+  VM; its key is its sandbox's (disable it and mint it again)`), as rename
+  and attributes do: it would have stranded the daemon's copy.
+- **A connecting sandbox is told the lock state either way** (B-3):
+  `unlock` when the broker is not locked for it, `lockdown` when it is,
+  then its held list, then pending keys, all from one hook in that order.
+  A VM that missed an unlock no longer stays locked forever.
+- **Lockdown and unlock tell sandboxes their held lists.** The Python did
+  this from `containment.record`/`lift_where`; without it a VM stayed
+  fully contained after an unlock. An unlock of one host while `*` remains
+  no longer unlocks that host's VM.
+- **A timed-out `project.grant` is followed by a best-effort
+  `project.revoke`** (B-7, broker half): the daemon may have applied it.
+
+sandboxd:
+- **State is a few JSON documents, not SQLite** (spec §4.3; the workspace
+  bans SQLite). Each change is written whole to a new 0600 file, fsynced,
+  renamed over the old one and the directory fsynced, under the
+  document's lock; memory changes only once the disk has. A document that
+  does not read, is not a regular file or is readable by others stops the
+  daemon at startup. A change that only lifts holds is not applied unless
+  it is written (fail closed); one that adds holds applies in memory even
+  if the write fails.
+- **Broker messages are handled off the read loop, holds first** (B-7).
+  A hold (`lockdown`, `unlock`, `agents.contained`) takes effect in memory
+  and on disk before the next message is read; its freezing and thawing
+  run in order on a worker, and deliveries after a release run in tasks of
+  their own. Project grants run in tasks (serialized per project pair). A
+  grant is recorded before its ACL is applied and undone if applying
+  fails, so a revoke after a failure or a broker timeout cleans up.
+- **Held means held on every path** (B-2, upstream review 2026-10): a unit
+  is thawed, and its queue delivered, only when nothing holds its agent
+  any more (lifting the lockdown keeps contained agents frozen; lifting a
+  containment during a lockdown thaws nothing). `core::sandbox`, with Kani
+  harnesses. A held run is not parked (frozen processes are kept), and a
+  turn that ends while held does not get its queue.
+- **Process limits are enforced** (B-4): a slot is held for as long as a
+  process runs (headless, TUI and triage alike), at most `max_processes`
+  in the VM and `max_processes_per_project` per project (the orchestrator
+  is its own). A delivery waits up to 120 s for a slot; then the text
+  waits in the conversation's queue and is retried. The Python's
+  semaphore counted starts only, and the per-project limit was unused.
+- **Idle TUIs are ended** (B-5): a TUI with no client attached and no
+  activity for `interactive_idle_secs` is stopped, and its conversation
+  goes back to headless.
+- **Queued deliveries are retried** (B-17): a thread that was accepted
+  is never rejected because its process then failed to start (no model
+  key, no slot, a broken runtime); the text waits and is retried (30 s,
+  doubling to 15 min) and with the next message.
+- **A refused key is asked for once, then waited for** (B-8): a dispatcher
+  or watcher that gets a 401 sends `key.rotate` (at most once per 5 minutes
+  per agent) and waits for a new key instead of ending (dispatcher) or
+  repeating every 5 s forever (watcher). A 401 while routing an open does
+  the same.
+- **Sessionless conversations get a new session** (B-9): when the broker
+  ends a conversation's session, the conversation gets a new one the next
+  time it is used (a claim, a process start); a claim that meets a dead
+  session retries with a new one, and a process still holding the dead
+  session is stopped. The Python claimed threads without a session and
+  never heard from them again.
+- **Root never follows a path an agent controls** (B-11, B-12, B-13).
+  Directories are opened `O_PATH|O_NOFOLLOW` one component at a time from
+  sandboxd's own roots, through `/proc/self/fd/<parent>/<name>` (std has no
+  `openat`); every entry of a tree is opened without following and acted
+  on through `/proc/self/fd/<n>`. Files are created `O_EXCL|O_NOFOLLOW`
+  under a random name and renamed in the same directory (a planted FIFO
+  or symlink only fails the write); reads take regular files of bounded
+  size only. Ownership changes use `chown(2)` on those magic links (no
+  `chown -R`), only for entries owned by an expected previous owner (seal:
+  the orchestrator's; the write-revoke hand-back: the grantee's; a codex
+  home: root's), never symlinks or multiply-linked files. ACLs still go
+  through `setfacl` (no xattr calls in std, no `unsafe`), but only on
+  `/proc/<sandboxd>/fd/<n>` paths of verified inodes, passed on stdin in
+  batches; only regular files and directories, and a grant only on
+  entries the target project owns with one link. The codex socket is
+  found by reading its symlink (never following it), opening each
+  directory of a `/tmp/<plain names>` target without following, and
+  connecting to the socket's `O_PATH` descriptor. Residual risk: a
+  project can hard-link into its tree a file it can already write
+  elsewhere (`protected_hardlinks`); removing an ACL entry is applied to
+  every entry; `setfacl` is a separate root process trusted with its
+  stdin; `X` is evaluated when it runs.
+- **The shared codex login is written back by one designated project
+  only** (upstream review 2026-10, flagged). New config key
+  `codex_auth_owner` (a project; default none). Every other project gets
+  the shared login copied in whenever its copy differs, and its own
+  changes never go back. The owner keeps its copy (and its refreshes go
+  back after it parks) unless the operator replaced the shared login since
+  the last sync. Contents are compared, not mtimes (B-11b).
+- **Grants of one pair combine**: adding a read grant keeps an existing
+  write grant's `rwX`, and a revoke restores the widest remaining grant
+  (the Python re-applied each in turn, the last one winning). Revoking the
+  last write grant hands what the grantee created back to the target
+  (upstream).
+- **codex turns**: the running turn and the queued inputs share one lock;
+  a steer refused because the turn just ended starts the next turn
+  instead of queueing behind one that never comes; the next queued turn is
+  started off the reader task (the Python awaited it inside the reader and
+  stalled for the call's 120 s timeout).
+- **Unit commands and env files**: every `$` in a unit's argv goes to
+  systemd as `$$` (as hostd's fix); env-file values are double-quoted with
+  `\`, `"`, `` ` `` and `$` escaped (the Python's `shlex.quote` single
+  quotes were not systemd's syntax for a value with a `'`) (B-18).
+- **Strict config and local API.** Unknown config keys and runtimes other
+  than `claude`/`codex` are refused; new keys `setpriv` and
+  `codex_auth_owner`. Local API parameters must have their JSON types
+  (the Python called `str()` on anything), unknown parameters are
+  refused, and strings are bounded; a missing one still answers
+  `internal error: '<name>'`. Projects list `sealed` as a boolean (the
+  Python's SQLite gave 0/1).
+- **Closed conversations' tokens stop working** and a TUI that ended by
+  itself has its env file removed (B-18).
+- **The gateway request waits for any undecided status** (up to 20 s;
+  the Python waited only for approved/provisioning/pending).
+- **sandboxctl prints log times in UTC** (no local time zone without libc).
+
 ## Open questions
 
 (for Jacob; nothing here is implemented until decided)
@@ -1234,10 +1374,6 @@ characters stripped; `mail_attachment` never served remotely). Beyond it:
 - **B19**: should the credential route refuse web-UI OAuth callers? (The
   spine's route.)
 
-- **Rotating a VM-minted agent's key** (http-api §8.13): still allowed, as
-  in the Python, although it breaks the sandbox daemon's copy. Refuse it
-  (like rename and attributes), or keep it as the operator's escape hatch?
-
 - **Remote MCP redirect URIs.** The allowlist is now exact callback URIs
   (`remote_mcp.redirect_uris`, replacing `redirect_hosts`; a policy with the
   old key does not load). Defaults: `https://claude.ai/api/mcp/auth_callback`
@@ -1250,6 +1386,28 @@ characters stripped; `mail_attachment` never served remotely). Beyond it:
   model provider reads every message and draft. Both by upstream's design;
   flagged there.
 
+- **Re-enabling an agent the operator disabled** (sandboxd B-1): a mint no
+  longer does it, and there is no admin route that does. Agents are never
+  deleted, so such a VM agent's name is unusable for good. Add
+  `POST /admin/agents/{id}/enable` (re-enable, rotate the key through its
+  sandbox)?
+- **`key.rotate` has no rate limit on the broker** (as the Python);
+  sandboxd now asks at most once per 5 minutes per agent.
+- **The shared codex login** (sandboxd B-11b, upstream flag): with
+  `codex_auth_owner` unset nobody writes it back, so a refresh in any
+  project may invalidate the shared refresh token for the others. Is a
+  shared refreshable login still wanted, or one login per project?
+- **codex triage is not tool-less** (B-16): `codex exec -s read-only`
+  keeps its read-only shell tools while reading untrusted text, and uses
+  the runtime's normal model when `triage_model` is unset. Unchanged.
+- **Conversations keep a broker session each, forever** (B-18): an
+  orchestrator with many conversations may reach the broker's
+  `max_sessions_per_agent`. Close idle conversations automatically?
+- **Triage picks the candidate whose id appears in the answer** (B-18):
+  kept (exactly one must match).
+- **`/run/sandboxd` is 0755** in the NixOS module (B-18; its files are
+  0600); not changed here.
+
 ## To do (engineering, tracked here until done)
 
 - Local unix-socket protocols (hostctl, hostd-user, sandboxd local API) are
@@ -1259,9 +1417,6 @@ characters stripped; `mail_attachment` never served remotely). Beyond it:
   deprecated `test::rand::FixedSliceRandom` (ring has no scalar-to-key
   constructor). Pinned by known-answer tests against the Python; revisit
   (a dedicated PKCS#8 key) in review.
-- Refuse `rotate-key` for an agent minted in an agent VM (as rename and
-  attributes are): rotating would strand the sandbox daemon's copy. The way
-  out for a suspect minted agent is disable, then re-mint.
 - Store lock-order doc vs. the finish phase (grant before request row):
   verify in the next review that no path locks request then grant.
 - At shutdown, end long-polls early with their current state instead of

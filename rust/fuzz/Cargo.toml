@@ -123,6 +123,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "sandbox_local_api"
+path = "fuzz_targets/sandbox_local_api.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "secretbox_open"
 path = "fuzz_targets/secretbox_open.rs"
 test = false
