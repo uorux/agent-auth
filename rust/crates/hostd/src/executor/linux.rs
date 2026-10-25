@@ -35,6 +35,9 @@ pub const POLKIT_ACTION: &str = "dev.agent-auth.hostd.run-as-root";
 /// Beyond the job's own RuntimeMaxSec, how long hostd waits before stopping
 /// the unit itself.
 pub const DEADLINE_SLACK: Duration = Duration::from_secs(120);
+/// After a kill, `systemctl stop` again this often until `systemd-run`
+/// exits.
+pub const RESTOP: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 pub struct LinuxConfig {
@@ -276,10 +279,20 @@ impl Executor for SystemdExecutor {
             Collect {
                 deadline: Some(deadline),
                 kill,
-                stop_at_exit: false,
+                // Once systemd-run is gone the unit is (its whole cgroup was
+                // stopped): what still holds the output pipe is outside it
+                // (handed to the user manager, say) and doesn't keep the
+                // job open past the drain (review 2026-10, finding 5).
+                stop_at_exit: true,
+                // A stop before the unit exists stops nothing: again until
+                // systemd-run ends (finding 2).
+                restop: Some(RESTOP),
             },
-            async || {
-                let _ = self.systemctl(&["stop", &unit]).await;
+            || {
+                let unit = unit.as_str();
+                async move {
+                    let _ = self.systemctl(&["stop", unit]).await;
+                }
             },
             async || {},
         )
@@ -297,15 +310,15 @@ impl Executor for SystemdExecutor {
 
     async fn polkit_auth(
         &self,
-        pid: i32,
+        process: super::Process,
         uid: u32,
         message: &str,
         timeout: Duration,
     ) -> Option<PolkitConfirmed> {
-        let stat = tokio::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .await
-            .ok()?;
-        let start = proc_start_time(&stat)?;
+        // The start time from when the helper connected: polkit then refuses
+        // if that process is gone, whoever has its pid now.
+        let pid = process.pid;
+        let start = process.start_time?;
         let mut child = tokio::process::Command::new(&self.cfg.pkcheck)
             .args([
                 "--action-id",
@@ -490,25 +503,12 @@ mod tests {
 
     /// The real `run` path against a stand-in `systemd-run` that runs what
     /// follows `--` (systemd itself is integration-tested on hosts).
-    #[tokio::test]
-    async fn runs_through_systemd_run() {
+    /// A root job admitted on an armed tier, stdin "in\n".
+    fn admitted_root(id: &str, argv: &[&str]) -> AdmittedJob {
         use agent_auth_core::hostd::{
             ArmProof, ArmState, Authorizations, Evidence, HostPolicy, HostView, LocalCaller,
             UnixMillis, admit, normalize,
         };
-        use std::os::unix::fs::PermissionsExt as _;
-        let d = crate::fsutil::testdir::TestDir::new("systemd");
-        let script = d.path().join("systemd-run");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do case \"$1\" in --setenv=*) export \"${1#--setenv=}\";; esac; shift; done\nshift\nexec \"$@\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut c = cfg();
-        c.systemd_run = script.to_string_lossy().into_owned();
-        c.job_path = std::env::var("PATH").unwrap();
-        let exec = SystemdExecutor::new(c);
         let mut policy = HostPolicy::connect_only("h");
         policy.root.enable = true;
         let now = UnixMillis(1_000_000);
@@ -523,18 +523,17 @@ mod tests {
         )
         .unwrap();
         let raw = serde_json::json!({"kind": "run", "host": "h", "tier": "root",
-            "argv": ["sh", "-c", "cat; printenv HOME; exit 7"], "cwd": null, "env": {},
-            "timeout": 60, "stdin": "in\n"});
+            "argv": argv, "cwd": null, "env": {}, "timeout": 60, "stdin": "in\n"});
         let job = normalize(&policy, &raw, false).unwrap();
         let digest = agent_auth_core::hostd::SpecDigest::parse(&"0".repeat(64)).unwrap();
-        let admitted = admit(
+        admit(
             HostView {
                 policy: &policy,
                 arm: &arm,
                 lock: agent_auth_core::hostd::LockState::Unlocked,
                 now,
             },
-            LocalId::parse("0123abcd-0000").unwrap(),
+            LocalId::parse(id).unwrap(),
             job,
             &digest,
             Evidence {
@@ -543,12 +542,109 @@ mod tests {
             },
             &mut Authorizations::default(),
         )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn runs_through_systemd_run() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = crate::fsutil::testdir::TestDir::new("systemd");
+        let script = d.path().join("systemd-run");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do case \"$1\" in --setenv=*) export \"${1#--setenv=}\";; esac; shift; done\nshift\nexec \"$@\"\n",
+        )
         .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut c = cfg();
+        c.systemd_run = script.to_string_lossy().into_owned();
+        c.job_path = std::env::var("PATH").unwrap();
+        let exec = SystemdExecutor::new(c);
+        let admitted = admitted_root("0123abcd-0000", &["sh", "-c", "cat; printenv HOME; exit 7"]);
         let mut out = OutputTail::new(1024);
         let (_tx, rx) = tokio::sync::watch::channel(false);
         let code = exec.run(&admitted, &mut out, rx).await.unwrap();
         assert_eq!(code, 7);
         // The root tier gets HOME=/root (daemons bug 21), stdin reached the job.
         assert_eq!(out.finish().bytes, b"in\n/root\n");
+    }
+
+    /// Security review 2026-10, finding 2: a kill that lands before
+    /// systemd-run has made the unit is stopped again until it has, so the
+    /// job does not run on.
+    #[tokio::test]
+    async fn a_kill_before_the_unit_exists_still_stops_the_job() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = crate::fsutil::testdir::TestDir::new("systemd-late");
+        let dir = d.path().to_string_lossy().into_owned();
+        // systemd-run makes the unit (its pid file) only after a while;
+        // systemctl stop kills what the unit holds, if it exists yet.
+        let run = d.path().join("systemd-run");
+        std::fs::write(
+            &run,
+            format!(
+                "#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do case \"$1\" in --unit=*) u=\"${{1#--unit=}}\";; esac; shift; done\nshift\nsleep 0.6\n\"$@\" &\necho $! > {dir}/$u.service.pid\nwait $!\n"
+            ),
+        )
+        .unwrap();
+        let ctl = d.path().join("systemctl");
+        std::fs::write(
+            &ctl,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = stop ] && [ -f {dir}/$2.pid ] && kill $(cat {dir}/$2.pid)\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        for f in [&run, &ctl] {
+            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut c = cfg();
+        c.systemd_run = run.to_string_lossy().into_owned();
+        c.systemctl = ctl.to_string_lossy().into_owned();
+        c.job_path = std::env::var("PATH").unwrap();
+        let exec = SystemdExecutor::new(c);
+        let admitted = admitted_root("0123abcd-0001", &["sh", "-c", "sleep 2; echo ran"]);
+        let mut out = OutputTail::new(1024);
+        // Killed after systemd-run started, before the unit exists.
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = tx.send(true);
+            // Kept: a closed signal would read as a kill anyway.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let code = exec.run(&admitted, &mut out, rx).await.unwrap();
+        assert_ne!(code, 0);
+        assert!(!String::from_utf8_lossy(&out.finish().bytes).contains("ran"));
+    }
+
+    /// Security review 2026-10, finding 5: once systemd-run is gone (its
+    /// unit with it), a process outside the unit still holding the output
+    /// pipe (handed to the user manager, say) doesn't keep the job open.
+    #[tokio::test]
+    async fn output_held_outside_the_unit_does_not_keep_the_job_open() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = crate::fsutil::testdir::TestDir::new("systemd-escape");
+        let run = d.path().join("systemd-run");
+        // The "unit" ends at once; something it started elsewhere keeps the
+        // pipe for 30 s.
+        std::fs::write(
+            &run,
+            "#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\n(sleep 30) &\n\"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut c = cfg();
+        c.systemd_run = run.to_string_lossy().into_owned();
+        c.job_path = std::env::var("PATH").unwrap();
+        let exec = SystemdExecutor::new(c);
+        let admitted = admitted_root("0123abcd-0002", &["echo", "done"]);
+        let mut out = OutputTail::new(1024);
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let started = std::time::Instant::now();
+        let code = exec.run(&admitted, &mut out, rx).await.unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(out.finish().bytes, b"done\n");
+        assert!(started.elapsed() < Duration::from_secs(15));
     }
 }

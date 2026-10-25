@@ -34,6 +34,10 @@ pub const MAX_BACKOFF_SECS: f64 = 60.0;
 /// Not paired, or the key was replaced: retrying quickly can't help until
 /// an admin acts.
 pub const REJECTED_BACKOFF_SECS: f64 = 300.0;
+/// A session that lasted at least this resets the backoff; a shorter one
+/// counts as a failure (a broker that welcomes and drops at once must not
+/// get a 1 Hz reconnect loop; security review 2026-10, finding 6).
+pub const STABLE_SESSION: Duration = Duration::from_secs(30);
 /// Protocol pings; a broker silent for two intervals is dropped.
 pub const PING_INTERVAL: Duration = Duration::from_secs(20);
 /// The broker closes with this when it does not know us.
@@ -96,10 +100,30 @@ pub trait Handler: Send + Sync + 'static {
 }
 
 /// Why a connection attempt ended.
+/// The wait before the next attempt (before jitter), and the backoff after
+/// it: network errors and sessions shorter than [`STABLE_SESSION`] double
+/// it (1 s up to 60 s), a refusal waits 5 minutes, and a session that held
+/// resets it (daemons bug 15: the Python slept a stale backoff after a
+/// session that had succeeded).
+fn next_delay(backoff: &mut f64, outcome: &Outcome) -> f64 {
+    match outcome {
+        Outcome::SessionEnded(_, lasted) if *lasted >= STABLE_SESSION => {
+            *backoff = 1.0;
+            1.0
+        }
+        Outcome::Rejected(_) => REJECTED_BACKOFF_SECS,
+        Outcome::SessionEnded(..) | Outcome::Failed(_) => {
+            let d = *backoff;
+            *backoff = (*backoff * 2.0).min(MAX_BACKOFF_SECS);
+            d
+        }
+    }
+}
+
 #[derive(Debug)]
 enum Outcome {
-    /// A session ran (then ended for whatever reason).
-    SessionEnded(String),
+    /// A session ran (then ended for whatever reason), for this long.
+    SessionEnded(String, Duration),
     /// The broker refused us, or did not prove the pinned key.
     Rejected(String),
     /// Network or protocol failure before the session.
@@ -217,30 +241,17 @@ impl Channel {
     }
 
     /// Hold the connection until the task is dropped, reconnecting with
-    /// backoff: network errors double the wait (1 s up to 60 s), a refusal
-    /// waits 5 minutes, and a session that ran resets it (daemons bug 15:
-    /// the Python slept a stale backoff after a session that had
-    /// succeeded).
+    /// backoff ([`next_delay`]).
     pub async fn run<H: Handler>(&self, handler: Arc<H>) {
         let mut backoff = 1.0f64;
         loop {
-            let delay = match self.connect_once(&handler).await {
-                Outcome::SessionEnded(why) => {
-                    tracing::warn!("broker connection ended: {why}");
-                    backoff = 1.0;
-                    1.0
-                }
-                Outcome::Rejected(why) => {
-                    tracing::error!("broker handshake failed: {why}");
-                    REJECTED_BACKOFF_SECS
-                }
-                Outcome::Failed(why) => {
-                    tracing::warn!("broker connection failed: {why}");
-                    let d = backoff;
-                    backoff = (backoff * 2.0).min(MAX_BACKOFF_SECS);
-                    d
-                }
-            };
+            let outcome = self.connect_once(&handler).await;
+            match &outcome {
+                Outcome::SessionEnded(why, _) => tracing::warn!("broker connection ended: {why}"),
+                Outcome::Rejected(why) => tracing::error!("broker handshake failed: {why}"),
+                Outcome::Failed(why) => tracing::warn!("broker connection failed: {why}"),
+            }
+            let delay = next_delay(&mut backoff, &outcome);
             tokio::time::sleep(Duration::from_secs_f64(delay * jitter())).await;
         }
     }
@@ -269,10 +280,11 @@ impl Channel {
                 Err(o) => return o,
             };
         tracing::info!(daemon = %ident.principal(), "connected to the broker");
+        let began = tokio::time::Instant::now();
         let why = self
             .session(ws, sealer, verifier, heartbeat_secs, handler)
             .await;
-        Outcome::SessionEnded(why)
+        Outcome::SessionEnded(why, began.elapsed())
     }
 
     async fn session<H: Handler>(
@@ -461,6 +473,25 @@ async fn handshake(
 
 #[cfg(test)]
 mod tests {
+
+    /// Security review 2026-10, finding 6: a session the broker ends at
+    /// once backs off like a failure; one that held resets the backoff.
+    #[test]
+    fn short_sessions_back_off() {
+        let mut b = 1.0;
+        let short = Outcome::SessionEnded("closed".into(), Duration::from_millis(50));
+        let delays: Vec<f64> = (0..8).map(|_| next_delay(&mut b, &short)).collect();
+        assert_eq!(delays, [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0]);
+        let long = Outcome::SessionEnded("closed".into(), STABLE_SESSION);
+        assert_eq!(next_delay(&mut b, &long), 1.0);
+        assert_eq!(next_delay(&mut b, &Outcome::Failed("x".into())), 1.0);
+        assert_eq!(next_delay(&mut b, &Outcome::Failed("x".into())), 2.0);
+        assert_eq!(
+            next_delay(&mut b, &Outcome::Rejected("x".into())),
+            REJECTED_BACKOFF_SECS
+        );
+    }
+
     use super::*;
 
     #[test]

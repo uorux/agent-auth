@@ -20,6 +20,7 @@ pub mod daemon;
 pub mod desk;
 pub mod executor;
 pub mod fsutil;
+pub mod peers;
 pub mod presence;
 pub mod spool;
 pub mod totp_store;
@@ -86,9 +87,10 @@ pub async fn run<E: Executor>(config: HostConfig, executor: E) -> anyhow::Result
     let mut tasks = tokio::task::JoinSet::new();
     if serve_ctl {
         let listener = agent_auth_daemon::localsock::bind(&ctl_path, 0o666)?;
-        tasks.spawn(agent_auth_daemon::localsock::serve(
+        tasks.spawn(agent_auth_daemon::localsock::serve_with(
             listener,
             Arc::new(ctl::Ctl(Arc::clone(&hostd))),
+            agent_auth_daemon::localsock::Limits::control(),
         ));
     }
     if desktop {

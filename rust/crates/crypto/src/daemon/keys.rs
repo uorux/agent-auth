@@ -33,6 +33,62 @@ pub enum KeyParseError {
     PublicKeyNotBase64,
     #[error("public key must be 32 bytes")]
     PublicKeyLength,
+    #[error("public key is a small-order point")]
+    PublicKeyWeak,
+}
+
+/// The y-coordinates (little-endian, sign bit cleared) of Ed25519's
+/// small-order points, and the non-canonical encodings of 0 and 1 (p and
+/// p + 1): libsodium's `has_small_order` blocklist. A key among them (the
+/// identity among them) has signatures that verify for many messages, so
+/// it identifies nobody (security review 2026-10, finding 6).
+const SMALL_ORDER: [[u8; 32]; 7] = [
+    // 0 (order 4)
+    [0; 32],
+    // 1 (the identity, order 1)
+    [
+        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0,
+    ],
+    // order 8
+    [
+        0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef, 0x98,
+        0xf0, 0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39, 0xb1, 0x38, 0x02, 0x88, 0x6d, 0x53,
+        0xfc, 0x05,
+    ],
+    // order 8
+    [
+        0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10, 0x67,
+        0x0f, 0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77, 0x92, 0xac,
+        0x03, 0x7a,
+    ],
+    // p - 1 (order 2)
+    [
+        0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x7f,
+    ],
+    // p (0, order 4)
+    [
+        0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x7f,
+    ],
+    // p + 1 (1, order 1)
+    [
+        0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x7f,
+    ],
+];
+
+/// Is `raw` the encoding of a small-order point (either sign of x)?
+fn small_order(raw: &[u8; 32]) -> bool {
+    let mut y = *raw;
+    if let Some(last) = y.last_mut() {
+        *last &= 0x7f;
+    }
+    SMALL_ORDER.contains(&y)
 }
 
 /// An Ed25519 private key (the broker's, or a daemon's identity). Cheap to
@@ -126,9 +182,12 @@ impl PublicKey {
             .strip_prefix(PUBLIC_KEY_PREFIX)
             .ok_or(KeyParseError::PublicKeyPrefix)?;
         let raw = b64url_decode(body).ok_or(KeyParseError::PublicKeyNotBase64)?;
-        <[u8; 32]>::try_from(raw.as_slice())
-            .map(Self)
-            .map_err(|_| KeyParseError::PublicKeyLength)
+        let raw =
+            <[u8; 32]>::try_from(raw.as_slice()).map_err(|_| KeyParseError::PublicKeyLength)?;
+        if small_order(&raw) {
+            return Err(KeyParseError::PublicKeyWeak);
+        }
+        Ok(Self(raw))
     }
 
     pub fn from_bytes(raw: [u8; 32]) -> Self {
@@ -212,6 +271,34 @@ mod tests {
         );
         let k = PublicKey::from_bytes([1; 32]);
         assert_eq!(PublicKey::parse(&k.to_text()).unwrap(), k);
+    }
+
+    /// Security review 2026-10, finding 6: the identity and the other
+    /// small-order points (either sign, canonical or not) are refused.
+    #[test]
+    fn small_order_keys_are_refused() {
+        // The two order-8 y values are each other's negation mod p.
+        let p: [u8; 32] = SMALL_ORDER[5];
+        let (a, b) = (SMALL_ORDER[2], SMALL_ORDER[3]);
+        let mut carry = 0u16;
+        for i in 0..32 {
+            let sum = u16::from(a[i]) + u16::from(b[i]) + carry;
+            assert_eq!(u8::try_from(sum & 0xff).unwrap(), p[i]);
+            carry = sum >> 8;
+        }
+        for y in SMALL_ORDER {
+            for sign in [0u8, 0x80] {
+                let mut raw = y;
+                raw[31] |= sign;
+                assert_eq!(
+                    PublicKey::parse(&PublicKey::from_bytes(raw).to_text()).unwrap_err(),
+                    KeyParseError::PublicKeyWeak
+                );
+            }
+        }
+        // A real key is fine.
+        let real = SigningKey::generate().unwrap().public_key();
+        assert_eq!(PublicKey::parse(&real.to_text()).unwrap(), real);
     }
 
     #[test]

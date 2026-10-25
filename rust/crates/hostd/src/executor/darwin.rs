@@ -247,8 +247,9 @@ pub(crate) async fn run_in_group(
             deadline: Some(super::after(timeout)),
             kill: stop,
             stop_at_exit: true,
+            restop: None,
         },
-        async || kill_group(kill, pgid).await,
+        move || kill_group(kill, pgid),
         // The main process is done: so is the rest of its group.
         async || {
             signal_group(kill, pgid, "KILL").await;
@@ -297,7 +298,13 @@ impl Executor for DarwinExecutor {
         self.groups.kill(job).await;
     }
 
-    async fn polkit_auth(&self, _: i32, _: u32, _: &str, _: Duration) -> Option<PolkitConfirmed> {
+    async fn polkit_auth(
+        &self,
+        _: super::Process,
+        _: u32,
+        _: &str,
+        _: Duration,
+    ) -> Option<PolkitConfirmed> {
         // No polkit: approving root commands at the desk is refused by the
         // config on macOS, and this never says yes.
         None

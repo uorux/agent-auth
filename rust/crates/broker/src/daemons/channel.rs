@@ -44,16 +44,22 @@ struct Hello {
 
 impl DaemonHub {
     /// Serve one WebSocket until it closes.
-    /// `peer`: the client's address (handshake slots are bounded per peer
-    /// and overall).
-    pub async fn serve(self: Arc<Self>, mut ws: WebSocket, peer: String) {
+    /// `peer`: the client's address when it is believed (handshake slots
+    /// are bounded per such address, and overall).
+    pub async fn serve(self: Arc<Self>, mut ws: WebSocket, peer: Option<String>) {
         if self.config.signing_key.is_none() {
             close_quietly(&mut ws, CLOSE_DISABLED, "daemon channel disabled").await;
             return;
         }
-        let Some(slot) = self.peer_slot(&peer) else {
-            close_quietly(&mut ws, CLOSE_TRY_AGAIN, "too many pending handshakes").await;
-            return;
+        let slot = match &peer {
+            Some(p) => match self.peer_slot(p) {
+                Some(s) => Some(s),
+                None => {
+                    close_quietly(&mut ws, CLOSE_TRY_AGAIN, "too many pending handshakes").await;
+                    return;
+                }
+            },
+            None => None,
         };
         let Ok(permit) = Arc::clone(&self.pending).try_acquire_owned() else {
             close_quietly(&mut ws, CLOSE_TRY_AGAIN, "too many pending handshakes").await;

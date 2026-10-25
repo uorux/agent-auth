@@ -9,11 +9,12 @@ fn any_tier() -> Tier {
 }
 
 fn any_source() -> Option<Source> {
-    match kani::any::<u8>() % 5 {
+    match kani::any::<u8>() % 6 {
         0 => None,
         1 => Some(Source::Human),
         2 => Some(Source::Rule),
         3 => Some(Source::Llm),
+        4 => Some(Source::Desk),
         _ => Some(Source::Policy),
     }
 }
@@ -21,10 +22,10 @@ fn any_source() -> Option<Source> {
 fn any_facts() -> AdmissionFacts {
     let authorization = if kani::any() {
         Some(AuthzFacts {
-            via: if kani::any() {
-                ApprovalVia::Totp
-            } else {
-                ApprovalVia::Desk
+            via: match kani::any::<u8>() % 3 {
+                0 => ApprovalVia::Totp,
+                1 => ApprovalVia::TotpShell,
+                _ => ApprovalVia::Desk,
             },
             tier: any_tier(),
             digest_matches: kani::any(),
@@ -44,6 +45,25 @@ fn any_facts() -> AdmissionFacts {
         armed: kani::any(),
         accept_approve_all: kani::any(),
         accept_machine_approvals: kani::any(),
+    }
+}
+
+/// Security review 2026-10, finding 1: a desk answer the host did not
+/// itself authorize (no recorded desk/TOTP approval of this job) admits
+/// nothing, armed or not; only an `auto_commands` match needs no evidence.
+#[kani::proof]
+fn hostd_desk_click_never_admits() {
+    let f = any_facts();
+    kani::assume(f.source == Some(Source::Desk));
+    if let Ok(via) = decide(&f) {
+        match via {
+            Via::Auto => assert!(f.auto_match && f.kind_run && f.tier == Tier::User),
+            Via::Totp | Via::Desk => {
+                let a = f.authorization.unwrap();
+                assert!(a.tier == f.tier && a.digest_matches && a.unexpired);
+            }
+            _ => panic!("a desk click admitted on arming"),
+        }
     }
 }
 

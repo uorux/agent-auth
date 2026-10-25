@@ -1,6 +1,6 @@
 //! The kill switch (spec §10.7): revoke grants, disarm hosts, kill jobs and
 //! shells, freeze (or stop) agent VMs; and lifting the broker's side of
-//! it. A host's own lock is lifted only with its root-arm code (or by root
+//! it. A host's own lock is lifted only with its root-unlock code (or by root
 //! on the host): nothing the broker says alone can (INV-26).
 
 use std::collections::BTreeMap;
@@ -289,7 +289,7 @@ async fn record_entry(
 }
 
 /// Without a host: clear the broker's side (and tell sandboxes). With a
-/// host and its root-arm code: also unlock that host's hostd first (its
+/// host and its root-unlock code: also unlock that host's hostd first (its
 /// refusal aborts everything).
 pub async fn unlock(
     st: &AppState,

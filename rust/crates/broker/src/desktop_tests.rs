@@ -22,7 +22,7 @@ use crate::daemons::testkit::{Broker, HOST, Host, caller, wait_until};
 /// A host whose user is at the desk: the helper attached, unlocked.
 async fn at_desk(b: &Broker) -> (Host, Receiver<String>) {
     let host = Host::start(b).await;
-    let rx = host.hostd.helper_attached(1, 4242).await;
+    let rx = host.hostd.helper_attached(1, 4242, Some(77)).await;
     host.hostd.presence_event(PresenceEvent::Unlocked);
     host.hostd.presence_changed().await;
     let desktop = b.part.desktop.clone().unwrap();
@@ -262,4 +262,72 @@ async fn an_agent_can_ask_for_attention_on_the_desks(pool: sqlx::PgPool) {
     desktop.set_dnd(3600).await;
     assert!(desktop.notify(&a, "again", "normal").await.is_empty());
     wait_until(|| true).await;
+}
+
+/// Security review 2026-10, finding 1: with root armed but the desk not
+/// approving root commands, a desk click never approves a root command:
+/// hostd doesn't show it, and an Allow it didn't authorize isn't applied.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_desk_click_never_approves_a_root_command_on_an_armed_host(pool: sqlx::PgPool) {
+    let b = Broker::start(pool).await;
+    let (host, mut rx) = at_desk(&b).await;
+    host.hostd
+        .arm_local(
+            agent_auth_core::Tier::Root,
+            600,
+            agent_auth_core::hostd::LocalCaller::Root,
+            0,
+        )
+        .unwrap();
+    let a = b.agent("desk-1").await;
+    let run: RequestCreate = serde_json::from_value(json!({
+        "platform": "hostexec", "capability": "run", "resource": HOST,
+        "scope": {"tier": "root", "argv": ["id"]},
+        "justification": "x", "requested_duration": "1h"}))
+    .unwrap();
+    let r = crate::service::create(&b.st, &caller(&a), run)
+        .await
+        .unwrap();
+    // Whatever reaches the desk, Allow it.
+    if let Ok(prompt) = tokio::time::timeout(Duration::from_secs(2), next_prompt(&mut rx)).await {
+        host.hostd
+            .answered(prompt["id"].as_str().unwrap(), "allow", 1)
+            .await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(status(&b, r.id).await.status, RequestStatus::AwaitingHuman);
+}
+
+/// Security review 2026-10, finding 1b: the broker applies a desk Allow
+/// for a host command only from that host, when hostd authorized it.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_desk_allow_counts_only_when_its_host_authorized_it(pool: sqlx::PgPool) {
+    use agent_auth_wire::daemon::host::Answer;
+    let b = Broker::start(pool).await;
+    let a = b.agent("desk-1").await;
+    let run: RequestCreate = serde_json::from_value(json!({
+        "platform": "hostexec", "capability": "run", "resource": HOST,
+        "scope": {"tier": "user", "argv": ["id"]},
+        "justification": "x", "requested_duration": "1h"}))
+    .unwrap();
+    let r = crate::service::create(&b.st, &caller(&a), run)
+        .await
+        .unwrap();
+    let row = status(&b, r.id).await;
+    let believed = |host: &str, answer, authorized| {
+        super::Desktop::believed(&row, Some(host), answer, authorized)
+    };
+    assert_eq!(believed(HOST, Answer::Allow, false), Answer::Discord);
+    assert_eq!(believed("elsewhere", Answer::Allow, true), Answer::Discord);
+    assert_eq!(believed(HOST, Answer::Allow, true), Answer::Allow);
+    assert_eq!(believed("elsewhere", Answer::Deny, false), Answer::Deny);
+    // Not a host command: a desk's click is the decision.
+    let other = crate::service::create(&b.st, &caller(&a), homelab())
+        .await
+        .unwrap();
+    let other = status(&b, other.id).await;
+    assert_eq!(
+        super::Desktop::believed(&other, Some(HOST), Answer::Allow, false),
+        Answer::Allow
+    );
 }

@@ -81,8 +81,17 @@ async fn connect(
     ws: WebSocketUpgrade,
 ) -> ApiResult<Response> {
     let hub = hub(&state)?;
-    let peer = crate::auth::client_address(&parts, state.auth.trust_x_real_ip)
-        .unwrap_or_else(|| "unknown".to_owned());
+    // Per address only when the address is believed (a trusted proxy's
+    // X-Real-IP): behind a proxy that isn't trusted every daemon shares the
+    // proxy's address, and a per-address cap would let one client lock
+    // them all out (security review 2026-10, finding 6). The global cap
+    // holds either way.
+    let peer = state
+        .auth
+        .trust_x_real_ip
+        .then(|| crate::auth::client_address(&parts, true))
+        .flatten()
+        .filter(|_| parts.headers.contains_key("x-real-ip"));
     Ok(ws
         .max_message_size(MAX_FRAME_BYTES)
         .max_frame_size(MAX_FRAME_BYTES)

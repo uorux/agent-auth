@@ -53,7 +53,8 @@ const HOUR: Duration = Duration::from_secs(3600);
 struct Offer {
     /// prompt id → host.
     prompts: HashMap<String, String>,
-    answer: Option<oneshot::Sender<(Option<String>, Answer)>>,
+    /// (host, answer, whether hostd says Allow was its own approval).
+    answer: Option<oneshot::Sender<(Option<String>, Answer, bool)>>,
 }
 
 #[derive(Debug, Default)]
@@ -418,7 +419,7 @@ impl Desktop {
 
     async fn ask(self: Arc<Self>, request_id: RequestId) -> Result<(), String> {
         let st = self.st.get().ok_or("not bound")?.clone();
-        let (request, agent, delegator, target) = {
+        let (request, agent, delegator) = {
             let tx = st.store.begin().await.map_err(|e| e.to_string())?;
             let Some(request) = agent_auth_store::requests::get(&tx, request_id)
                 .await
@@ -440,15 +441,8 @@ impl Desktop {
                     .map_err(|e| e.to_string())?,
                 None => None,
             };
-            let target = if request.platform == Platform::Hostexec {
-                daemons::by_name(&tx, DaemonRole::Host, &request.resource)
-                    .await
-                    .map_err(|e| e.to_string())?
-            } else {
-                None
-            };
             tx.commit().await.map_err(|e| e.to_string())?;
-            (request, agent, delegator, target)
+            (request, agent, delegator)
         };
         let mut hosts = self.present_hosts().await;
         let mut job = None;
@@ -482,23 +476,11 @@ impl Desktop {
                     job = Some(json!({"job_id": request.id.to_string(), "spec": spec.to_json()}));
                 }
                 _ => {
-                    // Elsewhere an answer is only a click: worth asking while
-                    // the target's tier is armed, and not for what stays on
-                    // Discord.
-                    let status = crate::hostexec::sanitize_status(
-                        target.as_ref().and_then(|t| t.last_status.as_ref()),
-                    );
-                    let tier = agent_auth_wire::common::TierName::from(match &authority {
-                        Authority::Hostexec(h) => h.tier(),
-                        _ => agent_auth_core::Tier::User,
-                    });
-                    let armed = status
-                        .tiers
-                        .get(&tier)
-                        .is_some_and(|t| t.armed_until.is_some());
-                    if !armed || self.too_sensitive(&request) {
-                        return Ok(());
-                    }
+                    // Not at its own host's desk: a click elsewhere approves
+                    // no host command (no desk approves another host's tier),
+                    // so it isn't asked there (security review 2026-10,
+                    // finding 1f).
+                    return Ok(());
                 }
             }
         }
@@ -533,14 +515,15 @@ impl Desktop {
             })
             .collect();
         let wait = Duration::from_secs(u64::from(timeout)).saturating_add(QUEUE);
-        let (host, answer) = match tokio::time::timeout(wait, rx).await {
+        let (host, answer, authorized) = match tokio::time::timeout(wait, rx).await {
             Ok(Ok(a)) => a,
-            _ => (None, Answer::Timeout),
+            _ => (None, Answer::Timeout, false),
         };
         for s in shows {
             s.abort();
         }
         self.close(request_id).await;
+        let answer = Self::believed(&request, host.as_deref(), answer, authorized);
         self.apply(&st, request_id, agent.id, host, answer).await;
         Ok(())
     }
@@ -634,8 +617,33 @@ impl Desktop {
             return;
         }
         if let Some(tx) = s.offers.get_mut(&request).and_then(|o| o.answer.take()) {
-            let _ = tx.send((Some(peer.name().to_owned()), a.answer));
+            let _ = tx.send((Some(peer.name().to_owned()), a.answer, a.authorized));
         }
+    }
+
+    /// What a desk answer counts as. An Allow for a host command counts
+    /// only from that host's own desk, when hostd says it was its own
+    /// approval (`authorized`: the desk approves that tier, and polkit
+    /// confirmed for root); otherwise it is ignored (security review
+    /// 2026-10, finding 1b).
+    fn believed(
+        request: &RequestRow,
+        host: Option<&str>,
+        answer: Answer,
+        authorized: bool,
+    ) -> Answer {
+        if answer == Answer::Allow
+            && request.platform == Platform::Hostexec
+            && !(authorized && host == Some(request.resource.as_str()))
+        {
+            tracing::warn!(
+                request = %request.id,
+                host = host.unwrap_or("?"),
+                "a desk Allow for a host command that host did not authorize was ignored"
+            );
+            return Answer::Discord;
+        }
+        answer
     }
 
     async fn apply(
@@ -687,7 +695,7 @@ impl Desktop {
     pub fn cancel(&self, request: RequestId) {
         let mut s = self.state();
         if let Some(tx) = s.offers.get_mut(&request).and_then(|o| o.answer.take()) {
-            let _ = tx.send((None, Answer::Discord));
+            let _ = tx.send((None, Answer::Discord, false));
         }
     }
 

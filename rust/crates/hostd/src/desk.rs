@@ -45,9 +45,17 @@ async fn connection<E: Executor>(stream: UnixStream, hostd: Arc<Hostd<E>>) {
         // Not the configured user: closed without a word.
         return;
     }
+    if let Err(why) = hostd.check_peer(peer.pid) {
+        // A job of the user's must not become the desk that approves it
+        // (security review 2026-10, finding 1e).
+        tracing::warn!(pid = ?peer.pid, "desktop helper refused: {why}");
+        return;
+    }
     let conn = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
     let (read, mut write) = stream.into_split();
-    let mut outbox = hostd.helper_attached(conn, peer.pid.unwrap_or(0)).await;
+    let pid = peer.pid.unwrap_or(0);
+    let start_time = crate::executor::start_time_of(pid);
+    let mut outbox = hostd.helper_attached(conn, pid, start_time).await;
     let writer = tokio::spawn(async move {
         while let Some(line) = outbox.recv().await {
             let mut bytes = line.into_bytes();

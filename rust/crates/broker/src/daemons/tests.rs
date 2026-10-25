@@ -533,23 +533,36 @@ async fn a_daemon_refuses_a_broker_without_the_pinned_key(pool: sqlx::PgPool) {
     std::fs::remove_dir_all(dir).ok();
 }
 
+async fn raw_from(b: &Broker, real_ip: Option<&str>) -> Raw {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    let mut req = format!("ws://127.0.0.1:{}/v1/daemons/connect", b.addr.port())
+        .into_client_request()
+        .unwrap();
+    if let Some(ip) = real_ip {
+        req.headers_mut().insert("x-real-ip", ip.parse().unwrap());
+    }
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    Raw { ws }
+}
+
+/// Behind a trusted proxy: silent sockets from one address hold only that
+/// address's slots, and are dropped after the short hello timeout.
 #[sqlx::test(migrations = "../store/migrations")]
 async fn silent_sockets_cannot_take_every_handshake_slot(pool: sqlx::PgPool) {
-    let b = Broker::start(pool).await;
-    // Four silent sockets from one address hold its slots...
+    let b = Broker::start_full(pool, super::testkit::POLICY, 30, true).await;
     let mut held = Vec::new();
     for _ in 0..super::MAX_PENDING_PER_PEER {
-        held.push(Raw::connect(&b).await.0);
+        held.push(raw_from(&b, Some("10.0.0.1")).await);
     }
-    // ...a fifth is told to try again...
-    let (ws, _) = tokio_tungstenite::connect_async(format!(
-        "ws://127.0.0.1:{}/v1/daemons/connect",
-        b.addr.port()
-    ))
-    .await
-    .unwrap();
-    let mut fifth = Raw { ws };
+    // A fifth from that address is told to try again...
+    let mut fifth = raw_from(&b, Some("10.0.0.1")).await;
     assert_eq!(fifth.close_code().await, Some(1013));
+    // ...another address gets its challenge...
+    let mut other = raw_from(&b, Some("10.0.0.2")).await;
+    let first = tokio::time::timeout(Duration::from_secs(5), other.ws.next())
+        .await
+        .unwrap();
+    assert!(matches!(first, Some(Ok(Message::Text(_)))), "{first:?}");
     // ...and the silent ones are dropped after the short hello timeout,
     // which frees the slots for a real daemon.
     for mut raw in held {
@@ -557,4 +570,25 @@ async fn silent_sockets_cannot_take_every_handshake_slot(pool: sqlx::PgPool) {
     }
     let host = Host::start(&b).await;
     drop(host);
+}
+
+/// Security review 2026-10, finding 6: behind a proxy that isn't trusted,
+/// every daemon shares the proxy's address, so there is no per-address cap
+/// (one client could lock out all daemons), only the global one.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn an_untrusted_address_is_not_a_handshake_cap(pool: sqlx::PgPool) {
+    let b = Broker::start(pool).await;
+    let mut held = Vec::new();
+    for _ in 0..super::MAX_PENDING_PER_PEER {
+        held.push(raw_from(&b, Some("10.0.0.1")).await);
+    }
+    // More from the same (unbelieved) address still get their challenge.
+    let (_raw, _nonce) = Raw::connect(&b).await;
+    // The global cap still holds.
+    for _ in held.len().saturating_add(1)..super::MAX_PENDING_HANDSHAKES {
+        held.push(raw_from(&b, None).await);
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut over = raw_from(&b, None).await;
+    assert_eq!(over.close_code().await, Some(1013));
 }

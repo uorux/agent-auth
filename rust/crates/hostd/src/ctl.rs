@@ -45,6 +45,13 @@ fn root_only(caller: LocalCaller, method: &str) -> Result<(), LocalError> {
 }
 
 impl<E: Executor> LocalApi for Ctl<E> {
+    /// Root or the configured user, and not from inside a job (security
+    /// review 2026-10, findings 3 and 6), before anything is read.
+    async fn admit(&self, peer: Peer) -> Result<(), LocalError> {
+        self.caller(peer.uid).await?;
+        self.0.check_peer(peer.pid).map_err(LocalError)
+    }
+
     async fn call(
         &self,
         method: &str,
@@ -109,7 +116,7 @@ impl<E: Executor> LocalApi for Ctl<E> {
                     .and_then(Value::as_str)
                     .and_then(SecretName::parse)
                     .ok_or_else(|| {
-                        LocalError::new("name: user-arm | user-direct | root-arm | root-direct")
+                        LocalError::new("name: user-arm | user-direct | root-arm | root-direct | user-shell | root-shell | root-unlock")
                     })?;
                 hostd
                     .totp()

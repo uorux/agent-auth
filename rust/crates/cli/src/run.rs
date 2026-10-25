@@ -568,7 +568,7 @@ async fn admin(cmd: AdminCommand, client: &BrokerClient, io: &mut Io<'_>) -> u8 
         }
         AdminCommand::Unlock { host } => {
             let code = match &host {
-                Some(h) => match io.secret(&format!("{h} root-arm code")) {
+                Some(h) => match io.secret(&format!("{h} root-unlock code")) {
                     Ok(c) => Some(c),
                     Err(code) => return code,
                 },

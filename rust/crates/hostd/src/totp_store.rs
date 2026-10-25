@@ -38,11 +38,15 @@ pub enum TotpError {
 #[derive(Debug)]
 pub struct TotpStore {
     dir: PathBuf,
-    locks: [Mutex<()>; 4],
+    locks: [Mutex<()>; 7],
+    /// Secrets whose state could not be written: refused in memory until
+    /// root clears the lock (a failure that isn't on disk must not give a
+    /// guesser a fresh count; security review 2026-10).
+    unwritten: [std::sync::atomic::AtomicBool; 7],
 }
 
 fn index(name: SecretName) -> usize {
-    SecretName::ALL.iter().position(|n| *n == name).unwrap_or(0)
+    SecretName::every().position(|n| n == name).unwrap_or(0)
 }
 
 fn io_err(e: &io::Error) -> TotpError {
@@ -55,6 +59,7 @@ impl TotpStore {
         TotpStore {
             dir,
             locks: Default::default(),
+            unwritten: Default::default(),
         }
     }
 
@@ -135,14 +140,30 @@ impl TotpStore {
         }
     }
 
+    fn unwritten(&self, name: SecretName) -> Option<&std::sync::atomic::AtomicBool> {
+        self.unwritten.get(index(name))
+    }
+
     fn write_state(&self, name: SecretName, state: &TotpState) -> Result<(), TotpError> {
-        fsutil::private_dir(&self.dir, 0o700).map_err(|e| io_err(&e))?;
-        fsutil::write_atomic(
-            &self.state_path(name),
-            state.to_json().to_string().as_bytes(),
-            0o600,
-        )
-        .map_err(|e| io_err(&e))
+        let written = fsutil::private_dir(&self.dir, 0o700).and_then(|()| {
+            fsutil::write_atomic(
+                &self.state_path(name),
+                state.to_json().to_string().as_bytes(),
+                0o600,
+            )
+        });
+        if let Some(flag) = self.unwritten(name) {
+            // Set on failure; cleared only by `clear_lock`.
+            if written.is_err() {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        written.map_err(|e| io_err(&e))
+    }
+
+    fn locked_in_memory(&self, name: SecretName) -> bool {
+        self.unwritten(name)
+            .is_none_or(|f| f.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// Accept `code` for `name` once, at `now_secs`, or say why not. The
@@ -155,6 +176,9 @@ impl TotpStore {
     ) -> Result<AcceptedCode, TotpError> {
         let _guard = self.lock(name);
         let secret = self.read_secret(name)?;
+        if self.locked_in_memory(name) {
+            return Err(TotpRefusal::HardLocked { name }.into());
+        }
         let Some(mut state) = self.read_state(name) else {
             return Err(TotpRefusal::HardLocked { name }.into());
         };
@@ -179,12 +203,19 @@ impl TotpStore {
             ..TotpState::default()
         });
         state.clear_lock();
-        self.write_state(name, &state)
+        self.write_state(name, &state)?;
+        if let Some(flag) = self.unwritten(name) {
+            flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     /// Is the secret refusing every code now (for the status)?
     #[must_use]
     pub fn locked(&self, name: SecretName, now_secs: u64) -> bool {
+        if self.locked_in_memory(name) {
+            return true;
+        }
         match self.read_state(name) {
             None => true,
             Some(s) => s.lock_reason(name, now_secs).is_some(),
@@ -280,5 +311,30 @@ mod tests {
                 .verify(UD, secret.code_at(later / 30).expose(), later)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn a_failure_that_cannot_be_written_locks_in_memory() {
+        let d = TestDir::new("totp3");
+        let store = TotpStore::new(d.path().join("totp"));
+        let secret = store.enroll(UD, false).unwrap();
+        // The state can't be replaced (a directory where its temp goes).
+        let blocker = d.path().join("totp/.user-direct.state.tmp");
+        fs::create_dir_all(blocker.join("x")).unwrap();
+        let now = 1_700_000_000u64;
+        assert!(matches!(
+            store.verify(UD, "000000", now),
+            Err(TotpError::Io(_))
+        ));
+        fs::remove_dir_all(&blocker).unwrap();
+        // The unrecorded failure still counts: refused until root clears it.
+        let code = secret.code_at(now / 30).expose().clone();
+        assert!(matches!(
+            store.verify(UD, &code, now),
+            Err(TotpError::Refused(TotpRefusal::HardLocked { .. }))
+        ));
+        assert!(store.locked(UD, now));
+        store.clear_lock(UD, now).unwrap();
+        assert!(store.verify(UD, &code, now).is_ok());
     }
 }

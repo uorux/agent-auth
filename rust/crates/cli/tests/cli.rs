@@ -727,7 +727,7 @@ async fn codes_are_prompted_for_hidden() {
     );
 
     let r = agent_auth(&fake.url, &["admin", "arm", "excelsior", "--tier", "root"]).await;
-    assert_eq!(r.prompts, ["excelsior root-arm code: "]);
+    assert_eq!(r.prompts, ["excelsior root-unlock code: "]);
     assert_eq!(
         fake.calls("POST", "/admin/hosts/*/arm")[0].json(),
         json!({"tier": "root", "duration": "1h", "totp": "123456"})
@@ -737,7 +737,7 @@ async fn codes_are_prompted_for_hidden() {
     let r = agent_auth(&fake.url, &["admin", "unlock"]).await;
     assert!(r.prompts.is_empty());
     let r = agent_auth(&fake.url, &["admin", "unlock", "--host", "excelsior"]).await;
-    assert_eq!(r.prompts, ["excelsior root-arm code: "]);
+    assert_eq!(r.prompts, ["excelsior root-unlock code: "]);
     assert_eq!(
         fake.calls("POST", "/admin/unlock")[1].json(),
         json!({"host": "excelsior", "totp": "123456"})

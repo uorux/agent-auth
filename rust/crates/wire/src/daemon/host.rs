@@ -48,7 +48,7 @@ pub enum BrokerToHost {
     Disarm(Disarm),
     #[serde(rename = "lockdown")]
     Lockdown(Lockdown),
-    /// Needs the host's root-arm code.
+    /// Needs the host's root-unlock code.
     #[serde(rename = "unlock")]
     Unlock(Unlock),
     #[serde(rename = "dnd")]
@@ -195,6 +195,10 @@ pub struct Authorize {
     /// `sha256` of the spec's canonical JSON, lowercase hex.
     pub digest: LowerHex<64>,
     pub totp: TotpCode,
+    /// The code is for opening a shell (checked against the tier's shell
+    /// secret, when it has one).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shell: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_id: Option<CallId>,
 }
@@ -295,7 +299,7 @@ pub struct Lockdown {
     pub call_id: Option<CallId>,
 }
 
-/// `unlock` to a host: needs its root-arm code. Replied
+/// `unlock` to a host: needs its root-unlock code. Replied
 /// `{"locked": false, "vm": ...}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

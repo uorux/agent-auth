@@ -114,7 +114,8 @@ impl HostExec {
             self.call(
                 &host,
                 json!({"type": "hostexec.authorize", "job_id": request.to_string(),
-                       "tier": spec.tier().as_str(), "digest": d, "totp": code}),
+                       "tier": spec.tier().as_str(), "digest": d, "totp": code,
+                       "shell": shell}),
                 CALL_TIMEOUT,
             )
             .await

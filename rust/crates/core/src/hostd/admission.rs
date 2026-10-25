@@ -335,7 +335,10 @@ pub fn normalize(
 /// How this host itself approved a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ApprovalVia {
+    /// A `{tier}-direct` code.
     Totp,
+    /// A `{tier}-shell` code: opens a shell, never admits a job.
+    TotpShell,
     Desk,
 }
 
@@ -346,19 +349,22 @@ pub enum ApprovalVia {
 pub struct TotpApproval {
     tier: Tier,
     digest: SpecDigest,
+    /// `Direct` or `Shell`: what the code was typed for.
+    purpose: Purpose,
 }
 
 impl TotpApproval {
-    /// The approval a `{tier}-direct` code stands for. An arm code is not
-    /// a direct approval.
+    /// The approval a `{tier}-direct` or `{tier}-shell` code stands for.
+    /// An arm or unlock code is not an approval.
     pub fn new(code: AcceptedCode, digest: SpecDigest) -> Result<TotpApproval, Refused> {
         let name = code.name();
-        if name.purpose != Purpose::Direct {
+        if !matches!(name.purpose, Purpose::Direct | Purpose::Shell) {
             return Err(Refused(format!("{name} is not a direct approval code")));
         }
         Ok(TotpApproval {
             tier: name.tier,
             digest,
+            purpose: name.purpose,
         })
     }
 
@@ -435,42 +441,32 @@ impl PolkitConfirmed {
     }
 }
 
-/// A prompt about a command at this desk (`_desk_job`): `Some` when Allow
-/// here approves it; `None` when it does not but the tier is armed (Allow is
-/// then only a click relayed to the broker). Refused when locked, or when
-/// neither holds.
+/// A prompt about a command at this desk (`_desk_job`): only when this
+/// desk itself approves the command's tier. Never a click relayed on an
+/// armed tier: a desk Allow is this host's own approval or nothing
+/// (security review 2026-10, finding 1). Refused when locked.
 pub fn desk_prompt(
     host: HostView<'_>,
     job: LocalId,
     raw_digest: SpecDigest,
     normalized: &Normalized,
     message: String,
-) -> Result<Option<DeskPrompt>, Refused> {
-    let HostView {
-        policy,
-        arm,
-        lock,
-        now,
-    } = host;
+) -> Result<DeskPrompt, Refused> {
+    let HostView { policy, lock, .. } = host;
     if lock.is_locked() {
         return Err(locked_refusal(policy));
     }
     let tier = normalized.tier();
-    if policy.desk_approves(tier) {
-        return Ok(Some(DeskPrompt {
-            job,
-            digest: raw_digest,
-            tier,
-            message,
-        }));
-    }
-    if !arm.armed(tier, now) {
+    if !policy.desk_approves(tier) {
         let t = tier_word(tier);
-        return Err(Refused(format!(
-            "the {t} tier is not armed, and this desk doesn't approve {t} commands"
-        )));
+        return Err(Refused(format!("this desk doesn't approve {t} commands")));
     }
-    Ok(None)
+    Ok(DeskPrompt {
+        job,
+        digest: raw_digest,
+        tier,
+        message,
+    })
 }
 
 /// An Allow answer to a desk prompt: an approval when the host is not
@@ -539,7 +535,11 @@ impl Authorizations {
         let a = Authorization {
             digest: approval.digest,
             tier: approval.tier,
-            via: ApprovalVia::Totp,
+            via: if approval.purpose == Purpose::Shell {
+                ApprovalVia::TotpShell
+            } else {
+                ApprovalVia::Totp
+            },
             expires_at: now.plus_secs(AUTHZ_TTL_SECS),
         };
         self.insert(job, a, now);
@@ -675,16 +675,17 @@ impl ArmState {
         }
     }
 
-    /// What may lift a lockdown: the root-arm code, or root on the host
-    /// (INV-26).
+    /// What may lift a lockdown: the root-unlock code, or root on the host
+    /// (INV-26; a root-arm code no longer does, so a code typed to unlock
+    /// can't arm: security review 2026-10, finding 4).
     pub fn check_unlock(proof: &ArmProof) -> Result<(), Refused> {
         match proof {
-            ArmProof::Totp(code) if code.name() == SecretName::new(Tier::Root, Purpose::Arm) => {
+            ArmProof::Totp(code) if code.name() == SecretName::new(Tier::Root, Purpose::Unlock) => {
                 Ok(())
             }
             ArmProof::Local(LocalCaller::Root) => Ok(()),
             ArmProof::Totp(code) => Err(Refused(format!(
-                "{} does not unlock; the root-arm code does",
+                "{} does not unlock; the root-unlock code does",
                 code.name()
             ))),
             ArmProof::Local(LocalCaller::User) => Err(Refused::new("unlock needs root")),
@@ -731,6 +732,8 @@ pub enum RefusalKind {
     NoWindows,
     HumanOnly(Source),
     NotArmed,
+    /// A desk click relayed by the broker: not evidence on any tier.
+    DeskClick,
 }
 
 /// `_admit`, in order (§8.4): locked; the host's own approval of exactly
@@ -745,10 +748,12 @@ pub fn decide(f: &AdmissionFacts) -> Result<Via, RefusalKind> {
         && a.digest_matches
         && a.tier == f.tier
     {
-        return Ok(match a.via {
-            ApprovalVia::Totp => Via::Totp,
-            ApprovalVia::Desk => Via::Desk,
-        });
+        match a.via {
+            ApprovalVia::Totp => return Ok(Via::Totp),
+            ApprovalVia::Desk => return Ok(Via::Desk),
+            // A shell code admits no job.
+            ApprovalVia::TotpShell => {}
+        }
     }
     if f.kind_run && f.tier == Tier::User && f.auto_match {
         return Ok(Via::Auto);
@@ -756,6 +761,9 @@ pub fn decide(f: &AdmissionFacts) -> Result<Via, RefusalKind> {
     let Some(source) = f.source else {
         return Err(RefusalKind::NoEvidence);
     };
+    if source == Source::Desk {
+        return Err(RefusalKind::DeskClick);
+    }
     if !f.armed {
         return Err(RefusalKind::NotArmed);
     }
@@ -772,6 +780,7 @@ pub fn decide(f: &AdmissionFacts) -> Result<Via, RefusalKind> {
         Source::Rule => Ok(Via::ArmedRule),
         Source::Llm => Ok(Via::ArmedLlm),
         Source::Policy => Ok(Via::ArmedPolicy),
+        Source::Desk => Err(RefusalKind::DeskClick),
     }
 }
 
@@ -787,6 +796,9 @@ fn refusal_text(policy: &HostPolicy, tier: Tier, kind: RefusalKind) -> Refused {
         RefusalKind::HumanOnly(source) => format!(
             "{name} only accepts a human's approval for the {t} tier (this one came from {})",
             source.as_str()
+        ),
+        RefusalKind::DeskClick => format!(
+            "a desk answer approves only a command that desk showed and approved itself; approve the {t} command on Discord or with a TOTP code"
         ),
         RefusalKind::NotArmed => format!(
             "not_armed: the {t} tier of {name} is not armed — arm it (/arm) or approve with a TOTP code"
@@ -957,25 +969,43 @@ pub fn precheck_job(
     if let Some(id) = job_id
         && !lock.is_locked()
         && let Some(via) = auths.peek(id).and_then(|a| a.admits(tier, raw_digest, now))
+        && via != ApprovalVia::TotpShell
     {
         return Ok(match via {
-            ApprovalVia::Totp => Via::Totp,
             ApprovalVia::Desk => Via::Desk,
+            _ => Via::Totp,
         });
     }
     let f = facts(host, &job, None, evidence);
     decide(&f).map_err(|kind| refusal_text(policy, tier, kind))
 }
 
+/// The secret whose code opens a `tier` shell: `{tier}-shell` when it is
+/// enrolled; otherwise `user-direct` for a user shell, and nothing for a
+/// root shell (a code typed to approve one command must not open a root
+/// shell; security review 2026-10, finding 4).
+pub fn shell_secret(tier: Tier, shell_enrolled: bool) -> Result<SecretName, Refused> {
+    match (tier, shell_enrolled) {
+        (_, true) => Ok(SecretName::new(tier, Purpose::Shell)),
+        (Tier::User, false) => Ok(SecretName::new(Tier::User, Purpose::Direct)),
+        (Tier::Root, false) => Err(Refused::new(
+            "a root shell needs a root-shell code; enroll one on the host (agent-auth-hostd totp-enroll root-shell)",
+        )),
+    }
+}
+
 /// `hostexec.precheck` for a shell: everything the host would refuse,
-/// before a code is spent. Replied `{"needs": "totp"}`.
+/// before a code is spent. Replied `{"needs": "totp"}`. `shell_enrolled`:
+/// the tier's `{tier}-shell` secret is enrolled.
 pub fn precheck_shell(
     policy: &HostPolicy,
     tier: Option<&Value>,
     duration: Option<&Value>,
     lock: LockState,
+    shell_enrolled: bool,
 ) -> Result<(), Refused> {
     let tier = check_tier(policy, tier)?;
+    shell_secret(tier, shell_enrolled)?;
     let cfg = policy.tier(tier);
     let t = tier_word(tier);
     if !cfg.shell_enable {
@@ -1040,7 +1070,9 @@ impl OpenShell {
 
 /// `shell.open`: only a TOTP approval for this exact shell spec opens a
 /// shell (INV-23); arming, windows, rules and desk answers never do. The
-/// approval under `shell_id` is spent.
+/// approval under `shell_id` is spent; it must be from the secret
+/// [`shell_secret`] names.
+#[allow(clippy::too_many_arguments)]
 pub fn open_shell(
     policy: &HostPolicy,
     shell_id: LocalId,
@@ -1049,6 +1081,7 @@ pub fn open_shell(
     auths: &mut Authorizations,
     lock: LockState,
     now: UnixMillis,
+    shell_enrolled: bool,
 ) -> Result<OpenShell, Refused> {
     let tier = spec.tier();
     let cfg = policy.tier(tier);
@@ -1071,8 +1104,19 @@ pub fn open_shell(
     let via = auths
         .take(&shell_id)
         .and_then(|a| a.admits(tier, digest, now));
-    if via != Some(ApprovalVia::Totp) {
-        return Err(Refused::new("a shell is opened with a TOTP code only"));
+    let wanted = match shell_secret(tier, shell_enrolled)?.purpose {
+        Purpose::Shell => ApprovalVia::TotpShell,
+        _ => ApprovalVia::Totp,
+    };
+    if via != Some(wanted) {
+        return Err(Refused(if via.is_some_and(|v| v != ApprovalVia::Desk) {
+            format!(
+                "a {t} shell is opened with a {} code",
+                shell_secret(tier, shell_enrolled)?
+            )
+        } else {
+            "a shell is opened with a TOTP code only".to_owned()
+        }));
     }
     Ok(OpenShell {
         id: shell_id,

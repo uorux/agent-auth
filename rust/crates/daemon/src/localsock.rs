@@ -7,14 +7,19 @@
 //! reply:   {"ok": true, "result": ...} | {"ok": false, "error": "..."}
 //! ```
 //!
-//! Lines are capped ([`MAX_LINE`]); a longer one ends the connection. The
-//! caller's credentials are read once per connection, from the socket, and
-//! handed to the API with every request: the API decides who may do what.
+//! Lines are capped ([`Limits::max_line`]); a longer one ends the
+//! connection. The caller's credentials are read once per connection, from
+//! the socket, and the API admits or refuses the caller before anything is
+//! read ([`LocalApi::admit`]); they are handed to the API with every
+//! request too. Connections are capped per uid and overall, and one that
+//! sends nothing for [`Limits::idle`] is closed (security review 2026-10,
+//! finding 3: any uid could hold descriptors and memory).
 
+use std::collections::HashMap;
 use std::io;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
@@ -23,6 +28,86 @@ use tokio::net::{UnixListener, UnixStream};
 
 /// The longest request or reply line.
 pub const MAX_LINE: usize = 1024 * 1024;
+/// The longest line of a control socket (hostctl's requests are small).
+pub const MAX_CONTROL_LINE: usize = 4 * 1024;
+
+/// What one listener allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// The longest request line.
+    pub max_line: usize,
+    /// Connections at once.
+    pub max_conns: usize,
+    /// Connections at once from one uid.
+    pub max_per_uid: usize,
+    /// A connection is closed when a request line takes longer than this
+    /// to arrive.
+    pub idle: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits {
+            max_line: MAX_LINE,
+            max_conns: 64,
+            max_per_uid: 8,
+            idle: Duration::from_secs(60),
+        }
+    }
+}
+
+impl Limits {
+    /// A control socket's: short lines.
+    #[must_use]
+    pub fn control() -> Limits {
+        Limits {
+            max_line: MAX_CONTROL_LINE,
+            ..Limits::default()
+        }
+    }
+}
+
+/// Open connections, per uid and overall.
+#[derive(Debug, Default)]
+struct Slots {
+    total: usize,
+    per_uid: HashMap<u32, usize>,
+}
+
+/// A connection's place, given back on drop.
+struct Slot {
+    slots: Arc<Mutex<Slots>>,
+    uid: u32,
+}
+
+impl Slot {
+    fn take(slots: &Arc<Mutex<Slots>>, uid: u32, limits: Limits) -> Option<Slot> {
+        let mut s = slots.lock().unwrap_or_else(PoisonError::into_inner);
+        let mine = s.per_uid.get(&uid).copied().unwrap_or(0);
+        if s.total >= limits.max_conns || mine >= limits.max_per_uid {
+            return None;
+        }
+        s.total = s.total.saturating_add(1);
+        s.per_uid.insert(uid, mine.saturating_add(1));
+        Some(Slot {
+            slots: Arc::clone(slots),
+            uid,
+        })
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut s = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        s.total = s.total.saturating_sub(1);
+        if let Some(n) = s.per_uid.get_mut(&self.uid) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                s.per_uid.remove(&self.uid);
+            }
+        }
+    }
+}
 
 /// Who is on the other end, as the kernel says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +141,13 @@ impl LocalError {
 
 /// A local API.
 pub trait LocalApi: Send + Sync + 'static {
+    /// Whether `peer` may use this socket at all, decided before anything
+    /// it sent is read. By default everyone may (each call still checks).
+    fn admit(&self, peer: Peer) -> impl Future<Output = Result<(), LocalError>> + Send {
+        let _ = peer;
+        async { Ok(()) }
+    }
+
     fn call(
         &self,
         method: &str,
@@ -82,13 +174,21 @@ pub fn bind(path: &Path, mode: u32) -> io::Result<UnixListener> {
     Ok(listener)
 }
 
-/// Serve `api` on `listener` until the task is dropped.
+/// Serve `api` on `listener` with the default [`Limits`] until the task is
+/// dropped.
 pub async fn serve<A: LocalApi>(listener: UnixListener, api: Arc<A>) {
+    serve_with(listener, api, Limits::default()).await;
+}
+
+/// Serve `api` on `listener` within `limits` until the task is dropped.
+pub async fn serve_with<A: LocalApi>(listener: UnixListener, api: Arc<A>, limits: Limits) {
+    let slots = Arc::new(Mutex::new(Slots::default()));
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let api = Arc::clone(&api);
-                tokio::spawn(async move { serve_conn(stream, api).await });
+                let slots = Arc::clone(&slots);
+                tokio::spawn(async move { serve_conn(stream, api, &slots, limits).await });
             }
             Err(e) => {
                 tracing::warn!(error = %e, "local socket accept failed");
@@ -141,7 +241,12 @@ fn reply_line(reply: &Result<Value, LocalError>) -> Vec<u8> {
     out
 }
 
-async fn serve_conn<A: LocalApi>(stream: UnixStream, api: Arc<A>) {
+async fn serve_conn<A: LocalApi>(
+    stream: UnixStream,
+    api: Arc<A>,
+    slots: &Arc<Mutex<Slots>>,
+    limits: Limits,
+) {
     let peer = match Peer::of(&stream) {
         Ok(p) => p,
         Err(e) => {
@@ -150,22 +255,42 @@ async fn serve_conn<A: LocalApi>(stream: UnixStream, api: Arc<A>) {
         }
     };
     let (read, mut write) = stream.into_split();
+    // Who it is, before reading a byte.
+    if let Err(e) = api.admit(peer).await {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            write.write_all(&reply_line(&Err(e))),
+        )
+        .await;
+        return;
+    }
+    let Some(_slot) = Slot::take(slots, peer.uid, limits) else {
+        let busy = Err(LocalError::new("too many connections"));
+        let _ =
+            tokio::time::timeout(Duration::from_secs(1), write.write_all(&reply_line(&busy))).await;
+        return;
+    };
     let mut reader = BufReader::new(read);
     loop {
-        let line = match read_line_capped(&mut reader, MAX_LINE).await {
-            Ok(Some(l)) => l,
-            Ok(None) => return,
-            Err(e) => {
-                let _ = write
-                    .write_all(&reply_line(&Err(LocalError::new(format!(
-                        "bad request: {e}"
-                    )))))
-                    .await;
-                return;
-            }
-        };
+        let line =
+            match tokio::time::timeout(limits.idle, read_line_capped(&mut reader, limits.max_line))
+                .await
+            {
+                Err(_) => return,
+                Ok(Ok(Some(l))) => l,
+                Ok(Ok(None)) => return,
+                Ok(Err(e)) => {
+                    let _ = write
+                        .write_all(&reply_line(&Err(LocalError::new(format!(
+                            "bad request: {e}"
+                        )))))
+                        .await;
+                    return;
+                }
+            };
         let reply = handle(&*api, &line, peer).await;
-        if write.write_all(&reply_line(&reply)).await.is_err() {
+        let sent = tokio::time::timeout(limits.idle, write.write_all(&reply_line(&reply))).await;
+        if !matches!(sent, Ok(Ok(()))) {
             return;
         }
     }
@@ -358,5 +483,82 @@ mod tests {
             lines,
             vec![b"abc".to_vec(), b"defgh".to_vec(), b"ij".to_vec()]
         );
+    }
+
+    struct Picky;
+
+    impl LocalApi for Picky {
+        async fn admit(&self, _peer: Peer) -> Result<(), LocalError> {
+            Err(LocalError::new("not you"))
+        }
+
+        async fn call(
+            &self,
+            _: &str,
+            _: Map<String, Value>,
+            _: Option<Value>,
+            _: Peer,
+        ) -> Result<Value, LocalError> {
+            panic!("a refused peer's request was read");
+        }
+    }
+
+    /// Security review 2026-10, finding 3: the caller is refused before
+    /// anything is read; connections are capped per uid; a silent one is
+    /// closed; control lines are short.
+    #[tokio::test]
+    async fn callers_are_checked_first_and_connections_are_bounded() {
+        let dir = scratch();
+        let path = dir.join("p.sock");
+        let server = tokio::spawn(serve(bind(&path, 0o600).unwrap(), Arc::new(Picky)));
+        let err = call(&path, "status", Map::new(), None, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "not you");
+        server.abort();
+
+        let path = dir.join("q.sock");
+        let limits = Limits {
+            max_per_uid: 2,
+            idle: Duration::from_millis(300),
+            ..Limits::control()
+        };
+        let server = tokio::spawn(serve_with(
+            bind(&path, 0o600).unwrap(),
+            Arc::new(Echo),
+            limits,
+        ));
+        let held: Vec<UnixStream> = vec![
+            UnixStream::connect(&path).await.unwrap(),
+            UnixStream::connect(&path).await.unwrap(),
+        ];
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let err = call(&path, "echo", Map::new(), None, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "too many connections");
+        // The silent ones are closed after the idle time, freeing the slots.
+        for s in held {
+            let mut r = BufReader::new(s);
+            let closed =
+                tokio::time::timeout(Duration::from_secs(2), read_line_capped(&mut r, 100))
+                    .await
+                    .unwrap();
+            assert!(matches!(closed, Ok(None)));
+        }
+        assert!(
+            call(&path, "echo", Map::new(), None, Duration::from_secs(5))
+                .await
+                .is_ok()
+        );
+        // A control line is at most 4 KiB.
+        let mut p = Map::new();
+        p.insert("x".into(), json!("y".repeat(MAX_CONTROL_LINE)));
+        let err = call(&path, "echo", p, None, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("line too long"), "{err}");
+        server.abort();
+        std::fs::remove_dir_all(dir).ok();
     }
 }

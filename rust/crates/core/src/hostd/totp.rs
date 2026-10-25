@@ -49,14 +49,22 @@ pub const WINDOW_STEPS: u64 = 1;
 /// What a secret is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Purpose {
-    /// Opens an arming window for its tier (and `root-arm` unlocks).
+    /// Opens an arming window for its tier.
     Arm,
     /// Approves one request (its digest), armed or not.
     Direct,
+    /// Opens one shell (its digest). Optional for the user tier (a
+    /// `user-direct` code does when it isn't enrolled); a root shell needs
+    /// it (security review 2026-10, finding 4).
+    Shell,
+    /// Lifts a lockdown from the broker (`root-unlock` only): a code typed
+    /// to unlock can't arm.
+    Unlock,
 }
 
-/// One of a host's four secrets: `user-arm`, `user-direct`, `root-arm`,
-/// `root-direct`.
+/// One of a host's secrets: `user-arm`, `user-direct`, `root-arm`,
+/// `root-direct`, and the optional `user-shell`, `root-shell` and
+/// `root-unlock`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SecretName {
     pub tier: Tier,
@@ -64,12 +72,25 @@ pub struct SecretName {
 }
 
 impl SecretName {
+    /// The four every host has.
     pub const ALL: [SecretName; 4] = [
         SecretName::new(Tier::User, Purpose::Arm),
         SecretName::new(Tier::User, Purpose::Direct),
         SecretName::new(Tier::Root, Purpose::Arm),
         SecretName::new(Tier::Root, Purpose::Direct),
     ];
+
+    /// Enrolled only when wanted.
+    pub const OPTIONAL: [SecretName; 3] = [
+        SecretName::new(Tier::User, Purpose::Shell),
+        SecretName::new(Tier::Root, Purpose::Shell),
+        SecretName::new(Tier::Root, Purpose::Unlock),
+    ];
+
+    /// Every name a secret may have.
+    pub fn every() -> impl Iterator<Item = SecretName> {
+        SecretName::ALL.into_iter().chain(SecretName::OPTIONAL)
+    }
 
     #[must_use]
     pub const fn new(tier: Tier, purpose: Purpose) -> SecretName {
@@ -78,7 +99,7 @@ impl SecretName {
 
     #[must_use]
     pub fn parse(s: &str) -> Option<SecretName> {
-        SecretName::ALL.into_iter().find(|n| n.as_str() == s)
+        SecretName::every().find(|n| n.as_str() == s)
     }
 
     #[must_use]
@@ -88,6 +109,11 @@ impl SecretName {
             (Tier::User, Purpose::Direct) => "user-direct",
             (Tier::Root, Purpose::Arm) => "root-arm",
             (Tier::Root, Purpose::Direct) => "root-direct",
+            (Tier::User, Purpose::Shell) => "user-shell",
+            (Tier::Root, Purpose::Shell) => "root-shell",
+            // Not a secret a host has (unlocking is root's).
+            (Tier::User, Purpose::Unlock) => "user-unlock",
+            (Tier::Root, Purpose::Unlock) => "root-unlock",
         }
     }
 }

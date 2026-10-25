@@ -58,7 +58,7 @@ enum Cmd {
     Unlock,
     /// Clear a TOTP secret's lock after wrong codes (root only).
     TotpUnlock {
-        /// user-arm | user-direct | root-arm | root-direct
+        /// user-arm | user-direct | root-arm | root-direct | user-shell | root-shell | root-unlock
         name: String,
     },
     /// No approval prompts on this desktop for a while (they go to Discord).

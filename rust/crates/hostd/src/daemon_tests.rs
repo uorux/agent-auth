@@ -84,7 +84,7 @@ impl T {
         let hostd = Hostd::new(cfg, exec);
         hostd.pin_user_uid(Some(USER_UID));
         let mut secrets = BTreeMap::new();
-        for name in SecretName::ALL {
+        for name in SecretName::every() {
             secrets.insert(name.as_str(), hostd.totp().enroll(name, false).unwrap());
         }
         T {
@@ -447,9 +447,22 @@ async fn shells_take_a_totp_code_and_stay_bounded() {
         t.call(open.clone()).await.unwrap_err(),
         "a shell is opened with a TOTP code only"
     );
+    // A direct code (typed to approve a command) doesn't open a shell
+    // once the tier has a shell secret (security review 2026-10, finding 4).
     t.call(authorize(&shell, "user", &spec, &t.code("user-direct")))
         .await
         .unwrap();
+    assert_eq!(
+        t.call(open.clone()).await.unwrap_err(),
+        "a user shell is opened with a user-shell code"
+    );
+    // Nor is a direct code relayed as a shell code checked as one.
+    let mut as_shell = authorize(&shell, "user", &spec, &t.code_peek("user-direct"));
+    as_shell["shell"] = json!(true);
+    assert_eq!(t.call(as_shell).await.unwrap_err(), "wrong code");
+    let mut a = authorize(&shell, "user", &spec, &t.code("user-shell"));
+    a["shell"] = json!(true);
+    t.call(a).await.unwrap();
     let opened = t.call(open).await.unwrap();
     assert!(opened["expires_at"].as_f64().unwrap() > now_f64() + 290.0);
     let exec = |id: u32, argv: &[&str], tier: &str| json!({"type": "shell.exec", "shell_id": shell, "job_id": job_id(id), "spec": run_spec(tier, argv)});
@@ -479,7 +492,7 @@ async fn shells_take_a_totp_code_and_stay_bounded() {
 }
 
 #[tokio::test]
-async fn lockdown_stops_everything_and_only_the_root_arm_code_unlocks() {
+async fn lockdown_stops_everything_and_only_the_root_unlock_code_unlocks() {
     let t = T::new();
     t.call(json!({"type": "arm", "tier": "user", "duration": 600, "totp": t.code("user-arm")}))
         .await
@@ -512,20 +525,24 @@ async fn lockdown_stops_everything_and_only_the_root_arm_code_unlocks() {
             .unwrap_err(),
         "excelsior is locked down"
     );
-    // A wrong root-arm code doesn't unlock; a user-arm code is not a root code.
+    // A wrong code doesn't unlock; neither does a user-arm code, nor the
+    // root-arm code (a code typed to unlock can't arm, and the reverse;
+    // security review 2026-10, finding 4).
     assert_eq!(
         t.call(json!({"type": "unlock", "totp": "000000"}))
             .await
             .unwrap_err(),
         "wrong code"
     );
-    let err = t
-        .call(json!({"type": "unlock", "totp": t.code_peek("user-arm")}))
-        .await
-        .unwrap_err();
-    assert_eq!(err, "wrong code");
+    for other in ["user-arm", "root-arm"] {
+        let err = t
+            .call(json!({"type": "unlock", "totp": t.code_peek(other)}))
+            .await
+            .unwrap_err();
+        assert_eq!(err, "wrong code");
+    }
     let unlocked = t
-        .call(json!({"type": "unlock", "totp": t.code_peek("root-arm")}))
+        .call(json!({"type": "unlock", "totp": t.code_peek("root-unlock")}))
         .await
         .unwrap();
     assert_eq!(unlocked["locked"], json!(false));
@@ -580,13 +597,19 @@ async fn lockdown_survives_a_restart_and_jobs_running_at_a_crash_are_lost_and_ki
     );
     assert_eq!(done.result["lost"], json!(true));
     assert_eq!(hostd.orphans(), vec![lost.clone()]);
-    // The orphan can't start again under its id, and lockdown kills it.
-    hostd.lockdown("test", false).await.unwrap();
-    assert!(hostd.orphans().is_empty());
+    // Locked at startup: its unit was stopped before anything else
+    // (security review 2026-10, finding 2).
     assert_eq!(
         hostd.executor().recorded.lock().unwrap().killed,
         vec![lost.to_string()]
     );
+    // A unit hostd knows nothing of: lockdown sweeps every job unit too.
+    let stray = LocalId::parse(&job_id(71)).unwrap();
+    hostd.executor().recorded.lock().unwrap().leftover = vec![lost.clone(), stray.clone()];
+    hostd.lockdown("test", false).await.unwrap();
+    assert!(hostd.orphans().is_empty());
+    let killed = hostd.executor().recorded.lock().unwrap().killed.clone();
+    assert!(killed.contains(&stray.to_string()), "{killed:?}");
     drop(_dir);
 }
 
@@ -680,7 +703,7 @@ async fn a_host_without_tiers_runs_nothing() {
 #[tokio::test]
 async fn allow_at_its_own_desk_approves_exactly_that_command() {
     let t = T::new();
-    let mut rx = t.hostd.helper_attached(7, 1234).await;
+    let mut rx = t.hostd.helper_attached(7, 1234, Some(4321)).await;
     for state in ["unlocked", "active"] {
         t.ctl(USER_UID, "presence", json!({"state": state}))
             .await
@@ -710,9 +733,14 @@ async fn allow_at_its_own_desk_approves_exactly_that_command() {
             .unwrap()
             .contains("stdin (11 chars): $'secret-ish\\n'")
     );
+    // The helper answers by hostd's nonce, not the broker's prompt id.
+    let nonce = line["id"].as_str().unwrap().to_owned();
+    assert_ne!(nonce, prompt_id);
+    t.hostd.answered(prompt_id, "allow", 7).await;
+    assert!(t.call(start(&job_id(90), &spec, None)).await.is_err());
     // No password: no approval, the answer becomes "discord".
     t.hostd.executor().recorded.lock().unwrap().password_ok = false;
-    t.hostd.answered(prompt_id, "allow", 7).await;
+    t.hostd.answered(&nonce, "allow", 7).await;
     assert!(t.call(start(&job_id(90), &spec, None)).await.is_err());
     // With the password: exactly that job, that digest.
     t.hostd.executor().recorded.lock().unwrap().password_ok = true;
@@ -724,8 +752,10 @@ async fn allow_at_its_own_desk_approves_exactly_that_command() {
     )
     .await
     .unwrap();
-    // An answer from another (replaced) connection is not this host's approval.
-    t.hostd.answered(p2, "allow", 8).await;
+    let line: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+    let nonce = line["id"].as_str().unwrap().to_owned();
+    // An answer from another connection is not this host's approval.
+    t.hostd.answered(&nonce, "allow", 8).await;
     assert!(t.call(start(&job_id(91), &spec, None)).await.is_err());
     let p3 = "11111111-2222-4333-8444-555555555557";
     t.call(
@@ -735,13 +765,22 @@ async fn allow_at_its_own_desk_approves_exactly_that_command() {
     )
     .await
     .unwrap();
-    t.hostd.answered(p3, "allow", 7).await;
+    let line: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+    let nonce = line["id"].as_str().unwrap().to_owned();
+    t.hostd.answered(&nonce, "allow", 7).await;
     let started = t.call(start(&job_id(92), &spec, None)).await.unwrap();
     assert_eq!(started["via"], json!("desk"));
     assert_eq!(t.done(&job_id(92)).await["output"], json!("a\nb\n"));
     let polkit = t.hostd.executor().recorded.lock().unwrap().polkit.clone();
     assert_eq!(polkit.len(), 2);
-    assert_eq!(polkit[1].0, 1234);
+    // The process as it was when it connected.
+    assert_eq!(
+        polkit[1].0,
+        crate::executor::Process {
+            pid: 1234,
+            start_time: Some(4321)
+        }
+    );
 }
 
 #[tokio::test]
@@ -753,7 +792,7 @@ async fn nobody_at_the_desk_means_no_prompt() {
         t.call(prompt.clone()).await.unwrap_err(),
         "nobody is at this desktop"
     );
-    let _rx = t.hostd.helper_attached(1, 1).await;
+    let _rx = t.hostd.helper_attached(1, 1, None).await;
     // Lock state unknown: away.
     assert_eq!(
         t.call(prompt.clone()).await.unwrap_err(),
@@ -769,8 +808,11 @@ async fn nobody_at_the_desk_means_no_prompt() {
     t.ctl(USER_UID, "dnd", json!({"duration": "1h"}))
         .await
         .unwrap();
+    // (A prompt id that was shown is spent: a fresh one.)
+    let mut again = prompt;
+    again["prompt_id"] = json!("11111111-2222-4333-8444-555555555565");
     assert_eq!(
-        t.call(prompt).await.unwrap_err(),
+        t.call(again).await.unwrap_err(),
         "nobody is at this desktop"
     );
 }
@@ -778,7 +820,7 @@ async fn nobody_at_the_desk_means_no_prompt() {
 #[tokio::test]
 async fn a_desk_is_shown_everything_or_not_asked_and_prompt_ids_are_single() {
     let t = T::new();
-    let _rx = t.hostd.helper_attached(7, 1234).await;
+    let _rx = t.hostd.helper_attached(7, 1234, None).await;
     t.ctl(USER_UID, "presence", json!({"state": "unlocked"}))
         .await
         .unwrap();
@@ -809,4 +851,162 @@ async fn a_desk_is_shown_everything_or_not_asked_and_prompt_ids_are_single() {
         .unwrap_err(),
         "too long to show in full at a desk"
     );
+}
+
+/// Security review 2026-10, finding 1: with `desktop.approve.root` off and
+/// root armed, a root command is not asked at the desk at all, and a desk
+/// click relayed by the broker (`decided_by` `desktop:...`) admits nothing
+/// on the armed tier.
+#[tokio::test]
+async fn a_desk_click_never_approves_on_an_armed_tier() {
+    let t = T::with(|raw| raw["desktop"]["approve"] = json!({"user": true}));
+    let mut rx = t.hostd.helper_attached(7, 1234, None).await;
+    t.ctl(USER_UID, "presence", json!({"state": "unlocked"}))
+        .await
+        .unwrap();
+    t.call(json!({"type": "arm", "tier": "root", "duration": 600, "totp": t.code("root-arm")}))
+        .await
+        .unwrap();
+    let spec = run_spec("root", &["id"]);
+    let err = t
+        .call(
+            json!({"type": "prompt", "prompt_id": "11111111-2222-4333-8444-555555555560",
+                     "request_id": job_id(100), "who": "a", "what": "", "detail": "", "timeout": 30,
+                     "job": {"job_id": job_id(100), "spec": spec}}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err, "this desk doesn't approve root commands");
+    assert!(rx.try_recv().is_err(), "nothing was shown");
+    // The broker relays a desk click anyway: refused on the armed tier.
+    let mut msg = start(&job_id(100), &spec, Some("human"));
+    msg["evidence"]["decided_by"] = json!("desktop:excelsior");
+    let err = t.call(msg).await.unwrap_err();
+    assert!(err.starts_with("a desk answer approves only"), "{err}");
+    // A human's approval on Discord still counts while armed.
+    t.call(start(&job_id(101), &spec, Some("human")))
+        .await
+        .unwrap();
+}
+
+/// Security review 2026-10, finding 1d: an answer counts only from the
+/// helper connection the prompt was shown on, even if another connection
+/// of the user's has replaced it since.
+#[tokio::test]
+async fn only_the_connection_shown_a_prompt_answers_it() {
+    let t = T::new();
+    let mut rx = t.hostd.helper_attached(7, 1234, None).await;
+    t.ctl(USER_UID, "presence", json!({"state": "unlocked"}))
+        .await
+        .unwrap();
+    let spec = run_spec("user", &["id"]);
+    t.call(
+        json!({"type": "prompt", "prompt_id": "11111111-2222-4333-8444-555555555561",
+                  "request_id": job_id(102), "who": "a", "what": "", "detail": "", "timeout": 30,
+                  "job": {"job_id": job_id(102), "spec": spec}}),
+    )
+    .await
+    .unwrap();
+    let line: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+    let nonce = line["id"].as_str().unwrap().to_owned();
+    // Another connection of the user's takes the helper's place and
+    // answers the prompt it didn't show.
+    let _rx2 = t.hostd.helper_attached(8, 999, None).await;
+    t.hostd.answered(&nonce, "allow", 8).await;
+    assert!(t.call(start(&job_id(102), &spec, None)).await.is_err());
+}
+
+/// Security review 2026-10, findings 1e and 6: a process inside a job's
+/// unit is refused on ctl.sock (it can't arm its own tier or unlock) and
+/// as the desktop helper.
+#[tokio::test]
+async fn a_job_can_be_neither_hostctl_nor_the_desk() {
+    let t = T::new();
+    let procs = TestDir::new("proc");
+    let job_pid = 4100;
+    let desk_pid = 4101;
+    for (pid, cgroup) in [
+        (job_pid, "0::/system.slice/aa-job-0123abcd-0000.service\n"),
+        (desk_pid, "0::/user.slice/user-4242.slice/session-2.scope\n"),
+    ] {
+        std::fs::create_dir_all(procs.path().join(pid.to_string())).unwrap();
+        std::fs::write(procs.path().join(format!("{pid}/cgroup")), cgroup).unwrap();
+    }
+    t.hostd.set_proc_root(procs.path().to_path_buf());
+    let ctl = Ctl(Arc::clone(&t.hostd));
+    let peer = |uid: u32, pid: i32| Peer {
+        uid,
+        gid: 0,
+        pid: Some(pid),
+    };
+    for uid in [USER_UID, 0] {
+        assert_eq!(
+            ctl.admit(peer(uid, job_pid)).await.unwrap_err().0,
+            "not from inside a job"
+        );
+        assert!(ctl.admit(peer(uid, desk_pid)).await.is_ok());
+    }
+    // Unknown process: refused (fail closed).
+    assert!(ctl.admit(peer(0, 4199)).await.is_err());
+    assert!(ctl.admit(peer(999, desk_pid)).await.is_err());
+    // As the helper: over the real socket, from this process placed in a job.
+    let me = std::process::id();
+    let my_uid = {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        Peer::of(&tokio::net::UnixStream::from_std(a).unwrap())
+            .unwrap()
+            .uid
+    };
+    let dir = TestDir::new("usersock");
+    let procs2 = TestDir::new("proc2");
+    std::fs::create_dir_all(procs2.path().join(me.to_string())).unwrap();
+    std::fs::write(
+        procs2.path().join(format!("{me}/cgroup")),
+        "0::/system.slice/aa-job-1.service\n",
+    )
+    .unwrap();
+    let cfg = config(&dir, |_| {});
+    let hostd = Hostd::new(
+        cfg,
+        DirectExecutor::new(&std::env::var("PATH").unwrap_or_default(), &find("kill")),
+    );
+    hostd.pin_user_uid(Some(my_uid));
+    hostd.set_proc_root(procs2.path().to_path_buf());
+    let path = dir.path().join("user.sock");
+    let listener = agent_auth_daemon::localsock::bind(&path, 0o600).unwrap();
+    let server = tokio::spawn(crate::desk::serve(listener, Arc::clone(&hostd)));
+    let mut s = tokio::net::UnixStream::connect(&path).await.unwrap();
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let _ = s
+        .write_all(b"{\"type\":\"presence\",\"locked\":false,\"fresh\":true}\n")
+        .await;
+    let mut buf = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap_or(0);
+    assert_eq!(n, 0, "closed at once");
+    assert_eq!(hostd.status()["desktop"]["present"], json!(false));
+    server.abort();
+}
+
+/// Security review 2026-10, finding 5: an arming racing a lockdown never
+/// leaves the host locked and armed (the lockdown lands as the arming
+/// starts).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arming_never_survives_a_concurrent_lockdown() {
+    let t = T::new();
+    let hostd = Arc::clone(&t.hostd);
+    *t.hostd.arm_hook.lock().unwrap() = Some(Box::new(move || {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(hostd.lockdown("test", false))
+                .unwrap();
+        });
+    }));
+    let armed = t.hostd.arm_local(Tier::User, 600, LocalCaller::Root, 0);
+    assert!(t.hostd.lock_state().is_locked());
+    assert_eq!(armed.unwrap_err(), "excelsior is locked down");
+    assert!(t.hostd.status()["tiers"]["user"]["armed_until"].is_null());
 }

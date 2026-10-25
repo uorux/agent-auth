@@ -286,7 +286,7 @@ async fn a_shell_takes_a_code_and_shows_every_command_first(pool: sqlx::PgPool) 
     );
     let d = HumanDecision {
         duration_secs: Some(600),
-        ..totp(host.code("user-direct", 0))
+        ..totp(host.code("user-shell", 0))
     };
     crate::service::decide(&b.st, r.id, &jrt(), d)
         .await
@@ -370,16 +370,27 @@ async fn lockdown_stops_the_host_and_only_its_code_unlocks_it(pool: sqlx::PgPool
         .unwrap();
     assert!(un.broker_locked.is_empty());
     assert!(host.hostd.lock_state().is_locked());
-    // A wrong root-arm code is refused; the right one unlocks the host.
+    // A wrong root-unlock code is refused; the right one unlocks the host.
     let err = lockdown::unlock(&b.st, &hx, Some(HOST), Some("000000"), "jrt")
         .await
         .unwrap_err();
+    assert_eq!(err.0, "wrong code");
+    // A root-arm code doesn't unlock (a code typed to unlock can't arm).
+    let err = lockdown::unlock(
+        &b.st,
+        &hx,
+        Some(HOST),
+        Some(&host.code("root-arm", 0)),
+        "jrt",
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err.0, "wrong code");
     lockdown::unlock(
         &b.st,
         &hx,
         Some(HOST),
-        Some(&host.code("root-arm", 0)),
+        Some(&host.code("root-unlock", 0)),
         "jrt",
     )
     .await

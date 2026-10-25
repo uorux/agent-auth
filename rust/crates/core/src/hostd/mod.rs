@@ -39,7 +39,7 @@ pub use admission::{
     AuthzFacts, DeskApproval, DeskPrompt, Evidence, HostView, LocalCaller, Normalized, OpenShell,
     PolkitConfirmed, RefusalKind, TotpApproval, admit, admit_shell_command, auto_matches,
     check_tier, decide, deny_matches, desk_approval, desk_prompt, loggable, normalize, open_shell,
-    parse_shell_request, precheck_job, precheck_shell,
+    parse_shell_request, precheck_job, precheck_shell, shell_secret,
 };
 pub use policy::{HostPolicy, TierPolicy};
 
@@ -197,6 +197,10 @@ pub enum Source {
     Rule,
     Llm,
     Policy,
+    /// A click at a desk (`decided_by` `desktop:<host>`). Never believed
+    /// on arming: a desk approves a host's command only as that host's own
+    /// recorded approval (security review 2026-10, finding 1).
+    Desk,
 }
 
 impl Source {
@@ -218,7 +222,18 @@ impl Source {
             Source::Rule => "rule",
             Source::Llm => "llm",
             Source::Policy => "policy",
+            Source::Desk => "desk",
         }
+    }
+
+    /// The broker's evidence, marked: a decision made at a desk is
+    /// [`Source::Desk`] whatever source the broker gives it.
+    #[must_use]
+    pub fn from_evidence(source: Option<&str>, decided_by: Option<&str>) -> Option<Source> {
+        if decided_by.is_some_and(|d| d.starts_with("desktop:")) {
+            return Some(Source::Desk);
+        }
+        source.and_then(Source::parse)
     }
 
     /// From an `evidence.source` / precheck `source` JSON value.

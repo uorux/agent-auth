@@ -620,6 +620,10 @@
               restartTriggers = [ configFile ];
               serviceConfig = {
                 ExecStart = "${cfg.package}/bin/agent-auth-hostd run";
+                # ctl.sock and user.sock take any local uid's connection
+                # (each capped per uid and overall, and checked before a byte
+                # is read): room for those and the jobs' pipes.
+                LimitNOFILE = 65536;
                 StateDirectory = "agent-auth-hostd";
                 StateDirectoryMode = "0700";
                 RuntimeDirectory = "agent-auth-hostd";

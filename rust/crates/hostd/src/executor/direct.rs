@@ -20,8 +20,8 @@ pub struct Recorded {
     pub runs: Vec<(String, String, Vec<String>)>,
     /// `(action, unit)` of every unit action.
     pub units: Vec<(String, String)>,
-    /// `(pid, uid, message)` of every polkit request.
-    pub polkit: Vec<(i32, u32, String)>,
+    /// `(process, uid, message)` of every polkit request.
+    pub polkit: Vec<(super::Process, u32, String)>,
     /// Does the user type their password when polkit asks?
     pub password_ok: bool,
     /// Jobs reported as still running from an earlier process.
@@ -100,13 +100,13 @@ impl Executor for DirectExecutor {
 
     async fn polkit_auth(
         &self,
-        pid: i32,
+        process: super::Process,
         uid: u32,
         message: &str,
         _timeout: Duration,
     ) -> Option<PolkitConfirmed> {
         let mut rec = self.rec();
-        rec.polkit.push((pid, uid, message.to_owned()));
+        rec.polkit.push((process, uid, message.to_owned()));
         rec.password_ok
             .then(PolkitConfirmed::after_successful_pkcheck)
     }

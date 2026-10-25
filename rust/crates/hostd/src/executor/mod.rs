@@ -92,11 +92,11 @@ pub trait Executor: Send + Sync + 'static {
     /// [`KillSignal`].
     fn kill(&self, job: &LocalId) -> impl Future<Output = ()> + Send;
 
-    /// Have polkit authenticate the user of process `pid` as an
-    /// administrator, showing `message`. `Some` only if they did.
+    /// Have polkit authenticate the user of `process` as an administrator,
+    /// showing `message`. `Some` only if they did.
     fn polkit_auth(
         &self,
-        pid: i32,
+        process: Process,
         uid: u32,
         message: &str,
         timeout: Duration,
@@ -112,6 +112,25 @@ pub trait Executor: Send + Sync + 'static {
     /// Jobs still running from an earlier hostd process (Linux: their
     /// `aa-job-*` units), so a crash leaves nothing unkillable.
     fn running_jobs(&self) -> impl Future<Output = Vec<LocalId>> + Send;
+}
+
+/// A process as polkit names it: its pid and its start time (read when it
+/// connected, so a process that took the pid later isn't the one asked
+/// about; security review 2026-10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Process {
+    pub pid: i32,
+    pub start_time: Option<u64>,
+}
+
+/// `pid`'s start time (`/proc/<pid>/stat` field 22), on Linux.
+#[must_use]
+pub fn start_time_of(pid: i32) -> Option<u64> {
+    if pid <= 0 {
+        return None;
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    linux::proc_start_time(&stat)?.parse().ok()
 }
 
 /// A process's exit status as a job's exit code.
@@ -139,6 +158,10 @@ pub(crate) struct Collect {
     /// process left in the background must not hold the job open). Without
     /// it, read to end of output.
     pub stop_at_exit: bool,
+    /// After the first stop: stop again this often until the main process
+    /// ends (Linux: a `systemctl stop` that lands before `systemd-run` made
+    /// the unit stops nothing; security review 2026-10, finding 2).
+    pub restop: Option<Duration>,
 }
 
 /// A command with stdout and stderr on one pipe, stdin from `stdin` (or
@@ -162,9 +185,10 @@ pub(crate) fn spawn_piped(
 }
 
 /// Feed `stdin`, collect output into `out`, wait for the child. Calls
-/// `on_deadline` once if the deadline passes or the kill signal fires, and
+/// `on_deadline` if the deadline passes or the kill signal fires (once, or
+/// every [`Collect::restop`] until the main process ends), and
 /// `after_exit` once when the main process has ended.
-pub(crate) async fn collect<D, A>(
+pub(crate) async fn collect<D, DF, A>(
     child: &mut tokio::process::Child,
     mut rx: tokio::net::unix::pipe::Receiver,
     stdin: Option<&str>,
@@ -174,7 +198,8 @@ pub(crate) async fn collect<D, A>(
     after_exit: A,
 ) -> io::Result<ExitStatus>
 where
-    D: AsyncFnOnce(),
+    D: Fn() -> DF,
+    DF: Future<Output = ()>,
     A: AsyncFnOnce(),
 {
     if let Some(mut pipe) = child.stdin.take() {
@@ -186,12 +211,13 @@ where
             let _ = pipe.shutdown().await;
         });
     }
-    let mut on_deadline = Some(on_deadline);
+    let mut stopped = false;
+    let mut next_stop: Option<Instant> = None;
     let mut kill = how.kill.clone();
-    if *kill.borrow_and_update()
-        && let Some(f) = on_deadline.take()
-    {
-        f().await;
+    if *kill.borrow_and_update() {
+        stopped = true;
+        on_deadline().await;
+        next_stop = how.restop.map(after);
     }
     let mut after_exit = Some(after_exit);
     let mut buf = vec![0u8; READ_CHUNK];
@@ -205,6 +231,7 @@ where
         // A disabled branch's timer is built but never polled.
         let deadline = how.deadline.unwrap_or_else(Instant::now);
         let drain = drain_until.unwrap_or_else(Instant::now);
+        let restop = next_stop.unwrap_or_else(Instant::now);
         tokio::select! {
             n = rx.read(&mut buf), if !eof => {
                 match n {
@@ -214,6 +241,7 @@ where
             }
             s = child.wait(), if status.is_none() => {
                 status = Some(s?);
+                next_stop = None;
                 if let Some(f) = after_exit.take() {
                     f().await;
                 }
@@ -221,17 +249,21 @@ where
                     drain_until = Some(after(DRAIN));
                 }
             }
-            changed = kill.changed(), if on_deadline.is_some() => {
-                if (changed.is_err() || *kill.borrow_and_update())
-                    && let Some(f) = on_deadline.take()
-                {
-                    f().await;
+            changed = kill.changed(), if !stopped => {
+                if changed.is_err() || *kill.borrow_and_update() {
+                    stopped = true;
+                    on_deadline().await;
+                    next_stop = how.restop.filter(|_| status.is_none()).map(after);
                 }
             }
-            () = tokio::time::sleep_until(deadline), if on_deadline.is_some() && how.deadline.is_some() => {
-                if let Some(f) = on_deadline.take() {
-                    f().await;
-                }
+            () = tokio::time::sleep_until(deadline), if !stopped && how.deadline.is_some() => {
+                stopped = true;
+                on_deadline().await;
+                next_stop = how.restop.filter(|_| status.is_none()).map(after);
+            }
+            () = tokio::time::sleep_until(restop), if next_stop.is_some() && status.is_none() => {
+                on_deadline().await;
+                next_stop = how.restop.map(after);
             }
             () = tokio::time::sleep_until(drain), if drain_until.is_some() => {
                 eof = true;

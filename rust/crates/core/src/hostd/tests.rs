@@ -109,6 +109,13 @@ impl Host {
         let approval = TotpApproval::new(direct(tier), d.clone()).unwrap();
         self.auths.record_totp(job.clone(), approval, NOW);
     }
+
+    /// A `{tier}-shell` code for `d`.
+    fn shell_code(&mut self, job: &LocalId, tier: Tier, d: &SpecDigest) {
+        let code = AcceptedCode::for_tests(SecretName::new(tier, Purpose::Shell), 1);
+        let approval = TotpApproval::new(code, d.clone()).unwrap();
+        self.auths.record_totp(job.clone(), approval, NOW);
+    }
 }
 
 #[test]
@@ -234,7 +241,9 @@ fn a_wrong_tier_code_arms_nothing_and_users_arm_only_the_user_tier() {
     assert!(ArmState::check_unlock(&ArmProof::Totp(arm_code(Tier::User))).is_err());
     assert!(ArmState::check_unlock(&ArmProof::Totp(direct(Tier::Root))).is_err());
     assert!(ArmState::check_unlock(&ArmProof::Local(LocalCaller::User)).is_err());
-    assert!(ArmState::check_unlock(&ArmProof::Totp(arm_code(Tier::Root))).is_ok());
+    // A root-arm code no longer unlocks (review 2026-10, finding 4).
+    assert!(ArmState::check_unlock(&ArmProof::Totp(arm_code(Tier::Root))).is_err());
+    assert!(ArmState::check_unlock(&ArmProof::Local(LocalCaller::Root)).is_ok());
 }
 
 #[test]
@@ -497,7 +506,8 @@ fn shells_open_with_a_totp_code_only_and_stay_bounded() {
             &digest(1),
             &mut h.auths,
             h.lock,
-            NOW
+            NOW,
+            true
         )
         .unwrap_err()
         .0,
@@ -519,7 +529,6 @@ fn shells_open_with_a_totp_code_only_and_stay_bounded() {
         &n,
         "m".into(),
     )
-    .unwrap()
     .unwrap();
     let (job, approval) = desk_approval(
         prompt,
@@ -537,12 +546,13 @@ fn shells_open_with_a_totp_code_only_and_stay_bounded() {
             &digest(1),
             &mut h.auths,
             h.lock,
-            NOW
+            NOW,
+            true
         )
         .is_err()
     );
-    // A TOTP code for the shell's digest does.
-    h.totp(&id(1), Tier::Root, &digest(1));
+    // A root-shell code for the shell's digest does.
+    h.shell_code(&id(1), Tier::Root, &digest(1));
     let shell = open_shell(
         &h.policy,
         id(1),
@@ -551,6 +561,7 @@ fn shells_open_with_a_totp_code_only_and_stay_bounded() {
         &mut h.auths,
         h.lock,
         NOW,
+        true,
     )
     .unwrap();
     assert_eq!(shell.expires_at(), NOW.plus_secs(300));
@@ -618,7 +629,7 @@ fn shells_open_with_a_totp_code_only_and_stay_bounded() {
     // Duration bounded by the host, at precheck and at open.
     let long = json!({"kind": "shell", "host": HOST, "tier": "root", "duration": 601});
     let long_spec = parse_shell_request(&h.policy, &long).unwrap();
-    h.totp(&id(4), Tier::Root, &digest(4));
+    h.shell_code(&id(4), Tier::Root, &digest(4));
     assert_eq!(
         open_shell(
             &h.policy,
@@ -627,21 +638,180 @@ fn shells_open_with_a_totp_code_only_and_stay_bounded() {
             &digest(4),
             &mut h.auths,
             h.lock,
-            NOW
+            NOW,
+            true
         )
         .unwrap_err()
         .0,
         "a root shell on excelsior lasts at most 600s"
     );
-    assert!(precheck_shell(&h.policy, Some(&json!("root")), Some(&json!(601)), h.lock).is_err());
-    assert!(precheck_shell(&h.policy, Some(&json!("root")), Some(&json!(600)), h.lock).is_ok());
+    assert!(
+        precheck_shell(
+            &h.policy,
+            Some(&json!("root")),
+            Some(&json!(601)),
+            h.lock,
+            true
+        )
+        .is_err()
+    );
+    assert!(
+        precheck_shell(
+            &h.policy,
+            Some(&json!("root")),
+            Some(&json!(600)),
+            h.lock,
+            true
+        )
+        .is_ok()
+    );
     h.policy.root.shell_enable = false;
     assert_eq!(
-        precheck_shell(&h.policy, Some(&json!("root")), None, h.lock)
+        precheck_shell(&h.policy, Some(&json!("root")), None, h.lock, true)
             .unwrap_err()
             .0,
         "root shells are not enabled on excelsior"
     );
+}
+
+/// Security review 2026-10, finding 4: a code is bound to what it was
+/// typed for. A direct code never opens a root shell; with a `{tier}-shell`
+/// secret enrolled a direct code opens no shell of that tier; a shell code
+/// never admits a job; only a root-unlock code unlocks.
+#[test]
+fn codes_are_bound_to_what_they_were_typed_for() {
+    let mut h = Host::new();
+    h.policy.user.shell_enable = true;
+    let root = parse_shell_request(
+        &h.policy,
+        &json!({"kind": "shell", "host": HOST, "tier": "root", "duration": 300}),
+    )
+    .unwrap();
+    let user = parse_shell_request(
+        &h.policy,
+        &json!({"kind": "shell", "host": HOST, "tier": "user", "duration": 300}),
+    )
+    .unwrap();
+    // No root-shell secret: refused before a code is spent, and a direct
+    // code doesn't open one.
+    assert!(
+        precheck_shell(&h.policy, Some(&json!("root")), None, h.lock, false)
+            .unwrap_err()
+            .0
+            .contains("root-shell")
+    );
+    h.totp(&id(1), Tier::Root, &digest(1));
+    assert!(
+        open_shell(
+            &h.policy,
+            id(1),
+            &root,
+            &digest(1),
+            &mut h.auths,
+            h.lock,
+            NOW,
+            false
+        )
+        .is_err()
+    );
+    // Enrolled: still not with a direct code.
+    h.totp(&id(1), Tier::Root, &digest(1));
+    assert_eq!(
+        open_shell(
+            &h.policy,
+            id(1),
+            &root,
+            &digest(1),
+            &mut h.auths,
+            h.lock,
+            NOW,
+            true
+        )
+        .unwrap_err()
+        .0,
+        "a root shell is opened with a root-shell code"
+    );
+    // A user shell: a direct code while no user-shell secret is enrolled,
+    // only a user-shell code once one is.
+    h.totp(&id(2), Tier::User, &digest(2));
+    assert!(
+        open_shell(
+            &h.policy,
+            id(2),
+            &user,
+            &digest(2),
+            &mut h.auths,
+            h.lock,
+            NOW,
+            false
+        )
+        .is_ok()
+    );
+    h.totp(&id(3), Tier::User, &digest(3));
+    assert!(
+        open_shell(
+            &h.policy,
+            id(3),
+            &user,
+            &digest(3),
+            &mut h.auths,
+            h.lock,
+            NOW,
+            true
+        )
+        .is_err()
+    );
+    h.shell_code(&id(3), Tier::User, &digest(3));
+    assert!(
+        open_shell(
+            &h.policy,
+            id(3),
+            &user,
+            &digest(3),
+            &mut h.auths,
+            h.lock,
+            NOW,
+            true
+        )
+        .is_ok()
+    );
+    // A shell code admits no job, armed or not.
+    h.shell_code(&id(4), Tier::User, &digest(4));
+    assert!(
+        h.start(&id(4), &run("user", &["whoami"]), &digest(4), None, false)
+            .is_err()
+    );
+    // Unlocking takes the root-unlock code; a root-arm code doesn't, and
+    // an unlock code doesn't arm.
+    let unlock = AcceptedCode::for_tests(SecretName::new(Tier::Root, Purpose::Unlock), 1);
+    assert!(ArmState::check_unlock(&ArmProof::Totp(arm_code(Tier::Root))).is_err());
+    assert!(ArmState::check_unlock(&ArmProof::Totp(unlock)).is_ok());
+    let unlock = AcceptedCode::for_tests(SecretName::new(Tier::Root, Purpose::Unlock), 2);
+    assert!(
+        h.arm
+            .arm(
+                &h.policy,
+                Tier::Root,
+                60,
+                ArmProof::Totp(unlock),
+                h.lock,
+                NOW
+            )
+            .is_err()
+    );
+    // The broker can't arm longer than this host's max_arm.
+    let until = h
+        .arm
+        .arm(
+            &h.policy,
+            Tier::Root,
+            999_999,
+            ArmProof::Totp(arm_code(Tier::Root)),
+            h.lock,
+            NOW,
+        )
+        .unwrap();
+    assert_eq!(until, NOW.plus_secs(u64::from(h.policy.root.max_arm_secs)));
 }
 
 #[test]
@@ -666,7 +836,8 @@ fn the_desk_approves_only_when_allowed_and_root_needs_polkit() {
         .0
         .contains("this desk doesn't approve root commands")
     );
-    // Armed: shown, but Allow is only a click.
+    // Armed: still refused. A desk Allow is never a click relayed on an
+    // armed tier (security review 2026-10, finding 1).
     h.arm
         .arm(
             &h.policy,
@@ -689,8 +860,10 @@ fn the_desk_approves_only_when_allowed_and_root_needs_polkit() {
             digest(1),
             &n,
             "m".into(),
-        ),
-        Ok(None)
+        )
+        .unwrap_err()
+        .0,
+        "this desk doesn't approve root commands"
     );
     h.policy.desk_approve_root = true;
     let prompt = desk_prompt(
@@ -705,7 +878,6 @@ fn the_desk_approves_only_when_allowed_and_root_needs_polkit() {
         &n,
         "m".into(),
     )
-    .unwrap()
     .unwrap();
     // No password: no approval.
     let prompt = desk_approval(prompt, true, h.lock, None).unwrap_err();
@@ -858,7 +1030,8 @@ fn any_source() -> impl Strategy<Value = Option<Source>> {
         Just(Some(Source::Human)),
         Just(Some(Source::Rule)),
         Just(Some(Source::Llm)),
-        Just(Some(Source::Policy))
+        Just(Some(Source::Policy)),
+        Just(Some(Source::Desk))
     ]
 }
 
@@ -914,6 +1087,40 @@ proptest! {
             Ok(v) => prop_assert!(v.is_armed() && armed, "{v:?}"),
             Err(_) => {}
         }
+    }
+
+    /// Security review 2026-10, finding 1: a desk answer is admission only
+    /// as the host's own recorded desk approval, which exists only when the
+    /// desk approves the tier; a desk click relayed on an armed tier admits
+    /// nothing.
+    #[test]
+    fn a_desk_click_is_never_armed_evidence(
+        tier in any_tier(), armed in any::<bool>(), approves in any::<bool>(),
+        window in any::<bool>(), approve_all in any::<bool>(), machine in any::<bool>(),
+    ) {
+        let mut h = Host::new();
+        for t in [&mut h.policy.user, &mut h.policy.root] {
+            t.accept_approve_all = approve_all;
+            t.accept_machine_approvals = machine;
+        }
+        h.policy.desk_approve_root = approves;
+        h.policy.desk_approve_user = approves;
+        if armed {
+            h.arm.arm(&h.policy, tier, 60, ArmProof::Local(LocalCaller::Root), h.lock, NOW).unwrap();
+        }
+        let raw = run(tier.as_str(), &["whoami"]);
+        let n = normalize(&h.policy, &raw, false).unwrap();
+        let prompt = desk_prompt(
+            HostView { policy: &h.policy, arm: &h.arm, lock: h.lock, now: NOW },
+            id(1), digest(1), &n, "m".into(),
+        );
+        prop_assert_eq!(prompt.is_ok(), approves);
+        // The broker's relay of the click: never admits.
+        prop_assert!(h.start(&id(1), &raw, &digest(1), Some(Source::Desk), window).is_err());
+        prop_assert_eq!(
+            Source::from_evidence(Some("human"), Some("desktop:excelsior")),
+            Some(Source::Desk)
+        );
     }
 
     /// Wrong codes are counted; within any window at most

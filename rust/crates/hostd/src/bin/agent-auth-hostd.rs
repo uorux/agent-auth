@@ -65,9 +65,14 @@ enum Cmd {
     },
     /// Create this host's TOTP secrets and show each ONCE (as a QR code).
     TotpEnroll {
-        /// Replace one secret: user-arm, user-direct, root-arm, root-direct.
+        /// Replace one secret: user-arm, user-direct, root-arm, root-direct,
+        /// user-shell, root-shell, root-unlock.
         #[arg(long)]
         rotate: Option<String>,
+        /// Enroll one optional secret: user-shell, root-shell (a root shell
+        /// needs it) or root-unlock (unlocking from the broker needs it).
+        #[arg(long, conflicts_with = "rotate")]
+        add: Option<String>,
         #[arg(long)]
         qrencode: Option<String>,
         #[command(flatten)]
@@ -228,7 +233,12 @@ async fn pair(source: Option<String>, common: Common) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn totp_enroll(rotate: Option<String>, qrencode: Option<String>, common: Common) -> ExitCode {
+fn totp_enroll(
+    rotate: Option<String>,
+    add: Option<String>,
+    qrencode: Option<String>,
+    common: Common,
+) -> ExitCode {
     let config = match &common.config {
         Some(path) => match HostConfig::load(path) {
             Ok(c) => Some(c),
@@ -248,12 +258,12 @@ fn totp_enroll(rotate: Option<String>, qrencode: Option<String>, common: Common)
         .as_ref()
         .map_or_else(default_name, |c| c.name.as_str().to_owned());
     let store = TotpStore::new(state_dir.join("totp"));
-    let names: Vec<SecretName> = match &rotate {
-        Some(n) => match SecretName::parse(n) {
+    let names: Vec<SecretName> = match (&rotate, &add) {
+        (Some(n), _) | (None, Some(n)) => match SecretName::parse(n) {
             Some(n) => vec![n],
             None => return fail(&format!("unknown TOTP secret {n:?}"), 1),
         },
-        None => SecretName::ALL
+        (None, None) => SecretName::ALL
             .into_iter()
             .filter(|n| !store.enrolled(*n))
             .collect(),
@@ -379,9 +389,10 @@ fn main() -> ExitCode {
             }
             Cmd::TotpEnroll {
                 rotate,
+                add,
                 qrencode,
                 common,
-            } => totp_enroll(rotate, qrencode, common),
+            } => totp_enroll(rotate, add, qrencode, common),
             Cmd::Run { common } => run(common).await,
             Cmd::User { config } => {
                 init_logging();

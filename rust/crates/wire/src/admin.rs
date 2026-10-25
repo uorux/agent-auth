@@ -401,7 +401,7 @@ pub struct LockdownResult {
     pub threads_closed: u32,
 }
 
-/// `POST /admin/unlock`. With a host and its root-arm code, the host's own
+/// `POST /admin/unlock`. With a host and its root-unlock code, the host's own
 /// lock is lifted too.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

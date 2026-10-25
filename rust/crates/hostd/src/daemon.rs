@@ -86,8 +86,23 @@ pub fn audit(host: &str, event: &str, fields: Value) {
     tracing::info!(target: "agent_auth.hostd.audit", "{line}");
 }
 
-fn source(s: Option<DecisionSource>) -> Option<Source> {
-    s.and_then(|s| Source::parse(s.as_str()))
+/// The broker's evidence; a desk click (`decided_by` `desktop:<host>`) is
+/// marked [`Source::Desk`], which arming never covers.
+fn source(s: Option<DecisionSource>, decided_by: Option<&str>) -> Option<Source> {
+    Source::from_evidence(s.map(DecisionSource::as_str), decided_by)
+}
+
+/// Prompt ids remembered so a broker can't show one again.
+pub const PROMPT_IDS_KEPT: usize = 4096;
+
+/// A prompt up at the desk: shown to the helper connection `conn` under
+/// `nonce` (what the helper answers with). `desk`: Allow there is this
+/// host's own approval of a command.
+#[derive(Debug)]
+struct ShownPrompt {
+    nonce: String,
+    conn: u64,
+    desk: Option<DeskPrompt>,
 }
 
 #[derive(Debug)]
@@ -101,6 +116,9 @@ struct RunningJob {
 struct Helper {
     conn: u64,
     pid: i32,
+    /// The process's start time, read when it connected (polkit asks about
+    /// that process, not one that took its pid later).
+    start_time: Option<u64>,
     tx: mpsc::Sender<String>,
 }
 
@@ -110,7 +128,10 @@ struct State {
     auths: Authorizations,
     jobs: BTreeMap<LocalId, RunningJob>,
     shells: BTreeMap<LocalId, (OpenShell, Option<AbortHandle>)>,
-    desk_prompts: BTreeMap<LocalId, DeskPrompt>,
+    /// By the broker's prompt id.
+    prompts: BTreeMap<LocalId, ShownPrompt>,
+    /// Every prompt id seen lately (never shown twice).
+    prompt_ids: std::collections::VecDeque<LocalId>,
     presence: Presence,
     /// Jobs still running from an earlier hostd (their units), killable.
     orphans: BTreeSet<LocalId>,
@@ -129,12 +150,17 @@ pub struct Hostd<E: Executor> {
     channel: OnceLock<Channel>,
     started_at: f64,
     user_uid: OnceLock<Option<u32>>,
+    /// Where processes are looked up (`/proc`; tests use a stand-in).
+    proc_root: OnceLock<std::path::PathBuf>,
     /// Locked down in memory too: holds even if the flag file could not
     /// be written (cleared by an unlock).
     locked: std::sync::atomic::AtomicBool,
     /// Tests move the TOTP clock forward to use more than two codes.
     #[cfg(test)]
     totp_skew: std::sync::atomic::AtomicU64,
+    /// Tests run this as an arming starts (a lockdown racing it).
+    #[cfg(test)]
+    arm_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     me: Weak<Hostd<E>>,
 }
 
@@ -175,9 +201,12 @@ impl<E: Executor> Hostd<E> {
             channel: OnceLock::new(),
             started_at: now_f64(),
             user_uid: OnceLock::new(),
+            proc_root: OnceLock::new(),
             locked: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             totp_skew: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            arm_hook: Mutex::new(None),
             me: me.clone(),
         })
     }
@@ -251,6 +280,21 @@ impl<E: Executor> Hostd<E> {
     /// (tests; a host whose account database hostd cannot read).
     pub fn pin_user_uid(&self, uid: Option<u32>) {
         let _ = self.user_uid.set(uid);
+    }
+
+    /// Look processes up under `root` instead of `/proc` (tests).
+    pub fn set_proc_root(&self, root: std::path::PathBuf) {
+        let _ = self.proc_root.set(root);
+    }
+
+    /// Refuse a local peer inside a job's unit, or one that can't be
+    /// placed ([`crate::peers`]).
+    pub fn check_peer(&self, pid: Option<i32>) -> Result<(), String> {
+        let root = self
+            .proc_root
+            .get()
+            .map_or(std::path::Path::new("/proc"), std::path::PathBuf::as_path);
+        crate::peers::check(root, pid)
     }
 
     /// The configured user's uid (looked up once).
@@ -393,11 +437,13 @@ impl<E: Executor> Hostd<E> {
             }
             BrokerToHost::Lockdown(l) => self.lockdown("the broker", l.kill_vm).await,
             BrokerToHost::Unlock(u) => {
-                let code = self.verify(
-                    SecretName::new(Tier::Root, Purpose::Arm),
-                    u.totp.expose(),
-                    None,
-                )?;
+                // Its own secret: a code typed to unlock can't arm (security
+                // review 2026-10, finding 4).
+                let name = SecretName::new(Tier::Root, Purpose::Unlock);
+                if !self.totp.enrolled(name) {
+                    return Err("this host has no root-unlock secret: unlock it with hostctl on the host, or enroll one (agent-auth-hostd totp-enroll root-unlock)".to_owned());
+                }
+                let code = self.verify(name, u.totp.expose(), None)?;
                 ArmState::check_unlock(&ArmProof::Totp(code)).map_err(refused)?;
                 self.unlock("root arm code via the broker").await
             }
@@ -408,13 +454,18 @@ impl<E: Executor> Hostd<E> {
             BrokerToHost::Prompt(p) => self.prompt(p).await,
             BrokerToHost::PromptCancel(c) => {
                 let id = LocalId::parse(&c.prompt_id.to_string()).map_err(refused)?;
-                let tx = {
+                let cancel = {
                     let mut st = self.state();
-                    st.desk_prompts.remove(&id);
-                    st.helper.as_ref().map(|h| h.tx.clone())
+                    let shown = st.prompts.remove(&id);
+                    shown.and_then(|p| {
+                        st.helper
+                            .as_ref()
+                            .filter(|h| h.conn == p.conn)
+                            .map(|h| (h.tx.clone(), p.nonce))
+                    })
                 };
-                if let Some(tx) = tx {
-                    let _ = tx.try_send(json!({"type": "cancel", "id": id.as_str()}).to_string());
+                if let Some((tx, nonce)) = cancel {
+                    let _ = tx.try_send(json!({"type": "cancel", "id": nonce}).to_string());
                 }
                 Ok(Map::new())
             }
@@ -442,6 +493,7 @@ impl<E: Executor> Hostd<E> {
                     Some(&tier),
                     Some(&json!(s.duration)),
                     self.lock_state(),
+                    self.shell_enrolled(Tier::from(s.tier)),
                 )
                 .map_err(refused)?;
                 Ok(data(json!({"needs": "totp"})))
@@ -458,7 +510,7 @@ impl<E: Executor> Hostd<E> {
                     j.totp,
                     job_id.as_deref(),
                     Evidence {
-                        source: source(j.source),
+                        source: source(j.source, None),
                         window: j.window,
                     },
                     &st.auths,
@@ -509,11 +561,15 @@ impl<E: Executor> Hostd<E> {
         if self.lock_state().is_locked() {
             return Err(format!("{} is locked down", self.name()));
         }
-        let code = self.verify(
-            SecretName::new(tier, Purpose::Direct),
-            a.totp.expose(),
-            Some(&job),
-        )?;
+        // The secret the code was typed for: a shell's is its own when
+        // enrolled (a root shell's always), so a code typed to approve one
+        // command doesn't open a shell (security review 2026-10, finding 4).
+        let secret = if a.shell {
+            core_hostd::shell_secret(tier, self.shell_enrolled(tier)).map_err(refused)?
+        } else {
+            SecretName::new(tier, Purpose::Direct)
+        };
+        let code = self.verify(secret, a.totp.expose(), Some(&job))?;
         let approval = TotpApproval::new(code, d.clone()).map_err(refused)?;
         let mut st = self.state();
         // A lockdown that landed while the code was checked wins.
@@ -527,6 +583,11 @@ impl<E: Executor> Hostd<E> {
             json!({"job": job.as_str(), "tier": tier.as_str(), "digest": d.as_str()}),
         );
         Ok(data(json!({"authorized": true})))
+    }
+
+    /// Is the tier's `{tier}-shell` secret enrolled?
+    fn shell_enrolled(&self, tier: Tier) -> bool {
+        self.totp.enrolled(SecretName::new(tier, Purpose::Shell))
     }
 
     fn already_ran(&self, st: &State, id: &LocalId) -> bool {
@@ -555,7 +616,10 @@ impl<E: Executor> Hostd<E> {
                 job,
                 &d,
                 Evidence {
-                    source: source(s.evidence.source),
+                    source: source(
+                        s.evidence.source,
+                        s.evidence.decided_by.as_ref().map(|d| d.as_str()),
+                    ),
                     window: s.evidence.window,
                 },
                 &mut st.auths,
@@ -719,6 +783,7 @@ impl<E: Executor> Hostd<E> {
         let raw = Value::Object(o.spec.into_map());
         let spec = core_hostd::parse_shell_request(&self.config.policy, &raw).map_err(refused)?;
         let d = spec_digest(&spec.to_json())?;
+        let enrolled = self.shell_enrolled(spec.tier());
         let mut st = self.state();
         let opened = core_hostd::open_shell(
             &self.config.policy,
@@ -728,6 +793,7 @@ impl<E: Executor> Hostd<E> {
             &mut st.auths,
             self.lock_state(),
             now_millis(),
+            enrolled,
         );
         let shell = match opened {
             Ok(s) => s,
@@ -848,12 +914,27 @@ impl<E: Executor> Hostd<E> {
         via: &str,
     ) -> Result<UnixMillis, String> {
         let now = now_millis();
-        let lock = self.lock_state();
-        let until = self
-            .state()
-            .arm
-            .arm(&self.config.policy, tier, secs, proof, lock, now)
-            .map_err(refused)?;
+        #[cfg(test)]
+        {
+            let hook = self
+                .arm_hook
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        // The lock is read under the state lock a lockdown disarms under,
+        // so an arming either sees the lockdown or is undone by it (security
+        // review 2026-10, finding 5).
+        let until = {
+            let mut st = self.state();
+            let lock = self.lock_state();
+            st.arm
+                .arm(&self.config.policy, tier, secs, proof, lock, now)
+                .map_err(refused)?
+        };
         let granted = until.0.saturating_sub(now.0) / 1000;
         self.audit(
             "arm",
@@ -877,8 +958,12 @@ impl<E: Executor> Hostd<E> {
     /// (also those left from an earlier hostd), and freeze or stop the VM.
     pub async fn lockdown(&self, via: &str, kill_vm: bool) -> HandlerResult {
         // The flag first; whatever happens to it, everything below still
-        // runs (stopping things never waits on the disk).
-        self.locked.store(true, std::sync::atomic::Ordering::SeqCst);
+        // runs (stopping things never waits on the disk). Set under the state
+        // lock arming reads it under.
+        {
+            let _st = self.state();
+            self.locked.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         let flag = fsutil::private_dir(&self.config.state_dir, 0o700)
             .and_then(|()| {
                 fsutil::write_atomic(
@@ -892,7 +977,7 @@ impl<E: Executor> Hostd<E> {
             let mut st = self.state();
             st.arm.disarm(None);
             st.auths.clear();
-            st.desk_prompts.clear();
+            st.prompts.clear();
             let shells: Vec<LocalId> = st.shells.keys().cloned().collect();
             let jobs: Vec<LocalId> = st.jobs.keys().cloned().collect();
             let orphans: Vec<LocalId> = st.orphans.iter().cloned().collect();
@@ -908,6 +993,10 @@ impl<E: Executor> Hostd<E> {
         // In parallel: one slow kill must not hold up the others (bug 17).
         let kills = jobs.iter().chain(orphans.iter()).map(|j| self.kill(j));
         futures::future::join_all(kills).await;
+        // And every job unit there is, whatever hostd knows of (security
+        // review 2026-10, finding 2).
+        let units = self.executor.running_jobs().await;
+        futures::future::join_all(units.iter().map(|j| self.executor.kill(j))).await;
         let mut vm = None;
         if let Some(unit) = &self.config.vm_unit {
             // From outside: nothing inside the guest is asked to cooperate.
@@ -1006,10 +1095,13 @@ impl<E: Executor> Hostd<E> {
 
     async fn prompt(&self, p: wire::Prompt) -> HandlerResult {
         let prompt_id = LocalId::parse(&p.prompt_id.to_string()).map_err(refused)?;
-        if self.state().desk_prompts.contains_key(&prompt_id) {
-            // An Allow on the dialog already up must not authorize another
-            // job (review 2026-10).
-            return Err("that prompt is already up".to_owned());
+        {
+            // A prompt id is shown once, ever (lately): an Allow on a dialog
+            // already up, or answered, or cancelled, must not authorize
+            // another job (review 2026-10).
+            if self.state().prompt_ids.contains(&prompt_id) {
+                return Err("that prompt is already up".to_owned());
+            }
         }
         if !self.present() {
             return Err("nobody is at this desktop".to_owned());
@@ -1022,15 +1114,17 @@ impl<E: Executor> Hostd<E> {
         let who = one_line(who_raw, PROMPT_WHO_MAX);
         let mut what = one_line(p.what.as_str(), PROMPT_WHAT_MAX);
         let mut detail = one_line(p.detail.as_str(), PROMPT_DETAIL_MAX);
+        let mut desk = None;
         if let Some(job) = &p.job {
             // What will run comes from this host, not from the broker's text.
-            let (w, extra) = self.desk_job(&prompt_id, job, &who)?;
+            let (w, extra, prompt) = self.desk_job(job, &who)?;
             what = w;
             detail = [extra, detail]
                 .into_iter()
                 .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
                 .join(" · ");
+            desk = Some(prompt);
         }
         let timeout = p
             .timeout
@@ -1040,32 +1134,63 @@ impl<E: Executor> Hostd<E> {
         } else {
             u64::from(timeout)
         };
-        let shown = self.to_helper(&json!({
-            "type": "prompt", "id": prompt_id.as_str(), "who": who, "what": what,
-            "detail": detail, "timeout": timeout,
-        }));
+        // The helper answers by a nonce of ours, over the connection it was
+        // shown on (security review 2026-10, findings 1d and 5).
+        let nonce = agent_auth_crypto::token_urlsafe(18).map_err(refused)?;
+        let approves = desk.is_some();
+        let shown = {
+            let mut st = self.state();
+            let sent = st.helper.as_ref().map(|h| {
+                let msg = json!({
+                    "type": "prompt", "id": nonce, "who": who, "what": what,
+                    "detail": detail, "timeout": timeout,
+                });
+                (h.conn, h.tx.try_send(msg.to_string()).is_ok())
+            });
+            match sent {
+                // Shown: its id is spent for good (checked again here, under
+                // the lock that records it).
+                Some((_, true)) if st.prompt_ids.contains(&prompt_id) => {
+                    return Err("that prompt is already up".to_owned());
+                }
+                Some((conn, true)) => {
+                    if st.prompt_ids.len() >= PROMPT_IDS_KEPT {
+                        st.prompt_ids.pop_front();
+                    }
+                    st.prompt_ids.push_back(prompt_id.clone());
+                    st.prompts
+                        .insert(prompt_id.clone(), ShownPrompt { nonce, conn, desk });
+                    true
+                }
+                Some((_, false)) => {
+                    tracing::warn!("the desktop helper is not reading; dropping it");
+                    st.helper = None;
+                    st.presence.connected = false;
+                    false
+                }
+                None => false,
+            }
+        };
         if !shown {
-            self.state().desk_prompts.remove(&prompt_id);
             return Err("nobody is at this desktop".to_owned());
         }
         self.audit(
             "prompt.shown",
             json!({"prompt": prompt_id.as_str(), "request": p.request_id.to_string()}),
         );
-        let approves = self.state().desk_prompts.contains_key(&prompt_id);
         Ok(data(json!({"shown": true, "approves": approves})))
     }
 
-    /// A prompt about a command on this host: (what, extra detail) from
-    /// what this host would run, the whole of it or a notice that it was
-    /// cut with the digest it approves (daemons bug 5). Registers a desk
-    /// prompt when Allow here approves it.
+    /// A prompt about a command on this host: (what, extra detail, the
+    /// desk approval it would be), from what this host would run, the
+    /// whole of it (daemons bug 5). Refused unless Allow at this desk is
+    /// itself this host's approval of it: a desk never relays a click for
+    /// a tier it doesn't approve (security review 2026-10, finding 1).
     fn desk_job(
         &self,
-        prompt_id: &LocalId,
         job: &wire::DeskJob,
         who: &str,
-    ) -> Result<(String, String), String> {
+    ) -> Result<(String, String, DeskPrompt), String> {
         let job_id = LocalId::parse(&job.job_id.to_string()).map_err(refused)?;
         let raw = Value::Object(job.spec.as_map().clone());
         let d = spec_digest(&raw)?;
@@ -1097,14 +1222,10 @@ impl<E: Executor> Hostd<E> {
         } else {
             format!("{who} asks to {what} ({extra})")
         };
-        let mut guard = self.state();
-        let st: &mut State = &mut guard;
+        let st = self.state();
         let prompt = core_hostd::desk_prompt(self.view(&st.arm), job_id, d, &normalized, message)
             .map_err(refused)?;
-        if let Some(prompt) = prompt {
-            st.desk_prompts.insert(prompt_id.clone(), prompt);
-        }
-        Ok((what, extra))
+        Ok((what, extra, prompt))
     }
 
     fn notify(&self, n: wire::Notify) -> HandlerResult {
@@ -1132,12 +1253,23 @@ impl<E: Executor> Hostd<E> {
     }
 
     /// hostd-user attached (its uid was checked): it replaces any earlier
-    /// helper connection. Returns the connection's id and its outbox.
-    pub async fn helper_attached(&self, conn: u64, pid: i32) -> mpsc::Receiver<String> {
+    /// helper connection. Returns the connection's outbox. `start_time`:
+    /// the process's start time, read now.
+    pub async fn helper_attached(
+        &self,
+        conn: u64,
+        pid: i32,
+        start_time: Option<u64>,
+    ) -> mpsc::Receiver<String> {
         let (tx, rx) = mpsc::channel(HELPER_QUEUE);
         {
             let mut st = self.state();
-            st.helper = Some(Helper { conn, pid, tx });
+            st.helper = Some(Helper {
+                conn,
+                pid,
+                start_time,
+                tx,
+            });
             st.presence.connected = true;
         }
         self.presence_changed().await;
@@ -1200,34 +1332,53 @@ impl<E: Executor> Hostd<E> {
         }
     }
 
-    /// The desk answered a prompt (over connection `conn`). For a command
-    /// on this host, Allow is this host's own approval of exactly what it
+    /// The desk answered a prompt (`nonce`, over connection `conn`). Only
+    /// the connection the prompt was shown on answers it. For a command on
+    /// this host, Allow is this host's own approval of exactly what it
     /// showed (with the user's password, for root).
-    pub async fn answered(&self, prompt: &str, answer: &str, conn: u64) {
+    pub async fn answered(&self, nonce: &str, answer: &str, conn: u64) {
         let mut answer = match answer {
             "allow" | "deny" | "mute" | "discord" | "timeout" => answer.to_owned(),
             _ => "timeout".to_owned(),
         };
-        let Ok(prompt_id) = LocalId::parse(prompt) else {
-            return;
-        };
-        let (desk, current, pid) = {
+        let (prompt_id, desk, pid, start_time) = {
             let mut st = self.state();
-            let desk = st.desk_prompts.remove(&prompt_id);
             let current = st.helper.as_ref().filter(|h| h.conn == conn);
-            (desk, current.is_some(), current.map_or(0, |h| h.pid))
+            let (pid, start_time) = current.map_or((0, None), |h| (h.pid, h.start_time));
+            let current = current.is_some();
+            let found = st
+                .prompts
+                .iter()
+                .find(|(_, p)| p.nonce == nonce)
+                .map(|(id, p)| (id.clone(), p.conn));
+            match found {
+                Some((id, shown_on)) if shown_on == conn && current => {
+                    let shown = st.prompts.remove(&id);
+                    (id, shown.and_then(|p| p.desk), pid, start_time)
+                }
+                Some((id, _)) => {
+                    drop(st);
+                    tracing::warn!(prompt = %id, "a desk answer from another connection was ignored");
+                    self.audit(
+                        "prompt.answer.ignored",
+                        json!({"prompt": id.as_str(), "why": "not the connection it was shown on"}),
+                    );
+                    return;
+                }
+                None => return,
+            }
         };
         let mut authorized = false;
         if let Some(desk) = desk
             && answer == "allow"
         {
             let mut polkit = None;
-            if desk.tier() == Tier::Root && current && !self.lock_state().is_locked() {
+            if desk.tier() == Tier::Root && !self.lock_state().is_locked() {
                 let uid = self.user_uid().await.unwrap_or(u32::MAX);
                 polkit = self
                     .executor
                     .polkit_auth(
-                        pid,
+                        crate::executor::Process { pid, start_time },
                         uid,
                         desk.message(),
                         Duration::from_secs(self.config.desktop.prompt_timeout_secs),
@@ -1236,12 +1387,12 @@ impl<E: Executor> Hostd<E> {
             }
             let job = desk.job().clone();
             let tier = desk.tier();
-            // Still the current helper and still unlocked, after the password.
-            let still_current = self.state().helper.as_ref().is_some_and(|h| h.conn == conn);
             // Decided and recorded under the state lock: a lockdown that
             // landed during the password dialog either is seen here or
-            // clears this approval after (review 2026-10).
+            // clears this approval after (review 2026-10). Still the current
+            // helper, after the password.
             let mut st = self.state();
+            let still_current = st.helper.as_ref().is_some_and(|h| h.conn == conn);
             let decided = core_hostd::desk_approval(desk, still_current, self.lock_state(), polkit);
             match decided {
                 Ok((job, approval)) => {
@@ -1291,6 +1442,17 @@ impl<E: Executor> Hostd<E> {
                 count = leftover.len(),
                 "jobs from an earlier hostd are still running"
             );
+        }
+        if self.lock_state().is_locked() {
+            // Locked down: they stop before anything else happens (security
+            // review 2026-10, finding 2).
+            futures::future::join_all(leftover.iter().map(|j| self.executor.kill(j))).await;
+            for id in &leftover {
+                self.audit(
+                    "job.kill",
+                    json!({"job": id.as_str(), "why": "locked down at startup"}),
+                );
+            }
         }
         let mut st = self.state();
         st.orphans.extend(leftover);

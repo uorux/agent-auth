@@ -1045,11 +1045,65 @@ Upstream fixes of review 2026-10, adopted:
   request's would be); a template request carrying any of them is refused
   on the host ("template 'x' takes no cwd/environment/stdin"). The broker
   still validates the request shape; the host is authoritative.
-- **Handshake slots**: at most 4 unauthenticated handshakes per peer
-  address (X-Real-IP when trusted) and 32 overall; the hello timeout is
-  5 s (was 10 s).
+- **Handshake slots**: at most 32 unauthenticated handshakes overall, and
+  4 per address only when the address is believed (a trusted proxy's
+  `X-Real-IP`; behind an untrusted proxy every daemon would share one
+  address); the hello timeout is 5 s (was 10 s).
 - **Every TOTP refusal is logged as a warning** besides its audit record;
   lockouts escalate as before.
+
+Security review 2026-10 (hostd/hostexec), fixed:
+- **1 (HIGH) A desk click no longer forges a human approval.** hostd asks
+  at its desk only about commands of a tier its desk approves
+  (`desktop.approve.<tier>`): no prompt, so no click to relay, on a tier
+  that is merely armed. The broker applies a desk Allow for a host command
+  only from that host's own desk and only when hostd reports
+  `authorized: true` (its own recorded desk approval, polkit-confirmed for
+  root); otherwise it is ignored and logged. Desk evidence is marked
+  (`decided_by` `desktop:<host>` reads as source `desk` on the host) and
+  arming never covers it. An answer counts only from the helper connection
+  the prompt was shown on, keyed by a nonce hostd makes (the broker's
+  prompt id never reaches the helper). Host commands are no longer asked
+  at other hosts' desks (no desk approves another host's tier). A Kani
+  harness (`hostd_desk_click_never_admits`) and property tests check that
+  desk evidence admits nothing without the host's own approval.
+- **1e/6 Local peers inside a job are refused**: ctl.sock and the desktop
+  helper's registration on user.sock refuse a process whose
+  `/proc/<pid>/cgroup` is in an `aa-job-*` unit, read on hostd's side and
+  failing closed. Gaps: macOS has no equivalent (launchd marks nothing a
+  peer can see), and a user-tier job that reaches the user's service
+  manager (`systemd-run --user`) can start a process outside its unit;
+  the check also reads the pid after connect (a pid reused in between is
+  possible, narrowly).
+- **2 A kill before the unit exists is not lost** (Linux): after a kill,
+  `systemctl stop` repeats every 250 ms until `systemd-run` exits.
+  Lockdown also stops every `aa-job-*` unit `running_jobs()` lists, and
+  hostd, starting locked down, stops leftover units before anything else.
+- **3 Local sockets are bounded**: the caller is admitted (uid, and the
+  job check) before anything is read; at most 8 connections per uid and
+  64 overall; a request line must arrive within 60 s; ctl.sock lines are at
+  most 4 KiB. The NixOS hostd unit gets `LimitNOFILE=65536`.
+- **4 A TOTP code is bound to what it was typed for.** New optional
+  secrets `user-shell`, `root-shell`, `root-unlock` (`agent-auth-hostd
+  totp-enroll --add <name>`). A shell is opened with its tier's shell code
+  when that secret is enrolled (a direct code then opens no shell, and a
+  shell code admits no job); a root shell needs `root-shell` (a direct
+  code never opens one). Unlocking from the broker takes `root-unlock`
+  (a root-arm code no longer unlocks, so a code typed to unlock can't arm);
+  without it, unlock locally with hostctl. Arm durations were already
+  capped by hostd's own `max_arm`. `hostexec.authorize` carries
+  `shell: true` for shells.
+- **5** Arming reads the lock under the state lock a lockdown disarms
+  under. A prompt id is shown at most once (kept for the last 4096). A
+  TOTP failure that can't be written to disk locks that secret in memory
+  until root clears it. polkit is asked about the helper process as it
+  was when it connected (pid and start time read then). Linux jobs stop
+  reading output 5 s after `systemd-run` exits, so a process outside the
+  unit holding the pipe doesn't keep the job open (macOS already did).
+- **6** Ed25519 public keys that are small-order points (the identity
+  among them, either sign, canonical or not) are refused when parsed. A
+  daemon session shorter than 30 s backs off like a failure (no 1 Hz
+  reconnect loop against a broker that welcomes and drops).
 
 ## Open questions
 
@@ -1065,6 +1119,16 @@ Upstream fixes of review 2026-10, adopted:
   passes on an auto pattern** (bug 13): kept as in the Python.
 - **TOTP hard-lock thresholds** (20 wrong codes in 30 days) are a guess at
   the right balance between typos and relayed guessing; tune?
+- **Root shells now need a `root-shell` secret** (security review
+  2026-10, finding 4): with only the four original secrets a root shell is
+  refused. The review also allowed a polkit desk approval instead; that
+  path isn't built (shells are approved on Discord only). Build it, or keep
+  root shells TOTP-only? Likewise remote unlock now needs `root-unlock`.
+- **A user-tier job can reach the user's service manager** and start a
+  process outside its unit, past the `aa-job-*` peer check (and so arm
+  the user tier via hostctl, or act as the desk helper). Close it by
+  denying job units the user bus (`InaccessiblePaths=/run/user/<uid>/bus`
+  and `.../systemd`, which breaks `systemctl --user` in jobs), or accept?
 
 - **Panel logout is client-side only** (Bug-B1, unchanged): a copied
   session cookie stays valid until its `exp` (8 h). A server-side session

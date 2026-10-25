@@ -68,6 +68,16 @@ impl Broker {
     }
 
     pub async fn start_with(pool: sqlx::PgPool, policy: &str, heartbeat_secs: u32) -> Broker {
+        Broker::start_full(pool, policy, heartbeat_secs, false).await
+    }
+
+    /// Behind a trusted proxy (`X-Real-IP` believed) or not.
+    pub async fn start_full(
+        pool: sqlx::PgPool,
+        policy: &str,
+        heartbeat_secs: u32,
+        trust_x_real_ip: bool,
+    ) -> Broker {
         let store = Store::from_pool(pool);
         let policy = Policy::from_yaml(policy).unwrap();
         let key = SigningKey::generate().unwrap();
@@ -77,7 +87,7 @@ impl Broker {
             AuthConfig {
                 admin_token: Some(Secret::new("admin-token".to_owned())),
                 oauth_enabled: false,
-                trust_x_real_ip: false,
+                trust_x_real_ip,
             },
         );
         let part = HostdPart::build(
@@ -293,7 +303,7 @@ impl Host {
         let hostd = Hostd::new(config, exec);
         hostd.pin_user_uid(Some(4242));
         let mut secrets = BTreeMap::new();
-        for name in agent_auth_core::hostd::totp::SecretName::ALL {
+        for name in agent_auth_core::hostd::totp::SecretName::every() {
             secrets.insert(
                 name.as_str().to_owned(),
                 hostd.totp().enroll(name, false).unwrap(),
