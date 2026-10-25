@@ -11,7 +11,7 @@ use agent_auth_core::policy::schema::{McpConfig, McpServer};
 use agent_auth_core::{Authority, Platform};
 use agent_auth_crypto::jwt::TokenIssuer;
 use agent_auth_store::agents::{self, AgentRow};
-use agent_auth_store::grants::{GrantRow, IssuableGrant};
+use agent_auth_store::grants::{GrantRow, IssuableGrant, ProvisioningGrant};
 use agent_auth_store::{StoreError, Tx};
 use agent_auth_wire::catalog::{McpServerEntry, PlatformCatalog};
 use serde_json::{Map, Value, json};
@@ -184,12 +184,13 @@ impl Provisioner for McpProvisioner {
         Ok(self.validate_spec(&spec))
     }
 
-    async fn provision(
+    async fn provision<'t>(
         &self,
-        _tx: &Tx<'_>,
-        grant: &GrantRow,
+        _tx: &'t Tx<'_>,
+        grant: &ProvisioningGrant<'t>,
         _now: OffsetDateTime,
     ) -> Result<Value, ProvisionError> {
+        let grant = grant.grant();
         if !self.config.servers.contains_key(grant.resource.as_str()) {
             return Err(Self::gone(&grant.resource));
         }
@@ -205,10 +206,10 @@ impl Provisioner for McpProvisioner {
         Ok(()) // nothing changed anywhere; tokens stop being issued
     }
 
-    async fn credential(
+    async fn credential<'t>(
         &self,
-        tx: &Tx<'_>,
-        issuable: &IssuableGrant<'_>,
+        tx: &'t Tx<'_>,
+        issuable: &IssuableGrant<'t>,
         now: OffsetDateTime,
     ) -> Result<Credential, ProvisionError> {
         let grant = issuable.grant();

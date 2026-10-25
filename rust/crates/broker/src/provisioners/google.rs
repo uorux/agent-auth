@@ -3,7 +3,7 @@
 
 use agent_auth_core::{Authority, Platform};
 use agent_auth_store::agents::AgentRow;
-use agent_auth_store::grants::{GrantRow, IssuableGrant};
+use agent_auth_store::grants::{GrantRow, IssuableGrant, ProvisioningGrant};
 use agent_auth_store::{StoreError, Tx};
 use agent_auth_wire::catalog::PlatformCatalog;
 use serde_json::{Value, json};
@@ -54,10 +54,10 @@ impl Provisioner for GoogleProvisioner {
         }))
     }
 
-    async fn provision(
+    async fn provision<'t>(
         &self,
-        _tx: &Tx<'_>,
-        _grant: &GrantRow,
+        _tx: &'t Tx<'_>,
+        _grant: &ProvisioningGrant<'t>,
         _now: OffsetDateTime,
     ) -> Result<Value, ProvisionError> {
         Ok(json!({"stub": true}))
@@ -72,10 +72,10 @@ impl Provisioner for GoogleProvisioner {
         Ok(())
     }
 
-    async fn credential(
+    async fn credential<'t>(
         &self,
-        _tx: &Tx<'_>,
-        _grant: &IssuableGrant<'_>,
+        _tx: &'t Tx<'_>,
+        _grant: &IssuableGrant<'t>,
         _now: OffsetDateTime,
     ) -> Result<Credential, ProvisionError> {
         Err(ProvisionError::NotImplemented)

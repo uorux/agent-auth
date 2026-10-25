@@ -10,7 +10,8 @@
 //!   It runs at request time and again on approval with the final
 //!   (possibly human-edited) resource and authority.
 //! - `provision` applies the grant externally, idempotently, for a grant
-//!   row already committed in status `provisioning` (so a crash leaves
+//!   row already committed in status `provisioning` (a `ProvisioningGrant`
+//!   loaded in the finishing transaction) (so a crash leaves
 //!   evidence for the reaper). Its JSON result is stored as the grant's
 //!   `provisioner_state`.
 //! - `revoke` removes external access, idempotently, and must cope with an
@@ -41,7 +42,7 @@ use agent_auth_core::{Authority, Platform};
 use agent_auth_crypto::Secret;
 use agent_auth_store::Tx;
 use agent_auth_store::agents::AgentRow;
-use agent_auth_store::grants::{GrantRow, IssuableGrant};
+use agent_auth_store::grants::{GrantRow, IssuableGrant, ProvisioningGrant};
 use serde_json::Value;
 use time::OffsetDateTime;
 
@@ -108,10 +109,12 @@ pub trait Provisioner {
         now: OffsetDateTime,
     ) -> impl Future<Output = Result<Result<Validated, Refused>, agent_auth_store::StoreError>> + Send;
 
-    fn provision(
+    /// For a grant row committed PROVISIONING and loaded (locked) in this
+    /// transaction (`store::grants::load_provisioning`).
+    fn provision<'t>(
         &self,
-        tx: &Tx<'_>,
-        grant: &GrantRow,
+        tx: &'t Tx<'_>,
+        grant: &ProvisioningGrant<'t>,
         now: OffsetDateTime,
     ) -> impl Future<Output = Result<Value, ProvisionError>> + Send;
 
@@ -122,10 +125,11 @@ pub trait Provisioner {
         now: OffsetDateTime,
     ) -> impl Future<Output = Result<(), ProvisionError>> + Send;
 
-    fn credential(
+    /// For a grant `store::grants::issuable` cleared in this transaction.
+    fn credential<'t>(
         &self,
-        tx: &Tx<'_>,
-        grant: &IssuableGrant<'_>,
+        tx: &'t Tx<'_>,
+        grant: &IssuableGrant<'t>,
         now: OffsetDateTime,
     ) -> impl Future<Output = Result<Credential, ProvisionError>> + Send;
 
@@ -213,10 +217,10 @@ impl Provisioner for AnyProvisioner {
     ) -> Result<Result<Validated, Refused>, agent_auth_store::StoreError> {
         dispatch!(self, p => p.validate(tx, spec, now).await)
     }
-    async fn provision(
+    async fn provision<'t>(
         &self,
-        tx: &Tx<'_>,
-        grant: &GrantRow,
+        tx: &'t Tx<'_>,
+        grant: &ProvisioningGrant<'t>,
         now: OffsetDateTime,
     ) -> Result<Value, ProvisionError> {
         dispatch!(self, p => p.provision(tx, grant, now).await)
@@ -229,10 +233,10 @@ impl Provisioner for AnyProvisioner {
     ) -> Result<(), ProvisionError> {
         dispatch!(self, p => p.revoke(tx, grant, now).await)
     }
-    async fn credential(
+    async fn credential<'t>(
         &self,
-        tx: &Tx<'_>,
-        grant: &IssuableGrant<'_>,
+        tx: &'t Tx<'_>,
+        grant: &IssuableGrant<'t>,
         now: OffsetDateTime,
     ) -> Result<Credential, ProvisionError> {
         dispatch!(self, p => p.credential(tx, grant, now).await)
@@ -250,6 +254,8 @@ pub struct FakeProvisioner {
     pub calls: std::sync::Mutex<Vec<String>>,
     /// When set, provision fails with this text.
     pub fail_provision: Option<String>,
+    /// `(resource, text)`: validation refuses that resource with that text.
+    pub refusals: Vec<(String, String)>,
 }
 
 impl FakeProvisioner {
@@ -259,6 +265,7 @@ impl FakeProvisioner {
             platform,
             calls: std::sync::Mutex::new(Vec::new()),
             fail_provision: None,
+            refusals: Vec::new(),
         }
     }
     fn record(&self, what: String) {
@@ -279,19 +286,22 @@ impl Provisioner for FakeProvisioner {
         spec: RequestSpec<'_>,
         _now: OffsetDateTime,
     ) -> Result<Result<Validated, Refused>, agent_auth_store::StoreError> {
+        if let Some((_, text)) = self.refusals.iter().find(|(r, _)| *r == spec.resource) {
+            return Ok(Err(Refused(text.clone())));
+        }
         Ok(Ok(Validated {
             resource: spec.resource,
             authority: spec.authority,
             notes: Vec::new(),
         }))
     }
-    async fn provision(
+    async fn provision<'t>(
         &self,
-        _tx: &Tx<'_>,
-        grant: &GrantRow,
+        _tx: &'t Tx<'_>,
+        grant: &ProvisioningGrant<'t>,
         _now: OffsetDateTime,
     ) -> Result<Value, ProvisionError> {
-        self.record(format!("provision {}", grant.id));
+        self.record(format!("provision {}", grant.grant().id));
         match &self.fail_provision {
             Some(msg) => Err(ProvisionError::failed(msg.clone())),
             None => Ok(serde_json::json!({"fake": true})),
@@ -306,14 +316,15 @@ impl Provisioner for FakeProvisioner {
         self.record(format!("revoke {}", grant.id));
         Ok(())
     }
-    async fn credential(
+    async fn credential<'t>(
         &self,
-        _tx: &Tx<'_>,
-        grant: &IssuableGrant<'_>,
+        _tx: &'t Tx<'_>,
+        grant: &IssuableGrant<'t>,
         _now: OffsetDateTime,
     ) -> Result<Credential, ProvisionError> {
         Ok(Credential {
-            kind: "fake".to_owned(),
+            // A real kind, so the credential route can serve it in tests.
+            kind: "a2a_grant".to_owned(),
             note: Some(grant.grant().resource.clone()),
             ..Credential::default()
         })

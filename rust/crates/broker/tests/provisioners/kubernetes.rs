@@ -12,7 +12,7 @@ use agent_auth_core::authority::KubernetesAuthority;
 use agent_auth_core::policy::Policy;
 use agent_auth_core::policy::schema::KubernetesConfig;
 use agent_auth_core::{Authority, Glob, Platform};
-use agent_auth_store::Store;
+use agent_auth_store::{Store, grants};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
@@ -471,7 +471,9 @@ async fn a_half_made_provision_leaves_nothing_behind(pool: PgPool) {
     t.state.lock().unwrap().fail_post = None;
     let g = provisioning(&t.store, a.id, &role("view", false), "apps-a", 3600).await;
     let tx = t.store.begin().await.unwrap();
-    let _ = t.p.provision(&tx, &g, now()).await.unwrap();
+    let pg = grants::load_provisioning(&tx, g.id).await.unwrap().unwrap();
+    let _ = t.p.provision(&tx, &pg, now()).await.unwrap();
+    drop(pg);
     tx.rollback().await.unwrap();
     assert_eq!(t.objects().len(), 2);
     reap(&t.store, &t.p, &g).await.unwrap();

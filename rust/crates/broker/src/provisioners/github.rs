@@ -21,7 +21,7 @@ use agent_auth_crypto::Secret;
 use agent_auth_crypto::jwt::GitHubAppKey;
 use agent_auth_crypto::secretbox::{Binding, SecretBox};
 use agent_auth_store::agents::AgentRow;
-use agent_auth_store::grants::{GrantRow, IssuableGrant};
+use agent_auth_store::grants::{GrantRow, IssuableGrant, ProvisioningGrant};
 use agent_auth_store::{StoreError, Tx, credentials, grants};
 use agent_auth_wire::catalog::PlatformCatalog;
 use reqwest::Method;
@@ -988,12 +988,13 @@ impl Provisioner for GithubProvisioner {
         Ok(out)
     }
 
-    async fn provision(
+    async fn provision<'t>(
         &self,
-        tx: &Tx<'_>,
-        grant: &GrantRow,
+        tx: &'t Tx<'_>,
+        grant: &ProvisioningGrant<'t>,
         now: OffsetDateTime,
     ) -> Result<Value, ProvisionError> {
+        let grant = grant.grant();
         match &grant.authority {
             Authority::Github(GithubAuthority::Create { visibility }) => {
                 self.create(tx, grant, *visibility, now).await
@@ -1050,10 +1051,10 @@ impl Provisioner for GithubProvisioner {
         Ok(())
     }
 
-    async fn credential(
+    async fn credential<'t>(
         &self,
-        tx: &Tx<'_>,
-        issuable: &IssuableGrant<'_>,
+        tx: &'t Tx<'_>,
+        issuable: &IssuableGrant<'t>,
         now: OffsetDateTime,
     ) -> Result<Credential, ProvisionError> {
         let grant = issuable.grant();

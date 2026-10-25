@@ -8,7 +8,7 @@ use agent_auth_core::containment::AgentKind;
 use agent_auth_core::pyfmt::repr;
 use agent_auth_core::{Authority, Platform};
 use agent_auth_store::agents::{self, AgentRow};
-use agent_auth_store::grants::{GrantRow, IssuableGrant};
+use agent_auth_store::grants::{GrantRow, IssuableGrant, ProvisioningGrant};
 use agent_auth_store::{StoreError, Tx};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -63,10 +63,10 @@ impl Provisioner for A2aProvisioner {
         }))
     }
 
-    async fn provision(
+    async fn provision<'t>(
         &self,
-        _tx: &Tx<'_>,
-        _grant: &GrantRow,
+        _tx: &'t Tx<'_>,
+        _grant: &ProvisioningGrant<'t>,
         _now: OffsetDateTime,
     ) -> Result<Value, ProvisionError> {
         Ok(json!({"mode": "check_based"}))
@@ -81,10 +81,10 @@ impl Provisioner for A2aProvisioner {
         Ok(())
     }
 
-    async fn credential(
+    async fn credential<'t>(
         &self,
-        _tx: &Tx<'_>,
-        _grant: &IssuableGrant<'_>,
+        _tx: &'t Tx<'_>,
+        _grant: &IssuableGrant<'t>,
         _now: OffsetDateTime,
     ) -> Result<Credential, ProvisionError> {
         Ok(Credential {

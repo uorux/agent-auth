@@ -20,7 +20,7 @@ use agent_auth_core::policy::schema::KubernetesConfig;
 use agent_auth_core::{Authority, Glob, Platform, zones};
 use agent_auth_crypto::Secret;
 use agent_auth_store::agents::{self, AgentRow};
-use agent_auth_store::grants::{GrantRow, IssuableGrant};
+use agent_auth_store::grants::{GrantRow, IssuableGrant, ProvisioningGrant};
 use agent_auth_store::{StoreError, Tx};
 use agent_auth_wire::catalog::{CatalogEntry, PlatformCatalog};
 use reqwest::Method;
@@ -808,12 +808,13 @@ impl Provisioner for KubernetesProvisioner {
         Ok(self.validate_spec(&spec))
     }
 
-    async fn provision(
+    async fn provision<'t>(
         &self,
-        tx: &Tx<'_>,
-        grant: &GrantRow,
+        tx: &'t Tx<'_>,
+        grant: &ProvisioningGrant<'t>,
         _now: OffsetDateTime,
     ) -> Result<Value, ProvisionError> {
+        let grant = grant.grant();
         self.provision_grant(tx, grant).await
     }
 
@@ -826,10 +827,10 @@ impl Provisioner for KubernetesProvisioner {
         self.revoke_grant(tx, grant).await
     }
 
-    async fn credential(
+    async fn credential<'t>(
         &self,
-        _tx: &Tx<'_>,
-        issuable: &IssuableGrant<'_>,
+        _tx: &'t Tx<'_>,
+        issuable: &IssuableGrant<'t>,
         now: OffsetDateTime,
     ) -> Result<Credential, ProvisionError> {
         self.credential_for(issuable.grant(), now).await

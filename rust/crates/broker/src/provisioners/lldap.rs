@@ -25,7 +25,7 @@ use agent_auth_core::{AgentId, Authority, Platform};
 use agent_auth_crypto::Secret;
 use agent_auth_crypto::secretbox::{Binding, SecretBox};
 use agent_auth_store::agents::{self, AgentRow};
-use agent_auth_store::grants::{self, GrantRow, IssuableGrant};
+use agent_auth_store::grants::{self, GrantRow, IssuableGrant, ProvisioningGrant};
 use agent_auth_store::{StoreError, Tx};
 use agent_auth_wire::catalog::{CatalogEntry, PlatformCatalog};
 use reqwest::Method;
@@ -558,12 +558,13 @@ impl Provisioner for LldapProvisioner {
         }))
     }
 
-    async fn provision(
+    async fn provision<'t>(
         &self,
-        tx: &Tx<'_>,
-        grant: &GrantRow,
+        tx: &'t Tx<'_>,
+        grant: &ProvisioningGrant<'t>,
         _now: OffsetDateTime,
     ) -> Result<Value, ProvisionError> {
+        let grant = grant.grant();
         self.provision_grant(tx, grant).await
     }
 
@@ -617,10 +618,10 @@ impl Provisioner for LldapProvisioner {
         self.mutate(REMOVE, &user, group, false).await
     }
 
-    async fn credential(
+    async fn credential<'t>(
         &self,
-        tx: &Tx<'_>,
-        issuable: &IssuableGrant<'_>,
+        tx: &'t Tx<'_>,
+        issuable: &IssuableGrant<'t>,
         _now: OffsetDateTime,
     ) -> Result<Credential, ProvisionError> {
         let grant = issuable.grant();

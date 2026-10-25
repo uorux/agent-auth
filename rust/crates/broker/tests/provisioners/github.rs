@@ -11,7 +11,7 @@ use agent_auth_broker::provisioners::http::Http;
 use agent_auth_core::authority::{GithubAccess, GithubAuthority, Visibility};
 use agent_auth_core::policy::schema::GithubConfig;
 use agent_auth_core::{Authority, Glob, Platform};
-use agent_auth_store::{Store, lockdown};
+use agent_auth_store::{Store, grants, lockdown};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use time::format_description::well_known::Rfc3339;
@@ -638,7 +638,10 @@ async fn a_cancelled_create_still_revokes_the_admin_token(pool: PgPool) {
     .await;
     let tx = t.store.begin().await.unwrap();
     let _held = lockdown::check(&tx, a.id, now()).await.unwrap().unwrap();
-    let out = tokio::time::timeout(Duration::from_millis(500), t.p.provision(&tx, &g, now())).await;
+    let pg = grants::load_provisioning(&tx, g.id).await.unwrap().unwrap();
+    let out =
+        tokio::time::timeout(Duration::from_millis(500), t.p.provision(&tx, &pg, now())).await;
+    drop(pg);
     assert!(out.is_err(), "the create should still be pending");
     drop(_held);
     tx.rollback().await.unwrap();

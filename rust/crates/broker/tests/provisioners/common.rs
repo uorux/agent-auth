@@ -283,7 +283,7 @@ pub async fn provision<P: Provisioner>(
         .await
         .unwrap()
         .unwrap();
-    let out = p.provision(&tx, pg.grant(), now()).await;
+    let out = p.provision(&tx, &pg, now()).await;
     let res = match out {
         Ok(state) => {
             let g = grants::activate(&tx, pg, &nh, &state)

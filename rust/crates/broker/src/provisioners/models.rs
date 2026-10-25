@@ -16,7 +16,7 @@ use agent_auth_core::{Authority, Platform};
 use agent_auth_crypto::Secret;
 use agent_auth_crypto::secretbox::{Binding, SecretBox};
 use agent_auth_store::agents::{self, AgentRow};
-use agent_auth_store::grants::{GrantRow, IssuableGrant};
+use agent_auth_store::grants::{GrantRow, IssuableGrant, ProvisioningGrant};
 use agent_auth_store::{StoreError, Tx};
 use agent_auth_wire::catalog::{GatewayEntry, PlatformCatalog};
 use futures::StreamExt as _;
@@ -412,12 +412,13 @@ impl Provisioner for ModelsProvisioner {
         }))
     }
 
-    async fn provision(
+    async fn provision<'t>(
         &self,
-        tx: &Tx<'_>,
-        grant: &GrantRow,
+        tx: &'t Tx<'_>,
+        grant: &ProvisioningGrant<'t>,
         now: OffsetDateTime,
     ) -> Result<Value, ProvisionError> {
+        let grant = grant.grant();
         self.provision_grant(tx, grant, now).await
     }
 
@@ -430,10 +431,10 @@ impl Provisioner for ModelsProvisioner {
         self.revoke_grant(grant).await
     }
 
-    async fn credential(
+    async fn credential<'t>(
         &self,
-        _tx: &Tx<'_>,
-        issuable: &IssuableGrant<'_>,
+        _tx: &'t Tx<'_>,
+        issuable: &IssuableGrant<'t>,
         _now: OffsetDateTime,
     ) -> Result<Credential, ProvisionError> {
         let grant = issuable.grant();
