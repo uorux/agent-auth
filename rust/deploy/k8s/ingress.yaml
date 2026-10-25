@@ -1,0 +1,20 @@
+# The broker's own auth (API keys, the admin token, the panel's OIDC
+# sign-in, OAuth for remote MCP): no forward-auth in front of it. Paired
+# daemons hold a WebSocket at /v1/daemons/connect; long-polls last up to
+# 300 s (keep any proxy's read timeout above 330 s).
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: agent-auth
+  namespace: agent-auth
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`agent-auth.rooty.dev`) || Host(`agent-auth.k8s.rooty.dev`)
+      kind: Rule
+      services:
+        - name: agent-auth
+          port: 80
+  tls:
+    secretName: rooty-dev-wildcard

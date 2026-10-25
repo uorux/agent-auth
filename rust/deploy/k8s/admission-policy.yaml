@@ -1,0 +1,78 @@
+# What RBAC cannot say: the broker's ServiceAccount may create, delete and
+# mint tokens only for the grants' own objects (upstream review 2026-10:
+# an unrestricted `serviceaccounts/token create` would let the broker's
+# credential mint a token for any ServiceAccount where it is bound). For
+# requests made as system:serviceaccount:agent-auth:agent-auth:
+#   - every object it creates or deletes, and every token it requests, is
+#     named aa-* (the provisioner's names: aa-<agent>-<grant id>);
+#   - ServiceAccounts and their tokens only in agent-auth-grants;
+#   - a binding it creates binds a ClusterRole to exactly one subject: the
+#     ServiceAccount of the same name in agent-auth-grants (so an
+#     allowlisted role can't be bound to the broker itself, or to a
+#     workload's ServiceAccount);
+#   - a ClusterRoleBinding binds only a role of the cluster allowlist
+#     (`bind` alone cannot say that: with components/all-namespaces the
+#     provisioner's `bind` on the namespaced roles holds cluster-wide);
+#   - it never updates or patches a binding.
+# The grant namespace here must be the policy's
+# platforms.kubernetes.grant_namespace. Needs Kubernetes >= 1.30.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: agent-auth-provisioner
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: [serviceaccounts, serviceaccounts/token]
+      - apiGroups: [rbac.authorization.k8s.io]
+        apiVersions: ["v1"]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: [rolebindings, clusterrolebindings]
+  matchConditions:
+    - name: the-broker
+      expression: request.userInfo.username == 'system:serviceaccount:agent-auth:agent-auth'
+  variables:
+    - name: grantNamespace
+      expression: "'agent-auth-grants'"
+    - name: isServiceAccount
+      expression: request.resource.resource == 'serviceaccounts'
+    # MUST list exactly the policy's cluster_role_allowlist (and the `bind`
+    # resourceNames of components/cluster-grants).
+    - name: clusterRoles
+      expression: "['view']"
+  validations:
+    - expression: request.name.startsWith('aa-')
+      messageExpression: "'agent-auth may only touch aa-* objects, not ' + request.name"
+      reason: Forbidden
+    - expression: "!variables.isServiceAccount || request.namespace == variables.grantNamespace"
+      messageExpression: "'agent-auth makes ServiceAccounts and tokens only in ' + variables.grantNamespace"
+      reason: Forbidden
+    - expression: request.operation != 'UPDATE'
+      message: agent-auth never updates a ServiceAccount or a binding
+      reason: Forbidden
+    - expression: >-
+        variables.isServiceAccount || request.operation == 'DELETE' ||
+        (object.roleRef.kind == 'ClusterRole' &&
+         has(object.subjects) && size(object.subjects) == 1 &&
+         object.subjects.all(s, s.kind == 'ServiceAccount' &&
+           s.namespace == variables.grantNamespace &&
+           s.name == object.metadata.name))
+      message: an agent-auth binding binds a ClusterRole to its own grant ServiceAccount in the grant namespace, and nothing else
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'clusterrolebindings' || request.operation == 'DELETE' ||
+        object.roleRef.name in variables.clusterRoles
+      messageExpression: "'agent-auth binds cluster-wide only ' + variables.clusterRoles.join(', ')"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: agent-auth-provisioner
+spec:
+  policyName: agent-auth-provisioner
+  validationActions: [Deny]

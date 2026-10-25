@@ -1,0 +1,114 @@
+# What the broker talks to, and who talks to it.
+#
+# In: Traefik only (agents, the operator's browser, paired daemons'
+# WebSockets all come through the IngressRoute). Kubelet probes come from
+# the node, which Cilium allows by default.
+#
+# Out:
+#   - DNS;
+#   - the CNPG primary (cnpg/postgres, 5432);
+#   - LLDAP in-cluster (lldap/lldap: HTTP 17170, LDAP 3890, LDAPS 6360);
+#   - Traefik, for services the policy names by their *.k8s.rooty.dev
+#     names (the model gateway); those resolve to Traefik's address;
+#   - the Kubernetes API (networkpolicy-cilium.yaml: plain NetworkPolicy
+#     cannot select the API server under Cilium);
+#   - the public internet on 443 (GitHub, Discord's API and gateway,
+#     OpenRouter, Google, SimpleLogin, Gmail, agents' a2a webhooks) and the
+#     mail ports (IMAPS 993, SMTP 465/587), never private ranges.
+# An a2a webhook to a private address (A2A_WEBHOOK_HTTP_HOSTS) or a
+# self-hosted mail server on a private address needs a rule of its own.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-auth
+  namespace: agent-auth
+spec:
+  podSelector:
+    matchLabels:
+      app: agent-auth
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - port: 8400
+          protocol: TCP
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: cnpg
+          podSelector:
+            matchLabels:
+              cnpg.io/cluster: postgres
+      ports:
+        - port: 5432
+          protocol: TCP
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: lldap
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: lldap
+      ports:
+        - port: 17170
+          protocol: TCP
+        - port: 3890
+          protocol: TCP
+        - port: 6360
+          protocol: TCP
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - port: 8443
+          protocol: TCP
+        - port: 443
+          protocol: TCP
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+              - 127.0.0.0/8
+        - ipBlock:
+            cidr: ::/0
+            except:
+              - fc00::/7
+              - fe80::/10
+              - ::1/128
+      ports:
+        - port: 443
+          protocol: TCP
+        - port: 993
+          protocol: TCP
+        - port: 465
+          protocol: TCP
+        - port: 587
+          protocol: TCP

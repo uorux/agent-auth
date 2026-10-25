@@ -1,0 +1,59 @@
+# agent-auth (Rust broker) on Kubernetes, laid out as the homelab repo lays
+# out an app: copy this directory to apps/infra/agent-auth/ and Flux applies
+# it through this kustomization. rust/README.md "Kubernetes" walks through
+# it; the steps outside this directory are:
+#   - the database role: add `agent-auth` to the managed roles of the CNPG
+#     Cluster (apps/infra/postgres/cluster.yaml), passwordSecret
+#     agent-auth-postgres (postgres.yaml here makes the Database and the
+#     secret in both namespaces);
+#   - the CNPG CA certificate as ConfigMap `cnpg-ca` in this namespace
+#     (public; see deployment.yaml);
+#   - the 1Password items named in secrets.yaml and postgres.yaml;
+#   - Kubernetes >= 1.30 (ValidatingAdmissionPolicy, admission-policy.yaml).
+#
+# No top-level `namespace:` here: the RBAC objects live in several
+# namespaces (agent-auth, agent-auth-grants, and every brokered one).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - secrets.yaml
+  - postgres.yaml
+  - rbac.yaml
+  - roles.yaml
+  - admission-policy.yaml
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+  - networkpolicy.yaml
+  - networkpolicy-cilium.yaml
+
+# Where the provisioner may create RoleBindings (pick what matches the
+# policy's platforms.kubernetes):
+#   components/namespaces      one RoleBinding per namespace_allowlist entry
+#                              (edit the list there);
+#   components/all-namespaces  namespace_allowlist ["*"], or restricted zones
+#                              (a zone-avoiding cluster grant is a
+#                              RoleBinding in every other namespace, and the
+#                              broker lists namespaces first);
+#   components/cluster-grants  cluster_role_allowlist not empty
+#                              (ClusterRoleBindings).
+# The homelab policy today: all namespaces, cluster-wide `view`.
+components:
+  - components/all-namespaces
+  - components/cluster-grants
+  # - components/namespaces
+
+# The policy as a ConfigMap whose name changes with its content, so a policy
+# change rolls the Deployment (the broker reads its policy at start only).
+configMapGenerator:
+  - name: agent-auth-policy
+    namespace: agent-auth
+    files:
+      - policy.yaml
+
+images:
+  - name: agent-auth
+    # `nix build ./rust#image`, then push it. Pin a digest in production.
+    newName: git.rooty.dev/jrt/agent-auth-rs
+    newTag: 0.1.0

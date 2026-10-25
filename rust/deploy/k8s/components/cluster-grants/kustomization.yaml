@@ -1,0 +1,8 @@
+# Cluster-wide grants (policy cluster_role_allowlist; an agent requests
+# namespace "*"): a ClusterRoleBinding per grant. Every such grant is a
+# human's decision, but the standing power is real: keep
+# cluster_role_allowlist tiny and read-only.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - rbac.yaml

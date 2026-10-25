@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-auth
+  namespace: agent-auth
+  labels:
+    app: agent-auth
+spec:
+  type: ClusterIP
+  selector:
+    app: agent-auth
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

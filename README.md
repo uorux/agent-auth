@@ -14,6 +14,12 @@ agent ──HTTP/MCP/CLI──▶ broker ──policy──▶ deny | approve | 
                               └─ expiry scheduler revokes at expires_at
 ```
 
+**Rust port.** `rust/` holds a Rust implementation of everything here
+(broker, CLI, MCP, hostd, sandboxd) with its own flake (`./rust#broker`,
+`nixosModules`, an OCI image, Kubernetes manifests in `rust/deploy/k8s`).
+How to build, configure, deploy and migrate to it: [rust/README.md](rust/README.md);
+what behaves differently: [rust/DEVIATIONS.md](rust/DEVIATIONS.md).
+
 ## Platforms
 
 | platform  | capability    | resource            | grant means                                                                 |

@@ -1,0 +1,152 @@
+# The broker. Exactly one: it holds a session advisory lock on its database
+# for its whole life and a second broker exits, so replicas stay 1 and the
+# strategy is Recreate (a rolling update would start the new pod while the
+# old one holds the lock). Long-polls, the daemon hub and the scheduler live
+# in the process.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-auth
+  namespace: agent-auth
+  labels:
+    app: agent-auth
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: agent-auth
+  template:
+    metadata:
+      labels:
+        app: agent-auth
+    spec:
+      serviceAccountName: agent-auth
+      automountServiceAccountToken: true
+      enableServiceLinks: false
+      # SIGTERM: open requests get 10 s, LLM evaluations 10 s more.
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent-auth
+          image: agent-auth
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8400
+          envFrom:
+            - secretRef:
+                name: agent-auth-env
+          env:
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: agent-auth-postgres
+                  key: username
+            - name: DB_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: agent-auth-postgres
+                  key: password
+            # TLS to the CNPG primary, checked against the cluster's CA and
+            # the server's name (sqlx: rustls with the CA file only).
+            - name: DATABASE_URL
+              value: "postgres://$(DB_USER):$(DB_PASS)@postgres-rw.cnpg.svc.cluster.local:5432/agent-auth?sslmode=verify-full&sslrootcert=/etc/agent-auth/cnpg-ca/ca.crt"
+            - name: LISTEN_HOST
+              value: "0.0.0.0"
+            - name: LISTEN_PORT
+              value: "8400"
+            - name: POLICY_FILE
+              value: /etc/agent-auth/policy/policy.yaml
+            - name: POLICY_OVERLAYS
+              value: /etc/agent-auth/policy-private/policy-private.yaml
+            - name: KUBERNETES_API_URL
+              value: in-cluster
+            - name: GITHUB_APP_PRIVATE_KEY_FILE
+              value: /etc/agent-auth/github/app.pem
+            # Traefik sets X-Real-IP: the security log and the per-address
+            # limits see the client, not the proxy.
+            - name: TRUST_PROXY_HEADERS
+              value: "1"
+            - name: LOG_LEVEL
+              value: info
+          volumeMounts:
+            - name: policy
+              mountPath: /etc/agent-auth/policy
+              readOnly: true
+            - name: policy-private
+              mountPath: /etc/agent-auth/policy-private
+              readOnly: true
+            - name: github-key
+              mountPath: /etc/agent-auth/github
+              readOnly: true
+            - name: cnpg-ca
+              mountPath: /etc/agent-auth/cnpg-ca
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: [ALL]
+          # Migrations and the boot tick (reaper, stalled LLM reviews) run
+          # before the listener opens.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 36
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+      volumes:
+        - name: policy
+          configMap:
+            name: agent-auth-policy
+        - name: policy-private
+          secret:
+            secretName: agent-auth-policy-private
+            defaultMode: 0440
+        - name: github-key
+          secret:
+            secretName: agent-auth-github-key
+            defaultMode: 0440
+        # The CNPG cluster's CA certificate (public), out of band:
+        #   kubectl -n cnpg get secret postgres-ca -o jsonpath='{.data.ca\.crt}' \
+        #     | base64 -d > ca.crt
+        #   kubectl -n agent-auth create configmap cnpg-ca --from-file=ca.crt
+        # Refresh it when CNPG renews its CA (rust/README.md, Kubernetes).
+        - name: cnpg-ca
+          configMap:
+            name: cnpg-ca
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi

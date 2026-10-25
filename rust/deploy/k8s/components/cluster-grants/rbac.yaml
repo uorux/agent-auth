@@ -1,0 +1,28 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: agent-auth-provisioner-cluster
+rules:
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterrolebindings]
+    verbs: [create, get, delete]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterroles]
+    verbs: [bind]
+    # MUST list exactly the policy's cluster_role_allowlist (and the
+    # clusterRoles variable of admission-policy.yaml).
+    resourceNames:
+      - view
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: agent-auth-provisioner-cluster
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: agent-auth-provisioner-cluster
+subjects:
+  - kind: ServiceAccount
+    name: agent-auth
+    namespace: agent-auth

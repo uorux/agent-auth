@@ -1508,6 +1508,47 @@ inherited from the Python; "port" what the port introduced.
   is read again (at least once; deliveries happen under the thread's
   lock, so the claim and the watcher don't both deliver it).
 
+## Packaging (`flake.nix`, `nix/`, `deploy/k8s`)
+
+- **Modules keep the Python's names and options** (`services.agent-auth`,
+  `-hostd`, `-sandboxd`, `darwinModules.hostd`). The broker module adds
+  `database.createLocally` (PostgreSQL on the host, peer authentication on
+  the socket; the Python's SQLite state directory is gone) and asserts that
+  `environmentFiles` holds no Nix path literal (upstream review 2026-10)
+  and that `settings` holds no secret.
+- **Stricter units.** Broker: W^X memory (no cffi), `PrivateUsers`,
+  `ProcSubset=pid`, `~@resources`, `LimitNOFILE=65536`, no state
+  directory, working directory `/var/empty` (it reads `./.env`). hostd: W^X
+  memory, and `ProcSubset=pid` when unprivileged.
+- **Unprivileged hostd sees other users' processes** (no
+  `ProtectProc=invisible`, which the Python unit had): hostd reads a local
+  peer's `/proc/<pid>/cgroup` to refuse callers inside a job's unit
+  (security review 2026-10, finding 1e/6) and refuses a peer it cannot
+  place, so with the Python setting every hostctl and desktop-helper
+  connection to a connect-only hostd would have been refused.
+- **The desktop helper's unit has util-linux on its PATH**: hostd-user ends
+  a withdrawn dialog with `kill`, which coreutils on NixOS does not ship.
+- **sandboxd's runtime directories are created 0700** by the unit (the
+  Python module's 0755; upstream review 2026-10, B-18) and sandboxd sets
+  their modes itself (Agent VMs above).
+- **sandboxd module**: `orchestratorRuntime` is `claude` or `codex` and
+  must be in `runtimes` (assertions); `hostName` has no `-`; new options
+  `max_processes_per_project`, `interactive_idle_secs`, `codex_auth_owner`,
+  `refuse_vm_logins_when_unreachable`, `extraConfig`;
+  `fs.protected_hardlinks` defaults to 1.
+- **Image**: no shell and no CA bundle (the broker never reads the system
+  store), uid 65532, no `HEALTHCHECK` (nothing to run it with; probe
+  `/healthz`).
+- **Kubernetes RBAC is scoped and fenced** (upstream review 2026-10): grant
+  ServiceAccounts and their tokens only in `agent-auth-grants` (a Role);
+  RoleBindings per namespace or cluster-wide by component;
+  ClusterRoleBindings only with `components/cluster-grants`; a
+  ValidatingAdmissionPolicy holds the broker's ServiceAccount to `aa-*`
+  names, bindings of a ClusterRole to exactly the grant's own
+  ServiceAccount, the cluster allowlist for ClusterRoleBindings, and no
+  updates. A quota of zero pods in the grant namespace. Python's
+  `deploy/k8s.yaml` gave a ClusterRole with unrestricted token creation.
+
 ## Open questions
 
 (for Jacob; nothing here is implemented until decided)
@@ -1532,6 +1573,15 @@ inherited from the Python; "port" what the port introduced.
   the user tier via hostctl, or act as the desk helper). Close it by
   denying job units the user bus (`InaccessiblePaths=/run/user/<uid>/bus`
   and `.../systemd`, which breaks `systemctl --user` in jobs), or accept?
+
+- **The CNPG CA on Kubernetes** (packaging): the broker verifies Postgres
+  against a copy of CNPG's CA in a ConfigMap, which must be refreshed when
+  CNPG renews its self-made CA. A cert-manager CA for the cluster
+  (`spec.certificates`) with trust distribution would remove the manual
+  step; that is a homelab change.
+- **Where the broker runs**: on Kubernetes the gitops repo and the image
+  registry decide its policy and RBAC (the reason the Python ran on
+  recusant). The manifests are ready; whether to move is Jacob's call.
 
 - **Panel logout is client-side only** (Bug-B1, unchanged): a copied
   session cookie stays valid until its `exp` (8 h). A server-side session

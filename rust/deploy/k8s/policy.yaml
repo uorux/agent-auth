@@ -1,0 +1,18 @@
+# The broker's policy (see ../../../policy.example.yaml, and
+# rust/DEVIATIONS.md "Policy" for what the Rust broker reads differently).
+# Replace with the real one. Policy that must not sit in this repo (a
+# restricted zone's rules) goes in the private overlay (secrets.yaml,
+# POLICY_OVERLAYS).
+defaults:
+  action: surface
+  max_duration: 8h
+platforms:
+  kubernetes:
+    # Every grant's ServiceAccount is made here (namespace.yaml); no grant
+    # may target it. Must match admission-policy.yaml.
+    grant_namespace: agent-auth-grants
+    namespace_allowlist: ["*"]
+    # Exactly the `bind` resourceNames in rbac.yaml.
+    role_allowlist: [view, logs-reader]
+    # Exactly the `bind` resourceNames in components/cluster-grants.
+    cluster_role_allowlist: [view]

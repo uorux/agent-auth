@@ -1,0 +1,24 @@
+# The Kubernetes API server, for the provisioner (KUBERNETES_API_URL
+# in-cluster). Under Cilium the API server is the `kube-apiserver` entity,
+# which a plain NetworkPolicy's ipBlock cannot select; this adds to
+# networkpolicy.yaml (policies are unions). Without Cilium, delete this file
+# from kustomization.yaml and add an ipBlock rule for the API server's
+# addresses on 6443 to networkpolicy.yaml.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: agent-auth-kube-apiserver
+  namespace: agent-auth
+spec:
+  endpointSelector:
+    matchLabels:
+      app: agent-auth
+  egress:
+    - toEntities:
+        - kube-apiserver
+      toPorts:
+        - ports:
+            - port: "6443"
+              protocol: TCP
+            - port: "443"
+              protocol: TCP
