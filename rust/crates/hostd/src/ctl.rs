@@ -12,7 +12,7 @@ use agent_auth_daemon::localsock::{LocalApi, LocalError, Peer};
 use serde_json::{Map, Value, json};
 
 use crate::config::duration_secs;
-use crate::daemon::{Hostd, now_millis};
+use crate::daemon::Hostd;
 use crate::executor::Executor;
 use crate::presence::PresenceEvent;
 
@@ -113,7 +113,7 @@ impl<E: Executor> LocalApi for Ctl<E> {
                     })?;
                 hostd
                     .totp()
-                    .clear_lock(name, now_millis().secs())
+                    .clear_lock(name, hostd.totp_now())
                     .map_err(err)?;
                 crate::daemon::audit(
                     hostd.config.name.as_str(),

@@ -109,6 +109,11 @@ fn hostd_totp_replay_and_lock() {
     let before = state.clone();
     let name = SecretName::new(Tier::Root, Purpose::Direct);
     let matched: u64 = kani::any();
+    // A code that matched: its step is in the attempt's window (the
+    // wrong-code path, which counts failures in a list, is covered by the
+    // property tests).
+    let current = now / totp::STEP_SECS;
+    kani::assume(matched.saturating_add(1) >= current && matched <= current.saturating_add(1));
     match totp::begin(&state, name, now) {
         Err(_) => {
             assert!(before.hard_locked || before.locked_until.is_some_and(|u| u > now));

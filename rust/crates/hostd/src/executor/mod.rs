@@ -84,9 +84,12 @@ pub trait Executor: Send + Sync + 'static {
         &self,
         job: &AdmittedJob,
         out: &mut OutputTail,
+        kill: KillSignal,
     ) -> impl Future<Output = Result<i32, String>> + Send;
 
-    /// Stop a running job (and everything it started).
+    /// Stop a job by id, outside its run: a job left running by an earlier
+    /// hostd (its unit). Running jobs are stopped through their
+    /// [`KillSignal`].
     fn kill(&self, job: &LocalId) -> impl Future<Output = ()> + Send;
 
     /// Have polkit authenticate the user of process `pid` as an
@@ -121,10 +124,17 @@ pub fn exit_code(status: ExitStatus) -> i32 {
     }
 }
 
+/// Set to true to stop a running job (hostd's `job.kill`, a shell's end,
+/// lockdown). The job's own run watches it, so a kill that lands before
+/// the process exists still stops it.
+pub type KillSignal = tokio::sync::watch::Receiver<bool>;
+
 /// What to do while collecting a child's output.
 pub(crate) struct Collect {
-    /// Past this, `on_deadline` runs (once).
+    /// Past this, `on_stop` runs (once).
     pub deadline: Option<Instant>,
+    /// When it turns true, `on_stop` runs (once).
+    pub kill: KillSignal,
     /// Once the main process ended, stop reading after [`DRAIN`] (a
     /// process left in the background must not hold the job open). Without
     /// it, read to end of output.
@@ -152,8 +162,8 @@ pub(crate) fn spawn_piped(
 }
 
 /// Feed `stdin`, collect output into `out`, wait for the child. Calls
-/// `on_deadline` once if the deadline passes, and `after_exit` once when
-/// the main process has ended.
+/// `on_deadline` once if the deadline passes or the kill signal fires, and
+/// `after_exit` once when the main process has ended.
 pub(crate) async fn collect<D, A>(
     child: &mut tokio::process::Child,
     mut rx: tokio::net::unix::pipe::Receiver,
@@ -177,6 +187,12 @@ where
         });
     }
     let mut on_deadline = Some(on_deadline);
+    let mut kill = how.kill.clone();
+    if *kill.borrow_and_update()
+        && let Some(f) = on_deadline.take()
+    {
+        f().await;
+    }
     let mut after_exit = Some(after_exit);
     let mut buf = vec![0u8; READ_CHUNK];
     let mut status: Option<ExitStatus> = None;
@@ -203,6 +219,13 @@ where
                 }
                 if how.stop_at_exit && !eof {
                     drain_until = Some(after(DRAIN));
+                }
+            }
+            changed = kill.changed(), if on_deadline.is_some() => {
+                if (changed.is_err() || *kill.borrow_and_update())
+                    && let Some(f) = on_deadline.take()
+                {
+                    f().await;
                 }
             }
             () = tokio::time::sleep_until(deadline), if on_deadline.is_some() && how.deadline.is_some() => {

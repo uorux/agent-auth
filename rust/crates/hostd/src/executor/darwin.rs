@@ -31,7 +31,8 @@ use serde::{Deserialize, Serialize};
 use super::linux::JobParts;
 use super::passwd::{self, Passwd};
 use super::{
-    Collect, Executor, UnitAction, collect, exit_code, kill_group, signal_group, spawn_piped,
+    Collect, Executor, KillSignal, UnitAction, collect, exit_code, kill_group, signal_group,
+    spawn_piped,
 };
 
 /// Homebrew, for the user tier only (its directories are the user's).
@@ -66,7 +67,7 @@ pub struct DarwinExecutor {
     pub user: Option<String>,
     /// This binary (the `asuser` step).
     pub self_exe: PathBuf,
-    groups: Mutex<BTreeMap<LocalId, u32>>,
+    groups: Groups,
 }
 
 /// A directory on the root tier's PATH that someone other than root could
@@ -98,7 +99,7 @@ impl DarwinExecutor {
             job_path,
             user,
             self_exe,
-            groups: Mutex::new(BTreeMap::new()),
+            groups: Groups::new(KILL),
         }
     }
 
@@ -173,13 +174,36 @@ impl DarwinExecutor {
             env: launch_env,
         })
     }
+}
 
-    fn group(&self, job: &LocalId) -> Option<u32> {
-        self.groups
+/// Running jobs' process groups, and the `kill(1)` that signals them.
+#[derive(Debug)]
+pub(crate) struct Groups {
+    pub(crate) kill: String,
+    pub(crate) map: Mutex<BTreeMap<LocalId, u32>>,
+}
+
+impl Groups {
+    pub(crate) fn new(kill: &str) -> Groups {
+        Groups {
+            kill: kill.to_owned(),
+            map: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    pub(crate) fn get(&self, id: &LocalId) -> Option<u32> {
+        self.map
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(job)
+            .get(id)
             .copied()
+    }
+
+    /// TERM, then KILL, the job's group.
+    pub(crate) async fn kill(&self, id: &LocalId) {
+        if let Some(pgid) = self.get(id) {
+            kill_group(&self.kill, pgid).await;
+        }
     }
 }
 
@@ -187,14 +211,17 @@ impl DarwinExecutor {
 /// group dies with the main process (and at the timeout). Shared with the
 /// direct executor.
 pub(crate) async fn run_in_group(
-    groups: &Mutex<BTreeMap<LocalId, u32>>,
-    kill: &str,
+    groups: &Groups,
     id: &LocalId,
     c: DarwinCommand,
     stdin: Option<&str>,
     timeout: Duration,
     out: &mut OutputTail,
+    stop: KillSignal,
 ) -> Result<i32, String> {
+    if *stop.borrow() {
+        return Err("killed before it started".to_owned());
+    }
     let mut cmd = std::process::Command::new(&c.program);
     cmd.args(&c.args)
         .env_clear()
@@ -205,7 +232,9 @@ pub(crate) async fn run_in_group(
     let pgid = child
         .id()
         .ok_or_else(|| "the job exited at once".to_owned())?;
+    let kill = groups.kill.as_str();
     groups
+        .map
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .insert(id.clone(), pgid);
@@ -216,6 +245,7 @@ pub(crate) async fn run_in_group(
         out,
         Collect {
             deadline: Some(super::after(timeout)),
+            kill: stop,
             stop_at_exit: true,
         },
         async || kill_group(kill, pgid).await,
@@ -226,6 +256,7 @@ pub(crate) async fn run_in_group(
     )
     .await;
     groups
+        .map
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .remove(id);
@@ -233,7 +264,12 @@ pub(crate) async fn run_in_group(
 }
 
 impl Executor for DarwinExecutor {
-    async fn run(&self, job: &AdmittedJob, out: &mut OutputTail) -> Result<i32, String> {
+    async fn run(
+        &self,
+        job: &AdmittedJob,
+        out: &mut OutputTail,
+        kill: KillSignal,
+    ) -> Result<i32, String> {
         if job.tier() == Tier::Root
             && let Some(problem) = root_path_problem(&self.job_path)
         {
@@ -247,20 +283,18 @@ impl Executor for DarwinExecutor {
         let c = self.command(&parts, user.as_ref())?;
         run_in_group(
             &self.groups,
-            KILL,
             job.id(),
             c,
             job.stdin(),
             Duration::from_secs(u64::from(job.timeout_secs())),
             out,
+            kill,
         )
         .await
     }
 
     async fn kill(&self, job: &LocalId) {
-        if let Some(pgid) = self.group(job) {
-            kill_group(KILL, pgid).await;
-        }
+        self.groups.kill(job).await;
     }
 
     async fn polkit_auth(&self, _: i32, _: u32, _: &str, _: Duration) -> Option<PolkitConfirmed> {

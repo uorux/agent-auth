@@ -10,8 +10,8 @@ use std::time::Duration;
 use agent_auth_core::hostd::output::OutputTail;
 use agent_auth_core::hostd::{AdmittedJob, LocalId, PolkitConfirmed};
 
-use super::darwin::{DarwinCommand, run_in_group};
-use super::{Executor, UnitAction, kill_group};
+use super::darwin::{DarwinCommand, Groups, run_in_group};
+use super::{Executor, KillSignal, UnitAction};
 
 /// What a test can observe and steer.
 #[derive(Debug, Default)]
@@ -33,8 +33,7 @@ pub struct Recorded {
 #[derive(Debug)]
 pub struct DirectExecutor {
     path: String,
-    kill_program: String,
-    groups: Mutex<BTreeMap<LocalId, u32>>,
+    groups: Groups,
     pub recorded: Mutex<Recorded>,
 }
 
@@ -44,8 +43,7 @@ impl DirectExecutor {
     pub fn new(path: &str, kill_program: &str) -> DirectExecutor {
         DirectExecutor {
             path: path.to_owned(),
-            kill_program: kill_program.to_owned(),
-            groups: Mutex::new(BTreeMap::new()),
+            groups: Groups::new(kill_program),
             recorded: Mutex::new(Recorded {
                 password_ok: true,
                 ..Recorded::default()
@@ -59,7 +57,12 @@ impl DirectExecutor {
 }
 
 impl Executor for DirectExecutor {
-    async fn run(&self, job: &AdmittedJob, out: &mut OutputTail) -> Result<i32, String> {
+    async fn run(
+        &self,
+        job: &AdmittedJob,
+        out: &mut OutputTail,
+        kill: KillSignal,
+    ) -> Result<i32, String> {
         self.rec().runs.push((
             job.id().to_string(),
             job.tier().to_string(),
@@ -80,27 +83,19 @@ impl Executor for DirectExecutor {
         };
         run_in_group(
             &self.groups,
-            &self.kill_program,
             job.id(),
             c,
             job.stdin(),
             Duration::from_secs(u64::from(job.timeout_secs())),
             out,
+            kill,
         )
         .await
     }
 
     async fn kill(&self, job: &LocalId) {
         self.rec().killed.push(job.to_string());
-        let pgid = self
-            .groups
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(job)
-            .copied();
-        if let Some(pgid) = pgid {
-            kill_group(&self.kill_program, pgid).await;
-        }
+        self.groups.kill(job).await;
     }
 
     async fn polkit_auth(

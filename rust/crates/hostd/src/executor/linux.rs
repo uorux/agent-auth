@@ -26,7 +26,8 @@ use agent_auth_core::hostd::{AdmittedJob, LocalId, PolkitConfirmed};
 
 use super::passwd::{self, Passwd};
 use super::{
-    Collect, Executor, UNIT_PREFIX, UnitAction, collect, exit_code, spawn_piped, unit_name,
+    Collect, Executor, KillSignal, UNIT_PREFIX, UnitAction, collect, exit_code, spawn_piped,
+    unit_name,
 };
 
 /// Installed by the NixOS module (auth_admin for the active local session).
@@ -211,7 +212,15 @@ impl SystemdExecutor {
 }
 
 impl Executor for SystemdExecutor {
-    async fn run(&self, job: &AdmittedJob, out: &mut OutputTail) -> Result<i32, String> {
+    async fn run(
+        &self,
+        job: &AdmittedJob,
+        out: &mut OutputTail,
+        kill: KillSignal,
+    ) -> Result<i32, String> {
+        if *kill.borrow() {
+            return Err("killed before it started".to_owned());
+        }
         let user = match (job.tier(), &self.cfg.user) {
             (Tier::User, Some(name)) => Some(passwd::lookup(name).await?),
             _ => None,
@@ -234,6 +243,7 @@ impl Executor for SystemdExecutor {
             out,
             Collect {
                 deadline: Some(deadline),
+                kill,
                 stop_at_exit: false,
             },
             async || {
@@ -424,5 +434,69 @@ mod tests {
             parse_job_units(units),
             vec![LocalId::parse("0123abcd-0000").unwrap()]
         );
+    }
+
+    /// The real `run` path against a stand-in `systemd-run` that runs what
+    /// follows `--` (systemd itself is integration-tested on hosts).
+    #[tokio::test]
+    async fn runs_through_systemd_run() {
+        use agent_auth_core::hostd::{
+            ArmProof, ArmState, Authorizations, Evidence, HostPolicy, HostView, LocalCaller,
+            UnixMillis, admit, normalize,
+        };
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = crate::fsutil::testdir::TestDir::new("systemd");
+        let script = d.path().join("systemd-run");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do case \"$1\" in --setenv=*) export \"${1#--setenv=}\";; esac; shift; done\nshift\nexec \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut c = cfg();
+        c.systemd_run = script.to_string_lossy().into_owned();
+        c.job_path = std::env::var("PATH").unwrap();
+        let exec = SystemdExecutor::new(c);
+        let mut policy = HostPolicy::connect_only("h");
+        policy.root.enable = true;
+        let now = UnixMillis(1_000_000);
+        let mut arm = ArmState::default();
+        arm.arm(
+            &policy,
+            Tier::Root,
+            60,
+            ArmProof::Local(LocalCaller::Root),
+            agent_auth_core::hostd::LockState::Unlocked,
+            now,
+        )
+        .unwrap();
+        let raw = serde_json::json!({"kind": "run", "host": "h", "tier": "root",
+            "argv": ["sh", "-c", "cat; echo $HOME; exit 7"], "cwd": null, "env": {},
+            "timeout": 60, "stdin": "in\n"});
+        let job = normalize(&policy, &raw, false).unwrap();
+        let digest = agent_auth_core::hostd::SpecDigest::parse(&"0".repeat(64)).unwrap();
+        let admitted = admit(
+            HostView {
+                policy: &policy,
+                arm: &arm,
+                lock: agent_auth_core::hostd::LockState::Unlocked,
+                now,
+            },
+            LocalId::parse("0123abcd-0000").unwrap(),
+            job,
+            &digest,
+            Evidence {
+                source: Some(agent_auth_core::hostd::Source::Human),
+                window: false,
+            },
+            &mut Authorizations::default(),
+        )
+        .unwrap();
+        let mut out = OutputTail::new(1024);
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let code = exec.run(&admitted, &mut out, rx).await.unwrap();
+        assert_eq!(code, 7);
+        // The root tier gets HOME=/root (daemons bug 21), stdin reached the job.
+        assert_eq!(out.finish().bytes, b"in\n/root\n");
     }
 }

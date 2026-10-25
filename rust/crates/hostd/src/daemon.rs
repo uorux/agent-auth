@@ -92,6 +92,7 @@ fn source(s: Option<DecisionSource>) -> Option<Source> {
 struct RunningJob {
     shell: Option<LocalId>,
     killed: bool,
+    kill: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Debug)]
@@ -126,6 +127,9 @@ pub struct Hostd<E: Executor> {
     channel: OnceLock<Channel>,
     started_at: f64,
     user_uid: OnceLock<Option<u32>>,
+    /// Tests move the TOTP clock forward to use more than two codes.
+    #[cfg(test)]
+    totp_skew: std::sync::atomic::AtomicU64,
     me: Weak<Hostd<E>>,
 }
 
@@ -166,6 +170,8 @@ impl<E: Executor> Hostd<E> {
             channel: OnceLock::new(),
             started_at: now_f64(),
             user_uid: OnceLock::new(),
+            #[cfg(test)]
+            totp_skew: std::sync::atomic::AtomicU64::new(0),
             me: me.clone(),
         })
     }
@@ -216,6 +222,27 @@ impl<E: Executor> Hostd<E> {
         } else {
             LockState::Unlocked
         }
+    }
+
+    /// The time TOTP codes are checked at (Unix seconds).
+    #[must_use]
+    pub fn totp_now(&self) -> u64 {
+        #[cfg(test)]
+        {
+            now_millis()
+                .secs()
+                .saturating_add(self.totp_skew.load(std::sync::atomic::Ordering::Relaxed))
+        }
+        #[cfg(not(test))]
+        {
+            now_millis().secs()
+        }
+    }
+
+    /// Pin the configured user's uid when it is known without a lookup
+    /// (tests; a host whose account database hostd cannot read).
+    pub fn pin_user_uid(&self, uid: Option<u32>) {
+        let _ = self.user_uid.set(uid);
     }
 
     /// The configured user's uid (looked up once).
@@ -442,7 +469,7 @@ impl<E: Executor> Hostd<E> {
         code: &str,
         job: Option<&LocalId>,
     ) -> Result<agent_auth_core::hostd::totp::AcceptedCode, String> {
-        match self.totp.verify(name, code, now_millis().secs()) {
+        match self.totp.verify(name, code, self.totp_now()) {
             Ok(c) => Ok(c),
             Err(e) => {
                 self.audit(
@@ -552,26 +579,32 @@ impl<E: Executor> Hostd<E> {
         self.spool
             .write_running(&id, job.tier(), now_f64())
             .map_err(|e| format!("hostd error: could not spool the job: {e}"))?;
+        let (kill, kill_rx) = tokio::sync::watch::channel(false);
         st.jobs.insert(
             id,
             RunningJob {
                 shell: job.shell().cloned(),
                 killed: false,
+                kill,
             },
         );
         let me = self.me.clone();
         tokio::spawn(async move {
             if let Some(me) = me.upgrade() {
-                me.run_job(job).await;
+                me.run_job(job, kill_rx).await;
             }
         });
         Ok(())
     }
 
-    async fn run_job(self: Arc<Self>, job: core_hostd::AdmittedJob) {
+    async fn run_job(
+        self: Arc<Self>,
+        job: core_hostd::AdmittedJob,
+        kill: tokio::sync::watch::Receiver<bool>,
+    ) {
         let started = Instant::now();
         let mut tail = OutputTail::new(MAX_OUTPUT_BYTES);
-        let outcome = self.executor.run(&job, &mut tail).await;
+        let outcome = self.executor.run(&job, &mut tail, kill).await;
         let id = job.id().clone();
         let (killed, stopping) = {
             let st = self.state();
@@ -581,9 +614,9 @@ impl<E: Executor> Hostd<E> {
             Ok(code) => (Some(code), None),
             Err(e) => (None, Some(format!("could not run: {e}"))),
         };
-        if error.is_none() && stopping {
+        if stopping {
             error = Some("hostd stopped while the job was running".to_owned());
-        } else if error.is_none() && killed {
+        } else if killed {
             error = Some("killed".to_owned());
         }
         let kept = tail.finish();
@@ -637,20 +670,26 @@ impl<E: Executor> Hostd<E> {
 
     /// Kill a running job (or one left from an earlier hostd).
     pub async fn kill(&self, id: &LocalId) -> bool {
-        let known = {
+        let running = {
             let mut st = self.state();
             if let Some(job) = st.jobs.get_mut(id) {
                 job.killed = true;
-                true
+                job.kill.send_replace(true);
+                Some(true)
+            } else if st.orphans.remove(id) {
+                Some(false)
             } else {
-                st.orphans.remove(id)
+                None
             }
         };
-        if !known {
+        let Some(running) = running else {
             return false;
-        }
+        };
         self.audit("job.kill", json!({"job": id.as_str()}));
-        self.executor.kill(id).await;
+        if !running {
+            // Left by an earlier hostd: only its unit knows it.
+            self.executor.kill(id).await;
+        }
         true
     }
 
@@ -1261,13 +1300,12 @@ impl<E: Executor> Hostd<E> {
 
     /// Stopping (SIGTERM): kill what runs; its results say hostd stopped.
     pub async fn shutdown(&self) {
-        let jobs: Vec<LocalId> = {
+        {
             let mut st = self.state();
             st.stopping = true;
-            st.jobs.keys().cloned().collect()
-        };
-        for id in &jobs {
-            self.executor.kill(id).await;
+            for job in st.jobs.values() {
+                job.kill.send_replace(true);
+            }
         }
         let until = crate::executor::after(Duration::from_secs(10));
         while tokio::time::Instant::now() < until && !self.state().jobs.is_empty() {
@@ -1332,3 +1370,7 @@ impl<E: Executor> Handler for Hostd<E> {
 pub fn refusal_text(r: &Refused) -> String {
     r.0.clone()
 }
+
+#[cfg(test)]
+#[path = "daemon_tests.rs"]
+mod tests;
