@@ -98,7 +98,7 @@ async fn approve_needs_an_armed_tier_and_totp_works_disarmed(pool: sqlx::PgPool)
     assert_eq!(j.via.as_deref(), Some("totp"));
     assert_eq!(j.exit_code, Some(3));
     assert_eq!(j.output.as_deref(), Some("in\nerr\n"));
-    assert!(b.recorded().iter().any(|l| l.starts_with("job_finished")));
+    assert!(b.wait_recorded("job_finished").await);
     // The job API: the agent's own job, its output once done.
     let got = b
         .hostexec()

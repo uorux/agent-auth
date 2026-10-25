@@ -31,7 +31,7 @@ pub fn bin(name: &str) -> PathBuf {
                 path.display()
             )
         });
-    let (newest, source) = newest_source(name);
+    let (newest, source) = newest_input(&path);
     assert!(
         built >= newest,
         "{} is older than {}: run `cargo build --workspace --bins` first \
@@ -42,57 +42,49 @@ pub fn bin(name: &str) -> PathBuf {
     path
 }
 
-/// The most recently modified source (`.rs`, `.sql`, `Cargo.toml`) of the
-/// package that builds `bin` and of the workspace packages it depends on.
-fn newest_source(bin: &str) -> (SystemTime, PathBuf) {
-    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    let package = match bin {
-        "agent-auth-server" => "broker",
-        "agent-auth" => "cli",
-        "agent-auth-mcp" => "mcp",
-        other => panic!("which package builds {other}?"),
+/// The most recently modified of the files cargo compiled into `bin`, as
+/// listed in its dep-info file (`<bin>.d` next to it): exactly the inputs of
+/// that binary, so a test-only file changing does not count as stale.
+fn newest_input(bin: &Path) -> (SystemTime, PathBuf) {
+    let dep_info = bin.with_extension("d");
+    let text = std::fs::read_to_string(&dep_info).unwrap_or_else(|_| {
+        panic!(
+            "{} is missing: run `cargo build --workspace --bins` first",
+            dep_info.display()
+        )
+    });
+    let inputs = text
+        .split_once(": ")
+        .map_or("", |(_, rest)| rest)
+        .lines()
+        .next()
+        .unwrap_or_default();
+    // Paths are separated by spaces; a space inside a path is `\ `.
+    let mut newest = (SystemTime::UNIX_EPOCH, bin.to_path_buf());
+    let mut current = String::new();
+    let mut chars = inputs.chars().peekable();
+    let flush = |current: &mut String, newest: &mut (SystemTime, PathBuf)| {
+        if current.is_empty() {
+            return;
+        }
+        let path = PathBuf::from(std::mem::take(current));
+        if let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified())
+            && modified > newest.0
+        {
+            *newest = (modified, path);
+        }
     };
-    // The package and its workspace dependencies (`agent-auth-<dir>`).
-    let mut packages = vec![package.to_owned()];
-    let mut i = 0;
-    while let Some(p) = packages.get(i).cloned() {
-        i += 1;
-        let manifest = std::fs::read_to_string(crates.join(&p).join("Cargo.toml")).unwrap();
-        let deps = manifest
-            .split("\n[")
-            .find(|section| section.starts_with("dependencies]"))
-            .unwrap_or_default();
-        for line in deps.lines() {
-            if let Some(dep) = line
-                .strip_prefix("agent-auth-")
-                .and_then(|rest| rest.split(|c: char| !c.is_ascii_alphanumeric()).next())
-                && !packages.iter().any(|q| q == dep)
-            {
-                packages.push(dep.to_owned());
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.peek() == Some(&' ') => {
+                current.push(' ');
+                chars.next();
             }
+            ' ' => flush(&mut current, &mut newest),
+            c => current.push(c),
         }
     }
-    let mut newest = (SystemTime::UNIX_EPOCH, crates.to_path_buf());
-    let mut dirs: Vec<PathBuf> = packages.iter().map(|p| crates.join(p)).collect();
-    while let Some(dir) = dirs.pop() {
-        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
-            let path = entry.path();
-            let Ok(meta) = entry.metadata() else { continue };
-            if meta.is_dir() {
-                // Tests and benches are not part of the binaries.
-                if !path.ends_with("tests") && !path.ends_with("benches") {
-                    dirs.push(path);
-                }
-            } else if path
-                .extension()
-                .is_some_and(|e| e == "rs" || e == "sql" || e == "toml")
-                && let Ok(modified) = meta.modified()
-                && modified > newest.0
-            {
-                newest = (modified, path);
-            }
-        }
-    }
+    flush(&mut current, &mut newest);
     newest
 }
 

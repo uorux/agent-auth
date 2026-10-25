@@ -34,7 +34,7 @@ webpki-roots = { version = "1.0.11", default-features = false }
 rustls-pki-types = { version = "1.15.1", default-features = false, features = ["std"] }
 # `__rustls-tls`: TLS through a rustls config we pass in (agent-auth-tls),
 # with no bundled root store of its own.
-tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "__rustls-tls"] }
+tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect", "handshake", "__rustls-tls"] }
 # TLS for the daemons' channel, over the shared rustls config (agent-auth-tls).
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["tls12"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "macros", "migrate", "json", "time", "uuid", "tls-rustls-ring-webpki"] }

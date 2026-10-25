@@ -147,6 +147,19 @@ impl Broker {
         }
     }
 
+    /// Wait (up to 5 s) for a recorded notification starting with
+    /// `prefix`: notifications are sent after the state they report is
+    /// committed, so a test that reads the state first must wait for them.
+    pub async fn wait_recorded(&self, prefix: &str) -> bool {
+        for _ in 0..250 {
+            if self.recorded().iter().any(|l| l.starts_with(prefix)) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        false
+    }
+
     /// Issue a pairing code for a host.
     pub async fn code(&self, name: &str) -> String {
         let id = ChannelId::new(Role::Host, DaemonName::parse(name).unwrap());
