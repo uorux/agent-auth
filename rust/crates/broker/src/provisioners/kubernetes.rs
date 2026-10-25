@@ -30,7 +30,7 @@ use time::OffsetDateTime;
 use super::common::{
     agent_ref, at, parse_time, py_isoformat, repr, repr_list, secs_until, store_failed,
 };
-use super::http::{self, Http, MAX_BODY, Reply};
+use super::http::{Http, MAX_BODY, Reply};
 use super::setup::{ConfigError, Env};
 use super::{Credential, ProvisionError, Provisioner, Refused, RequestSpec, Validated};
 
@@ -290,7 +290,7 @@ impl KubernetesProvisioner {
             if let Some(b) = body {
                 rb = rb.json(b);
             }
-            match http::send(rb, TIMEOUT, MAX_BODY).await {
+            match self.http.send(rb, TIMEOUT, MAX_BODY).await {
                 Ok(r) => {
                     if i > 0 {
                         let mut rotated = endpoints.get(i..).unwrap_or_default().to_vec();

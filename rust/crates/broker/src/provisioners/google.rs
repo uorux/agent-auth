@@ -39,9 +39,15 @@ use serde_json::{Value, json};
 use time::OffsetDateTime;
 
 use super::common::{repr, repr_list};
-use super::http::{self, Http, MAX_BODY};
+use super::http::{Http, MAX_BODY};
 use super::setup::ConfigError;
 use super::{Credential, ProvisionError, Provisioner, Refused, RequestSpec, Validated};
+
+/// What ending a grant does (catalog and README): tokens are shared per
+/// (account, scope) and Google cannot revoke one minted from a refresh
+/// token without revoking the broker's login (`provisioners/google.py`).
+pub const GOOGLE_REVOCATION: &str =
+    "revoking a google grant stops new tokens; one already fetched lives up to 1 h";
 
 /// Google's token endpoint, unless a login file names another.
 pub const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -326,7 +332,7 @@ impl GoogleTokens {
             .request(Method::POST, &req.url)
             .header("content-type", "application/x-www-form-urlencoded")
             .body(body);
-        let reply = http::send(rb, TIMEOUT, MAX_BODY).await.map_err(|e| {
+        let reply = self.http.send(rb, TIMEOUT, MAX_BODY).await.map_err(|e| {
             tracing::error!(account = %account.address, error = %e, "google token endpoint");
             failed("google token endpoint unreachable (see broker logs)")
         })?;
@@ -697,7 +703,7 @@ impl Provisioner for GoogleProvisioner {
         let mut c = PlatformCatalog::new(
             Platform::Google,
             format!(
-                "{} (account-wide tokens; Gmail is platform mail)",
+                "{} (account-wide tokens; Gmail is platform mail; {GOOGLE_REVOCATION})",
                 GOOGLE_CAPABILITIES.join(" | ")
             ),
             "<account name or address>",

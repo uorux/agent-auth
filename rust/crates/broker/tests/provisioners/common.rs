@@ -277,6 +277,22 @@ pub async fn provision<P: Provisioner>(
     p: &P,
     grant: &GrantRow,
 ) -> Result<GrantRow, String> {
+    // As the finishing phase: the provisioner's own preparation first, in
+    // its own transactions, before anything is locked.
+    if let Err(e) = p.prepare(store, grant, now()).await {
+        let tx = store.begin().await.unwrap();
+        let _ = lockdown::check(&tx, grant.agent_id, now()).await.unwrap();
+        let pg = grants::load_provisioning(&tx, grant.id)
+            .await
+            .unwrap()
+            .unwrap();
+        grants::fail_provisioning(&tx, pg, &e.to_string(), None)
+            .await
+            .unwrap()
+            .unwrap();
+        tx.commit().await.unwrap();
+        return Err(e.to_string());
+    }
     let tx = store.begin().await.unwrap();
     let nh = lockdown::check(&tx, grant.agent_id, now())
         .await

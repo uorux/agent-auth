@@ -496,6 +496,12 @@ async fn provision_and_credential(pool: PgPool) {
         entry["capabilities"],
         json!(["calendar.read", "calendar.write", "drive.read"])
     );
+    // What ending a grant does is said where agents choose (review).
+    assert!(
+        entry["capability_hint"].as_str().unwrap().contains(
+            "revoking a google grant stops new tokens; one already fetched lives up to 1 h"
+        )
+    );
 }
 
 #[sqlx::test(migrations = "../store/migrations")]

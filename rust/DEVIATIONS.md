@@ -664,6 +664,25 @@ and why. Keep entries short. Group by area.
   repo token (proving the installation covers the repo) and revokes it at
   once; the first credential fetch mints and caches. One more mint per
   grant; no unused token lives on (B8).
+- **A GitHub token revoke counts only when GitHub confirms it** (review):
+  204, or 401 (the token is already dead). Any other status, or no
+  answer, fails the revoke (`GitHub token revoke failed (<status>)`): the
+  grant stays ACTIVE with its cached token and the revoke is retried (the
+  Python treated any answer as done and dropped the token). A cached token
+  that has already run out, or no longer opens, needs no revoking.
+- **Shorter upstream timeouts while provisioning** (review): every
+  provisioner call is capped at 15 s (connecting at most 10 s of it; the
+  Python allowed 15-30 s per call), and a whole `provision` at 60 s
+  (`PROVISION_DEADLINE`), because the finishing transaction holds the
+  containment lock shared meanwhile. A provision cut off is reverted with
+  `revoke` and failed with `the platform did not answer in time; try again
+  later`; if reverting fails it is left PROVISIONING for the reaper.
+- **Google says what revoking does** (review): the catalog's capability
+  hint and the README add "revoking a google grant stops new tokens; one
+  already fetched lives up to 1 h". Tokens stay shared per (account,
+  scope): Google offers no per-token revocation that leaves the broker's
+  login in place (`provisioners/google.py`), so per-grant tokens would not
+  shorten that hour.
 - **GitHub installation cache entries are dropped when a mint fails** (B9),
   so a reinstalled app is found again without a restart.
 - **LLDAP administration groups are never brokered** (B1): `lldap_admin`,
@@ -687,12 +706,17 @@ and why. Keep entries short. Group by area.
   sibling grants, so of two concurrent revokes of an agent's last two
   grants on a group, the second sees the first one's outcome and removes
   the membership (the Python, and the first port, could keep it forever).
-- **LLDAP account creation holds the agent row** (B3): `ensure_account`
-  locks the agent row `FOR UPDATE` in the provisioning transaction, so a
-  concurrent provision for the same fresh agent waits for the commit (or,
-  if both already hold the containment check's share lock, Postgres aborts
-  one as a deadlock: that grant fails and can be requested again). The
-  Python's in-process mutex released before the commit.
+- **LLDAP managed accounts are made before the grant is locked** (B3, and
+  review: lock order). The finishing phase calls the new
+  `Provisioner::prepare` before its own transaction locks anything; LLDAP's
+  makes the managed account there, in a transaction that locks only the
+  agent row (`FOR UPDATE`) and commits. A concurrent first provision for
+  the same agent waits on that row and then finds the account (one
+  account, one password). The finishing transaction no longer writes the
+  agent row after locking the grant, which deadlocked against a concurrent
+  credential fetch (`issuable` holds the agent share-locked and waits for
+  the grant) and against a second provision. The Python's in-process
+  mutex released before the commit. A held agent gets no account.
 - **LLDAP passwords are set over LDAP, not `lldap_set_password`** (B4).
   `lldap_set_password` takes the admin JWT only on its command line (no
   env/stdin option), where `/proc/<pid>/cmdline` shows it to every local

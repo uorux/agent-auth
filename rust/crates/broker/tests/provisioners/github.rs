@@ -783,3 +783,112 @@ async fn the_wiki_repo_is_never_brokered(pool: PgPool) {
     .unwrap_err();
     assert_eq!(err, "repo 'jrt/agent-wiki' is never brokered (denylist)");
 }
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_token_github_did_not_revoke_keeps_the_grant_for_a_retry(pool: PgPool) {
+    let t = setup(pool).await;
+    let a = agent(&t.store, "gh-agent").await;
+    let g = granted(
+        &t.store,
+        &t.p,
+        a.id,
+        &repo(&[("contents", GithubAccess::Read)]),
+        "jrt/cactus",
+    )
+    .await;
+    credential(&t.store, &t.p, &g).await.unwrap();
+    let n = t.n.clone();
+    t.fake.set(move |c| {
+        if c.is("DELETE", "/installation/token") {
+            r(502, json!({}))
+        } else {
+            github_default(c, &n)
+        }
+    });
+    let err = expire(&t.store, &t.p, g.id).await.unwrap_err();
+    assert_eq!(err, "GitHub token revoke failed (502)");
+    assert_eq!(
+        grant(&t.store, g.id).await.status,
+        agent_auth_core::GrantStatus::Active
+    );
+    assert_eq!(
+        credential_rows(&t.store, &g).await,
+        1,
+        "kept to revoke again"
+    );
+    // 401: the token is already dead, which is what revoking wanted.
+    let n = t.n.clone();
+    t.fake.set(move |c| {
+        if c.is("DELETE", "/installation/token") {
+            r(401, json!({}))
+        } else {
+            github_default(c, &n)
+        }
+    });
+    revoke_due(&t.store, &t.p, g.id).await.unwrap();
+    assert_eq!(credential_rows(&t.store, &g).await, 0);
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_slow_platform_is_cut_off(pool: PgPool) {
+    use agent_auth_broker::provisioners::{FakeProvisioner, PROVISION_DEADLINE, provision_within};
+    assert!(agent_auth_broker::provisioners::http::CALL_TIMEOUT <= Duration::from_secs(15));
+    assert!(PROVISION_DEADLINE <= Duration::from_secs(60));
+    // Each call is capped...
+    let n = Arc::new(AtomicUsize::new(0));
+    let n2 = n.clone();
+    let fake = Fake::start(move |c| {
+        if c.path.ends_with("/installation") {
+            R(200, json!({"id": 42}), 3000)
+        } else {
+            github_default(c, &n2)
+        }
+    })
+    .await;
+    let app = GithubApp::new(
+        "1",
+        key_file(),
+        &fake.url,
+        None,
+        Http::new().unwrap().with_cap(Duration::from_millis(200)),
+    );
+    let p = GithubProvisioner::new(Arc::new(app), &config(), Some(secret_box())).unwrap();
+    let store = Store::from_pool(pool);
+    let a = agent(&store, "gh-agent").await;
+    let g = provisioning(
+        &store,
+        a.id,
+        &repo(&[("contents", GithubAccess::Read)]),
+        "jrt/slow",
+        3600,
+    )
+    .await;
+    let started = std::time::Instant::now();
+    assert_eq!(
+        provision(&store, &p, &g).await.unwrap_err(),
+        "GitHub API unreachable (see broker logs)"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    // ...and so is a whole provision.
+    let mut slow = FakeProvisioner::new(Platform::Github);
+    slow.delay = Some(Duration::from_secs(5));
+    let g = provisioning(
+        &store,
+        a.id,
+        &repo(&[("contents", GithubAccess::Read)]),
+        "jrt/slower",
+        3600,
+    )
+    .await;
+    let tx = store.begin().await.unwrap();
+    let _nh = lockdown::check(&tx, a.id, now()).await.unwrap().unwrap();
+    let pg = agent_auth_store::grants::load_provisioning(&tx, g.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        provision_within(&slow, &tx, &pg, now(), Duration::from_millis(100))
+            .await
+            .is_none()
+    );
+}

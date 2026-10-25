@@ -33,7 +33,7 @@ use serde_json::{Value, json};
 use time::OffsetDateTime;
 
 use super::common::{at, repr, store_failed};
-use super::http::{self, Http, MAX_BODY, Reply};
+use super::http::{Http, MAX_BODY, Reply};
 use super::ldap::LdapTarget;
 use super::setup::{ConfigError, Env};
 use super::{Credential, ProvisionError, Provisioner, Refused, RequestSpec, Validated};
@@ -194,7 +194,7 @@ impl LldapProvisioner {
         if let Some(t) = token {
             rb = rb.header("Authorization", format!("Bearer {t}"));
         }
-        http::send(rb, TIMEOUT, MAX_BODY).await.map_err(|e| {
+        self.http.send(rb, TIMEOUT, MAX_BODY).await.map_err(|e| {
             tracing::warn!(error = %e, path, "LLDAP call failed");
             ProvisionError::failed("LLDAP unreachable (see broker logs)")
         })
@@ -506,9 +506,13 @@ impl LldapProvisioner {
             .await
             .map_err(|e| store_failed(&e))?
             .ok_or_else(|| ProvisionError::failed("agent not found"))?;
-        let user = match agent.lldap_username.filter(|u| !u.is_empty()) {
-            Some(u) => u,
-            None => self.ensure_account(tx, agent.id).await?,
+        // A managed account was made by `prepare`, before this
+        // transaction locked the grant: never lock the agent row here.
+        let Some(user) = agent.lldap_username.filter(|u| !u.is_empty()) else {
+            return Err(ProvisionError::failed(format!(
+                "agent {} has no LLDAP service account",
+                repr(&agent.name)
+            )));
         };
         // The add is serialized with every revoke of this membership.
         agent_auth_store::lldap::lock_membership(tx, grant.agent_id, &grant.resource)
@@ -523,6 +527,38 @@ impl LldapProvisioner {
 impl Provisioner for LldapProvisioner {
     fn platform(&self) -> Platform {
         Platform::Homelab
+    }
+
+    /// Make the agent's managed account, if it needs one, in a transaction
+    /// of its own that locks only the agent row and commits before the
+    /// finishing phase locks the grant (lock order: agent before grant).
+    /// A concurrent first provision for the same agent waits on the row
+    /// lock and then finds the account.
+    async fn prepare(
+        &self,
+        store: &agent_auth_store::Store,
+        grant: &GrantRow,
+        now: OffsetDateTime,
+    ) -> Result<(), ProvisionError> {
+        if is_admin_group(&grant.resource) {
+            return Ok(()); // provision refuses it
+        }
+        // A held agent gets no account (the finish fails the grant). Read
+        // in a short transaction: taking the agent row FOR UPDATE after
+        // the check's share lock in one transaction would deadlock two
+        // concurrent prepares.
+        let check = store.begin().await.map_err(|e| store_failed(&e))?;
+        let held = agent_auth_store::lockdown::check(&check, grant.agent_id, now)
+            .await
+            .map_err(|e| store_failed(&e))?
+            .is_err();
+        check.rollback().await.map_err(|e| store_failed(&e))?;
+        if held {
+            return Ok(());
+        }
+        let tx = store.begin().await.map_err(|e| store_failed(&e))?;
+        self.ensure_account(&tx, grant.agent_id).await?;
+        tx.commit().await.map_err(|e| store_failed(&e))
     }
 
     async fn validate(
