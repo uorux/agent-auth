@@ -300,6 +300,58 @@ and why. Keep entries short. Group by area.
   exclusively, so it waits for in-flight checks rather than deadlocking
   with a provisioning (reproduced with psql and in a test).
 
+## Discord (broker/src/discord)
+
+- **No twilight-http or twilight-gateway** (dependency policy). twilight-http
+  always enables HTTP/2 (h2, banned) and both bring their own TLS roots
+  (twilight-gateway's connector cannot be replaced). Only twilight-model
+  (types) is used. REST goes over `agent-auth-tls::reqwest_builder`
+  (HTTP/1.1, no compression, the shared root store, 15 s per attempt, 429
+  `retry_after` and the global flag honoured, at most 3 retries and 30 s per
+  wait). The gateway is our own client over tokio-tungstenite (feature
+  `__rustls-tls`, the shared rustls config): JSON, no compression, intents
+  0, heartbeat with jitter, zombie detection, resume via
+  `resume_gateway_url` (followed only if `wss://`), identify again after a
+  non-resumable invalid session, 1 s→60 s backoff, 1 MiB frame/message cap.
+  The protocol is a pure state machine (`gateway::Machine`), property-tested.
+- **All agent- and model-chosen text is escaped** (surfaces A.5, Bug-A1,
+  INV-A5): justification, resource, agent and delegator names, agent
+  attributes, risk notes, decided-by, decision and revoke reasons, job
+  errors, attention desks. The escape is stricter than discord.py's: a
+  backslash before every markup character (backslash, `*`, `_`, `~`, `|`,
+  backtick, `>`, `<`, `#`, `-`, `[`, `]`, `(`, `)`, `:`) and a zero-width space after every `@`; trimming never splits an escape.
+  Code spans/blocks (scope JSON, commands, thread topics, resources in
+  backticks) replace backticks with `ˋ`. Privilege labels (made from a parsed
+  authority) and the broker's own words are not escaped.
+- **Every message names who it may ping** (Bug-A3): `allowed_mentions` with
+  `parse: []` and at most the owner. The approval card's `<@owner>` is
+  omitted when no owner is configured (Python wrote `<@0>`).
+- **A card decided before its ids were stored is updated** (Bug-A4):
+  `surface` re-reads the request after storing the message ids and applies
+  the outcome if it is already final. `update_outcome`, `job_finished` and
+  the shell thread read the ids fresh from the database.
+- **Edit refuses what it cannot hold whole** (Bug-A2): a resource over 512
+  characters or scope JSON over 4000 gets "This request is too long to edit
+  here (...): approve or deny it as it is." instead of a truncated prefill.
+- **`/release` answers ephemerally** (Bug-A5), after a deferral.
+- **Stateless components.** The decision modal's custom id says what it
+  decides: `aa:decision:approve:{rid}` / `aa:decision:deny:{rid}` (Python:
+  `aa:decision:{rid}`, with approve/deny held in memory, so a submission
+  after a restart failed). The rules browser's select and buttons carry the
+  page and rule id (`aa:rules:sel|page|toggle|del:...`) instead of a
+  600-second in-memory view, and redraw from the database after the owner
+  check. Custom ids parse strictly (canonical ids and numbers only).
+- **Modal inputs are `Label` components** around text inputs (Discord's
+  current form; the input's own `label` is deprecated). Same labels, limits
+  and placeholders.
+- **Autocomplete from anyone but the owner gets no choices** (Python listed
+  containment ids to any user).
+- **Not yet ported** (hostexec Discord UI, a follow-up): "Approve all…"
+  (window rules) is not offered on run/template cards; /arm, /disarm,
+  /lockdown, /unlock, /dnd and /hosts are not registered. "Approve with
+  TOTP" and "End shell" work through the generic decision/revoke
+  interfaces.
+
 ## Open questions
 
 (for Jacob; nothing here is implemented until decided)
@@ -311,6 +363,10 @@ and why. Keep entries short. Group by area.
   that refusal (it now fails up front with a clear reason). Allowing it
   would mean a delegated grant capped only by its own duration and revoked
   when the chat thread closes.
+
+- **`/release` with no entry lifts every containment** (Discord, as the
+  Python; its option says so). The admin API now needs an explicit
+  `{"all": true}`. Should Discord ask for confirmation, or require an entry?
 
 ## To do (engineering, tracked here until done)
 

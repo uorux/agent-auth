@@ -73,6 +73,8 @@ pub enum Notifier {
     Null,
     /// Records every call, for tests.
     Recording(Recorder),
+    /// The Discord bot (spec A.4).
+    Discord(crate::discord::DiscordNotifier),
 }
 
 macro_rules! dispatch {
@@ -80,6 +82,7 @@ macro_rules! dispatch {
         match $self {
             Notifier::Null => $null,
             Notifier::Recording($n) => $e,
+            Notifier::Discord($n) => $e,
         }
     };
 }

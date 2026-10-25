@@ -6,12 +6,14 @@
 //! Layout (one module per area; see rust/ARCHITECTURE.md):
 //! - `auth`: principals (`AgentCaller`, `AdminCaller`, `DiscordOwner`,
 //!   `HumanDecider`) and their extractors.
+//! - `discord`: the Discord bot and its notifier.
 //! - `error`: `ApiError` (`{"detail": ...}`).
 //! - `events`: subscribe-first wake-ups for long-polls.
 //! - `notify`: the human surface (`Notifier`).
 //! - `provisioners`: the contract, the registry, one module per platform.
 
 pub mod auth;
+pub mod discord;
 pub mod error;
 pub mod events;
 pub mod notify;
