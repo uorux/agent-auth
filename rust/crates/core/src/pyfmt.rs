@@ -68,7 +68,7 @@ fn push_python_escape(out: &mut String, c: char) {
 /// or hide text. Not: controls (including `\t`, `\n`, `\r`, ESC, DEL),
 /// line/paragraph separators and other non-space spaces, bidi controls
 /// (U+202A..E, U+2066..9, U+200E/F, U+061C), zero-width and invisible
-/// characters (U+200B..D, U+2060..4, U+FEFF, U+00AD, Hangul fillers), tag
+/// characters (U+200B..D, U+2060..F, U+FEFF, U+00AD, Hangul fillers), tag
 /// characters, private use.
 #[must_use]
 pub fn is_display_safe(c: char) -> bool {
@@ -112,8 +112,8 @@ fn is_printable(c: char) -> bool {
             | 0x180e
             | 0x200b..=0x200f
             | 0x202a..=0x202e
-            | 0x2060..=0x2064
-            | 0x2066..=0x206f
+            // The whole invisible-operators block, U+2065 (unassigned) too.
+            | 0x2060..=0x206f
             | 0xfeff
             | 0xfff9..=0xfffb
             | 0xe0001
@@ -288,6 +288,13 @@ mod tests {
         );
         assert_eq!(shlex_quote("a=b,c:d@e%f+g"), "a=b,c:d@e%f+g");
         assert_eq!(shlex_quote("é"), "'é'");
+    }
+
+    #[test]
+    fn unassigned_invisible_operator_is_escaped() {
+        // Found by the argv proptest: U+2065 sat between the two ranges.
+        assert!(!is_display_safe('\u{2065}'));
+        assert_eq!(escape_unprintable("a\u{2065}b"), "a\\u2065b");
     }
 
     #[test]

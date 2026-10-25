@@ -754,3 +754,10 @@ and why. Keep entries short. Group by area.
   (a dedicated PKCS#8 key) in review.
 - Core defines `AgentKind` and `Placement` twice (containment and policy);
   provisioners map between them. Unify in core.
+- Move the sensitive-namespace pinning rule (`pinned_here`) from the spine's
+  service into core's evaluation, where the other gates are proven.
+- Refuse `rotate-key` for an agent minted in an agent VM (as rename and
+  attributes are): rotating would strand the sandbox daemon's copy. The way
+  out for a suspect minted agent is disable, then re-mint.
+- Store lock-order doc vs. the finish phase (grant before request row):
+  verify in the next review that no path locks request then grant.
