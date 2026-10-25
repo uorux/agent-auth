@@ -95,6 +95,7 @@ fn hostd_root_jobs_need_a_human() {
 /// state; an accepted step is later than the last; a locked secret accepts
 /// nothing.
 #[kani::proof]
+#[kani::unwind(3)]
 fn hostd_totp_replay_and_lock() {
     let now: u64 = kani::any();
     kani::assume(now < u64::MAX / 2);
@@ -128,7 +129,13 @@ fn hostd_totp_replay_and_lock() {
                 }
                 Err(TotpRefusal::AlreadyUsed) => {
                     assert!(before.last_step.is_some_and(|l| matched <= l));
-                    assert!(state == before);
+                    // Unchanged (field by field: no slice compare to unwind).
+                    assert!(state.last_step == before.last_step);
+                    assert!(state.failures == before.failures);
+                    assert!(state.lockouts == before.lockouts);
+                    assert!(state.locked_until == before.locked_until);
+                    assert!(state.recent_failures.is_empty());
+                    assert!(state.hard_locked == before.hard_locked);
                 }
                 Err(_) => {}
             }
