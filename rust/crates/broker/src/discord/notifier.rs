@@ -69,8 +69,17 @@ fn scope_label(scope: &ScopeRow) -> String {
     format!(
         "scope {}: {}",
         code(&short(scope.id)),
-        escape(&cut(&scope.purpose, 300))
+        said(&one_line(&scope.purpose), 200)
     )
+}
+
+/// Agent text on one line, nothing hidden or reordered (a purpose may not
+/// pose as another notice in the thread).
+fn one_line(text: &str) -> String {
+    escape_unprintable(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn job_argv(job: &JobRow) -> Vec<String> {
@@ -398,8 +407,10 @@ impl DiscordNotifier {
         let full = shell_command_text(job);
         // In a scoped shell: which one, and what it is for.
         let label = scope.map_or(String::new(), |s| format!("{}\n", scope_label(s)));
-        let msg = if full.chars().count() <= 1700 {
-            Message::text(format!("{label}{}", code_block(&full, 1700)))
+        // The whole message stays within Discord's 2000 characters.
+        let room = 1900usize.saturating_sub(label.chars().count());
+        let msg = if full.chars().count() <= room.saturating_sub(10) {
+            Message::text(format!("{label}{}", code_block(&full, room)))
         } else {
             Message {
                 files: vec![File {
@@ -408,7 +419,7 @@ impl DiscordNotifier {
                 }],
                 ..Message::text(format!(
                     "{label}{}\n(the whole command is attached)",
-                    code_block(&full, 1300)
+                    code_block(&full, room.saturating_sub(40))
                 ))
             }
         };
@@ -421,10 +432,12 @@ impl DiscordNotifier {
         request: &RequestRow,
         event: ShellEvent<'_>,
     ) -> Result<(), Failure> {
-        let Some(thread) = self.shell_thread(request, false).await? else {
+        // The thread may not exist yet: a scope comes before any command,
+        // and the first command may be the one refused.
+        let Some(thread) = self.shell_thread(request, true).await? else {
             return Ok(());
         };
-        let command = |job: &JobRow| code_block(&shlex_join(&job_argv(job)), embeds::MAX_CODE);
+        let command = |job: &JobRow| code_block(&shlex_join(&job_argv(job)), 700);
         let in_scope = |scope: Option<&ScopeRow>| {
             scope.map_or(String::new(), |s| format!(" in {}", scope_label(s)))
         };
@@ -441,7 +454,7 @@ impl DiscordNotifier {
                     if alarming { "🚨" } else { "🛡️" },
                     in_scope(scope),
                     command(job),
-                    escape(why)
+                    said(why, 400)
                 ),
             ),
             ShellEvent::GuardUnavailable { job, scope } => (
@@ -457,15 +470,15 @@ impl DiscordNotifier {
                 format!(
                     "🔹 **Scoped shell opened**: {}\n> {}",
                     scope_label(scope),
-                    escape(&scope.verdict)
+                    said(&scope.verdict, 400)
                 ),
             ),
             ShellEvent::ScopeRefused { purpose, why } => (
                 false,
                 format!(
                     "🛡️ **Scoped shell refused**: {}\n> {}",
-                    escape(&cut(purpose, 400)),
-                    escape(why)
+                    said(&one_line(purpose), 400),
+                    said(why, 400)
                 ),
             ),
             ShellEvent::ScopeClosed { scope } => (

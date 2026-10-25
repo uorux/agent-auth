@@ -1188,6 +1188,30 @@ and why. Keep entries short. Group by area.
   model-checked (`proofs_shell`). The model client now exists whenever
   `OPENROUTER_API_KEY` is set; `platforms.hostexec.watch` still alone turns
   the after-the-fact watcher on. Tool count 35 → 36.
+  Hardened by its security review (three reviewers, 2026-10-25): the guard
+  sees the whole command (argv, cwd, env, stdin, timeout; nothing cut:
+  hostd's limits bound it) and the shell's earlier commands across every
+  scope, with their stdin, status and refusal reasons (the newest 40, at
+  most 160 000 characters, the number left out stated); its prompt makes
+  credentials, persistence, remote access, disabling security, changing
+  the approval system, hidden/encoded or fetched code, and loader/path
+  variables alarming unless the human-approved justification names that
+  exact action (an agent-written scope purpose never can), and refuses
+  running a file the agent wrote unless its content is in view; a guarded
+  shell's env may carry only LANG, LC_*, TZ, TERM (checked before any
+  model); one command or scope change per shell at a time (the guard
+  judges each in the light of the last, and the 16-scope cap holds); an
+  alarming refusal, or 5 refusals of commands or scope purposes, ends the
+  shell (`shell_refusals`; the agent must ask for a new one); guarded
+  commands are watched after they start too; the scope check sees the
+  umbrella's earlier scope purposes; scopes close when their shell ends;
+  scope and guard events open the shell's Discord thread if needed (they
+  were dropped before the first command), stay within 2000 characters,
+  show agent text on one line, and an alarming refusal reaches the desk
+  too; the card's mode text says what this broker actually does (no
+  "a model alerts you" when watching is off); a deny rule on a shell
+  covers it whatever its mode; `host_shell_close` with any `scope_id`
+  closes only a scope.
 
 - **TOTP lockout escalates and ends in a hard lock** (daemons-hostd §7, bug
   6). Five wrong codes in a row lock a secret for 5 min, then 10, 20, …

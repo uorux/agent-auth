@@ -1,0 +1,72 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT j.spec, j.status, j.error, s.purpose AS \"scope_purpose?\",\n                  count(*) OVER () AS \"total!\"\n           FROM host_jobs j\n           LEFT JOIN shell_scope_jobs l ON l.job_id = j.id\n           LEFT JOIN shell_scopes s ON s.id = l.scope_id\n           WHERE j.shell_id = $1\n           ORDER BY j.created_at DESC, j.id DESC LIMIT $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "spec",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "host_jobs",
+            "name": "spec"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "status",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "host_jobs",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "error",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "host_jobs",
+            "name": "error"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "scope_purpose?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "shell_scopes",
+            "name": "purpose"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "total!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      null
+    ]
+  },
+  "hash": "b2dc707c6a52a2d4c2900fe2ad1960fc9f3c785ace9eb7d82a7fdc83867ce296"
+}

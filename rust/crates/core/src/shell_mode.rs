@@ -5,8 +5,8 @@
 //!    shell has no scopes.
 //! 2. [`after_guard`]: a guarded or umbrella command runs only on the
 //!    guard's explicit allow (a refusal, or a guard that could not be
-//!    asked, refuses it); watched and general commands are not guarded and
-//!    are watched after they start instead.
+//!    asked, refuses it); watched and general commands are not guarded.
+//!    Every command sent is watched after it starts (when watching is on).
 
 use crate::authority::ShellMode;
 
@@ -48,17 +48,17 @@ pub fn scope_rule(mode: ShellMode, scoped: bool) -> Result<(), ShellRefusal> {
     }
 }
 
-/// Step 2: may it be sent, given what the guard said? `Ok(true)`: send it
-/// and have the watcher look at it after it starts; `Ok(false)`: send it,
-/// no watcher (the guard rated it already).
-pub fn after_guard(mode: ShellMode, guard: GuardOutcome) -> Result<bool, ShellRefusal> {
+/// Step 2: may it be sent, given what the guard said? Every command that
+/// is sent is also watched after it starts (when watching is on): a
+/// guard's allow is no reason to stop looking.
+pub fn after_guard(mode: ShellMode, guard: GuardOutcome) -> Result<(), ShellRefusal> {
     if !mode.guarded() {
         // An answer from a guard nobody should have asked changes nothing:
         // the operator still sees the command, and the watcher still looks.
-        return Ok(true);
+        return Ok(());
     }
     match guard {
-        GuardOutcome::Allow => Ok(false),
+        GuardOutcome::Allow => Ok(()),
         GuardOutcome::Refuse { alarming } => Err(ShellRefusal::Guard { alarming }),
         GuardOutcome::Unavailable => Err(ShellRefusal::GuardUnavailable),
         GuardOutcome::NotAsked => Err(ShellRefusal::GuardNotAsked),
@@ -91,9 +91,8 @@ mod tests {
                 let sent = after_guard(mode, g);
                 if mode.guarded() {
                     assert_eq!(sent.is_ok(), g == GuardOutcome::Allow, "{mode} {g:?}");
-                    assert_ne!(sent, Ok(true), "a guarded command is not watched again");
                 } else {
-                    assert_eq!(sent, Ok(true), "{mode} {g:?}");
+                    assert_eq!(sent, Ok(()), "{mode} {g:?}");
                 }
             }
         }

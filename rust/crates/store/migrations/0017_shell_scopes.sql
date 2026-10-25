@@ -84,3 +84,27 @@ END $$;
 CREATE TRIGGER shell_scope_jobs_guard
     BEFORE INSERT OR UPDATE ON shell_scope_jobs
     FOR EACH ROW EXECUTE FUNCTION shell_scope_jobs_guard();
+
+-- What a guarded or umbrella shell's models refused (a command, or a
+-- scope's purpose): the budget after which the shell is ended. Rows are
+-- never changed.
+CREATE TABLE shell_refusals (
+    id        uuid PRIMARY KEY,
+    grant_id  uuid NOT NULL REFERENCES grants (id),
+    kind      text NOT NULL CHECK (kind IN ('command', 'scope')),
+    alarming  boolean NOT NULL,
+    at        timestamptz NOT NULL
+);
+
+CREATE INDEX shell_refusals_grant ON shell_refusals (grant_id);
+
+CREATE FUNCTION shell_refusals_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'shell refusals are never changed'
+        USING ERRCODE = 'check_violation';
+END $$;
+
+CREATE TRIGGER shell_refusals_guard
+    BEFORE UPDATE ON shell_refusals
+    FOR EACH ROW EXECUTE FUNCTION shell_refusals_guard();

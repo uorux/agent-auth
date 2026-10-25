@@ -203,21 +203,26 @@ impl ShellMode {
         matches!(self, ShellMode::Guarded | ShellMode::Umbrella)
     }
 
-    /// What the operator is told, on the approval card.
+    /// What the operator is told, on the approval card. `watching`: the
+    /// broker watches shell commands after they start
+    /// (`platforms.hostexec.watch` with a model).
     #[must_use]
-    pub const fn describe(self) -> &'static str {
-        match self {
-            ShellMode::Watched => {
+    pub const fn describe(self, watching: bool) -> &'static str {
+        match (self, watching) {
+            (ShellMode::Watched, true) => {
                 "watched: commands run after you see them; a model alerts you on danger or off-purpose work"
             }
-            ShellMode::General => {
+            (ShellMode::General, true) => {
                 "general: a catch-all shell; a model alerts you on danger only, not on the purpose"
             }
-            ShellMode::Guarded => {
-                "guarded: a model checks each command against the purpose first and refuses what doesn't fit"
+            (ShellMode::Watched | ShellMode::General, false) => {
+                "unguarded: commands run after you see them; no model watches them (shell watching is off)"
             }
-            ShellMode::Umbrella => {
-                "umbrella: the agent opens scoped shells inside it, each purpose checked against this one by a model, and each command checked against its scope's purpose"
+            (ShellMode::Guarded, _) => {
+                "guarded: before each command runs, a model checks it against the justification above and refuses what doesn't serve it"
+            }
+            (ShellMode::Umbrella, _) => {
+                "umbrella: the justification above is the concept; the agent opens scoped shells inside it, each purpose checked against that concept by a model, and each command checked against its scope's purpose"
             }
         }
     }
@@ -1017,6 +1022,13 @@ pub fn rule_covers(rule: Option<&Authority>, request: &Authority) -> bool {
         }
         // A mail rule covers a request that asks for no more.
         (Authority::Mail(rule), Authority::Mail(wanted)) => rule.covers(wanted),
+        // A rule pinned to a shell is about the tier, whatever the mode: a
+        // deny for user shells still denies a general one. (No rule ever
+        // approves a shell: they are human-only.)
+        (
+            Authority::Hostexec(HostexecAuthority::Shell { tier: a, .. }),
+            Authority::Hostexec(HostexecAuthority::Shell { tier: b, .. }),
+        ) => a == b,
         _ => false,
     }
 }

@@ -444,7 +444,9 @@ async fn run<C: Caller>(caller: &C, name: &str, a: &Args) -> Result<String, Stri
         "host_shell_close" => {
             safe(caller, || async {
                 // Either way the answer is {"closed": bool}.
-                let closed = match a.opt_str("scope_id").filter(|s| !s.is_empty()) {
+                // A scope_id given (even empty) closes only a scope, never
+                // the whole shell by accident.
+                let closed = match a.opt_str("scope_id") {
                     Some(scope) => {
                         plain()
                             .host_shell_close_scope(a.str("grant_id"), scope)

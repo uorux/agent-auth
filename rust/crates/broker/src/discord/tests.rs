@@ -1688,3 +1688,70 @@ async fn shell_commands_are_shown_before_they_run(pool: sqlx::PgPool) {
     );
     assert_eq!(refs(&store, r.id).await.thread_id, Some(555));
 }
+
+/// Shell modes: a scope or a guard refusal may come before any command,
+/// and still reaches the shell's thread (made for it); a scoped command
+/// with a long purpose and a long command stays one postable message.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn shell_events_open_the_thread_and_fit_discord(pool: sqlx::PgPool) {
+    use agent_auth_store::shell_scopes::ScopeRow;
+    let (f, base) = fake().await;
+    let store = Store::from_pool(pool);
+    let ops = Arc::new(FakeOps::default());
+    let bot = bot_with(&base, OWNER, store.clone(), &ops);
+    let (a, r) = insert_request(
+        &store,
+        Platform::Hostexec,
+        "shell",
+        json!({"tier": "user", "mode": "umbrella"}),
+        "excelsior",
+    )
+    .await;
+    bot.notifier().surface(&r, &a).await;
+    let scope = ScopeRow {
+        id: agent_auth_core::ScopeId::new(),
+        grant_id: agent_auth_core::GrantId::new(),
+        agent_id: a.id,
+        purpose: format!(
+            "line one\n**fake notice** <@1> \u{202e}{}",
+            "p".repeat(3000)
+        ),
+        verdict: "fits".to_owned(),
+        opened_at: T0,
+        closed_at: None,
+    };
+    bot.notifier()
+        .shell_event(&r, crate::notify::ShellEvent::ScopeOpened { scope: &scope })
+        .await;
+    let calls = f.calls();
+    assert_eq!(calls.len(), 3, "card, thread, then the event in it");
+    assert_eq!(calls[1].path, "/channels/5/messages/900/threads");
+    assert_eq!(calls[2].path, "/channels/555/messages");
+    let posted = calls[2].body["content"].as_str().unwrap();
+    assert!(posted.contains("Scoped shell opened"));
+    assert!(
+        !posted.contains('\n') || posted.lines().count() == 2,
+        "{posted}"
+    );
+    assert!(
+        !posted.contains("<@1>") && !posted.contains('\u{202e}'),
+        "{posted}"
+    );
+    // A long command in that scope: shown, within 2000 characters.
+    let mut j = job(JobStatus::Starting, None, "");
+    j.shell_id = Some(r.id);
+    // Long, but short enough to go inline beside the scope label.
+    j.spec = json!({"argv": ["echo", "x".repeat(1500)]});
+    assert!(bot.notifier().shell_command(&r, &j, Some(&scope)).await);
+    let last = f.calls().pop().unwrap();
+    let content = last.body["content"].as_str().unwrap();
+    assert!(
+        content.chars().count() <= 2000,
+        "{}",
+        content.chars().count()
+    );
+    assert!(
+        content.starts_with(&format!("scope {}", &scope.id.to_string()[..8])),
+        "{content}"
+    );
+}

@@ -189,6 +189,18 @@ impl HostExec {
             grant.authority,
             Authority::Hostexec(HostexecAuthority::Shell { .. })
         ) {
+            // Its scopes end with it (only scope rows are locked: the
+            // revoke holds the grant).
+            let closed = async {
+                let tx = self.store.begin().await?;
+                agent_auth_store::shell_scopes::close_all(&tx, grant.id, OffsetDateTime::now_utc())
+                    .await?;
+                tx.commit().await
+            }
+            .await;
+            if let Err(e) = closed {
+                tracing::warn!(grant = %grant.id, "closing the shell's scopes failed: {e}");
+            }
             return self
                 .call(
                     &grant.resource,

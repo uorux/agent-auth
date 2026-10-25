@@ -26,22 +26,21 @@ fn any_outcome() -> GuardOutcome {
 /// A command is sent (both steps pass) only if: an umbrella's runs in a
 /// scope and no other shell's does; a guarded or umbrella command had the
 /// guard's explicit allow (never a refusal, an unavailable guard or no
-/// guard at all); and a watched or general command is always watched
-/// after it starts, a guarded one never again.
+/// guard at all); a watched or general one is never held back by a guard.
 #[kani::proof]
 fn shell_command_sent_only_as_its_mode_allows() {
     let mode = any_mode();
     let scoped: bool = kani::any();
     let guard = any_outcome();
     let sent = scope_rule(mode, scoped).and_then(|()| after_guard(mode, guard));
-    if let Ok(watched) = sent {
+    if sent.is_ok() {
         assert!(scoped == (mode == ShellMode::Umbrella));
         if matches!(mode, ShellMode::Guarded | ShellMode::Umbrella) {
             assert!(guard == GuardOutcome::Allow);
-            assert!(!watched);
-        } else {
-            assert!(watched);
         }
+    }
+    if !mode.guarded() && scope_rule(mode, scoped).is_ok() {
+        assert!(sent.is_ok());
     }
     // An alarming refusal is reported as alarming.
     if mode.guarded() && scope_rule(mode, scoped).is_ok() {

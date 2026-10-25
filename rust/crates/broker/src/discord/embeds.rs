@@ -475,11 +475,12 @@ pub fn hostexec_embed(
             true,
         );
         // How a model checks its commands (the agent chose; approving
-        // approves that mode).
+        // approves that mode). What it means here, with this broker's
+        // settings, is in the notes (validation wrote it).
         let mode = scope_str(&scope, "mode")
             .and_then(agent_auth_core::ShellMode::parse)
             .unwrap_or_default();
-        add_field(&mut e, "Checks", mode.describe().to_owned(), false);
+        add_field(&mut e, "Checks", format!("`{mode}` (see the notes)"), true);
     } else if let Some(t) = scope
         .get("timeout")
         .and_then(Value::as_u64)

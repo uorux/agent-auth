@@ -31,9 +31,11 @@ const CONCEPT: &str = "maintain the larder service on excelsior: builds, tests, 
 fn model() -> impl Fn(&str, &str) -> Option<Value> + Send + Sync + 'static {
     |system: &str, user: &str| {
         if system == GUARD_PROMPT {
-            Some(if user.contains("\"curl\"") {
+            // The command judged is the message's last field.
+            let command = user.rsplit("\"command\":").next().unwrap_or("");
+            Some(if command.contains("\"curl\"") {
                 json!({"level": "odd", "summary": "downloading is not part of this purpose"})
-            } else if user.contains("\"shred\"") {
+            } else if command.contains("\"shred\"") {
                 json!({"level": "alarming", "summary": "destroys data"})
             } else {
                 json!({"level": "fine", "summary": "part of the work"})
@@ -125,25 +127,26 @@ async fn a_guarded_shell_runs_what_its_guard_allows_and_nothing_else(pool: sqlx:
     let g = granted(&b, &host, &a, "guarded", "rebuild the larder service").await;
     let hx = b.hostexec();
 
-    let ok = hx
-        .shell_exec(a.id, g, &exec(&["echo", "allowed"], None))
-        .await
-        .unwrap();
-    wait_until(|| ran(&host, "allowed")).await;
+    let mut first = exec(&["tee", "/tmp/build.sh"], None);
+    first.stdin = Some(
+        serde_json::from_value(json!(format!("{}make all\n", "# step\n".repeat(900)))).unwrap(),
+    );
+    let ok = hx.shell_exec(a.id, g, &first).await.unwrap();
+    wait_until(|| ran(&host, "/tmp/build.sh")).await;
     assert!(
         b.recorded()
             .iter()
             .any(|l| *l == format!("shell_command {}", ok.id))
     );
-    // The guard saw the purpose and the command, inside its tag.
+    // The guard saw the purpose and the whole command, stdin and all.
     let asked = m.calls_to(GUARD_PROMPT);
     assert_eq!(asked.len(), 1);
     assert!(
-        asked[0].contains("rebuild the larder service"),
+        asked[0].contains("\"approved_purpose\": \"rebuild the larder service\""),
         "{}",
         asked[0]
     );
-    assert!(asked[0].contains("\"allowed\""));
+    assert!(asked[0].contains("make all"), "nothing is cut");
 
     // Off purpose: refused, never shown as a command, never sent.
     let err = hx
@@ -159,28 +162,17 @@ async fn a_guarded_shell_runs_what_its_guard_allows_and_nothing_else(pool: sqlx:
             .iter()
             .any(|l| l.starts_with("guard_refused") && l.ends_with("alarming=false"))
     );
-    // Alarming: refused, and the operator is pinged.
-    let err = hx
-        .shell_exec(a.id, g, &exec(&["shred", "/etc/passwd"], None))
+    // The next judgement sees what came before: the script it wrote (with
+    // its stdin) and the refused attempt.
+    hx.shell_exec(a.id, g, &exec(&["bash", "/tmp/build.sh"], None))
         .await
-        .unwrap_err();
-    assert!(matches!(err, ShellExecError::Refused(_)));
+        .unwrap();
+    let third = m.calls_to(GUARD_PROMPT).pop().unwrap();
     assert!(
-        b.recorded()
-            .iter()
-            .any(|l| l.starts_with("guard_refused") && l.ends_with("alarming=true"))
+        third.contains("make all") && third.contains("\"curl\"") && third.contains("refused"),
+        "{third}"
     );
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!ran(&host, "curl") && !ran(&host, "shred"));
-    assert_eq!(refused_job_count(&b).await, 2, "both on record as refused");
-    assert_eq!(
-        b.recorded()
-            .iter()
-            .filter(|l| l.starts_with("shell_command"))
-            .count(),
-        1,
-        "only the allowed command was shown as one about to run"
-    );
+    assert!(third.contains("\"earlier_commands_omitted\": 0"));
     // The agent's text cannot close the guard's tag.
     let _ = hx
         .shell_exec(
@@ -192,8 +184,16 @@ async fn a_guarded_shell_runs_what_its_guard_allows_and_nothing_else(pool: sqlx:
     let last = m.calls_to(GUARD_PROMPT).pop().unwrap();
     assert_eq!(last.matches("</guard>").count(), 1, "{last}");
     assert!(!last.to_lowercase().contains("</guard >"));
-    // A guarded command is not watched again afterwards.
-    assert!(m.calls_to(WATCH_PROMPT).is_empty());
+    // Variables that change what runs are refused outright; LANG is fine.
+    let mut with_env = exec(&["make"], None);
+    with_env.env = serde_json::from_value(json!({"PATH": "/tmp/evil"})).unwrap();
+    let err = hx.shell_exec(a.id, g, &with_env).await.unwrap_err();
+    assert!(
+        matches!(&err, ShellExecError::Spec(m) if m.contains("PATH")),
+        "{err:?}"
+    );
+    with_env.env = serde_json::from_value(json!({"LANG": "C.UTF-8"})).unwrap();
+    hx.shell_exec(a.id, g, &with_env).await.unwrap();
     // A scope id means nothing outside an umbrella.
     let err = hx
         .shell_exec(a.id, g, &exec(&["echo", "x"], Some(ScopeId::new())))
@@ -205,6 +205,111 @@ async fn a_guarded_shell_runs_what_its_guard_allows_and_nothing_else(pool: sqlx:
         matches!(&err, ShellExecError::Refused(m) if m.contains("only an umbrella")),
         "{err:?}"
     );
+
+    // Alarming: refused, the operator pinged, and the shell ended.
+    let err = hx
+        .shell_exec(a.id, g, &exec(&["shred", "/etc/passwd"], None))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ShellExecError::Refused(m) if m.contains("ended")),
+        "{err:?}"
+    );
+    assert!(
+        b.recorded()
+            .iter()
+            .any(|l| l.starts_with("guard_refused") && l.ends_with("alarming=true"))
+    );
+    let err = hx
+        .shell_exec(a.id, g, &exec(&["echo", "after"], None))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ShellExecError::Refused(_)), "{err:?}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!ran(&host, "curl") && !ran(&host, "shred") && !ran(&host, "after"));
+    assert!(refused_job_count(&b).await >= 2);
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_guard_that_keeps_refusing_ends_the_shell(pool: sqlx::PgPool) {
+    let m = FakeModel::start(|system: &str, _user: &str| {
+        Some(if system == GUARD_PROMPT {
+            json!({"level": "odd", "summary": "not for this purpose"})
+        } else {
+            json!({"level": "fine", "summary": "ok"})
+        })
+    })
+    .await;
+    let b = Broker::start_with_model(pool, POLICY, &m).await;
+    let host = Host::start(&b).await;
+    let a = b.agent("claude-1").await;
+    let g = granted(&b, &host, &a, "guarded", "rebuild the larder service").await;
+    let hx = b.hostexec();
+    for i in 0..4 {
+        let err = hx
+            .shell_exec(a.id, g, &exec(&["echo", &format!("try{i}")], None))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ShellExecError::Refused(m) if !m.contains("ended")),
+            "{i}: {err:?}"
+        );
+    }
+    let err = hx
+        .shell_exec(a.id, g, &exec(&["echo", "try4"], None))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ShellExecError::Refused(m) if m.contains("ended")),
+        "{err:?}"
+    );
+    let tx = b.st.store.begin().await.unwrap();
+    let grant = agent_auth_store::grants::get(&tx, g)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        grant.status,
+        agent_auth_core::GrantStatus::Active,
+        "the shell was ended"
+    );
+    drop(tx);
+    // No more model calls for it: the shell is gone.
+    let before = m.calls_to(GUARD_PROMPT).len();
+    let _ = hx
+        .shell_exec(a.id, g, &exec(&["echo", "again"], None))
+        .await;
+    assert_eq!(m.calls_to(GUARD_PROMPT).len(), before);
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn concurrent_commands_are_judged_one_after_another(pool: sqlx::PgPool) {
+    let m = FakeModel::start(model()).await;
+    let b = Broker::start_with_model(pool, POLICY, &m).await;
+    let host = Host::start(&b).await;
+    let a = b.agent("claude-1").await;
+    let g = granted(&b, &host, &a, "guarded", "rebuild the larder service").await;
+    let (h1, h2) = (b.hostexec(), b.hostexec());
+    let (id, gid) = (a.id, g);
+    let one = tokio::spawn(async move {
+        h1.shell_exec(id, gid, &exec(&["echo", "first-cmd"], None))
+            .await
+    });
+    let two = tokio::spawn(async move {
+        h2.shell_exec(id, gid, &exec(&["echo", "second-cmd"], None))
+            .await
+    });
+    one.await.unwrap().unwrap();
+    two.await.unwrap().unwrap();
+    let asked = m.calls_to(GUARD_PROMPT);
+    assert_eq!(asked.len(), 2);
+    // Whichever went second saw the other among its earlier commands.
+    assert!(
+        asked[1].contains("first-cmd") && asked[1].contains("second-cmd"),
+        "{}",
+        asked[1]
+    );
+    wait_until(|| ran(&host, "first-cmd") && ran(&host, "second-cmd")).await;
 }
 
 #[sqlx::test(migrations = "../store/migrations")]
@@ -315,7 +420,8 @@ async fn an_umbrella_runs_commands_only_in_scopes_it_let_open(pool: sqlx::PgPool
     );
     let guard = m.calls_to(GUARD_PROMPT).pop().unwrap();
     assert!(
-        guard.contains("run the larder test suite") && guard.contains("umbrella_concept"),
+        guard.contains("\"scope_purpose\": \"run the larder test suite\"")
+            && guard.contains("\"approved_purpose\": \"maintain the larder service"),
         "{guard}"
     );
     let err = hx

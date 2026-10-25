@@ -189,43 +189,111 @@ pub async fn link_job(tx: &Tx<'_>, job: JobId, scope: ScopeId) -> Result<(), Sto
     Ok(())
 }
 
-/// The specs of the commands sent in `scope` before, oldest first (the
-/// guard's context), at most `limit` of the newest.
-pub async fn earlier_specs(
-    tx: &Tx<'_>,
-    scope: ScopeId,
-    limit: i64,
-) -> Result<Vec<Value>, StoreError> {
-    let mut c = tx.conn().await;
-    let mut specs = sqlx::query_scalar!(
-        "SELECT j.spec FROM shell_scope_jobs l JOIN host_jobs j ON j.id = l.job_id
-         WHERE l.scope_id = $1 AND j.status <> 'refused'
-         ORDER BY j.created_at DESC, j.id DESC LIMIT $2",
-        Uuid::from(scope),
-        limit
-    )
-    .fetch_all(&mut **c)
-    .await?;
-    specs.reverse();
-    Ok(specs)
+/// One earlier command of a shell, for the guard.
+#[derive(Debug, Clone)]
+pub struct Earlier {
+    pub spec: Value,
+    /// `starting|running|done|refused|lost`.
+    pub status: String,
+    /// Why it was refused (the guard's or the host's words).
+    pub error: Option<String>,
+    /// The scope it ran in (an umbrella's).
+    pub scope_purpose: Option<String>,
 }
 
-/// The same for a guarded shell without scopes: the commands sent in the
-/// shell `shell` (its request's id), oldest first, at most `limit`.
-pub async fn earlier_in_shell_specs(
+/// The newest `limit` commands of the shell `shell` (its request's id),
+/// every scope's and the refused ones too, oldest first; and how many it
+/// has in all.
+pub async fn history(
     tx: &Tx<'_>,
     shell: agent_auth_core::RequestId,
     limit: i64,
-) -> Result<Vec<Value>, StoreError> {
+) -> Result<(Vec<Earlier>, i64), StoreError> {
     let mut c = tx.conn().await;
-    let mut specs = sqlx::query_scalar!(
-        "SELECT spec FROM host_jobs WHERE shell_id = $1 AND status <> 'refused'
-         ORDER BY created_at DESC, id DESC LIMIT $2",
+    let rows = sqlx::query!(
+        r#"SELECT j.spec, j.status, j.error, s.purpose AS "scope_purpose?",
+                  count(*) OVER () AS "total!"
+           FROM host_jobs j
+           LEFT JOIN shell_scope_jobs l ON l.job_id = j.id
+           LEFT JOIN shell_scopes s ON s.id = l.scope_id
+           WHERE j.shell_id = $1
+           ORDER BY j.created_at DESC, j.id DESC LIMIT $2"#,
         Uuid::from(shell),
         limit
     )
     .fetch_all(&mut **c)
     .await?;
-    specs.reverse();
-    Ok(specs)
+    let total = rows.first().map_or(0, |r| r.total);
+    let mut out: Vec<Earlier> = rows
+        .into_iter()
+        .map(|r| Earlier {
+            spec: r.spec,
+            status: r.status,
+            error: r.error,
+            scope_purpose: r.scope_purpose,
+        })
+        .collect();
+    out.reverse();
+    Ok((out, total))
+}
+
+/// The purposes of `grant`'s scopes so far, opened ones only, oldest first
+/// (the scope check's context).
+pub async fn purposes(tx: &Tx<'_>, grant: GrantId, limit: i64) -> Result<Vec<String>, StoreError> {
+    let mut c = tx.conn().await;
+    let mut p = sqlx::query_scalar!(
+        "SELECT purpose FROM shell_scopes WHERE grant_id = $1
+         ORDER BY opened_at DESC, id DESC LIMIT $2",
+        Uuid::from(grant),
+        limit
+    )
+    .fetch_all(&mut **c)
+    .await?;
+    p.reverse();
+    Ok(p)
+}
+
+/// What a shell's models refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalKind {
+    Command,
+    Scope,
+}
+
+/// Record a refusal (a guard's verdict, not an unreachable model).
+pub async fn record_refusal(
+    tx: &Tx<'_>,
+    grant: GrantId,
+    kind: RefusalKind,
+    alarming: bool,
+    now: OffsetDateTime,
+) -> Result<(), StoreError> {
+    let mut c = tx.conn().await;
+    sqlx::query!(
+        "INSERT INTO shell_refusals (id, grant_id, kind, alarming, at) VALUES ($1, $2, $3, $4, $5)",
+        Uuid::new_v4(),
+        Uuid::from(grant),
+        match kind {
+            RefusalKind::Command => "command",
+            RefusalKind::Scope => "scope",
+        },
+        alarming,
+        now
+    )
+    .execute(&mut **c)
+    .await?;
+    Ok(())
+}
+
+/// `(refusals, alarming ones)` of `grant` so far.
+pub async fn refusals(tx: &Tx<'_>, grant: GrantId) -> Result<(i64, i64), StoreError> {
+    let mut c = tx.conn().await;
+    let r = sqlx::query!(
+        r#"SELECT count(*) AS "n!", count(*) FILTER (WHERE alarming) AS "alarming!"
+           FROM shell_refusals WHERE grant_id = $1"#,
+        Uuid::from(grant)
+    )
+    .fetch_one(&mut **c)
+    .await?;
+    Ok((r.n, r.alarming))
 }

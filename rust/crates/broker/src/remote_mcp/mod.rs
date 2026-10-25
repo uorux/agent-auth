@@ -1037,7 +1037,8 @@ impl Api<'_> {
             "host_shell_close" => {
                 let grant = seg(&a.s("grant_id"));
                 let path = match a.v("scope_id") {
-                    Value::String(scope) if !scope.is_empty() => {
+                    // A scope_id given (even empty) closes only a scope.
+                    Value::String(scope) => {
                         format!("/v1/hostexec/shells/{grant}/scopes/{}/close", seg(&scope))
                     }
                     _ => format!("/v1/hostexec/shells/{grant}/close"),

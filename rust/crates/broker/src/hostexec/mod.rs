@@ -99,6 +99,8 @@ pub struct HostExec {
     buffers: Mutex<HashMap<(String, JobId), Vec<u8>>>,
     st: OnceLock<crate::state::AppState>,
     pub(crate) watcher: Option<watcher::Watcher>,
+    /// One command or scope change of a shell at a time (`shells`).
+    pub(crate) shell_locks: Mutex<HashMap<agent_auth_core::GrantId, Arc<tokio::sync::Mutex<()>>>>,
     me: std::sync::Weak<HostExec>,
 }
 
@@ -240,6 +242,7 @@ impl HostExec {
             buffers: Mutex::new(HashMap::new()),
             st: OnceLock::new(),
             watcher,
+            shell_locks: Mutex::new(HashMap::new()),
             me: weak.clone(),
         });
         let h = Arc::clone(&me);
@@ -387,7 +390,8 @@ impl HostExec {
                     "{} shell on {host}: any command, one at a time, each shown here before it runs",
                     if *tier == Tier::Root { "ROOT" } else { "user" }
                 ));
-                notes.push(mode.describe().to_owned());
+                let watching = self.watcher.is_some() && self.policy.platforms().hostexec.watch;
+                notes.push(mode.describe(watching).to_owned());
                 (
                     HostexecAuthority::Shell {
                         tier: *tier,

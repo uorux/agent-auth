@@ -258,7 +258,10 @@ The guard and the scope check use `platforms.hostexec.risk_model` (default
 `llm.model`) through OpenRouter: without `OPENROUTER_API_KEY` a guarded or
 umbrella shell is refused at request time, and when the model can't be
 reached a command (or scope) is refused, never let through. Refusals are
-posted in the shell's thread (an alarming one pings you). hostd knows
+posted in the shell's thread (an alarming one pings you, and your desk).
+An alarming refusal, or five refusals in all, ends the shell: the agent has
+to ask you for a new one. A guarded shell's commands may set only LANG,
+LC_*, TZ and TERM in their environment. hostd knows
 nothing of modes: an umbrella is one host shell, and its scopes live in the
 broker.
 

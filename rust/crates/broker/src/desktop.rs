@@ -835,7 +835,38 @@ impl Notify for Fanout {
         primary!(self, n => n.shell_command(request, job, scope).await, null => true)
     }
     async fn shell_event(&self, request: &RequestRow, event: crate::notify::ShellEvent<'_>) {
-        primary!(self, n => n.shell_event(request, event).await, null => ());
+        primary!(self, n => n.shell_event(request, event).await,
+            null => tracing::info!(request = %request.id, ?event, "shell event (no notifier)"));
+        // An alarming refusal reaches the desk too, as a watcher's alarm does.
+        if let crate::notify::ShellEvent::GuardRefused {
+            job,
+            why,
+            alarming: true,
+            ..
+        } = event
+        {
+            let argv: Vec<String> = job
+                .spec
+                .get("argv")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let command: String = escape_unprintable(&shlex_join(&argv))
+                .chars()
+                .take(200)
+                .collect();
+            let why: String = escape_unprintable(why).chars().take(300).collect();
+            self.desktop
+                .alert(
+                    &format!("agent-auth: guard refused on {}", job.host),
+                    &format!("{command} — {why}"),
+                )
+                .await;
+        }
     }
     async fn watch_alert(&self, request: &RequestRow, job: &JobRow, text: &str) {
         primary!(self, n => n.watch_alert(request, job, text).await,
