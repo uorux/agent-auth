@@ -439,6 +439,10 @@ and why. Keep entries short. Group by area.
   and placeholders.
 - **Autocomplete from anyone but the owner gets no choices** (Python listed
   containment ids to any user).
+- **`DISCORD_API_URL` and `DISCORD_GATEWAY_URL`** (new, optional): where
+  the REST API and the gateway are; default Discord's
+  (`https://discord.com/api/v10`, `wss://gateway.discord.gg`). The e2e
+  suite points them at a fake Discord.
 - **Not yet ported** (hostexec Discord UI, a follow-up): "Approve all…"
   (window rules) is not offered on run/template cards; /arm, /disarm,
   /lockdown, /unlock, /dnd and /hosts are not registered. "Approve with

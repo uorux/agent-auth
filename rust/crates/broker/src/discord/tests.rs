@@ -797,6 +797,21 @@ fn configuration() {
         (c.activity_channel(), c.loud_channel(), c.owner()),
         (5, 5, Some(42))
     );
+    assert_eq!(
+        (c.api_base.as_str(), c.gateway_url.as_str()),
+        (super::rest::DISCORD_API, super::gateway::DISCORD_GATEWAY)
+    );
+    let c = DiscordConfig::from_vars(vars(&[
+        ("DISCORD_TOKEN", "t"),
+        ("DISCORD_API_URL", "http://127.0.0.1:9/api"),
+        ("DISCORD_GATEWAY_URL", " ws://127.0.0.1:9 "),
+    ]))
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        (c.api_base.as_str(), c.gateway_url.as_str()),
+        ("http://127.0.0.1:9/api", "ws://127.0.0.1:9")
+    );
     let secret = DiscordConfig::from_vars(vars(&[("DISCORD_TOKEN", "sekrit-token")]))
         .unwrap()
         .unwrap();

@@ -90,14 +90,21 @@ impl DiscordConfig {
                     .map_err(|_| format!("{key} must be a Discord id (a number)")),
             }
         };
+        // Discord itself unless set (a fake Discord in the e2e tests).
+        let url = |key: &str, default: &str| {
+            get(key)
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| default.to_owned())
+        };
         Ok(Some(DiscordConfig {
             token: Secret::new(token.to_owned()),
             channel_id: id("DISCORD_CHANNEL_ID")?,
             owner_id: id("DISCORD_OWNER_ID")?,
             loud_channel_id: id("DISCORD_LOUD_CHANNEL_ID")?,
             activity_channel_id: id("DISCORD_ACTIVITY_CHANNEL_ID")?,
-            api_base: rest::DISCORD_API.to_owned(),
-            gateway_url: gateway::DISCORD_GATEWAY.to_owned(),
+            api_base: url("DISCORD_API_URL", rest::DISCORD_API),
+            gateway_url: url("DISCORD_GATEWAY_URL", gateway::DISCORD_GATEWAY),
         }))
     }
 
