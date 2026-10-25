@@ -12,7 +12,6 @@ use agent_auth_store::daemons::{self, DaemonRole};
 use agent_auth_wire::daemon::channel::{Heartbeat, Reply};
 use agent_auth_wire::daemon::handshake::{HelloParams, version_ok};
 use axum::extract::ws::{Message, WebSocket};
-use futures::SinkExt as _;
 use futures::stream::{SplitStream, StreamExt as _};
 use serde_json::{Map, Value, json};
 use tokio::sync::watch;
@@ -83,6 +82,7 @@ impl DaemonHub {
             }),
             close: close_tx,
             last_status_write: std::sync::Mutex::new(None),
+            stalled: std::sync::atomic::AtomicBool::new(false),
         });
         let key = key_of(peer.role(), peer.name());
         // The generation check and the registration are one step under the
@@ -100,13 +100,7 @@ impl DaemonHub {
         let Some(replaced) = replaced else {
             // Not 4401: a daemon re-paired a moment ago may land here with
             // its new key, and should simply reconnect.
-            let mut out = live.out.lock().await;
-            let _ = out
-                .sink
-                .send(close_frame(
-                    CLOSE_REPLACED,
-                    "re-paired or unpaired during handshake",
-                ))
+            live.send_close(CLOSE_REPLACED, "re-paired or unpaired during handshake")
                 .await;
             return;
         };
@@ -138,10 +132,9 @@ impl DaemonHub {
         let idle = Duration::from_secs(u64::from(self.config.heartbeat_secs))
             .saturating_mul(MISSED_HEARTBEATS);
         let peer = &live.peer;
-        let close_with = |code: u16, reason: String| async move {
-            let mut out = live.out.lock().await;
-            let _ = out.sink.send(close_frame(code, &reason)).await;
-        };
+        // Bounded: a peer that stopped reading can't keep this loop.
+        let close_with =
+            |code: u16, reason: String| async move { live.send_close(code, &reason).await };
         loop {
             let next = tokio::select! {
                 changed = close_rx.changed() => {
@@ -280,13 +273,7 @@ impl DaemonHub {
                         reg.live.remove(&key);
                     }
                 }
-                let mut out = live.out.lock().await;
-                let _ = out
-                    .sink
-                    .send(close_frame(
-                        CLOSE_UNAUTHORIZED,
-                        "no longer paired with this key",
-                    ))
+                live.send_close(CLOSE_UNAUTHORIZED, "no longer paired with this key")
                     .await;
                 return false;
             }

@@ -122,11 +122,13 @@ pub async fn lockdown(
     if let Err(e) = &entry {
         tracing::error!(error = %e, "lockdown: containment entry not recorded");
     }
-    // Agent VMs hold the agents the entry holds (as a containment does).
-    tell_sandboxes(st).await;
 
-    // Stop what runs before tidying the records. Sandboxes first, briefly:
-    // once its host froze the VM a sandbox can't answer any more.
+    // Stop what runs before tidying the records. Hosts and agent VMs are
+    // told at once, each within its own timeout: a host never waits on a
+    // VM (review 2026-10: one VM that stopped reading its connection held
+    // every host back). A VM gets its held list (the entry above holds its
+    // agents, as a containment does), then the lockdown; a host may freeze
+    // the VM meanwhile, and the report says so.
     let hub = &hostexec.hub;
     let tell = |d: &DaemonRow, timeout| {
         let role = role_of(d);
@@ -139,20 +141,23 @@ pub async fn lockdown(
             (role, name, r)
         }
     };
-    let sandboxes = futures::future::join_all(
-        targets
-            .iter()
-            .filter(|d| d.role == DaemonRole::Sandbox)
-            .map(|d| tell(d, SANDBOX_LOCKDOWN_TIMEOUT)),
-    )
-    .await;
-    let hosts = futures::future::join_all(
+    let to_hosts = futures::future::join_all(
         targets
             .iter()
             .filter(|d| d.role != DaemonRole::Sandbox)
             .map(|d| tell(d, CALL_TIMEOUT)),
-    )
-    .await;
+    );
+    let to_sandboxes = async {
+        tell_sandboxes(st).await;
+        futures::future::join_all(
+            targets
+                .iter()
+                .filter(|d| d.role == DaemonRole::Sandbox)
+                .map(|d| tell(d, SANDBOX_LOCKDOWN_TIMEOUT)),
+        )
+        .await
+    };
+    let (hosts, sandboxes) = tokio::join!(to_hosts, to_sandboxes);
     let frozen: Vec<String> = hosts
         .iter()
         .filter(|(_, _, r)| {
@@ -181,6 +186,17 @@ pub async fn lockdown(
             Err(e) => format!("NOT reached ({e}); it is locked when it reconnects"),
         };
         reports.insert(key, text);
+    }
+    let unreached: Vec<&String> = reports
+        .iter()
+        .filter(|(_, t)| t.starts_with("NOT reached"))
+        .map(|(k, _)| k)
+        .collect();
+    if !unreached.is_empty() {
+        tracing::error!(
+            ?unreached,
+            "lockdown: daemons not reached; each is locked when it reconnects"
+        );
     }
 
     // Revoke the affected agents' grants (falling back to expiring them

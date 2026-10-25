@@ -359,3 +359,111 @@ pub async fn wait_until(f: impl Fn() -> bool) {
     }
     panic!("condition not reached");
 }
+
+/// A sandbox daemon on the real channel that stops reading its socket
+/// once it is told to: its handler never returns from the next message,
+/// so the channel's read loop (which awaits it) reads nothing more, while
+/// its heartbeats keep the connection looking alive.
+pub struct StallingDaemon {
+    pub name: String,
+    stall: Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+struct StallingHandler {
+    stall: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl agent_auth_daemon::channel::Handler for StallingHandler {
+    fn status(&self) -> serde_json::Map<String, Value> {
+        serde_json::Map::new()
+    }
+
+    async fn on_message(&self, _body: serde_json::Map<String, Value>) {
+        if self.stall.load(std::sync::atomic::Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+impl StallingDaemon {
+    /// Pair sandbox `name` and connect; waits until it is online.
+    pub async fn start(b: &Broker, name: &str) -> StallingDaemon {
+        let id = ChannelId::new(Role::Sandbox, DaemonName::parse(name).unwrap());
+        let code = b
+            .part
+            .hub
+            .create_pairing_code(&id)
+            .await
+            .unwrap()
+            .code
+            .expose()
+            .clone();
+        let identity = agent_auth_daemon::channel::Identity::new(
+            id,
+            SigningKey::generate().unwrap(),
+            agent_auth_daemon::url::BrokerUrl::parse(&b.url()).unwrap(),
+            b.key.public_key(),
+        );
+        let tls = Arc::new(agent_auth_tls::default_client_config().unwrap());
+        agent_auth_daemon::pair::pair(&identity, &code, Arc::clone(&tls))
+            .await
+            .unwrap();
+        let channel = Channel::new(identity, "0.1.0-test", tls);
+        let stall = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler = Arc::new(StallingHandler {
+            stall: Arc::clone(&stall),
+        });
+        let task = tokio::spawn(async move { channel.run(handler).await });
+        wait_until(|| b.part.hub.is_online(Role::Sandbox, name)).await;
+        StallingDaemon {
+            name: name.to_owned(),
+            stall,
+            task,
+        }
+    }
+
+    /// Stop reading, and fill the connection until a send to it no longer
+    /// finishes (a background task, as an unrelated sender would be). The
+    /// returned task ends when the broker gives up on the connection.
+    pub async fn stall(&self, b: &Broker) -> tokio::task::JoinHandle<u32> {
+        self.stall.store(true, std::sync::atomic::Ordering::SeqCst);
+        let hub = Arc::clone(&b.part.hub);
+        let name = self.name.clone();
+        let done = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter = Arc::clone(&done);
+        let flood = tokio::spawn(async move {
+            let filler = "x".repeat(512 * 1024);
+            let mut msg = serde_json::Map::new();
+            msg.insert("type".into(), json!("filler"));
+            msg.insert("filler".into(), json!(filler));
+            let mut sent = 0u32;
+            while sent < 4096 && hub.send_default(Role::Sandbox, &name, &msg).await {
+                sent += 1;
+                counter.store(sent, std::sync::atomic::Ordering::SeqCst);
+            }
+            sent
+        });
+        // Stalled: no send has finished for a while, and it isn't over.
+        let mut last = 0;
+        let mut quiet = 0;
+        while quiet < 10 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let now = done.load(std::sync::atomic::Ordering::SeqCst);
+            if now == last && now > 0 {
+                quiet += 1;
+            } else {
+                quiet = 0;
+            }
+            last = now;
+            assert!(!flood.is_finished(), "the connection never filled");
+        }
+        flood
+    }
+}
+
+impl Drop for StallingDaemon {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}

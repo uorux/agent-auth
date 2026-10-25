@@ -29,6 +29,7 @@ mod tests;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -63,11 +64,20 @@ pub const MISSED_HEARTBEATS: u32 = 3;
 pub const MAX_STATUS_BYTES: usize = 16 * 1024;
 /// The largest frame accepted from a daemon (an output chunk is ~175 KB).
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+/// A message to a daemon that is not written within this long (waiting
+/// for the connection included) means the daemon stopped reading: its
+/// connection is dropped, so it holds up nobody else's sends (review
+/// 2026-10: one stalled VM could hold a lockdown back from every host).
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// Writing a close frame: at most this long (the peer may not be reading).
+pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub const CLOSE_BAD_HELLO: u16 = 4400;
 pub const CLOSE_UNAUTHORIZED: u16 = 4401;
 pub const CLOSE_REPLACED: u16 = 4409;
 pub const CLOSE_DISABLED: u16 = 4503;
+/// The daemon did not take a message within [`SEND_TIMEOUT`].
+pub const CLOSE_STALLED: u16 = 4408;
 pub const CLOSE_TRY_AGAIN: u16 = 1013;
 
 /// The daemon settings (spec §13.1).
@@ -198,12 +208,35 @@ pub(crate) struct Live {
     out: tokio::sync::Mutex<Outbound>,
     close: watch::Sender<Option<(u16, String)>>,
     last_status_write: Mutex<Option<tokio::time::Instant>>,
+    /// A send stalled: nothing more is written to this connection.
+    stalled: AtomicBool,
 }
 
 impl Live {
     fn close(&self, code: u16, reason: &str) {
         self.close.send_replace(Some((code, reason.to_owned())));
     }
+
+    /// Write a close frame, giving up after [`CLOSE_TIMEOUT`] (waiting for
+    /// the connection included): a peer that doesn't read can't hold the
+    /// caller.
+    async fn send_close(&self, code: u16, reason: &str) {
+        let write = async {
+            let mut out = self.out.lock().await;
+            let _ = out.sink.send(close_frame(code, reason)).await;
+        };
+        let _ = tokio::time::timeout(CLOSE_TIMEOUT, write).await;
+    }
+}
+
+/// How a send went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    Written,
+    /// Not connected, or the send failed at once.
+    NotWritten,
+    /// Not written within its limit: the connection was dropped.
+    Stalled,
 }
 
 #[derive(Default)]
@@ -361,7 +394,9 @@ impl DaemonHub {
     // ------------------------------------------------------ sending
 
     /// Seal and send one message to a connected daemon (sealing and
-    /// sending under one lock). False: offline, or the send failed.
+    /// sending under one lock). False: offline, the send failed, or it was
+    /// not written within [`SEND_TIMEOUT`] (the connection is then
+    /// dropped).
     pub async fn send(
         &self,
         role: Role,
@@ -369,24 +404,83 @@ impl DaemonHub {
         payload: &Map<String, Value>,
         ttl_secs: f64,
     ) -> bool {
+        self.deliver(role, name, payload, ttl_secs, SEND_TIMEOUT)
+            .await
+            == Delivery::Written
+    }
+
+    /// [`DaemonHub::send`] within `limit` (waiting for the connection
+    /// included). A send that doesn't finish in time drops the connection:
+    /// the daemon isn't reading, and a half-written message can't be
+    /// followed by another.
+    async fn deliver(
+        &self,
+        role: Role,
+        name: &str,
+        payload: &Map<String, Value>,
+        ttl_secs: f64,
+        limit: Duration,
+    ) -> Delivery {
         let Some(live) = self.live(role, name) else {
-            return false;
+            return Delivery::NotWritten;
         };
-        let mut out = live.out.lock().await;
-        let text = match out.sealer.seal_now(payload, ttl_secs) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!(daemon = %principal(role, name), error = %e, "could not seal a message");
-                return false;
+        let write = async {
+            let mut out = live.out.lock().await;
+            if live.stalled.load(Ordering::SeqCst) {
+                return Delivery::NotWritten;
+            }
+            let text = match out.sealer.seal_now(payload, ttl_secs) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!(daemon = %principal(role, name), error = %e, "could not seal a message");
+                    return Delivery::NotWritten;
+                }
+            };
+            match out.sink.send(Message::text(text)).await {
+                Ok(()) => Delivery::Written,
+                Err(e) => {
+                    tracing::warn!(daemon = %principal(role, name), error = %e, "send failed");
+                    Delivery::NotWritten
+                }
             }
         };
-        match out.sink.send(Message::text(text)).await {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!(daemon = %principal(role, name), error = %e, "send failed");
-                false
+        // A connection being closed (replaced, unpaired, dropped as
+        // stalled) takes nothing more, and a send in flight on it ends now:
+        // its future gives back the lock and the socket.
+        let mut closing = live.close.subscribe();
+        tokio::select! {
+            r = tokio::time::timeout(limit, write) => match r {
+                Ok(sent) => sent,
+                Err(_) => {
+                    self.drop_stalled(&live, limit);
+                    Delivery::Stalled
+                }
+            },
+            _ = closing.wait_for(Option::is_some) => Delivery::NotWritten,
+        }
+    }
+
+    /// A send to `live` did not finish within `limit`: forget the
+    /// connection (sends find the daemon offline) and close it. The
+    /// timed-out send's future was dropped with the lock it held.
+    fn drop_stalled(&self, live: &Arc<Live>, limit: Duration) {
+        if live.stalled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let peer = &live.peer;
+        tracing::warn!(
+            daemon = %peer.principal(),
+            "a message was not taken within {}s: the daemon is not reading; dropping its connection",
+            limit.as_secs()
+        );
+        {
+            let mut reg = self.registry();
+            let key = key_of(peer.role(), peer.name());
+            if reg.live.get(&key).is_some_and(|l| Arc::ptr_eq(l, live)) {
+                reg.live.remove(&key);
             }
         }
+        live.close(CLOSE_STALLED, "not reading");
     }
 
     /// Send with the default lifetime (60 s).
@@ -403,7 +497,8 @@ impl DaemonHub {
     /// Send a request and wait for the daemon's reply. Its `data` (an
     /// object; `{}` otherwise), or why not: offline, no answer in time, or
     /// the daemon's refusal (at most 500 characters). Only a reply from the
-    /// daemon the call went to counts (INV-10).
+    /// daemon the call went to counts (INV-10). `timeout` bounds the whole
+    /// call, the send included (at most [`SEND_TIMEOUT`] of it).
     pub async fn call(
         &self,
         role: Role,
@@ -422,23 +517,36 @@ impl DaemonHub {
         let ttl = timeout
             .as_secs_f64()
             .clamp(1.0, agent_auth_crypto::daemon::MAX_ENVELOPE_TTL_SECS);
-        let result = if self.send(role, name, &msg, ttl).await {
-            match tokio::time::timeout(timeout, rx).await {
-                Ok(Ok(reply)) => Ok(reply),
-                Ok(Err(_)) | Err(_) => Err(CallError::new(
-                    format!(
-                        "{} did not answer within {}s",
-                        principal(role, name),
-                        timeout.as_secs()
-                    ),
-                    true,
-                )),
+        let started = tokio::time::Instant::now();
+        let limit = timeout.min(SEND_TIMEOUT);
+        let result = match self.deliver(role, name, &msg, ttl, limit).await {
+            Delivery::Written => {
+                match tokio::time::timeout(timeout.saturating_sub(started.elapsed()), rx).await {
+                    Ok(Ok(reply)) => Ok(reply),
+                    Ok(Err(_)) | Err(_) => Err(CallError::new(
+                        format!(
+                            "{} did not answer within {}s",
+                            principal(role, name),
+                            timeout.as_secs()
+                        ),
+                        true,
+                    )),
+                }
             }
-        } else {
-            Err(CallError::new(
+            // Counted as a timeout (it may have read part of it, and a
+            // caller then makes sure nothing started).
+            Delivery::Stalled => Err(CallError::new(
+                format!(
+                    "{} did not take the message within {}s (not reading); its connection was dropped",
+                    principal(role, name),
+                    limit.as_secs()
+                ),
+                true,
+            )),
+            Delivery::NotWritten => Err(CallError::new(
                 format!("{} is offline", principal(role, name)),
                 false,
-            ))
+            )),
         };
         self.calls
             .lock()

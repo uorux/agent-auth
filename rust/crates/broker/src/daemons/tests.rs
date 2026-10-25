@@ -592,3 +592,51 @@ async fn an_untrusted_address_is_not_a_handshake_cap(pool: sqlx::PgPool) {
     let mut over = raw_from(&b, None).await;
     assert_eq!(over.close_code().await, Some(1013));
 }
+
+/// Review 2026-10: a daemon that stops reading its socket holds up nobody.
+/// A send that can't be written within its limit drops the connection; a
+/// send already waiting on it ends at once; a call fails within its own
+/// timeout, as a timeout (the daemon may have read part of it).
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_daemon_that_stops_reading_is_dropped_and_holds_up_nobody(pool: sqlx::PgPool) {
+    let b = Broker::start(pool).await;
+    let vm = super::testkit::StallingDaemon::start(&b, "stuck").await;
+    let flood = vm.stall(&b).await;
+    let started = tokio::time::Instant::now();
+    let mut ping = serde_json::Map::new();
+    ping.insert("type".into(), json!("ping"));
+    let err = b
+        .part
+        .hub
+        .call(Role::Sandbox, "stuck", ping.clone(), Duration::from_secs(2))
+        .await
+        .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(err.timed_out, "{err:?}");
+    assert!(err.message.contains("not reading"), "{err:?}");
+    // The stalled sender got out too, and the connection is gone.
+    let sent = tokio::time::timeout(Duration::from_secs(2), flood)
+        .await
+        .expect("the stalled send was not ended")
+        .unwrap();
+    assert!(sent > 0);
+    assert!(!b.part.hub.is_online(Role::Sandbox, "stuck"));
+    // Further sends find it offline at once.
+    let started = tokio::time::Instant::now();
+    assert!(!b.part.hub.send_default(Role::Sandbox, "stuck", &ping).await);
+    let err = b
+        .part
+        .hub
+        .call(Role::Sandbox, "stuck", ping, Duration::from_secs(2))
+        .await
+        .unwrap_err();
+    assert!(
+        !err.timed_out && err.message == "sandbox:stuck is offline",
+        "{err:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
