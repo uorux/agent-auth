@@ -18,3 +18,8 @@ time.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# The transaction's statement lock (Tx is used through `&Tx`).
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "macros", "rt-multi-thread", "time"] }

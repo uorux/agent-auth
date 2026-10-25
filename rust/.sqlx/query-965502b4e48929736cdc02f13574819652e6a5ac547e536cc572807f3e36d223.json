@@ -1,0 +1,268 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT * FROM agents WHERE name = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "description",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "description"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "key_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "key_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "api_key_hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "api_key_hash"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "webhook_url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "webhook_url"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "webhook_secret",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "webhook_secret"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "lldap_username",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "lldap_username"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "lldap_password_encrypted",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "lldap_password_encrypted"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "disabled",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "disabled"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "last_seen_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "last_seen_at"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "last_listen_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "last_listen_at"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "parent_agent_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "parent_agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "sandbox_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "sandbox_id"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "runtime",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "runtime"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "project",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "project"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "host",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "host"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "placement",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "placement"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "lease_expires_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "lease_expires_at"
+          }
+        }
+      },
+      {
+        "ordinal": 20,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "965502b4e48929736cdc02f13574819652e6a5ac547e536cc572807f3e36d223"
+}

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM pending_key_deliveries WHERE agent_id = $1 AND sandbox_id = $2 AND key_id = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b4c3d309d7eefbf3de4383716ddb505c7089acae188436634f969d04e279aec1"
+}

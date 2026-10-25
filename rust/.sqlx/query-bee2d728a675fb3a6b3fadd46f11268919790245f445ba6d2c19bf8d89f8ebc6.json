@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO agents (id, name, description, key_id, api_key_hash, kind, created_at)\n         VALUES ($1, 'operator', 'the operator, writing from the admin panel', $2, repeat('!', 64),\n                 'operator', $3)\n         ON CONFLICT DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bee2d728a675fb3a6b3fadd46f11268919790245f445ba6d2c19bf8d89f8ebc6"
+}

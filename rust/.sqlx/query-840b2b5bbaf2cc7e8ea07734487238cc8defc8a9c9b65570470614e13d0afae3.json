@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id FROM access_requests\n         WHERE agent_id = ANY($1) AND status IN ('awaiting_human', 'llm_evaluating', 'llm_denied')\n         ORDER BY created_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "840b2b5bbaf2cc7e8ea07734487238cc8defc8a9c9b65570470614e13d0afae3"
+}

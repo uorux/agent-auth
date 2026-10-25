@@ -7,6 +7,7 @@
 //! fuzzed, run under Miri, and model-checked with Kani (`cargo kani`).
 
 pub mod authority;
+pub mod containment;
 pub mod glob;
 pub mod ids;
 pub mod lifecycle;

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE oauth_tokens SET revoked_at = $2 WHERE family = $1 AND revoked_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "59b3c7f411016977d444cb3b92a5cb2ad5bd9f8c3348323e13ccd8fff54ed9ed"
+}

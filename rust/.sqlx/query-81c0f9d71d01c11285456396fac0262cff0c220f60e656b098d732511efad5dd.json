@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE rules SET agent_pattern = $2 WHERE agent_pattern = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "81c0f9d71d01c11285456396fac0262cff0c220f60e656b098d732511efad5dd"
+}

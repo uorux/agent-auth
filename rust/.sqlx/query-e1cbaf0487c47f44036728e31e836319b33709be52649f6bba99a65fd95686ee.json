@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT thread_id, count(*) AS \"n!\" FROM a2a_messages WHERE thread_id = ANY($1)\n           GROUP BY thread_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "thread_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "a2a_messages",
+            "name": "thread_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "n!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "e1cbaf0487c47f44036728e31e836319b33709be52649f6bba99a65fd95686ee"
+}

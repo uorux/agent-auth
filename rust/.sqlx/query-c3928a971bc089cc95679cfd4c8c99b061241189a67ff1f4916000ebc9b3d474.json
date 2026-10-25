@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE agents SET name = $2 WHERE id = $1 AND kind <> 'operator'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c3928a971bc089cc95679cfd4c8c99b061241189a67ff1f4916000ebc9b3d474"
+}

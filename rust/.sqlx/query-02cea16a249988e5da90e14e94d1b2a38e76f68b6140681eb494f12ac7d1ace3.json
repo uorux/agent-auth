@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM pending_key_deliveries WHERE agent_id = ANY($1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "02cea16a249988e5da90e14e94d1b2a38e76f68b6140681eb494f12ac7d1ace3"
+}

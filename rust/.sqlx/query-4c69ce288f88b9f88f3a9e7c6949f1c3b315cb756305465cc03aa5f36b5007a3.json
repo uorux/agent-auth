@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE oauth_clients SET agent_id = $2\n         WHERE id = $1 AND revoked_at IS NULL AND (agent_id IS NULL OR agent_id = $2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4c69ce288f88b9f88f3a9e7c6949f1c3b315cb756305465cc03aa5f36b5007a3"
+}

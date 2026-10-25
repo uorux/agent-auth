@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO broker_flags (key, value, updated_at) VALUES ($1, $2, $3)\n         ON CONFLICT (key) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Jsonb",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bf31346332a5857bbb8ce5f9dcd831dfc39d95bc72ae31bab1f8096f11da45dc"
+}

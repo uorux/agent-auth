@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH RECURSIVE tree AS (\n             SELECT id FROM agents WHERE id = $1\n             UNION\n             SELECT a.id FROM agents a JOIN tree t ON a.parent_agent_id = t.id\n         )\n         UPDATE agents SET disabled = true WHERE id IN (SELECT id FROM tree)\n         RETURNING id, name",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "b8458ba68c994ed6818c56e6030f2ca48301d54cdf932de681878e77e1b806c9"
+}
