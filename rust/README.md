@@ -295,6 +295,18 @@ request the reviewer saw, your decision labels its last review; when you
 release a held outgoing mail, its review is labelled `send`. Yours always
 win over those.
 
+From Discord: a message that reports a model's decision (a guard's
+refusal, a watcher's alert, a scoped shell opened or refused, the LLM
+reviewer's approval in the activity channel) has a **Wrong call** button.
+It asks what the decision should have been (prefilled with the other side:
+`fine` for a refusal or an alert) and an optional note, and labels the
+record; **Undo** takes it back. `/review` lists the latest decisions that
+went against an agent or pinged you and that you haven't labelled (an LLM
+denial goes to the agent, not to Discord: find it there), each with its
+own button; `kind:` narrows it, `everything:True` adds the ones that let
+things through. A label never changes what was decided. Mail decisions
+show no reason there (their records are sealed).
+
 Replays only read records and write their own results: no request, grant,
 command or mail is touched. They call the model gateway (cost: one call per
 replayed decision). Policy:

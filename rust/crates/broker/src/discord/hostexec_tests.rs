@@ -357,6 +357,7 @@ fn command_definitions() {
             "disarm",
             "lockdown",
             "unlock",
+            "review",
             "dnd"
         ]
     );

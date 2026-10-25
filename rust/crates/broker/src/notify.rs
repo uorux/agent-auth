@@ -14,6 +14,7 @@ use agent_auth_store::requests::RequestRow;
 use agent_auth_store::rules::RuleRow;
 use agent_auth_store::shell_scopes::ScopeRow;
 use serde_json::Value;
+use uuid::Uuid;
 
 /// What happened in a guarded or umbrella shell besides a command being
 /// sent (posted in the shell's thread).
@@ -25,17 +26,27 @@ pub enum ShellEvent<'a> {
         scope: Option<&'a ScopeRow>,
         why: &'a str,
         alarming: bool,
+        /// The guard's recorded decision (a human may say it was wrong).
+        call: Option<Uuid>,
     },
     /// The guard could not be asked, so a command did not run.
     GuardUnavailable {
         job: &'a JobRow,
         scope: Option<&'a ScopeRow>,
     },
-    /// A scoped shell was opened in an umbrella.
-    ScopeOpened { scope: &'a ScopeRow },
+    /// A scoped shell was opened in an umbrella (`call`: the scope
+    /// check's recorded decision).
+    ScopeOpened {
+        scope: &'a ScopeRow,
+        call: Option<Uuid>,
+    },
     /// A scoped shell was refused (its purpose is outside the umbrella, or
     /// the check could not be made).
-    ScopeRefused { purpose: &'a str, why: &'a str },
+    ScopeRefused {
+        purpose: &'a str,
+        why: &'a str,
+        call: Option<Uuid>,
+    },
     /// The agent closed a scoped shell.
     ScopeClosed { scope: &'a ScopeRow },
 }
@@ -81,12 +92,14 @@ pub trait Notify {
         request: &RequestRow,
         event: ShellEvent<'_>,
     ) -> impl Future<Output = ()> + Send;
-    /// The watcher found a running command alarming (advisory).
+    /// The watcher found a running command alarming (advisory). `call`:
+    /// the watcher's recorded decision.
     fn watch_alert(
         &self,
         request: &RequestRow,
         job: &JobRow,
         text: &str,
+        call: Option<Uuid>,
     ) -> impl Future<Output = ()> + Send;
     /// An agent wants the operator's attention; `desks` already showed it.
     fn attention(
@@ -163,8 +176,14 @@ impl Notify for Notifier {
         dispatch!(self, n => n.shell_event(request, event).await,
             null => tracing::info!(request = %request.id, ?event, "shell event (no notifier)"))
     }
-    async fn watch_alert(&self, request: &RequestRow, job: &JobRow, text: &str) {
-        dispatch!(self, n => n.watch_alert(request, job, text).await,
+    async fn watch_alert(
+        &self,
+        request: &RequestRow,
+        job: &JobRow,
+        text: &str,
+        call: Option<Uuid>,
+    ) {
+        dispatch!(self, n => n.watch_alert(request, job, text, call).await,
             null => tracing::warn!(job = %job.id, host = %job.host, "{text}"))
     }
     async fn attention(&self, agent: &AgentRow, text: &str, urgency: &str, desks: &[String]) {
@@ -247,7 +266,13 @@ impl Notify for Recorder {
         }
         !self.refuse_shell
     }
-    async fn watch_alert(&self, _request: &RequestRow, job: &JobRow, _text: &str) {
+    async fn watch_alert(
+        &self,
+        _request: &RequestRow,
+        job: &JobRow,
+        _text: &str,
+        _call: Option<Uuid>,
+    ) {
         self.record(format!("watch_alert {}", job.id));
     }
     async fn shell_event(&self, request: &RequestRow, event: ShellEvent<'_>) {
@@ -256,7 +281,7 @@ impl Notify for Recorder {
                 format!("guard_refused {} alarming={alarming}", job.id)
             }
             ShellEvent::GuardUnavailable { job, .. } => format!("guard_unavailable {}", job.id),
-            ShellEvent::ScopeOpened { scope } => format!("scope_opened {}", scope.id),
+            ShellEvent::ScopeOpened { scope, .. } => format!("scope_opened {}", scope.id),
             ShellEvent::ScopeRefused { .. } => format!("scope_refused {}", request.id),
             ShellEvent::ScopeClosed { scope } => format!("scope_closed {}", scope.id),
         });

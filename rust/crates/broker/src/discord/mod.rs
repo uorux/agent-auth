@@ -13,6 +13,8 @@
 //!   TLS stack.
 //! - `interactions`: buttons, modals and commands, each from the owner
 //!   only ([`crate::auth::DiscordOwner`]).
+//! - `review`: saying a model's decision was wrong (Wrong call, `/review`),
+//!   an eval label.
 //! - `notifier`: the `Notify` implementation.
 
 use std::sync::{Arc, OnceLock};
@@ -31,6 +33,7 @@ pub mod model;
 pub mod notifier;
 pub mod ops;
 pub mod rest;
+pub mod review;
 pub mod rules;
 pub mod text;
 pub mod views;

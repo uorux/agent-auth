@@ -205,6 +205,9 @@ pub struct Decision {
     pub answer: Option<Map<String, Value>>,
     /// The class it means (`None`: no usable answer).
     pub class: Option<String>,
+    /// The record of it (`None`: not recorded), for a human to say it
+    /// was wrong (`crate::discord`'s Wrong call).
+    pub call: Option<Uuid>,
 }
 
 /// The model gateway (OpenRouter's chat completions with a strict JSON
@@ -361,6 +364,7 @@ impl ModelClient {
             // Never in the clear: not recorded at all.
             (true, None) => None,
         };
+        let mut call = None;
         if let (Some(store), Some(sealer)) = (&self.store, sealer) {
             // Best effort, and never long: the decision waits for nothing
             // but the model.
@@ -386,14 +390,18 @@ impl ModelClient {
             )
             .await;
             match recorded {
-                Ok(Ok(())) => {}
+                Ok(Ok(id)) => call = Some(id),
                 Ok(Err(e)) => {
                     tracing::warn!(kind = kind.as_str(), "could not record a model call: {e}");
                 }
                 Err(_) => tracing::warn!(kind = kind.as_str(), "recording a model call timed out"),
             }
         }
-        Decision { answer, class }
+        Decision {
+            answer,
+            class,
+            call,
+        }
     }
 
     /// A record as it was made: sealed parts opened (an error without the
@@ -452,7 +460,7 @@ async fn record(
     store: &Store,
     sealer: Option<&SecretBox>,
     r: &Recording<'_>,
-) -> Result<(), String> {
+) -> Result<Uuid, String> {
     let id = Uuid::new_v4();
     let row = id.to_string();
     let sha = agent_auth_crypto::digest::sha256_hex(r.system.as_bytes());
@@ -508,6 +516,7 @@ async fn record(
         tx.commit().await
     };
     go.await
+        .map(|()| id)
         .map_err(|e: agent_auth_store::StoreError| e.to_string())
 }
 
@@ -559,9 +568,92 @@ pub fn valid_pattern(kind: Kind, pattern: &str) -> bool {
         .any(|c| class_matches(pattern, c) && !pattern.split('/').all(|p| p == "*"))
 }
 
+/// Did a decision of `kind` go against an agent or call a human: a
+/// denial, a refusal, a hold, an alert (what someone may want to say was
+/// wrong)?
+#[must_use]
+pub fn adverse(kind: Kind, class: &str) -> bool {
+    match kind {
+        Kind::RequestReview => class == "deny",
+        Kind::RiskLine => class == "high",
+        Kind::MailInbound => class != "in_scope/none",
+        Kind::MailOutbound => class != "send",
+        Kind::ShellGuard => class != "fine",
+        Kind::ShellScope => class == "does_not_fit",
+        Kind::ShellWatch | Kind::ShellWatchGeneral => class == "alarming",
+    }
+}
+
+/// What a decision of `kind` that said `class` most likely should have
+/// said, when a human says it was wrong (the other side of it).
+#[must_use]
+pub fn likely_fix(kind: Kind, class: &str) -> &'static str {
+    match kind {
+        Kind::RequestReview if class == "deny" => "approve",
+        Kind::RequestReview => "deny",
+        Kind::RiskLine if class == "low" => "high",
+        Kind::RiskLine => "low",
+        Kind::MailInbound if class == "in_scope/none" => "out_of_scope/*",
+        Kind::MailInbound => "in_scope/none",
+        Kind::MailOutbound if class == "send" => "hold",
+        Kind::MailOutbound => "send",
+        Kind::ShellScope if class == "fits" => "does_not_fit",
+        Kind::ShellScope => "fits",
+        Kind::ShellGuard | Kind::ShellWatch | Kind::ShellWatchGeneral if class == "fine" => "odd",
+        Kind::ShellGuard | Kind::ShellWatch | Kind::ShellWatchGeneral => "fine",
+    }
+}
+
+/// A kind as a person reads it.
+#[must_use]
+pub fn kind_title(kind: Kind) -> &'static str {
+    match kind {
+        Kind::RequestReview => "LLM reviewer",
+        Kind::RiskLine => "risk line",
+        Kind::MailInbound => "mail judge (incoming)",
+        Kind::MailOutbound => "mail judge (outgoing)",
+        Kind::ShellGuard => "shell guard",
+        Kind::ShellScope => "umbrella's scope check",
+        Kind::ShellWatch => "shell watcher",
+        Kind::ShellWatchGeneral => "general shell watcher",
+    }
+}
+
+/// The reason an answer gave (`summary`, `reasoning` or `reason`), on one
+/// line.
+#[must_use]
+pub fn reason_of(answer: &Value) -> Option<String> {
+    let text = ["summary", "reasoning", "reason"]
+        .iter()
+        .find_map(|k| answer.get(*k).and_then(Value::as_str))?;
+    Some(text.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_class_has_a_likely_fix_of_its_kind() {
+        for kind in Kind::ALL {
+            for class in recipe(kind).classes {
+                let fix = likely_fix(kind, class);
+                assert!(valid_pattern(kind, fix), "{kind:?} {class} -> {fix}");
+                assert!(!class_matches(fix, class), "{kind:?} {class} -> itself");
+            }
+        }
+    }
+
+    #[test]
+    fn adverse_classes() {
+        assert!(adverse(Kind::ShellGuard, "odd"));
+        assert!(!adverse(Kind::ShellGuard, "fine"));
+        assert!(adverse(Kind::ShellWatch, "alarming"));
+        assert!(!adverse(Kind::ShellWatch, "odd"));
+        assert!(adverse(Kind::RequestReview, "deny"));
+        assert!(adverse(Kind::MailInbound, "in_scope/suspected"));
+        assert!(!adverse(Kind::ShellScope, "fits"));
+    }
 
     #[test]
     fn patterns() {

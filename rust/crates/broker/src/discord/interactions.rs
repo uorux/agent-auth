@@ -60,7 +60,7 @@ impl Reply<'_> {
     }
 
     /// Replace the message the component is on (the rules browser).
-    async fn update(&self, msg: &Message) -> Result<(), RestError> {
+    pub(super) async fn update(&self, msg: &Message) -> Result<(), RestError> {
         self.callback(json!({"type": 7, "data": msg_value(msg)}))
             .await
     }
@@ -273,6 +273,8 @@ async fn component(
                 .update(&rules_page(bot, page, Some(rule)).await?)
                 .await?;
         }
+        CustomId::WrongCall(call) => super::review::wrong_call(bot, reply, call).await?,
+        CustomId::Unlabel(call) => super::review::unlabel(bot, reply, who, call).await?,
         CustomId::RulesDelete { page, rule } => {
             let tx = bot.store.begin().await?;
             if rule_store::delete(&tx, rule).await? {
@@ -286,6 +288,7 @@ async fn component(
         | CustomId::EditModal(_)
         | CustomId::TotpModal(_)
         | CustomId::WindowModal(_)
+        | CustomId::WrongCallModal(_)
         | CustomId::MailRelease(_)
         | CustomId::MailDiscard(_) => {}
     }
@@ -419,6 +422,9 @@ async fn modal_submit(
         CustomId::WindowModal(request) => {
             return super::hostexec::window_submit(bot, reply, who, request, form).await;
         }
+        CustomId::WrongCallModal(call) => {
+            return super::review::wrong_call_submit(bot, reply, who, call, form).await;
+        }
         _ => return Ok(()),
     };
     reply.defer().await?;
@@ -492,6 +498,14 @@ async fn command(
                 .await?;
         }
         "release" => release(bot, reply, who, c).await?,
+        "review" => {
+            let everything = matches!(
+                option(c, "everything"),
+                Some(CommandOptionValue::Boolean(true))
+            );
+            super::review::command(bot, reply, string_option(c, "kind").as_deref(), everything)
+                .await?;
+        }
         _ => {
             Box::pin(super::hostexec::command(bot, reply, who, c)).await?;
         }

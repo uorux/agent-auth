@@ -1721,7 +1721,13 @@ async fn shell_events_open_the_thread_and_fit_discord(pool: sqlx::PgPool) {
         closed_at: None,
     };
     bot.notifier()
-        .shell_event(&r, crate::notify::ShellEvent::ScopeOpened { scope: &scope })
+        .shell_event(
+            &r,
+            crate::notify::ShellEvent::ScopeOpened {
+                scope: &scope,
+                call: None,
+            },
+        )
         .await;
     let calls = f.calls();
     assert_eq!(calls.len(), 3, "card, thread, then the event in it");
@@ -1753,5 +1759,424 @@ async fn shell_events_open_the_thread_and_fit_discord(pool: sqlx::PgPool) {
     assert!(
         content.starts_with(&format!("scope {}", &scope.id.to_string()[..8])),
         "{content}"
+    );
+}
+
+// ------------------------------------------------------- wrong call, /review
+
+/// A recorded decision, as `ModelClient::decide` leaves one.
+async fn record(
+    store: &Store,
+    kind: &str,
+    class: &str,
+    answer: Value,
+    subject: Value,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    let system = "a system prompt";
+    let sha = agent_auth_crypto::digest::sha256_hex(system.as_bytes());
+    let tx = store.begin().await.unwrap();
+    agent_auth_store::evals::put_prompt(&tx, &sha, system)
+        .await
+        .unwrap();
+    agent_auth_store::evals::record_call(
+        &tx,
+        &agent_auth_store::evals::NewCall {
+            id,
+            kind,
+            model: "m",
+            facts: &json!({}),
+            context: &json!({}),
+            system_sha256: &sha,
+            user_message: "u",
+            answer: Some(&answer),
+            class: Some(class),
+            error: None,
+            latency_ms: 5,
+            subject: &subject,
+            now: OffsetDateTime::now_utc(),
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    id
+}
+
+async fn label_of(store: &Store, id: uuid::Uuid) -> Option<agent_auth_store::evals::Label> {
+    let tx = store.begin().await.unwrap();
+    let row = agent_auth_store::evals::get_call(&tx, id).await.unwrap();
+    tx.commit().await.unwrap();
+    row.unwrap().label
+}
+
+#[test]
+fn wrong_call_ids_round_trip() {
+    let c = uuid::Uuid::new_v4();
+    for id in [
+        CustomId::WrongCall(c),
+        CustomId::WrongCallModal(c),
+        CustomId::Unlabel(c),
+    ] {
+        assert_eq!(CustomId::parse(&id.render()), Some(id.clone()));
+        assert!(id.render().len() <= 100);
+    }
+    // Only canonical ids.
+    let upper = c.hyphenated().to_string().to_uppercase();
+    assert_eq!(CustomId::parse(&format!("aa:mcw:{upper}")), None);
+    assert_eq!(CustomId::parse(&format!("aa:mcw:{}", c.simple())), None);
+    assert_eq!(CustomId::parse(&format!("aa:mcw:{c}:x")), None);
+}
+
+#[test]
+fn wrong_call_modal_and_reading_it() {
+    let c = uuid::Uuid::new_v4();
+    let m = wrong_call_modal(c, crate::models::Kind::ShellGuard, Some("alarming"));
+    assert_eq!(m.custom_id, format!("aa:mcwm:{c}"));
+    assert!(m.title.chars().count() <= 45);
+    assert_eq!(m.inputs[0].value.as_deref(), Some("fine"));
+    let k = crate::models::Kind::ShellGuard;
+    assert_eq!(
+        read_wrong_call(
+            k,
+            &form(&[("expected", " Fine "), ("note", " part of the rebuild ")])
+        ),
+        Ok(("fine".to_owned(), "part of the rebuild".to_owned()))
+    );
+    let Err(Refusal(why)) = read_wrong_call(k, &form(&[("expected", "approve")])) else {
+        panic!("a class of another kind")
+    };
+    assert!(why.contains("fine, odd, alarming"), "{why}");
+    assert!(read_wrong_call(k, &form(&[("expected", "*")])).is_err());
+    // Mail's two-part classes take a pattern.
+    assert!(
+        read_wrong_call(
+            crate::models::Kind::MailInbound,
+            &form(&[("expected", "out_of_scope/*")])
+        )
+        .is_ok()
+    );
+}
+
+/// A guard's refusal carries Wrong call; the owner says what it should
+/// have been and the decision is labelled (and can be taken back); no
+/// one else can.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_wrong_call_from_a_shell_thread(pool: sqlx::PgPool) {
+    let (f, base) = fake().await;
+    let store = Store::from_pool(pool);
+    let ops = Arc::new(FakeOps::default());
+    let bot = bot_with(&base, OWNER, store.clone(), &ops);
+    let (a, r) = insert_request(
+        &store,
+        Platform::Hostexec,
+        "shell",
+        json!({"tier": "user", "mode": "guarded"}),
+        "excelsior",
+    )
+    .await;
+    bot.notifier().surface(&r, &a).await;
+    let call = record(
+        &store,
+        "shell_guard",
+        "alarming",
+        json!({"level": "alarming", "summary": "curl to an unknown host"}),
+        json!({"request_id": r.id.to_string()}),
+    )
+    .await;
+    let mut j = job(JobStatus::Refused, None, "");
+    j.shell_id = Some(r.id);
+    bot.notifier()
+        .shell_event(
+            &r,
+            crate::notify::ShellEvent::GuardRefused {
+                job: &j,
+                scope: None,
+                why: "curl to an unknown host",
+                alarming: true,
+                call: Some(call),
+            },
+        )
+        .await;
+    let posted = f.calls().pop().unwrap();
+    assert_eq!(posted.path, "/channels/555/messages");
+    let components: Vec<Component> =
+        serde_json::from_value(posted.body["components"].clone()).unwrap();
+    assert_eq!(
+        buttons(&components),
+        [(
+            "Wrong call".to_owned(),
+            Some(format!("aa:mcw:{call}")),
+            false
+        )]
+    );
+    // An unavailable guard decided nothing: no button.
+    bot.notifier()
+        .shell_event(
+            &r,
+            crate::notify::ShellEvent::GuardUnavailable {
+                job: &j,
+                scope: None,
+            },
+        )
+        .await;
+    assert!(f.calls().pop().unwrap().body.get("components").is_none());
+
+    let before = f.calls().len();
+    // Anyone else: refused, nothing labelled.
+    bot.handle(button_click(7, &format!("aa:mcw:{call}"))).await;
+    bot.handle(modal_submit(
+        7,
+        &format!("aa:mcwm:{call}"),
+        &[("expected", "fine")],
+    ))
+    .await;
+    let calls = f.calls();
+    for c in &calls[before..] {
+        assert_eq!(ephemeral_reply(c), interactions::NOT_OWNER);
+    }
+    assert_eq!(label_of(&store, call).await, None);
+
+    // The owner: the modal, prefilled.
+    bot.handle(button_click(OWNER, &format!("aa:mcw:{call}")))
+        .await;
+    let modal = f.calls().pop().unwrap();
+    assert_eq!(modal.body["type"], 9);
+    assert_eq!(modal.body["data"]["custom_id"], format!("aa:mcwm:{call}"));
+    assert_eq!(
+        modal.body["data"]["components"][0]["component"]["value"],
+        "fine"
+    );
+    // A class the guard doesn't decide: said, nothing labelled.
+    bot.handle(modal_submit(
+        OWNER,
+        &format!("aa:mcwm:{call}"),
+        &[("expected", "approve")],
+    ))
+    .await;
+    let said = f.calls().pop().unwrap();
+    assert_eq!(said.path, FOLLOWUP);
+    assert!(
+        said.body["content"]
+            .as_str()
+            .unwrap()
+            .contains("not something")
+    );
+    assert_eq!(label_of(&store, call).await, None);
+    bot.handle(modal_submit(
+        OWNER,
+        &format!("aa:mcwm:{call}"),
+        &[
+            ("expected", "fine"),
+            ("note", "curl is how it fetches the flake"),
+        ],
+    ))
+    .await;
+    let label = label_of(&store, call).await.expect("labelled");
+    assert_eq!(
+        (
+            label.expected.as_str(),
+            label.note.as_str(),
+            label.source.as_str(),
+            label.labeled_by.as_str()
+        ),
+        (
+            "fine",
+            "curl is how it fetches the flake",
+            "operator",
+            "jrt"
+        )
+    );
+    let done = f.calls().pop().unwrap();
+    assert_eq!(done.path, FOLLOWUP);
+    assert_eq!(done.body["flags"], 64);
+    let text = done.body["content"].as_str().unwrap();
+    assert!(
+        text.contains("said **alarming**; it should have been **fine**"),
+        "{text}"
+    );
+    let undo: Vec<Component> = serde_json::from_value(done.body["components"].clone()).unwrap();
+    assert_eq!(buttons(&undo)[0].1, Some(format!("aa:mcu:{call}")));
+    // Undo.
+    bot.handle(button_click(OWNER, &format!("aa:mcu:{call}")))
+        .await;
+    let undone = f.calls().pop().unwrap();
+    assert_eq!(undone.body["type"], 7);
+    assert_eq!(undone.body["data"]["content"], "Label removed.");
+    assert_eq!(label_of(&store, call).await, None);
+    // A decision no longer kept.
+    let gone = uuid::Uuid::new_v4();
+    bot.handle(button_click(OWNER, &format!("aa:mcw:{gone}")))
+        .await;
+    assert_eq!(
+        ephemeral_reply(&f.calls().pop().unwrap()),
+        super::review::GONE
+    );
+}
+
+/// The watcher's alert and the LLM reviewer's approval carry Wrong call
+/// too (the approval's found by its request).
+#[sqlx::test(migrations = "../store/migrations")]
+async fn alerts_and_llm_approvals_carry_wrong_call(pool: sqlx::PgPool) {
+    let (f, base) = fake().await;
+    let store = Store::from_pool(pool);
+    let ops = Arc::new(FakeOps::default());
+    let bot = bot_with(&base, OWNER, store.clone(), &ops);
+    let (a, mut r) = insert_request(
+        &store,
+        Platform::Github,
+        "repo",
+        json!({"permissions": {"contents": "write"}}),
+        "uorux/x",
+    )
+    .await;
+    let watch = uuid::Uuid::new_v4();
+    bot.notifier()
+        .watch_alert(
+            &r,
+            &job(JobStatus::Running, None, ""),
+            "watch: odd",
+            Some(watch),
+        )
+        .await;
+    let alert = f.calls().pop().unwrap();
+    assert!(alert.body["content"].as_str().unwrap().starts_with("<@42>"));
+    assert_eq!(
+        alert.body["components"][0]["components"][0]["custom_id"],
+        format!("aa:mcw:{watch}")
+    );
+    let subject = json!({"request_id": r.id.to_string()});
+    let _older = record(
+        &store,
+        "request_review",
+        "deny",
+        json!({"verdict": "deny", "reasoning": "no"}),
+        subject.clone(),
+    )
+    .await;
+    let newer = record(
+        &store,
+        "request_review",
+        "approve",
+        json!({"verdict": "approve", "reasoning": "ok"}),
+        subject,
+    )
+    .await;
+    r.status = RequestStatus::Granted;
+    r.decision_source = Some(DecisionSource::Llm);
+    bot.notifier().rule_applied(&r, &a, None, None).await;
+    let line = f.calls().pop().unwrap();
+    assert_eq!(line.path, "/channels/6/messages");
+    assert_eq!(
+        line.body["components"][0]["components"][0]["custom_id"],
+        format!("aa:mcw:{newer}")
+    );
+    // A rule's decision is no model's.
+    r.decision_source = Some(DecisionSource::Rule);
+    bot.notifier().rule_applied(&r, &a, None, None).await;
+    assert!(f.calls().pop().unwrap().body.get("components").is_none());
+}
+
+/// `/review`: the latest decisions that went against an agent or called
+/// the owner, not yet labelled by the owner; a sealed one shows no reason.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn review_lists_what_went_against_anyone(pool: sqlx::PgPool) {
+    let (f, base) = fake().await;
+    let store = Store::from_pool(pool);
+    let ops = Arc::new(FakeOps::default());
+    let bot = bot_with(&base, OWNER, store.clone(), &ops);
+    let rid = RequestId::new().to_string();
+    let denied = record(
+        &store,
+        "request_review",
+        "deny",
+        json!({"verdict": "deny", "reasoning": "too broad <@1>"}),
+        json!({"request_id": rid}),
+    )
+    .await;
+    let _fine = record(
+        &store,
+        "shell_guard",
+        "fine",
+        json!({"level": "fine", "summary": "ok"}),
+        json!({}),
+    )
+    .await;
+    let held = record(
+        &store,
+        "mail_outbound",
+        "hold",
+        json!({"sealed": "c2VjcmV0"}),
+        json!({"item_id": "ffffffff-0000"}),
+    )
+    .await;
+    let labelled = record(
+        &store,
+        "shell_watch",
+        "alarming",
+        json!({"level": "alarming", "summary": "x"}),
+        json!({}),
+    )
+    .await;
+    let tx = store.begin().await.unwrap();
+    agent_auth_store::evals::set_label(
+        &tx,
+        labelled,
+        "fine",
+        "",
+        "operator",
+        "jrt",
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    bot.handle(command(OWNER, "review", json!([]))).await;
+    let reply = f.calls().pop().unwrap();
+    let text = ephemeral_reply(&reply).to_owned();
+    assert!(
+        text.contains("**#1**") && text.contains("**#2**") && !text.contains("**#3**"),
+        "{text}"
+    );
+    assert!(
+        text.contains("the mail judge (outgoing) said **hold** · mail `ffffffff`"),
+        "{text}"
+    );
+    assert!(text.contains("the LLM reviewer said **deny**"), "{text}");
+    assert!(text.contains("too broad"), "{text}");
+    assert!(
+        !text.contains("<@1>") && !text.contains("c2VjcmV0"),
+        "{text}"
+    );
+    let components: Vec<Component> =
+        serde_json::from_value(reply.body["data"]["components"].clone()).unwrap();
+    let ids: Vec<_> = buttons(&components)
+        .into_iter()
+        .map(|b| (b.0, b.1.unwrap()))
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            ("Wrong #1".to_owned(), format!("aa:mcw:{held}")),
+            ("Wrong #2".to_owned(), format!("aa:mcw:{denied}")),
+        ]
+    );
+    // One kind, and everything.
+    bot.handle(command(
+        OWNER,
+        "review",
+        json!([{"name": "kind", "type": 3, "value": "shell_guard"}]),
+    ))
+    .await;
+    assert!(ephemeral_reply(&f.calls().pop().unwrap()).starts_with("Nothing to review"));
+    bot.handle(command(OWNER, "review", json!([{"name": "kind", "type": 3, "value": "shell_guard"}, {"name": "everything", "type": 5, "value": true}])))
+        .await;
+    assert!(ephemeral_reply(&f.calls().pop().unwrap()).contains("the shell guard said **fine**"));
+    // Not the owner: nothing listed.
+    bot.handle(command(7, "review", json!([]))).await;
+    assert_eq!(
+        ephemeral_reply(&f.calls().pop().unwrap()),
+        interactions::NOT_OWNER
     );
 }

@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::models::{Context, Kind, Knob, ModelClient, Recipe};
 
@@ -190,10 +191,34 @@ pub struct EarlierCommand {
 pub enum GuardVerdict {
     /// It may run.
     Allow(String),
-    /// Refused; `alarming` also tells the operator at once.
-    Refuse { alarming: bool, why: String },
+    /// Refused; `alarming` also tells the operator at once. `call`: the
+    /// record of the decision, if it was recorded.
+    Refuse {
+        alarming: bool,
+        why: String,
+        call: Option<Uuid>,
+    },
     /// The model could not be asked: refused (fail closed).
     Unavailable,
+}
+
+/// The watcher's finding about one command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assessment {
+    pub level: Level,
+    /// One sentence.
+    pub summary: String,
+    /// The record of the decision, if it was recorded.
+    pub call: Option<Uuid>,
+}
+
+/// The scope check's answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeFit {
+    pub fits: bool,
+    pub summary: String,
+    /// The record of the decision, if it was recorded.
+    pub call: Option<Uuid>,
 }
 
 /// The shell models: watcher, guard and scope check.
@@ -594,8 +619,8 @@ impl Watcher {
         build_watch_for(&watch_facts(w), &Context::default(), kind).unwrap_or_default()
     }
 
-    /// `(level, one sentence)`, or `None` if the model could not be asked.
-    pub async fn assess(&self, w: &Watched<'_>) -> Option<(Level, String)> {
+    /// The finding, or `None` if the model could not be asked.
+    pub async fn assess(&self, w: &Watched<'_>) -> Option<Assessment> {
         let kind = if w.general {
             Kind::ShellWatchGeneral
         } else {
@@ -615,7 +640,11 @@ impl Watcher {
         if parsed.is_none() {
             tracing::warn!(host = w.host, "watch failed: no verdict");
         }
-        parsed
+        parsed.map(|(level, summary)| Assessment {
+            level,
+            summary,
+            call: d.call,
+        })
     }
 
     /// The guard's user message (default context).
@@ -641,10 +670,12 @@ impl Watcher {
             Some((Level::Odd, why)) => GuardVerdict::Refuse {
                 alarming: false,
                 why,
+                call: d.call,
             },
             Some((Level::Alarming, why)) => GuardVerdict::Refuse {
                 alarming: true,
                 why,
+                call: d.call,
             },
             None => {
                 tracing::warn!(host = g.host, "guard failed: no verdict; refused");
@@ -665,7 +696,7 @@ impl Watcher {
         earlier: &[String],
         purpose: &str,
         subject: Value,
-    ) -> Option<(bool, String)> {
+    ) -> Option<ScopeFit> {
         let d = self
             .client
             .decide(
@@ -678,7 +709,11 @@ impl Watcher {
             .await;
         let answer = d.answer?;
         let fits = d.class.as_deref()? == "fits";
-        Some((fits, summary_of(&Value::Object(answer))))
+        Some(ScopeFit {
+            fits,
+            summary: summary_of(&Value::Object(answer)),
+            call: d.call,
+        })
     }
 }
 

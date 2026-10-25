@@ -868,8 +868,14 @@ impl Notify for Fanout {
                 .await;
         }
     }
-    async fn watch_alert(&self, request: &RequestRow, job: &JobRow, text: &str) {
-        primary!(self, n => n.watch_alert(request, job, text).await,
+    async fn watch_alert(
+        &self,
+        request: &RequestRow,
+        job: &JobRow,
+        text: &str,
+        call: Option<uuid::Uuid>,
+    ) {
+        primary!(self, n => n.watch_alert(request, job, text, call).await,
             null => tracing::warn!(job = %job.id, host = %job.host, "{text}"));
         let argv: Vec<String> = job
             .spec

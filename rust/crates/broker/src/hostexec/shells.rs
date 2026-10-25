@@ -18,7 +18,7 @@ use agent_auth_wire::hostexec::ShellExecBody;
 use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 
-use super::watcher::{EarlierCommand, GuardVerdict, Guarded, Level, Watched};
+use super::watcher::{Assessment, EarlierCommand, GuardVerdict, Guarded, Level, ScopeFit, Watched};
 use super::{CALL_TIMEOUT, HostExec};
 use crate::notify::{Notify as _, ShellEvent};
 
@@ -269,6 +269,7 @@ impl HostExec {
         };
         // The guard first, before anyone is shown it: it can only refuse.
         let mut guard_why = String::new();
+        let mut guard_call = None;
         let outcome = if mode.guarded() {
             let (earlier, total) = guard_context(&history.0, history.1);
             match &self.watcher {
@@ -292,8 +293,13 @@ impl HostExec {
                     .await
                 {
                     GuardVerdict::Allow(_) => GuardOutcome::Allow,
-                    GuardVerdict::Refuse { alarming, why } => {
+                    GuardVerdict::Refuse {
+                        alarming,
+                        why,
+                        call,
+                    } => {
                         guard_why = why;
+                        guard_call = call;
                         GuardOutcome::Refuse { alarming }
                     }
                     GuardVerdict::Unavailable => GuardOutcome::Unavailable,
@@ -326,6 +332,7 @@ impl HostExec {
                     scope: scope.as_ref(),
                     why: &guard_why,
                     alarming,
+                    call: guard_call,
                 },
                 _ => ShellEvent::GuardUnavailable {
                     job: &job,
@@ -577,14 +584,29 @@ impl HostExec {
                 .await
             }
         };
-        let summary = match verdict {
-            Some((true, summary)) => summary,
-            Some((false, why)) => {
+        let (summary, call) = match verdict {
+            Some(ScopeFit {
+                fits: true,
+                summary,
+                call,
+            }) => (summary, call),
+            Some(ScopeFit {
+                fits: false,
+                summary: why,
+                call,
+            }) => {
                 let ended = self
                     .count_refusal(grant_id, RefusalKind::Scope, false)
                     .await?;
                 self.notifier()
-                    .shell_event(&request, ShellEvent::ScopeRefused { purpose, why: &why })
+                    .shell_event(
+                        &request,
+                        ShellEvent::ScopeRefused {
+                            purpose,
+                            why: &why,
+                            call,
+                        },
+                    )
                     .await;
                 let mut text = format!("the umbrella's guard refused that purpose: {why}");
                 if let Some(e) = ended {
@@ -597,7 +619,14 @@ impl HostExec {
                 let why =
                     "the guard could not be asked (umbrella shells fail closed); try again shortly";
                 self.notifier()
-                    .shell_event(&request, ShellEvent::ScopeRefused { purpose, why })
+                    .shell_event(
+                        &request,
+                        ShellEvent::ScopeRefused {
+                            purpose,
+                            why,
+                            call: None,
+                        },
+                    )
                     .await;
                 return Err(ShellExecError::Refused(why.to_owned()));
             }
@@ -625,7 +654,13 @@ impl HostExec {
         drop(issuable);
         tx.commit().await?;
         self.notifier()
-            .shell_event(&request, ShellEvent::ScopeOpened { scope: &scope })
+            .shell_event(
+                &request,
+                ShellEvent::ScopeOpened {
+                    scope: &scope,
+                    call,
+                },
+            )
             .await;
         Ok(scope)
     }
@@ -752,13 +787,19 @@ impl HostExec {
                 subject: json!({"job_id": job.id.to_string(), "request_id": job.request_id.to_string()}),
             })
             .await;
-        if let Some((Level::Alarming, summary)) = verdict {
+        if let Some(Assessment {
+            level: Level::Alarming,
+            summary,
+            call,
+        }) = verdict
+        {
             tracing::warn!(job = %job.id, host = %job.host, "watch: {summary}");
             self.notifier()
                 .watch_alert(
                     &request,
                     &job,
                     &format!("watch ({}, advisory): {summary}", watcher.model),
+                    call,
                 )
                 .await;
         }

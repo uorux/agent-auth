@@ -60,6 +60,22 @@ and why. Keep entries short. Group by area.
   Python had none of this. Live prompts are as before (the reviewer
   still shows every prior verdict; the guard's history budget is measured
   as before); the existing prompt tests pass unchanged.
+- **Labelling from Discord** (2026-10-25, Jacob's request). `decide`
+  returns the record's id; the Discord messages that report a model's
+  decision carry **Wrong call** (`aa:mcw:<call>`): a guard's refusal (not
+  "guard unavailable": nothing was decided), a scoped shell opened or
+  refused, a watcher's alert, and the LLM reviewer's approval line (its
+  request's newest review). The owner (the same check as every
+  interaction) says what it should have been (prefilled with the other
+  side, checked against the kind's classes) and why; that is an operator
+  label, by the owner's Discord name, and **Undo** removes it. `/review
+  [kind] [everything]` shows, from the 200 newest records, the 5 newest
+  that went against an agent or called the owner (`models::adverse`: a
+  denial, refusal, hold, alert, high risk, doubtful inbound mail) without
+  an operator label, with a button each; mail records show no reason
+  (sealed). A decision whose record failed has no button. An LLM denial
+  still isn't posted to Discord (as in the Python); `/review` is the way to
+  it.
 
 ## Policy
 

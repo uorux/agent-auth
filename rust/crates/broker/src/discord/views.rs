@@ -18,11 +18,13 @@ use agent_auth_wire::admin::LockdownScope;
 use serde_json::{Map, Value};
 use twilight_model::channel::message::Component;
 use twilight_model::channel::message::component::ButtonStyle;
+use uuid::Uuid;
 
 use super::embeds::{capability, scope};
 use super::model::{Input, Modal, button, row};
 use super::ops::HumanDecision;
 use super::text::cut;
+use crate::models::{self, Kind};
 
 /// What a component or modal custom id names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +71,12 @@ pub enum CustomId {
     MailRelease(agent_auth_core::MailItemId),
     /// Held mail: keep it back.
     MailDiscard(agent_auth_core::MailItemId),
+    /// A model's decision was wrong: ask what it should have been.
+    WrongCall(Uuid),
+    /// Modal: what the decision should have been, and why.
+    WrongCallModal(Uuid),
+    /// Take back a label given from Discord.
+    Unlabel(Uuid),
 }
 
 impl CustomId {
@@ -76,6 +84,12 @@ impl CustomId {
     #[must_use]
     pub fn parse(s: &str) -> Option<CustomId> {
         let rid = |r: &str| r.parse::<RequestId>().ok();
+        // Canonical (hyphenated, lowercase) only, like a request id.
+        let call = |c: &str| {
+            Uuid::parse_str(c)
+                .ok()
+                .filter(|u| u.hyphenated().to_string() == c)
+        };
         let page = |p: &str| p.parse::<i64>().ok().filter(|n| n.to_string() == p);
         let mut parts = s.split(':');
         if parts.next()? != "aa" {
@@ -121,6 +135,9 @@ impl CustomId {
             },
             ("mlrel", [m]) => CustomId::MailRelease(m.parse().ok()?),
             ("mldis", [m]) => CustomId::MailDiscard(m.parse().ok()?),
+            ("mcw", [c]) => CustomId::WrongCall(call(c)?),
+            ("mcwm", [c]) => CustomId::WrongCallModal(call(c)?),
+            ("mcu", [c]) => CustomId::Unlabel(call(c)?),
             _ => return None,
         };
         Some(id)
@@ -154,6 +171,9 @@ impl CustomId {
             CustomId::RulesDelete { page, rule } => format!("aa:rules:del:{page}:{rule}"),
             CustomId::MailRelease(m) => format!("aa:mlrel:{m}"),
             CustomId::MailDiscard(m) => format!("aa:mldis:{m}"),
+            CustomId::WrongCall(c) => format!("aa:mcw:{c}"),
+            CustomId::WrongCallModal(c) => format!("aa:mcwm:{c}"),
+            CustomId::Unlabel(c) => format!("aa:mcu:{c}"),
         }
     }
 }
@@ -291,6 +311,33 @@ pub fn shell_view(rid: RequestId) -> Vec<Component> {
     )])]
 }
 
+/// The button on a message that reports a model's decision: say it was
+/// wrong (an eval label, `crate::models`).
+#[must_use]
+pub fn wrong_call_button(call: Uuid) -> Component {
+    live(
+        "Wrong call",
+        ButtonStyle::Secondary,
+        CustomId::WrongCall(call),
+    )
+}
+
+/// `wrong_call_button` alone in a row.
+#[must_use]
+pub fn wrong_call_view(call: Uuid) -> Vec<Component> {
+    vec![row(vec![wrong_call_button(call)])]
+}
+
+/// After labelling from Discord: take it back.
+#[must_use]
+pub fn unlabel_view(call: Uuid) -> Vec<Component> {
+    vec![row(vec![live(
+        "Undo",
+        ButtonStyle::Secondary,
+        CustomId::Unlabel(call),
+    )])]
+}
+
 // ----------------------------------------------------------------- modals
 
 const REASON: &str = "reason";
@@ -300,6 +347,8 @@ const SCOPE: &str = "scope";
 const RULE: &str = "rule";
 const NOTES: &str = "notes";
 const CODE: &str = "code";
+const EXPECTED: &str = "expected";
+const NOTE: &str = "note";
 
 /// Longest resource / scope text the Edit modal can hold.
 pub const EDIT_RESOURCE_MAX: usize = 512;
@@ -437,6 +486,49 @@ pub fn totp_modal(request: &RequestRow) -> Modal {
         title: cut(&format!("Approve with TOTP ({})", request.resource), 45),
         inputs,
     }
+}
+
+/// The Wrong call modal: what the decision should have been (prefilled
+/// with the likely answer, `crate::models::likely_fix`), and a note for
+/// whoever tunes the prompt.
+#[must_use]
+pub fn wrong_call_modal(call: Uuid, kind: Kind, class: Option<&str>) -> Modal {
+    let classes = models::recipe(kind).classes;
+    let fix = class.map(|c| models::likely_fix(kind, c));
+    Modal {
+        custom_id: CustomId::WrongCallModal(call).render(),
+        title: cut(&format!("Wrong call: {}", models::kind_title(kind)), 45),
+        inputs: vec![
+            Input {
+                value: fix.map(str::to_owned),
+                placeholder: Some(cut(&classes.join(" | "), 100)),
+                max_length: Some(64),
+                ..Input::new(EXPECTED, "It should have been")
+            },
+            Input {
+                paragraph: true,
+                required: false,
+                max_length: Some(1000),
+                placeholder: Some("what it missed (for tuning the prompt)".to_owned()),
+                ..Input::new(NOTE, "Note (optional)")
+            },
+        ],
+    }
+}
+
+/// The Wrong call modal's answer: `(expected, note)`, the expected class
+/// one `kind` can decide (or a pattern of them, `*` for a part).
+pub fn read_wrong_call(kind: Kind, form: &Submitted) -> Result<(String, String), Refusal> {
+    let expected = form.get(EXPECTED).trim().to_lowercase();
+    if !models::valid_pattern(kind, &expected) {
+        return Err(Refusal(format!(
+            "`{}` is not something the {} decides: one of {}.",
+            super::text::cut(&super::text::code(&expected), 64),
+            models::kind_title(kind),
+            models::recipe(kind).classes.join(", ")
+        )));
+    }
+    Ok((expected, form.get(NOTE).trim().to_owned()))
 }
 
 /// The values of a submitted modal, by input custom id.

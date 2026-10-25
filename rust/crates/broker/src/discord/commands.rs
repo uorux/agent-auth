@@ -93,6 +93,15 @@ pub fn definitions() -> Value {
         },
         {
             "type": 1,
+            "name": "review",
+            "description": "Recent model decisions that went against an agent or pinged you: say which were wrong",
+            "options": [
+                {"type": STRING, "name": "kind", "description": "only this kind of decision", "choices": kinds()},
+                {"type": BOOLEAN, "name": "everything", "description": "also the ones that let things through"},
+            ],
+        },
+        {
+            "type": 1,
             "name": "dnd",
             "description": "No approval prompts on your desktops for a while",
             "options": [
@@ -100,6 +109,16 @@ pub fn definitions() -> Value {
             ],
         },
     ])
+}
+
+/// The decision kinds (`crate::models::Kind`), by what a person calls them.
+fn kinds() -> Value {
+    Value::Array(
+        crate::models::Kind::ALL
+            .iter()
+            .map(|k| json!({"name": crate::models::kind_title(*k), "value": k.as_str()}))
+            .collect(),
+    )
 }
 
 fn tiers() -> Value {

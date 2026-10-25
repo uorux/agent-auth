@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use agent_auth_core::pyfmt::{escape_unprintable, shlex_join, shlex_quote};
-use agent_auth_core::{GrantStatus, Platform, RequestStatus};
+use agent_auth_core::{DecisionSource, GrantStatus, Platform, RequestStatus};
 use agent_auth_store::agents::{self, AgentRow};
 use agent_auth_store::grants::{self, GrantRow};
 use agent_auth_store::hostexec::JobRow;
@@ -17,6 +17,7 @@ use agent_auth_store::requests::{self, DiscordRefs, RequestRow};
 use agent_auth_store::rules::RuleRow;
 use agent_auth_store::{StoreError, a2a};
 use serde_json::Value;
+use uuid::Uuid;
 
 use super::Bot;
 use super::embeds::{
@@ -26,7 +27,9 @@ use super::embeds::{
 use super::model::{File, Message, MessageReference, add_field, embed, mentions, resendable};
 use super::rest::RestError;
 use super::text::{code, code_block, cut, display_lines, escape, said};
-use super::views::{disabled_view, hostexec_pending_view, pending_view, shell_view};
+use super::views::{
+    disabled_view, hostexec_pending_view, pending_view, shell_view, wrong_call_view,
+};
 use crate::notify::{Notify, ShellEvent};
 use agent_auth_store::shell_scopes::ScopeRow;
 
@@ -441,12 +444,13 @@ impl DiscordNotifier {
         let in_scope = |scope: Option<&ScopeRow>| {
             scope.map_or(String::new(), |s| format!(" in {}", scope_label(s)))
         };
-        let (ping, content) = match event {
+        let (ping, content, call) = match event {
             ShellEvent::GuardRefused {
                 job,
                 scope,
                 why,
                 alarming,
+                call,
             } => (
                 alarming,
                 format!(
@@ -456,6 +460,7 @@ impl DiscordNotifier {
                     command(job),
                     said(why, 400)
                 ),
+                call,
             ),
             ShellEvent::GuardUnavailable { job, scope } => (
                 false,
@@ -464,31 +469,36 @@ impl DiscordNotifier {
                     in_scope(scope),
                     command(job)
                 ),
+                None,
             ),
-            ShellEvent::ScopeOpened { scope } => (
+            ShellEvent::ScopeOpened { scope, call } => (
                 false,
                 format!(
                     "🔹 **Scoped shell opened**: {}\n> {}",
                     scope_label(scope),
                     said(&scope.verdict, 400)
                 ),
+                call,
             ),
-            ShellEvent::ScopeRefused { purpose, why } => (
+            ShellEvent::ScopeRefused { purpose, why, call } => (
                 false,
                 format!(
                     "🛡️ **Scoped shell refused**: {}\n> {}",
                     said(&one_line(purpose), 400),
                     said(why, 400)
                 ),
+                call,
             ),
             ShellEvent::ScopeClosed { scope } => (
                 false,
                 format!("▫️ Scoped shell closed: {}", scope_label(scope)),
+                None,
             ),
         };
         let (mention, base) = self.owner_ping(ping);
         let msg = Message {
             content: Some(cut(&format!("{mention}{content}"), 2000)),
+            components: call.map(wrong_call_view),
             ..base
         };
         self.send(thread, &msg).await?;
@@ -500,6 +510,7 @@ impl DiscordNotifier {
         request: &RequestRow,
         job: &JobRow,
         text: &str,
+        call: Option<Uuid>,
     ) -> Result<(), Failure> {
         let place = if job.shell_id.is_some() {
             self.shell_thread(request, false).await?
@@ -517,11 +528,33 @@ impl DiscordNotifier {
         );
         let msg = Message {
             content: Some(cut(&content, 2000)),
+            components: call.map(wrong_call_view),
             ..base
         };
         self.send(place.unwrap_or(self.bot.cfg.channel_id), &msg)
             .await?;
         Ok(())
+    }
+
+    /// The reviewer's newest recorded decision on `request` (the one that
+    /// decided it: a newer round supersedes an older one).
+    async fn review_call(&self, request: &RequestRow) -> Option<Uuid> {
+        let found = async {
+            let tx = self.bot.store.begin().await?;
+            let call = agent_auth_store::evals::latest_about(
+                &tx,
+                crate::models::Kind::RequestReview.as_str(),
+                &serde_json::json!({"request_id": request.id.to_string()}),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok::<_, StoreError>(call)
+        }
+        .await;
+        found.unwrap_or_else(|e| {
+            tracing::warn!("discord: could not find the review of {}: {e}", request.id);
+            None
+        })
     }
 
     async fn try_attention(
@@ -661,6 +694,13 @@ impl Notify for DiscordNotifier {
         rule: Option<&RuleRow>,
         grant: Option<&GrantRow>,
     ) {
+        // The LLM reviewer's approval: its recorded decision, to say it was
+        // wrong.
+        let call = if request.decision_source == Some(DecisionSource::Llm) {
+            self.review_call(request).await
+        } else {
+            None
+        };
         let msg = Message {
             embeds: Some(vec![rule_applied_embed(
                 request,
@@ -668,6 +708,7 @@ impl Notify for DiscordNotifier {
                 rule,
                 grant.map(GrantView::from).as_ref(),
             )]),
+            components: call.map(wrong_call_view),
             allowed_mentions: Some(mentions(None)),
             ..Message::default()
         };
@@ -706,10 +747,16 @@ impl Notify for DiscordNotifier {
         );
     }
 
-    async fn watch_alert(&self, request: &RequestRow, job: &JobRow, text: &str) {
+    async fn watch_alert(
+        &self,
+        request: &RequestRow,
+        job: &JobRow,
+        text: &str,
+        call: Option<Uuid>,
+    ) {
         swallow!(
             "post a watch alert",
-            self.try_watch_alert(request, job, text).await
+            self.try_watch_alert(request, job, text, call).await
         );
     }
 
