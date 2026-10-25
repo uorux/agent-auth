@@ -16,6 +16,8 @@ members = ["."]
 [dependencies]
 libfuzzer-sys = "=0.4.13"
 agent-auth-core = { path = "../crates/core" }
+agent-auth-crypto = { path = "../crates/crypto" }
+ring = { version = "=0.17.14", default-features = false, features = ["alloc", "std"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 time = { version = "=0.3.55", default-features = false }
 
@@ -46,6 +48,55 @@ bench = false
 [[bin]]
 name = "duration_parse"
 path = "fuzz_targets/duration_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "envelope_open"
+path = "fuzz_targets/envelope_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_key_parse"
+path = "fuzz_targets/api_key_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pairing_code"
+path = "fuzz_targets/pairing_code.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "secretbox_open"
+path = "fuzz_targets/secretbox_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "token_verify"
+path = "fuzz_targets/token_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "text_parsers"
+path = "fuzz_targets/text_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "canonical_json"
+path = "fuzz_targets/canonical_json.rs"
 test = false
 doc = false
 bench = false

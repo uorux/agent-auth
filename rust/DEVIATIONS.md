@@ -83,6 +83,57 @@ and why. Keep entries short. Group by area.
   checked nothing. Consequence: an expired hostexec run grant no longer
   returns its job summary here; `GET /v1/hostexec/jobs/{id}` still does.
 
+## Crypto (`agent-auth-crypto`)
+
+- **API keys parse strictly** (core-lifecycle-policy §10.1). Only the shape
+  ever issued parses: `aa_` + 12 lowercase hex + `_` + 43 URL-safe base64
+  characters. The Python split on `_` and accepted any parts (`aa__x`),
+  which then failed the lookup as "invalid API key"; such keys are now
+  "malformed API key".
+- **Encryption at rest is ChaCha20-Poly1305, not Fernet** (§10.2). Format
+  (`secretbox.rs`): base64url(`0x01` ‖ 96-bit random nonce ‖ ciphertext ‖
+  tag), with associated data binding the value to its table, column and row,
+  so a ciphertext copied to another row does not open. `ENCRYPTION_KEY` keeps
+  its shape (32 bytes, base64), so an existing Fernet key still parses; old
+  ciphertexts do not open (the database is new).
+- **Envelope sealing refuses what the Python let through** (daemons-hostd
+  §4.3, §17 item 14): a payload using a reserved key (`id iss aud seq iat
+  exp`) is an error instead of being overwritten, and a ttl outside
+  (0, 3600] s is an error instead of producing an envelope the peer refuses.
+- **Envelope bodies are read strictly** (§4.3): `iat`/`exp` must be JSON
+  numbers (Python's `float()` also took numeric strings and booleans), and a
+  `seq` above 2^64 − 1 is "malformed envelope body".
+- **Hello nonces must be 32 bytes of URL-safe base64** (§4.2). The Python
+  broker accepted any string as the daemon's nonce; every Python daemon
+  sends this shape.
+- **Base64 is decoded strictly** (§2.1): URL-safe alphabet only, padding
+  optional, non-zero trailing bits refused. Python skipped stray characters.
+- **Pairing proofs cover the canonical public key text** (§3.1). The Python
+  broker MACed the key text as received; the Rust re-encodes the parsed key,
+  so a peer sending a padded or otherwise non-canonical text fails the
+  proof. Honest peers send the canonical form.
+- **Key file symlink check without `O_NOFOLLOW`** (§2.3): `lstat` must show
+  a regular file and the opened file must be that inode (no libc, so no
+  `O_NOFOLLOW`). A symlinked key is refused with "is not a regular file"
+  (the Python failed with the OS's ELOOP error). The effective uid comes
+  from `/proc/self/status` on Linux (other systems: the owner of a probe
+  file created next to the key).
+- **Broker JWT verification** (§10.4) takes the time as an argument and
+  reports PyJWT's messages; `iat`/`nbf`/`exp` must be JSON numbers (PyJWT's
+  `int()` also took numeric strings). Tokens and the JWKS (`kid`, `x`, `y`)
+  are the Python's for the same `BROKER_SIGNING_KEY`.
+- **Note, not a change: ES256 key derivation uses a deprecated ring helper.** ring has no
+  "P-256 scalar → key pair" constructor and its PKCS#8 parser needs the
+  public key, so `jwt::TokenIssuer` feeds the derived scalar to ring's own
+  key generation through `ring::test::rand::FixedSliceRandom` (deprecated,
+  "will be removed"). Correct on ring 0.17.14 (checked against the Python's
+  `kid`/JWKS); a ring upgrade may need another route (the `p256` crate, or
+  storing the derived key as PKCS#8 once).
+- **Spec correction, not a change** (daemons-hostd §6.3): Python's
+  `ensure_ascii` escapes DEL (0x7f) as `\u007f`; the spec said raw. The Rust
+  canonical JSON (`core::canonical_json`) matches the Python, checked
+  against a vector from Python's `json.dumps`.
+
 ## Open questions
 
 (for Jacob; nothing here is implemented until decided)
@@ -90,6 +141,11 @@ and why. Keep entries short. Group by area.
 - **A missing base policy file** (bug B-12). `Policy::load` takes the
   file's text, so whether a missing `POLICY_FILE` is an error is the
   broker's call; the spec recommends refusing to start.
-- **Spec erratum, daemons-hostd §6.3**: Python's `json.dumps(...,
-  ensure_ascii=True)` escapes DEL (0x7f) as `\u007f`; the spec says it is
-  emitted raw. The canonical-JSON digest must escape it to stay compatible.
+- **a2a payload size count for unusual numbers.** `python_dumps_len` counts
+  floats as Python's `repr`, but serde_json without its `float_roundtrip`
+  feature reads some decimal literals one ulp off (e.g. `2.5e-308`), and
+  integers beyond ±2^64 become floats, so for such payloads the count can
+  differ from Python's by a few characters. Enabling `float_roundtrip` (and
+  possibly `arbitrary_precision`) on the workspace serde_json would close
+  it; not done here because it changes a shared dependency.
+

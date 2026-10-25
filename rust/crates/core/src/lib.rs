@@ -9,6 +9,7 @@
 //! fuzzed, run under Miri, and model-checked with Kani (`cargo kani`).
 
 pub mod authority;
+pub mod canonical_json;
 pub mod durations;
 pub mod glob;
 pub mod hostexec;

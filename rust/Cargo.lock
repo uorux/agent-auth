@@ -77,10 +77,11 @@ dependencies = [
 name = "agent-auth-crypto"
 version = "0.1.0"
 dependencies = [
+ "agent-auth-core",
  "base64 0.23.1",
  "hex",
+ "proptest",
  "ring",
- "serde",
  "serde_json",
  "thiserror",
  "zeroize",
