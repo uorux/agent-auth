@@ -1732,6 +1732,15 @@ Final review (sandboxes), fixed:
 - **Triage picks the candidate whose id appears in the answer** (B-18):
   kept (exactly one must match).
 
+- **LLDAP over LDAP in the cluster** (packaging). LLDAP's LDAPS
+  certificate is the `*.rooty.dev` wildcard, which no in-cluster service
+  name matches. Either `ldaps://` through a name the cert covers (the LDAP
+  NodePort: needs a NetworkPolicy egress rule to that private address), or
+  plain `ldap://` to the in-cluster service with its host in
+  `PLAINTEXT_HTTP_HOSTS` and `LLDAP_LDAP_ALLOW_PLAINTEXT=1` (the LLDAP admin
+  password then crosses the cluster network unencrypted). Not set in the
+  manifests until decided.
+
 ## To do (engineering, tracked here until done)
 
 - ES256 MCP token key: derived from `BROKER_SIGNING_KEY` via ring's
