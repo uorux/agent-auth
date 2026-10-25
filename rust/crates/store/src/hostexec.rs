@@ -384,3 +384,30 @@ pub async fn finished_since(
     .await?;
     rows(raw)
 }
+
+/// A job whose outcome is unknown — hostd restarted while it ran, or no
+/// result came long after its timeout (daemons bug 3) — becomes `lost`,
+/// from `starting`/`running` only, and only for the job's own host.
+/// `None`: it already had an outcome (or is not this host's).
+pub async fn mark_lost(
+    tx: &Tx<'_>,
+    id: JobId,
+    host: &str,
+    error: &str,
+    now: OffsetDateTime,
+) -> Result<Option<JobRow>, StoreError> {
+    let mut c = tx.conn().await;
+    let raw = sqlx::query_as!(
+        RawJob,
+        "UPDATE host_jobs SET status = 'lost', error = $3, finished_at = $4, updated_at = $4
+         WHERE id = $1 AND host = $2 AND status IN ('starting', 'running')
+         RETURNING *",
+        Uuid::from(id),
+        host,
+        error,
+        now
+    )
+    .fetch_optional(&mut **c)
+    .await?;
+    opt(raw)
+}
