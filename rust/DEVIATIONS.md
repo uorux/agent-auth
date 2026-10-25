@@ -1525,7 +1525,12 @@ inherited from the Python; "port" what the port introduced.
   `database.createLocally` (PostgreSQL on the host, peer authentication on
   the socket; the Python's SQLite state directory is gone) and asserts that
   `environmentFiles` holds no Nix path literal (upstream review 2026-10)
-  and that `settings` holds no secret.
+  and that `settings` holds no secret: names are compared upper-cased (as
+  the broker reads them), anything named `*_TOKEN`, `*_KEY`, `*_PASSWORD`
+  or `*_SECRET` counts, `DATABASE_URL` is allowed there only without a
+  password (in its user info or its query), and `settings` names must be
+  upper-case (two spellings of one variable would leave the winner to the
+  broker's map order).
 - **Stricter units.** Broker: W^X memory (no cffi), `PrivateUsers`,
   `ProcSubset=pid`, `~@resources`, `LimitNOFILE=65536`, no state
   directory, working directory `/var/empty` (it reads `./.env`). hostd: W^X

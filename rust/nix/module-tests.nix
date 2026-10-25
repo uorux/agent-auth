@@ -131,6 +131,23 @@ let
     }
   ];
 
+  # The broker with these settings (and no local database).
+  brokerWith =
+    settings:
+    evalSystem [
+      self.nixosModules.broker
+      {
+        services.agent-auth = {
+          enable = true;
+          policyFile = pkgs.writeText "policy.yaml" "{}\n";
+          database.createLocally = false;
+          inherit settings;
+        };
+      }
+    ];
+  refused = prefix: settings: lib.any (lib.hasPrefix prefix) (failed (brokerWith settings));
+  accepted = settings: failed (brokerWith settings) == [ ];
+
   failed = c: map (a: a.message) (lib.filter (a: !a.assertion) c.config.assertions);
 
   unit = c: name: c.config.systemd.services.${name}.serviceConfig;
@@ -147,6 +164,33 @@ let
     (expect "a path literal in environmentFiles is refused" (
       lib.any (lib.hasPrefix "services.agent-auth.environmentFiles") (failed pathLiteral)
     ))
+    (expect "a secret in settings is refused" (
+      refused "services.agent-auth.settings holds a secret" { ADMIN_TOKEN = "x"; }
+    ))
+    (expect "a secret in settings is refused whatever its case" (
+      refused "services.agent-auth.settings holds a secret" { admin_token = "x"; }
+    ))
+    (expect "secret-looking names are refused" (
+      refused "services.agent-auth.settings holds a secret" { GITHUB_WEBHOOK_SECRET = "x"; }
+    ))
+    (expect "lower-case names are refused" (
+      refused "services.agent-auth.settings: write variable names in upper case" { log_level = "info"; }
+    ))
+    (expect "a DATABASE_URL with a password is refused" (
+      refused "services.agent-auth.settings.DATABASE_URL holds a password" {
+        DATABASE_URL = "postgres://u:hunter2@db.example/aa?sslmode=verify-full&sslrootcert=/ca.crt";
+      }
+    ))
+    (expect "a password in DATABASE_URL's query is refused" (
+      refused "services.agent-auth.settings.DATABASE_URL holds a password" {
+        DATABASE_URL = "postgres://u@db.example/aa?sslmode=verify-full&PASSWORD=x";
+      }
+    ))
+    (expect "a DATABASE_URL without a password is accepted" (accepted {
+      DATABASE_URL = "postgres://agent-auth@db.example/aa?sslmode=verify-full&sslrootcert=/ca.crt";
+      KUBERNETES_TOKEN_FILE = "/run/credentials/agent-auth.service/k8s-token";
+      GITHUB_APP_PRIVATE_KEY_FILE = "/run/credentials/agent-auth.service/github-pem";
+    }))
     (expect "broker: local Postgres" full.config.services.postgresql.enable)
     (expect "broker: DATABASE_URL over the socket" (
       brokerEnv.DATABASE_URL == "postgres://agent-auth@localhost/agent-auth?host=/run/postgresql"

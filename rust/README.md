@@ -317,7 +317,10 @@ importing these instead of the Python flake's (never both). What differs:
   directory (the Python's `/var/lib/private/agent-auth` SQLite is not
   read; persist `/var/lib/postgresql` instead on impermanence hosts). An
   assertion refuses Nix path literals in `environmentFiles` (they would be
-  copied into the world-readable store) and secrets in `settings`. The
+  copied into the world-readable store) and secrets in `settings`
+  (names compared case-insensitively, as the broker reads them; anything
+  named `*_TOKEN`, `*_KEY`, `*_PASSWORD`, `*_SECRET`; a `DATABASE_URL` with
+  a password), and `settings` names must be upper-case. The
   sandbox is stricter than the Python unit's: W^X memory, a private user
   namespace, `ProcSubset=pid`, `~@resources`, `LimitNOFILE=65536`.
 - **hostd**: templates take `description`, `cwd`, `env`, `stdin` (pinned:

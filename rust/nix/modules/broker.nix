@@ -19,6 +19,45 @@ let
   cfg = config.services.agent-auth;
   inherit (lib) mkOption types;
   localDb = cfg.database.createLocally;
+  # The broker reads its environment case-insensitively (every key
+  # upper-cased), so every check here compares upper-cased names.
+  upperKeys = map lib.toUpper (lib.attrNames cfg.settings);
+  # Secrets that must never sit in `settings` (the world-readable store):
+  # these by name, and anything named like a token, key, password or secret
+  # (`*_FILE` paths to such files are fine).
+  secretNames = [
+    "ADMIN_TOKEN"
+    "ENCRYPTION_KEY"
+    "BROKER_SIGNING_KEY"
+    "DISCORD_TOKEN"
+    "OPENROUTER_API_KEY"
+    "LLDAP_ADMIN_PASSWORD"
+    "LITELLM_MASTER_KEY"
+    "KUBERNETES_TOKEN"
+    "WEBHOOK_SIGNING_SECRET"
+  ];
+  looksSecret =
+    k:
+    lib.elem k secretNames
+    || lib.any (suffix: lib.hasSuffix suffix k) [
+      "_TOKEN"
+      "_KEY"
+      "_PASSWORD"
+      "_SECRET"
+    ];
+  secretsInSettings = lib.filter looksSecret upperKeys;
+  # DATABASE_URL in `settings` only without a password (peer or certificate
+  # authentication); one with a password goes in an environment file.
+  settingsDbUrls = lib.mapAttrsToList (_: v: v) (
+    lib.filterAttrs (k: _: lib.toUpper k == "DATABASE_URL") cfg.settings
+  );
+  hasPassword =
+    url:
+    let
+      u = lib.toLower url;
+    in
+    builtins.match "[a-z0-9+.-]+://[^/?#@]*:[^/?#@]*@.*" u != null
+    || builtins.match ".*[?&]password=.*" u != null;
   overlayPaths = lib.imap0 (
     i: _: "/run/credentials/agent-auth.service/policy-overlay-${toString i}"
   ) cfg.policyOverlays;
@@ -138,22 +177,24 @@ in
         message = "services.agent-auth.environmentFiles: pass secret files as strings (e.g. config.sops.secrets.<x>.path), not Nix paths, which are copied into the world-readable store";
       }
       {
-        assertion = !(cfg.settings ? DATABASE_URL && localDb);
+        # Two spellings of one variable would leave which one wins to the
+        # broker's map order.
+        assertion = lib.all (k: k == lib.toUpper k) (lib.attrNames cfg.settings);
+        message = "services.agent-auth.settings: write variable names in upper case (the broker reads them case-insensitively): ${
+          toString (lib.filter (k: k != lib.toUpper k) (lib.attrNames cfg.settings))
+        }";
+      }
+      {
+        assertion = !(lib.elem "DATABASE_URL" upperKeys && localDb);
         message = "services.agent-auth: settings.DATABASE_URL is set while database.createLocally is on; turn one off";
       }
       {
-        assertion =
-          !(lib.any (k: cfg.settings ? ${k}) [
-            "ADMIN_TOKEN"
-            "ENCRYPTION_KEY"
-            "BROKER_SIGNING_KEY"
-            "DISCORD_TOKEN"
-            "OPENROUTER_API_KEY"
-            "LLDAP_ADMIN_PASSWORD"
-            "LITELLM_MASTER_KEY"
-            "KUBERNETES_TOKEN"
-          ]);
-        message = "services.agent-auth.settings holds a secret (it lands in the world-readable store): put it in environmentFiles";
+        assertion = !(lib.any hasPassword settingsDbUrls);
+        message = "services.agent-auth.settings.DATABASE_URL holds a password (it lands in the world-readable store): put DATABASE_URL in environmentFiles";
+      }
+      {
+        assertion = secretsInSettings == [ ];
+        message = "services.agent-auth.settings holds a secret (it lands in the world-readable store): put ${toString secretsInSettings} in environmentFiles";
       }
     ];
 
