@@ -263,7 +263,7 @@ fn hosts_and_daemons() {
     assert_eq!(arm.tier, TierName::User);
     assert_eq!(serde_json::to_value(&arm.duration).unwrap(), json!("1h"));
     let arm: ArmBody = accepted(json!({"tier": "root", "duration": 3600, "totp": "1"}));
-    assert_eq!(arm.duration, HostDuration::Seconds(3600));
+    assert_eq!(arm.duration, HostDuration::from_secs(3600).unwrap());
     assert!(refused::<ArmBody>(json!({"tier": "user"})).contains("missing field `totp`"));
 
     let l: LockdownBody = accepted(json!({}));

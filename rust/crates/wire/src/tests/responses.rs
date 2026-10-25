@@ -1163,7 +1163,7 @@ round_trips! {
         (request_id(), call_id()).prop_map(|(shell_id, call_id)| BrokerToHost::ShellClose(ShellRef { shell_id, call_id })),
         (any::<bool>(), call_id()).prop_map(|(kill_vm, call_id)| BrokerToHost::Lockdown(Lockdown { kill_vm, call_id })),
         ("[0-9]{6}", call_id()).prop_map(|(t, call_id)| BrokerToHost::Unlock(Unlock { totp: WireSecret::new(t).unwrap(), call_id })),
-        (option::of(any::<u64>()), call_id()).prop_map(|(d, call_id)| BrokerToHost::Dnd(Dnd { duration: d.map(crate::duration::HostDuration::Seconds), call_id })),
+        (option::of(1u64..=crate::duration::MAX_HOST_DURATION_SECS), call_id()).prop_map(|(d, call_id)| BrokerToHost::Dnd(Dnd { duration: d.map(|d| crate::duration::HostDuration::from_secs(d).unwrap()), call_id })),
         (uuid(), call_id()).prop_map(|(u, call_id)| BrokerToHost::PromptCancel(PromptCancel { prompt_id: u.hyphenated().to_string().parse().unwrap(), call_id })),
         (text::<0, 1024>(), text::<0, 4096>(), pick![Urgency::Low, Urgency::Normal, Urgency::Critical], call_id())
             .prop_map(|(title, text, urgency, call_id)| BrokerToHost::Notify(Notify { title, text, urgency, call_id })),

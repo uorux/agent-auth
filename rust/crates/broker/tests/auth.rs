@@ -1,5 +1,11 @@
 //! The extractors against a real database (rust/spec/http-api.md §3).
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::indexing_slicing, clippy::panic, clippy::arithmetic_side_effects)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::arithmetic_side_effects
+)]
 
 use agent_auth_broker::auth::{AdminCaller, AgentCaller, AuthConfig};
 use agent_auth_broker::state::AppState;

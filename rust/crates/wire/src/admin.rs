@@ -358,7 +358,7 @@ fn user_tier() -> TierName {
 }
 
 fn one_hour() -> HostDuration {
-    HostDuration::Text(Text::new("1h").unwrap_or_default())
+    HostDuration::parse("1h").unwrap_or(HostDuration::MIN)
 }
 
 /// The kill switch's reach.

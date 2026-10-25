@@ -227,10 +227,13 @@ impl Policy {
                     .unwrap_or_else(|| self.llm().model.clone()),
                 retry_budget: c.retry_budget.unwrap_or(self.llm().retry_budget),
                 pinned: false,
-                // Literal equality, and only for a rule about this platform
-                // (bug B-16: `capability: use` without a platform named
-                // both mcp and models).
-                explicit: m.platform.is_some() && m.capability.as_str() == capability,
+                // A literal pattern (no wildcard: `tpl.*` never names
+                // `tpl.x`) equal to the capability, and only for a rule
+                // about this platform (bug B-16: `capability: use` without
+                // a platform named both mcp and models).
+                explicit: m.platform.is_some()
+                    && m.capability.is_literal()
+                    && m.capability.as_str() == capability,
                 window: false,
             };
         }

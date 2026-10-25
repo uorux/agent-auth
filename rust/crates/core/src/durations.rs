@@ -88,6 +88,10 @@ impl DurationSecs {
     }
 }
 
+/// A JSON boolean or float where a duration belongs (the Python took
+/// `true` as 1 s and `1.0` as 1).
+pub const NOT_A_DURATION: &str = "duration must be a string or a whole number of seconds";
+
 fn too_long() -> DurationError {
     DurationError("duration must be at most 365 days".to_owned())
 }
@@ -150,14 +154,31 @@ impl<'de> Deserialize<'de> for DurationSecs {
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<DurationSecs, E> {
                 DurationSecs::parse(v).map_err(E::custom)
             }
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<DurationSecs, E> {
+                Err(E::custom(NOT_A_DURATION))
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<DurationSecs, E> {
+                Err(E::custom(NOT_A_DURATION))
+            }
         }
         d.deserialize_any(V)
     }
 }
 
+/// The longest duration a host accepts or is sent (arming, do-not-disturb,
+/// its own config): 365 days, like every other duration. Far above any
+/// sane arm (hostd caps those per tier, default 1 h), and small enough that
+/// `now + d` can never overflow on the host.
+pub const MAX_HOST_DURATION_SECS: u64 = 365 * 86_400;
+
+fn host_too_long() -> DurationError {
+    DurationError("duration must be at most 365 days".to_owned())
+}
+
 /// hostd's own config durations (`hostd/config.py` `duration_secs`, spec
 /// daemons-hostd §6.6): an integer > 0, or `<digits>[smhdw]` (no unit =
-/// seconds) with a positive number. Bounded only by `u64`.
+/// seconds) with a positive number; at most [`MAX_HOST_DURATION_SECS`]
+/// (the Python had no bound).
 pub fn host_duration_secs(text: &str) -> Result<u64, DurationError> {
     let value = text.trim().to_lowercase();
     let invalid = || {
@@ -178,22 +199,29 @@ pub fn host_duration_secs(text: &str) -> Result<u64, DurationError> {
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(invalid());
     }
-    let n = parse_digits(digits).ok_or_else(invalid)?;
+    let Some(n) = parse_digits(digits) else {
+        return Err(host_too_long());
+    };
     if n <= 0 {
         return Err(invalid());
     }
     u64::try_from(n)
         .ok()
         .and_then(|n| n.checked_mul(multiplier))
-        .ok_or_else(invalid)
+        .filter(|&s| s <= MAX_HOST_DURATION_SECS)
+        .ok_or_else(host_too_long)
 }
 
-/// hostd's integer form: must be positive.
+/// hostd's integer form: positive and at most [`MAX_HOST_DURATION_SECS`].
 pub fn host_duration_from_int(secs: i64) -> Result<u64, DurationError> {
-    u64::try_from(secs)
+    let secs = u64::try_from(secs)
         .ok()
         .filter(|&s| s > 0)
-        .ok_or_else(|| DurationError("duration must be positive".to_owned()))
+        .ok_or_else(|| DurationError("duration must be positive".to_owned()))?;
+    if secs > MAX_HOST_DURATION_SECS {
+        return Err(host_too_long());
+    }
+    Ok(secs)
 }
 
 #[cfg(test)]
@@ -263,8 +291,16 @@ mod tests {
         assert_eq!(d.get(), 3600);
         let d: DurationSecs = serde_json::from_str("\"24h\"").unwrap();
         assert_eq!(d.get(), 86400);
-        assert!(serde_json::from_str::<DurationSecs>("true").is_err());
-        assert!(serde_json::from_str::<DurationSecs>("1.5").is_err());
+        for bad in ["true", "1.5", "1.0"] {
+            let err = serde_json::from_str::<DurationSecs>(bad)
+                .unwrap_err()
+                .to_string();
+            assert!(err.starts_with(NOT_A_DURATION), "{err}");
+        }
+        let err = serde_json::from_str::<DurationSecs>("null")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected a duration"), "{err}");
         assert!(serde_json::from_str::<DurationSecs>("0").is_err());
         assert!(serde_json::from_str::<DurationSecs>("-1").is_err());
         assert!(serde_json::from_str::<DurationSecs>("18446744073709551615").is_err());
@@ -293,6 +329,14 @@ mod tests {
         assert!(host_duration_secs("").is_err());
         assert_eq!(host_duration_from_int(5), Ok(5));
         assert!(host_duration_from_int(0).is_err());
+        assert_eq!(host_duration_secs("365d"), Ok(MAX_HOST_DURATION_SECS));
+        assert_eq!(
+            host_duration_secs("366d").map_err(|e| e.0),
+            Err("duration must be at most 365 days".into())
+        );
+        assert!(host_duration_secs("99999999999999999999999w").is_err());
+        assert!(host_duration_from_int(i64::MAX).is_err());
+        assert_eq!(host_duration_from_int(31_536_000), Ok(31_536_000));
     }
 
     proptest! {

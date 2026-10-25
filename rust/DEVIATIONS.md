@@ -47,11 +47,17 @@ and why. Keep entries short. Group by area.
 - **A gone delegator matches no delegator pattern** (§5.3, bug B-18). The
   Python's stand-in agent was named `?` and matched delegator globs `*` and
   `?`; it still keeps rules without a delegator from granting.
-- **`explicit` needs the rule's platform** (§5.3, bug B-16). A policy-file
-  rule names a privilege (clearing github create, agents, hostexec, mcp,
-  models) only when its `match.platform` is set and `match.capability` is
-  literally the capability. `{match: {capability: use}}` written for MCP no
-  longer clears model keys.
+- **`explicit` needs the rule's platform and a literal** (§5.3, bug B-16).
+  A policy-file rule names a privilege (clearing github create, agents,
+  hostexec, mcp, models) only when its `match.platform` is set and
+  `match.capability` is a literal pattern (no `*`, `?` or set) equal to the
+  capability. `{match: {capability: use}}` written for MCP no longer clears
+  model keys, and `capability: "tpl.*"` (string-equal to nothing real, but a
+  pattern) never names `tpl.x`.
+- **Pinned resources are glob-escaped** (§4.6). A saved rule made from an
+  "approve exact" decision stores its resource through `glob::escape`
+  (`*`, `?`, `[` as `[*]`, `[?]`, `[[]`), so it matches that resource only;
+  the Python stored the resource verbatim as a glob.
 - **Saved rules are ordered totally** (§5.3, bug B-22): newest first, the
   rule id breaking ties (`policy::sort_saved_rules`).
 - **Containment "everyone" is semantic** (§8.5, bug B-2).
@@ -64,7 +70,16 @@ and why. Keep entries short. Group by area.
 - **Durations** (§9.4, bug B-14). Zero is refused on every path (`"0m"`
   parsed to 0), anything over 365 days is refused ("duration must be at
   most 365 days"), and only ASCII digits are digits (Python's `isdigit`
-  accepted e.g. Arabic-Indic digits).
+  accepted e.g. Arabic-Indic digits). One type for the wire, the policy and
+  the store (see Wire, Durations).
+- **Displayed text is display-safe** (job `describe`, risk notes, pattern
+  text). Control characters (`\n`, `\r`, ESC…), bidi overrides/isolates
+  and zero-width/invisible characters never reach what an approver reads:
+  a job argument holding one is shown in bash ANSI-C quoting (`$'a\nb'`,
+  `$'\u202e…'`, still the same argument as shell), other text with Python
+  escapes (`repr`, `pyfmt::escape_unprintable`). Python's `shlex.join`
+  passed them through inside quotes, so an argv could show a harmless fake
+  second line.
 - **No `make_spec(kind="shell")`** (daemons-hostd §6.2). The Python
   accepted it but nothing used it; a shell is a `ShellSpec`
   (`{"kind","host","tier","duration"}`), and shell commands are `run` specs.
@@ -151,10 +166,18 @@ and why. Keep entries short. Group by area.
   cursor and audit `next`.
 - **Durations** (http-api §2.1 `parse_duration`, §8.4). JSON `true` and
   floats are refused (Python: `true` = 1 s, `1.0` = 1); `"0m"` is refused
-  like `0` (Python returned 0); at most 2147483647 s, else 422 `duration
-  must be at most 2147483647 seconds` (Python: no bound, a 500 on
-  Postgres). Same for `DecideBody.duration`. Only ASCII digits count
-  (Python's `\d`/`isdigit` took other Unicode digits).
+  like `0` (Python returned 0); at most 365 days, else 422 `duration
+  must be at most 365 days` (Python: no bound, a 500 on Postgres). Same
+  for `DecideBody.duration`. Only ASCII digits count (Python's
+  `\d`/`isdigit` took other Unicode digits). The wire type *is*
+  `core::durations::DurationSecs`, so a request, a decision and the policy
+  file accept exactly the same durations.
+- **Host durations are bounded** (`ArmBody.duration`, `dnd`; daemons-hostd
+  §6.6). `HostDuration` is checked with hostd's own rules
+  (`host_duration_secs`: bare digits are seconds) and refused over 365
+  days (`MAX_HOST_DURATION_SECS`); hostd's config durations have the same
+  bound. The Python passed any value through and parsed it unbounded on the
+  host. hostd still caps arming per tier (`max_arm`).
 - **Unknown fields in request bodies are refused** (http-api §2.1 "Extra
   fields are ignored"): every agent and admin body is
   `deny_unknown_fields`, so a misspelt field is a 422 instead of silently

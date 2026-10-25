@@ -79,6 +79,28 @@ impl Glob {
         self.tokens.iter().all(|t| matches!(t, Token::Literal(_)))
     }
 
+    /// The one string this pattern matches, if it matches exactly one:
+    /// literal characters and one-character sets (`[*]`, as [`escape`]
+    /// writes them).
+    #[must_use]
+    pub fn literal_text(&self) -> Option<String> {
+        self.tokens
+            .iter()
+            .map(|t| match t {
+                Token::Literal(c) => Some(*c),
+                Token::Class {
+                    negated: false,
+                    items,
+                } => match items.as_slice() {
+                    [ClassItem::Char(c)] => Some(*c),
+                    [ClassItem::Range(lo, hi)] if lo == hi => Some(*lo),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
     #[must_use]
     pub fn matches(&self, text: &str) -> bool {
         let text: Vec<char> = text.chars().collect();
@@ -149,6 +171,24 @@ impl<'de> Deserialize<'de> for Glob {
         let s = String::deserialize(d)?;
         Ok(Glob::new(&s))
     }
+}
+
+/// A glob matching exactly `text`: each `*`, `?` and `[` becomes `[*]`,
+/// `[?]`, `[[]` (what a rule pinned to one resource stores; the Python's
+/// `_literal`). Everything else already matches itself.
+#[must_use]
+pub fn escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '*' | '?' | '[') {
+            out.push('[');
+            out.push(c);
+            out.push(']');
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// `fnmatch(text, pattern)` without keeping the compiled pattern.
@@ -311,6 +351,10 @@ mod tests {
         assert!(!Glob::new("a?").is_literal());
         assert!(!Glob::new("[ab]").is_literal());
         assert!(Glob::new("[").is_literal());
+        assert_eq!(Glob::new("a[*]b").literal_text().as_deref(), Some("a*b"));
+        assert_eq!(Glob::new("a[*b]").literal_text(), None);
+        assert_eq!(Glob::new("a*").literal_text(), None);
+        assert_eq!(Glob::new("[!a]").literal_text(), None);
     }
 
     /// Differential test against CPython's `fnmatch.fnmatchcase` on a
@@ -445,6 +489,22 @@ mod tests {
                 }
             }
             prop_assert_eq!(glob.matches_every_nonempty_over(&alphabet), all, "{}", pattern);
+        }
+
+        /// `escape(s)` matches `s` and nothing else, and is a literal.
+        #[test]
+        fn escape_matches_exactly_itself(s in "[a*?\\[\\]!^\\\\-]{0,10}", t in "[a*?\\[\\]!^\\\\-]{0,10}") {
+            let g = Glob::new(&escape(&s));
+            prop_assert!(g.matches(&s));
+            prop_assert_eq!(g.matches(&t), s == t);
+            prop_assert_eq!(g.literal_text(), Some(s.clone()));
+        }
+
+        #[test]
+        fn escape_any_text(s in ".{0,20}") {
+            prop_assert!(fnmatch(&s, &escape(&s)));
+            let longer = format!("{s}x");
+            prop_assert!(!fnmatch(&longer, &escape(&s)));
         }
 
         #[test]
