@@ -85,7 +85,8 @@ value that does not parse stops the broker with the variable's name.
 
 | variable | default | |
 |---|---|---|
-| `DATABASE_URL` | (required) | `postgres://` or `postgresql://` only. TLS: `?sslmode=verify-full&sslrootcert=/path/ca.crt`; unix socket: `postgres://user@localhost/db?host=/run/postgresql`. The broker runs its migrations at start |
+| `DATABASE_URL` | (required) | `postgres://` or `postgresql://` only. A server other than this machine needs `?sslmode=verify-full` (with `&sslrootcert=/path/ca.crt` for a private CA); a unix socket (`postgres://user@localhost/db?host=/run/postgresql`) or localhost needs nothing. The broker runs its migrations at start |
+| `DATABASE_ALLOW_INSECURE` | `false` | development only: allow a remote database without verified TLS (a loud warning) |
 | `POLICY_FILE` | `policy.yaml` | the policy; missing or invalid stops the broker (the Python ran on defaults) |
 | `POLICY_OVERLAYS` | (none) | comma-separated policy files merged over it in order (restricted zones' private policy); a missing one stops the broker |
 | `LISTEN_HOST` | `0.0.0.0` | |
@@ -99,7 +100,8 @@ value that does not parse stops the broker with the variable's name.
 
 | variable | default | |
 |---|---|---|
-| `ADMIN_TOKEN` | (none: admin API answers 503) | bearer token of the admin API and `agent-auth admin` |
+| `ADMIN_TOKEN` | (none: admin API answers 503) | bearer token of the admin API and `agent-auth admin`; at least 32 characters |
+| `PLAINTEXT_HTTP_HOSTS` | (empty) | comma-separated exact host names that outbound URL settings may reach over plain `http://`/`ws://`/`ldap://` (an in-cluster service without TLS); each is logged at start. Every other outbound URL must be `https://`/`wss://`/`ldaps://`, or plain text to localhost |
 | `ENCRYPTION_KEY` | (none) | 32 bytes, base64 (`agent-auth admin gen-key`). Encrypts secrets at rest (ChaCha20-Poly1305, not Fernet: a Python key still parses, Python ciphertexts don't open). Needed by GitHub token caching, models, the panel, remote MCP, managed LLDAP accounts, VM key delivery, held mail |
 | `BROKER_SIGNING_KEY` | (none: no daemons, no signed tokens) | the broker's ed25519 seed (`agent-auth admin gen-signing-key --out FILE`). Turns on the daemon channel (hostd, sandboxd) and the MCP token signer; `agent-auth admin broker-key` prints the public key the daemons pin. Keep the Python's to keep the daemons' pinned key and the JWKS `kid` |
 
@@ -134,7 +136,7 @@ value that does not parse stops the broker with the variable's name.
 
 | variable | default | |
 |---|---|---|
-| `LLDAP_URL` | (none: platform off) | the GraphQL API, `http(s)://host:17170` |
+| `LLDAP_URL` | (none: platform off) | the GraphQL API: `https://host:17170`, or `http://host:17170` with the host listed in `PLAINTEXT_HTTP_HOSTS` |
 | `LLDAP_ADMIN_USER`, `LLDAP_ADMIN_PASSWORD` | (none) | |
 | `LLDAP_LDAP_URL` | (none) | **new**: LDAP interface for setting managed accounts' passwords (`ldaps://host:6360`, or `ldap://host:3890`). Replaces `lldap_set_password`, whose command line exposed the admin token |
 | `LLDAP_BASE_DN` | (none) | **new**: `dc=example,dc=com` |
@@ -151,7 +153,7 @@ Managed accounts need `ENCRYPTION_KEY`, `LLDAP_LDAP_URL` and `LLDAP_BASE_DN`.
 | `KUBERNETES_TOKEN_FILE` | in-cluster: the pod's token | read at every call (rotation is picked up) |
 | `KUBERNETES_TOKEN` | (none) | a fixed token; the file wins |
 | `KUBERNETES_CA_FILE` | in-cluster: the pod's CA | otherwise the shared root store |
-| `KUBERNETES_INSECURE_SKIP_VERIFY` | `false` | a warning at start |
+| `KUBERNETES_INSECURE_SKIP_VERIFY` | `false` | only for an API on localhost (refused otherwise) |
 | `KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT` | `kubernetes.default.svc`, `443` | in-cluster only (the kubelet sets them) |
 
 Every grant's ServiceAccount is made in the policy's

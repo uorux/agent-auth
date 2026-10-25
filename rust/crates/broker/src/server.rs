@@ -279,9 +279,67 @@ async fn warn_stub_era_google_rules(store: &Store, policy: &Policy) -> anyhow::R
     Ok(())
 }
 
+/// How often the instance lock is checked, and how long a check may take.
+const LOCK_CHECK: Duration = Duration::from_secs(5);
+const LOCK_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Hold the instance lock until `stop` turns true (then release it and
+/// answer true). Every `every`, check that it is still ours; the moment it
+/// is not (the session was terminated, Postgres restarted or failed over,
+/// the check hangs), send on `lost` and answer false: another broker may
+/// hold it now, so this one must stop.
+pub async fn hold_instance(
+    mut lock: agent_auth_store::instance::InstanceLock,
+    every: Duration,
+    mut stop: watch::Receiver<bool>,
+    lost: tokio::sync::oneshot::Sender<()>,
+) -> bool {
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(every) => {}
+            _ = stop.changed() => {
+                if let Err(e) = lock.release().await {
+                    tracing::warn!(error = %e, "releasing the instance lock");
+                }
+                return true;
+            }
+        }
+        let ok = matches!(
+            tokio::time::timeout(LOCK_CHECK_TIMEOUT, lock.check()).await,
+            Ok(Ok(()))
+        );
+        if !ok {
+            tracing::error!(
+                "lost the instance lock (database session ended or unresponsive): stopping, \
+                 as another broker may be running"
+            );
+            let _ = lost.send(());
+            return false;
+        }
+    }
+}
+
+/// Mark platforms that are no longer configured but still have live grants
+/// as retired, so those grants can still end (expiry, revoke, containment).
+async fn retire_unconfigured(store: &Store, registry: &mut Registry) -> anyhow::Result<()> {
+    let tx = store.begin().await?;
+    for p in agent_auth_store::grants::live_platforms(&tx).await? {
+        if !registry.is_enabled(p) {
+            tracing::warn!(
+                platform = %p,
+                "platform has live grants but is no longer configured: its grants will end \
+                 without reaching it (remove any access they gave by hand)"
+            );
+            registry.retire(p);
+        }
+    }
+    Ok(())
+}
+
 pub async fn run(env: Env) -> anyhow::Result<()> {
     let config = Config::from_env(&env)?;
     let policy = config.load_policy()?;
+    crate::config::check_transport(&env, &config, &policy)?;
     let store = Store::connect(config.database_url.expose(), 20)
         .await
         .context("connecting to PostgreSQL")?;
@@ -367,6 +425,7 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
     if auth.admin_token.is_none() {
         tracing::warn!("ADMIN_TOKEN not set: the admin API is disabled");
     }
+    retire_unconfigured(&store, &mut registry).await?;
     let mut state = AppState::new(store, Policy::clone(&policy), auth);
     state.policy = policy;
     state.registry = Arc::new(registry);
@@ -411,7 +470,9 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
     }
 
     let (stop_tx, stop_rx) = watch::channel(false);
-    let scheduler = tokio::spawn(crate::scheduler::run(state.clone(), stop_rx));
+    let scheduler = tokio::spawn(crate::scheduler::run(state.clone(), stop_rx.clone()));
+    let (lost_tx, lost_rx) = tokio::sync::oneshot::channel();
+    let watchdog = tokio::spawn(hold_instance(instance, LOCK_CHECK, stop_rx, lost_tx));
 
     let addr: SocketAddr = format!("{}:{}", config.listen_host, config.listen_port)
         .parse()
@@ -434,7 +495,10 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
     // first; the drain then bounds whatever else is still open.
     let stopping = state.shutdown.clone();
     let signal = async move {
-        shutdown_signal().await;
+        tokio::select! {
+            () = shutdown_signal() => {}
+            Ok(()) = lost_rx => {}
+        }
         stopping.trigger();
     };
     let served = serve_until(listener, app, signal, DRAIN).await;
@@ -452,10 +516,12 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
     {
         tracing::warn!("LLM evaluations still running at shutdown; they resume at the next start");
     }
-    if let Err(e) = instance.release().await {
-        tracing::warn!(error = %e, "releasing the instance lock");
+    let still_held = watchdog.await.unwrap_or(false);
+    served.context("HTTP server")?;
+    if !still_held {
+        anyhow::bail!("lost the instance lock; exiting so a supervisor restarts the broker");
     }
-    served.context("HTTP server")
+    Ok(())
 }
 
 #[cfg(test)]

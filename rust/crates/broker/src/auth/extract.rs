@@ -77,6 +77,12 @@ fn record(
     state.security_log.record(kind, now, &all);
 }
 
+/// A minted agent past its lease (the scheduler disables it on its next
+/// tick; until then it is refused as if it were).
+fn lapsed(agent: &agents::AgentRow, now: OffsetDateTime) -> bool {
+    agent.lease_expires_at.is_some_and(|l| l <= now)
+}
+
 fn sha256_hex(text: &str) -> String {
     api_key::hash_secret(text).as_str().to_owned()
 }
@@ -98,7 +104,7 @@ impl FromRequestParts<AppState> for AgentCaller {
                 None => None,
             };
             match agent {
-                Some(a) if !a.disabled && a.kind != AgentKind::Operator => {
+                Some(a) if !a.disabled && !lapsed(&a, now) && a.kind != AgentKind::Operator => {
                     // A connector's token reaches only the routes its remote
                     // tools call (surfaces Bug-C1): new routes stay closed.
                     let path = parts.uri.path();
@@ -149,6 +155,9 @@ impl FromRequestParts<AppState> for AgentCaller {
             let refusal = match &found {
                 None => Some("unknown key"),
                 Some(a) if a.disabled => Some("disabled"),
+                // A minted agent whose lease ran out is disabled in all
+                // but the sweep's timing.
+                Some(a) if lapsed(a, now) => Some("lease expired"),
                 // The operator's row speaks only through the admin panel.
                 Some(a) if a.kind == AgentKind::Operator => Some("operator"),
                 Some(a) => match api_key::SecretHash::parse(&a.api_key_hash) {
@@ -201,6 +210,7 @@ impl AgentCaller {
         let row = agents::get(&tx, self.agent.id).await?;
         let agent_ok = row.as_ref().is_some_and(|a| {
             !a.disabled
+                && !lapsed(a, now)
                 && a.kind != AgentKind::Operator
                 && (self.via == AgentCredentialKind::OAuthConnector
                     || (a.key_id == self.agent.key_id && a.api_key_hash == self.agent.api_key_hash))

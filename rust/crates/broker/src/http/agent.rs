@@ -139,7 +139,15 @@ async fn wait(
         .unwrap_or_else(tokio::time::Instant::now);
     // Subscribe first: a change between the read and the sleep still wakes.
     let mut listener = st.request_events.listen(&id);
+    let mut first = true;
     loop {
+        // Re-check the caller at each pass (a key rotated, an agent
+        // disabled or a session closed mid-wait ends it), as the a2a
+        // long-polls do.
+        if !first {
+            caller.revalidate(&st).await?;
+        }
+        first = false;
         let tx = st.store.begin().await?;
         let row = requests::get_owned(&tx, caller.id(), id)
             .await?

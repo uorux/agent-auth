@@ -945,6 +945,29 @@ and why. Keep entries short. Group by area.
   flood of them cannot evict the other events.
 - **The boot tick** (reaper catch-up, stalled LLM work) completes before
   the HTTP listener and the Discord bot start.
+- **The instance lock is watched** (final review): every 5 s the broker
+  checks that its lock session is alive and still holds the lock (10 s
+  timeout); the lock's session has server-side TCP keepalives. On loss
+  (session terminated, Postgres restarted or failed over) the broker shuts
+  down gracefully and exits non-zero, so its supervisor restarts it.
+- **Transport settings are checked at load** (final review): every
+  outbound URL setting (OpenRouter, Discord API and gateway, LLDAP and its
+  LDAP URL, Kubernetes, GitHub, Gmail, the models gateway, `ui.issuer`
+  whenever the panel or the remote MCP is on) must be https/wss/ldaps;
+  plain http/ws/ldap only to localhost or to a host listed in
+  `PLAINTEXT_HTTP_HOSTS` (each logged). `DATABASE_URL` to another machine
+  needs `sslmode=verify-full` unless `DATABASE_ALLOW_INSECURE=1` (warned);
+  a unix socket or localhost needs nothing. `KUBERNETES_INSECURE_SKIP_VERIFY`
+  is refused unless the API is on localhost. `ADMIN_TOKEN` needs at least
+  32 characters.
+- **Grants of a platform no longer configured still end** (final review):
+  at startup such platforms (with live grants) are retired: nothing new is
+  asked or issued on them, and revocation, expiry, containment and the
+  reaper end their grants without calling out, with reason `platform no
+  longer configured` (logged: external access must be removed by hand).
+- **A lapsed lease is refused at authentication** (401, security log
+  `lease expired`), before the scheduler disables the agent; the decision
+  long-poll re-checks its caller at each recheck.
 - **Startup**: a missing `POLICY_FILE` stops the broker (core B-12);
   `DATABASE_URL` must be a postgres URL; one broker per database (a session
   advisory lock; a second one exits — B-19, ARCHITECTURE.md "Deployment").

@@ -154,6 +154,10 @@ pub fn not_enabled(platform: Platform) -> String {
 #[derive(Debug, Default)]
 pub struct Registry {
     enabled: Vec<AnyProvisioner>,
+    /// Platforms no longer configured that still have live grants: not
+    /// enabled (nothing new), but their grants can still end (the spine
+    /// ends them with `platform no longer configured`).
+    retired: Vec<Platform>,
 }
 
 impl Registry {
@@ -175,6 +179,19 @@ impl Registry {
 
     pub fn iter(&self) -> impl Iterator<Item = &AnyProvisioner> {
         self.enabled.iter()
+    }
+
+    /// Mark a platform that is not configured, but has live grants, as
+    /// retired (no-op for an enabled one).
+    pub fn retire(&mut self, platform: Platform) {
+        if !self.is_enabled(platform) && !self.retired.contains(&platform) {
+            self.retired.push(platform);
+        }
+    }
+
+    #[must_use]
+    pub fn is_retired(&self, platform: Platform) -> bool {
+        !self.is_enabled(platform) && self.retired.contains(&platform)
     }
 }
 

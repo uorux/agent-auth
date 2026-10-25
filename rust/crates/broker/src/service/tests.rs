@@ -2141,3 +2141,98 @@ async fn host_approvals_fail_closed(pool: sqlx::PgPool) {
         .unwrap();
     assert_eq!(d.status, RequestStatus::Denied);
 }
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn grants_of_a_platform_no_longer_configured_still_end(pool: sqlx::PgPool) {
+    let mut st = state(pool);
+    let a = agent(&st, "auto-x").await;
+    let r1 = create(
+        &st,
+        &caller(&a),
+        body("a2a", "talk", "p1", json!({}), json!("1h")),
+    )
+    .await
+    .unwrap();
+    let r2 = create(
+        &st,
+        &caller(&a),
+        body("a2a", "talk", "p2", json!({}), json!("1h")),
+    )
+    .await
+    .unwrap();
+    // Restarted without a2a configured: the platform is retired.
+    let mut reg = registry(&[]);
+    let mut without = Registry::default();
+    for p in Platform::ALL.into_iter().filter(|p| *p != Platform::A2a) {
+        if let Some(AnyProvisioner::Fake(_)) = reg.get(p) {
+            without.register(AnyProvisioner::Fake(FakeProvisioner::new(p)));
+        }
+    }
+    reg = without;
+    reg.retire(Platform::A2a);
+    assert!(!reg.is_enabled(Platform::A2a));
+    st.registry = Arc::new(reg);
+    // Nothing new on it.
+    let err = create(
+        &st,
+        &caller(&a),
+        body("a2a", "talk", "p3", json!({}), json!("1h")),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "platform 'a2a' is not enabled on this broker"
+    );
+    // A revoke ends one; containment the other.
+    let g1 = grant_of(&st, r1.id).await.unwrap();
+    let ended = revoke_grant(&st, g1.id, "by hand", "admin").await.unwrap();
+    assert_eq!(ended.status, GrantStatus::Revoked);
+    assert_eq!(
+        ended.revoke_reason.as_deref(),
+        Some("platform no longer configured")
+    );
+    crate::containment::contain(
+        &st,
+        json!({"name": "auto-x"}),
+        "held",
+        "",
+        "jrt",
+        ContainmentSource::Operator,
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        grant_of(&st, r2.id).await.unwrap().status,
+        GrantStatus::Active
+    );
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn losing_the_instance_lock_stops_the_broker(pool: sqlx::PgPool) {
+    let store = Store::from_pool(pool.clone());
+    let mut lock = agent_auth_store::instance::try_lock(&store)
+        .await
+        .unwrap()
+        .unwrap();
+    let pid = lock.backend_pid().await.unwrap();
+    let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let (lost_tx, lost_rx) = tokio::sync::oneshot::channel();
+    let held = tokio::spawn(crate::server::hold_instance(
+        lock,
+        StdDuration::from_millis(50),
+        stop_rx,
+        lost_tx,
+    ));
+    let _: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+        .bind(pid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    // The shutdown signal fires and the watchdog reports the loss.
+    tokio::time::timeout(StdDuration::from_secs(5), lost_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!held.await.unwrap());
+}

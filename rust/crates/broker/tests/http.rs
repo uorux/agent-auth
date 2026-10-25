@@ -991,3 +991,24 @@ async fn release_grant(pool: sqlx::PgPool) {
         r.body
     );
 }
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_lapsed_lease_is_refused(pool: sqlx::PgPool) {
+    let st = state(pool.clone(), POLICY);
+    let store = st.store.clone();
+    let app = router(st);
+    let key = agent(&app, "minted", json!({})).await;
+    let me = call(&app, "GET", "/v1/me", Some(&key), None).await;
+    let id: agent_auth_core::AgentId = me.body["id"].as_str().unwrap().parse().unwrap();
+    let tx = store.begin().await.unwrap();
+    agent_auth_store::agents::set_lease(
+        &tx,
+        id,
+        Some(time::OffsetDateTime::now_utc() - time::Duration::seconds(1)),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let r = call(&app, "GET", "/v1/me", Some(&key), None).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+}

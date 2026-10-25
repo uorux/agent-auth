@@ -79,9 +79,12 @@ takes a `HumanApproval`, which only an authenticated human surface makes
 the current facts and requires `Route::Llm`.
 
 **Issuing credentials.** Provisioners' `credential` takes an `IssuableGrant`,
-which `store::grants::issuable(tx, &AgentCaller, grant_id, now)` builds only
+which `store::grants::issuable(tx, agent_id, grant_id, now)` builds only
 for the caller's own grant that is `active`, unexpired, whose agent is not
 held, and (if delegated) whose thread is open and backing grant active.
+(The store cannot name `AgentCaller`, a broker type; the agent id it
+takes comes from the caller in the one place that issues credentials,
+the broker's credential route, which takes an `AgentCaller`.)
 This replaces the Python's per-provisioner checks.
 
 **Secrets.** Tokens, keys, passwords and TOTP seeds are `crypto::Secret<T>`:

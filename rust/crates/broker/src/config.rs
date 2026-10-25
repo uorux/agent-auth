@@ -125,6 +125,153 @@ impl Env {
     }
 }
 
+/// Hosts a plain-text URL may point at (as the daemons' `BrokerUrl`).
+const LOOPBACK: [&str; 3] = ["localhost", "127.0.0.1", "[::1]"];
+
+/// The one rule for every outbound URL setting: an encrypted scheme
+/// (`https`, `wss`, `ldaps`) to a named host, or its plain twin (`http`,
+/// `ws`, `ldap`) only to this machine or to a host listed in
+/// `PLAINTEXT_HTTP_HOSTS` (exact names). No credentials in the URL.
+pub fn outbound_url(
+    name: &str,
+    text: &str,
+    plaintext_hosts: &[String],
+) -> Result<url::Url, ConfigError> {
+    let bad = |why: &str| ConfigError(format!("{name} {text:?}: {why}"));
+    let url = url::Url::parse(text.trim()).map_err(|_| bad("not a URL"))?;
+    let host = url.host_str().unwrap_or("");
+    if host.is_empty() {
+        return Err(bad("no host"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(bad("credentials do not belong in the URL"));
+    }
+    match url.scheme() {
+        "https" | "wss" | "ldaps" => Ok(url),
+        "http" | "ws" | "ldap"
+            if LOOPBACK.contains(&host) || plaintext_hosts.iter().any(|h| h == host) =>
+        {
+            Ok(url)
+        }
+        "http" | "ws" | "ldap" => Err(bad(
+            "must be encrypted (https://, wss://, ldaps://); plain text only to localhost \
+             or a host listed in PLAINTEXT_HTTP_HOSTS",
+        )),
+        _ => Err(bad("unsupported scheme")),
+    }
+}
+
+fn loopback_host(url: &url::Url) -> bool {
+    LOOPBACK.contains(&url.host_str().unwrap_or(""))
+}
+
+/// `DATABASE_URL`: a Unix socket or loopback, or TLS with the server's
+/// certificate and name verified (`sslmode=verify-full`).
+/// `DATABASE_ALLOW_INSECURE=1` lifts the rule (development only).
+pub fn check_database_url(text: &str, allow_insecure: bool) -> Result<(), ConfigError> {
+    let url =
+        url::Url::parse(text).map_err(|_| ConfigError("DATABASE_URL is not a URL".to_owned()))?;
+    let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+    let param = |k: &str| {
+        pairs
+            .iter()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| v.clone())
+    };
+    let host = url.host_str().unwrap_or("");
+    let socket = host.is_empty() || param("host").is_some_and(|h| h.starts_with('/'));
+    if socket || LOOPBACK.contains(&host) {
+        return Ok(());
+    }
+    if param("sslmode").as_deref() == Some("verify-full") {
+        return Ok(());
+    }
+    if allow_insecure {
+        tracing::warn!(
+            "!!! DATABASE_ALLOW_INSECURE is set: the database connection to {host} is not \
+             verified TLS. Development only !!!"
+        );
+        return Ok(());
+    }
+    Err(ConfigError(format!(
+        "DATABASE_URL: a database on {host} needs sslmode=verify-full (or a local socket); \
+         set DATABASE_ALLOW_INSECURE=1 only for development"
+    )))
+}
+
+/// Every transport setting, checked at load (one rule for all of them).
+/// `PLAINTEXT_HTTP_HOSTS`: exact host names plain-text URLs may point at
+/// (an in-cluster service without TLS). Each is logged at startup.
+#[must_use]
+pub fn plaintext_hosts(env: &Env) -> Vec<String> {
+    env.string("PLAINTEXT_HTTP_HOSTS", "")
+        .split(',')
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect()
+}
+
+pub fn check_transport(env: &Env, config: &Config, policy: &Policy) -> Result<(), ConfigError> {
+    let plain = plaintext_hosts(env);
+    for h in &plain {
+        tracing::warn!(host = %h, "PLAINTEXT_HTTP_HOSTS: outbound calls to this host may be unencrypted");
+    }
+    let outbound_url = |name: &str, text: &str| outbound_url(name, text, &plain);
+    if let Some(t) = &config.admin_token
+        && t.expose().chars().count() < 32
+    {
+        return Err(ConfigError(
+            "ADMIN_TOKEN must be at least 32 characters".to_owned(),
+        ));
+    }
+    check_database_url(
+        config.database_url.expose(),
+        env.flag("DATABASE_ALLOW_INSECURE", false)?,
+    )?;
+    outbound_url("OPENROUTER_BASE_URL", &config.openrouter_base_url)?;
+    for key in [
+        "DISCORD_API_URL",
+        "DISCORD_GATEWAY_URL",
+        "LLDAP_URL",
+        "LLDAP_LDAP_URL",
+        "GITHUB_API_URL",
+        "GMAIL_API_URL",
+    ] {
+        if let Some(v) = env.get(key) {
+            outbound_url(key, v)?;
+        }
+    }
+    let mut k8s_loopback = true;
+    if let Some(api) = env.get("KUBERNETES_API_URL")
+        && api.trim() != "in-cluster"
+    {
+        for u in api.split(',').map(str::trim).filter(|u| !u.is_empty()) {
+            let url = outbound_url("KUBERNETES_API_URL", u)?;
+            k8s_loopback &= loopback_host(&url);
+        }
+    } else if env.get("KUBERNETES_API_URL").is_some() {
+        k8s_loopback = false;
+    }
+    if env.flag("KUBERNETES_INSECURE_SKIP_VERIFY", false)? && !k8s_loopback {
+        return Err(ConfigError(
+            "KUBERNETES_INSECURE_SKIP_VERIFY is only for an API on localhost".to_owned(),
+        ));
+    }
+    let models = &policy.platforms().models;
+    for (key, v) in [
+        ("platforms.models.url", Some(&models.url)),
+        ("platforms.models.admin_url", models.admin_url.as_ref()),
+    ] {
+        if let Some(v) = v.filter(|v| !v.is_empty()) {
+            outbound_url(key, v)?;
+        }
+    }
+    if policy.ui().enabled || policy.remote_mcp().enabled {
+        outbound_url("ui.issuer", &policy.ui().issuer)?;
+    }
+    Ok(())
+}
+
 /// A configuration the broker cannot start with.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
@@ -253,6 +400,137 @@ mod tests {
             Config::from_env(&bad).unwrap_err().0,
             "LISTEN_PORT: not a number: \"x\""
         );
+    }
+
+    #[test]
+    fn outbound_urls_are_encrypted_unless_local() {
+        for ok in [
+            "https://openrouter.ai/api/v1",
+            "wss://gateway.discord.gg",
+            "ldaps://lldap.internal:6360",
+            "http://127.0.0.1:8080",
+            "ws://localhost:9",
+            "ldap://[::1]:3890",
+        ] {
+            assert!(outbound_url("X", ok, &[]).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://lldap.internal",
+            "ws://gateway",
+            "ldap://10.0.0.1",
+            "ftp://x",
+            "https://user:pw@host",
+            "http://",
+            "nope",
+        ] {
+            assert!(outbound_url("X", bad, &[]).is_err(), "{bad}");
+        }
+        // One setting lets plain text reach exactly the hosts it names.
+        let listed = vec!["lldap".to_owned()];
+        assert!(outbound_url("LLDAP_URL", "http://lldap:17170", &listed).is_ok());
+        assert!(outbound_url("LLDAP_URL", "http://lldap.evil:17170", &listed).is_err());
+        let env = Env::from_pairs([("PLAINTEXT_HTTP_HOSTS", " lldap, ,Gitea ")]);
+        assert_eq!(
+            plaintext_hosts(&env),
+            vec!["lldap".to_owned(), "gitea".to_owned()]
+        );
+    }
+
+    fn cfg(pairs: &[(&str, &str)]) -> (Env, Config) {
+        let mut all = vec![("DATABASE_URL", "postgres://agent_auth@127.0.0.1/db")];
+        all.extend_from_slice(pairs);
+        let env = Env::from_pairs(all.iter().copied());
+        let config = Config::from_env(&env).unwrap();
+        (env, config)
+    }
+
+    #[test]
+    fn transport_settings_are_checked_at_load() {
+        let policy = Policy::default();
+        let (env, c) = cfg(&[]);
+        assert!(check_transport(&env, &c, &policy).is_ok());
+        for (pairs, want) in [
+            (
+                vec![("ADMIN_TOKEN", "short")],
+                "ADMIN_TOKEN must be at least 32 characters",
+            ),
+            (
+                vec![("OPENROUTER_BASE_URL", "http://openrouter.example/api")],
+                "OPENROUTER_BASE_URL",
+            ),
+            (vec![("LLDAP_URL", "http://lldap:17170")], "LLDAP_URL"),
+            (
+                vec![
+                    ("LLDAP_URL", "http://lldap:17170"),
+                    ("PLAINTEXT_HTTP_HOSTS", "gitea"),
+                ],
+                "LLDAP_URL",
+            ),
+            (
+                vec![("KUBERNETES_API_URL", "http://k8s.internal:6443")],
+                "KUBERNETES_API_URL",
+            ),
+            (
+                vec![
+                    ("KUBERNETES_API_URL", "https://k8s.internal:6443"),
+                    ("KUBERNETES_INSECURE_SKIP_VERIFY", "1"),
+                ],
+                "KUBERNETES_INSECURE_SKIP_VERIFY",
+            ),
+            (
+                vec![("DISCORD_GATEWAY_URL", "ws://gw.example")],
+                "DISCORD_GATEWAY_URL",
+            ),
+        ] {
+            let (env, c) = cfg(&pairs);
+            let err = check_transport(&env, &c, &policy).unwrap_err().0;
+            assert!(err.contains(want), "{err}");
+        }
+        let (env, c) = cfg(&[
+            ("LLDAP_URL", "http://lldap:17170"),
+            ("PLAINTEXT_HTTP_HOSTS", "lldap"),
+            ("KUBERNETES_API_URL", "https://127.0.0.1:6443"),
+            ("KUBERNETES_INSECURE_SKIP_VERIFY", "1"),
+            ("ADMIN_TOKEN", "0123456789abcdef0123456789abcdef"),
+        ]);
+        assert!(check_transport(&env, &c, &policy).is_ok());
+        // remote MCP on, panel off: the issuer is still checked.
+        let p = Policy::from_yaml(
+            "ui: {issuer: \"http://auth.example\", client_id: c}\nremote_mcp: {enabled: true, base_url: \"https://b.example\"}\n",
+        )
+        .unwrap();
+        let (env, c) = cfg(&[]);
+        assert!(
+            check_transport(&env, &c, &p)
+                .unwrap_err()
+                .0
+                .contains("ui.issuer")
+        );
+    }
+
+    #[test]
+    fn remote_databases_need_verified_tls() {
+        assert!(check_database_url("postgres://u@127.0.0.1/db", false).is_ok());
+        assert!(check_database_url("postgres://u@localhost/db", false).is_ok());
+        assert!(check_database_url("postgres:///db?host=/run/postgresql", false).is_ok());
+        // The NixOS module's default.
+        assert!(
+            check_database_url(
+                "postgres://agent-auth@localhost/agent-auth?host=/run/postgresql",
+                false
+            )
+            .is_ok()
+        );
+        assert!(
+            check_database_url("postgres://u@db.internal/db?sslmode=verify-full", false).is_ok()
+        );
+        for bad in [
+            "postgres://u@db.internal/db",
+            "postgres://u@db.internal/db?sslmode=require",
+        ] {
+            assert!(check_database_url(bad, false).is_err(), "{bad}");
+            assert!(check_database_url(bad, true).is_ok(), "{bad}");
+        }
     }
 
     #[test]

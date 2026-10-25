@@ -749,6 +749,19 @@ pub async fn stale_provisioning(
     .await?))
 }
 
+/// Platforms with ACTIVE or PROVISIONING grants (startup: a platform no
+/// longer configured must still be able to end them).
+pub async fn live_platforms(tx: &Tx<'_>) -> Result<Vec<Platform>, StoreError> {
+    let mut c = tx.conn().await;
+    let out = sqlx::query_scalar!(
+        "SELECT DISTINCT platform FROM grants WHERE status IN ('active', 'provisioning')
+         ORDER BY platform"
+    )
+    .fetch_all(&mut **c)
+    .await?;
+    out.iter().map(|p| values::platform(T, p)).collect()
+}
+
 /// Active grants whose expiry has come.
 pub async fn due(tx: &Tx<'_>, now: OffsetDateTime) -> Result<Vec<GrantId>, StoreError> {
     let mut c = tx.conn().await;

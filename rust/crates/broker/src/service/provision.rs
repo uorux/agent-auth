@@ -319,13 +319,9 @@ async fn reap_one(
         return Ok(None);
     };
     let request_id = grant.grant().request_id;
-    let platform = grant.grant().platform;
-    let provisioner = st
-        .registry
-        .get(platform)
-        .ok_or(ServiceError::NotEnabled(platform))?;
-    provisioner.revoke(&tx, grant.grant(), now).await?;
-    if grants::fail_provisioning(&tx, grant, why.grant, Some(now))
+    let external = revoke_external(st, &tx, grant.grant(), now).await?;
+    let reason = if external { why.grant } else { RETIRED };
+    if grants::fail_provisioning(&tx, grant, reason, Some(now))
         .await?
         .is_err()
     {
@@ -405,6 +401,38 @@ async fn grant_ended(st: &AppState, grant: &GrantRow) {
     }
 }
 
+/// Why a grant of a platform no longer configured ended.
+pub(crate) const RETIRED: &str = "platform no longer configured";
+
+/// Undo a grant's external state through its platform's provisioner.
+/// `Ok(false)`: the platform is no longer configured (retired at startup
+/// because it still had live grants): there is nothing to call, so the
+/// grant just ends; external state the platform kept is the operator's to
+/// clean up (logged).
+async fn revoke_external(
+    st: &AppState,
+    tx: &Tx<'_>,
+    grant: &GrantRow,
+    now: OffsetDateTime,
+) -> ServiceResult<bool> {
+    match st.registry.get(grant.platform) {
+        Some(p) => {
+            p.revoke(tx, grant, now).await?;
+            Ok(true)
+        }
+        None if st.registry.is_retired(grant.platform) => {
+            tracing::warn!(
+                grant = %grant.id,
+                platform = %grant.platform,
+                resource = %grant.resource,
+                "ending a grant of a platform no longer configured; any external access it gave must be removed by hand"
+            );
+            Ok(false)
+        }
+        None => Err(ServiceError::NotEnabled(grant.platform)),
+    }
+}
+
 /// End an ACTIVE grant through its provisioner (spec §4.9). The
 /// provisioner's error leaves the grant active and is returned.
 pub async fn revoke_grant(
@@ -419,12 +447,10 @@ pub async fn revoke_grant(
         Some(g) if g.status == GrantStatus::Active => g,
         _ => return Err(ServiceError::transition("grant is not active")),
     };
-    let provisioner = st
-        .registry
-        .get(grant.platform)
-        .ok_or(ServiceError::NotEnabled(grant.platform))?;
-    provisioner.revoke(&tx, &grant, now).await?;
-    let reason = if revoked_by.is_empty() {
+    let external = revoke_external(st, &tx, &grant, now).await?;
+    let reason = if !external {
+        RETIRED.to_owned()
+    } else if revoked_by.is_empty() {
         reason.to_owned()
     } else {
         format!("{reason} ({revoked_by})")
@@ -444,12 +470,14 @@ async fn expire_one(st: &AppState, id: GrantId) -> ServiceResult<Option<GrantRow
         Some(g) if g.status == GrantStatus::Active && g.expires_at <= now => g,
         _ => return Ok(None),
     };
-    let provisioner = st
-        .registry
-        .get(grant.platform)
-        .ok_or(ServiceError::NotEnabled(grant.platform))?;
-    provisioner.revoke(&tx, &grant, now).await?;
-    let ended = grants::end(&tx, id, GrantEnd::Expired, now).await?.ok();
+    let how = if revoke_external(st, &tx, &grant, now).await? {
+        GrantEnd::Expired
+    } else {
+        GrantEnd::Revoked {
+            reason: RETIRED.to_owned(),
+        }
+    };
+    let ended = grants::end(&tx, id, how, now).await?.ok();
     tx.commit().await?;
     Ok(ended)
 }
