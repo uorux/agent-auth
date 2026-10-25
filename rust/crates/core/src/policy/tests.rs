@@ -1719,3 +1719,273 @@ fn mcp_audiences_are_unique() {
         "platforms.mcp.servers: a and b have the same audience 'https://x/mcp'"
     );
 }
+
+// ------------------------------------------ test_review_2026_10.py (core)
+
+/// A saved rule pinned to a role with a widened resource (what Discord's
+/// Edit "approve:capability" saves) clears an ordinary namespace, never a
+/// sensitive one; a human's rule for exactly that namespace does.
+#[test]
+fn a_widened_saved_rule_does_not_clear_a_sensitive_namespace() {
+    let p = Policy::from_value(json!({
+        "platforms": {"kubernetes": {
+            "namespace_allowlist": ["apps-*"],
+            "role_allowlist": ["logs-reader"],
+            "sensitive_namespaces": ["kube-system", "apps-system"],
+        }}
+    }))
+    .unwrap();
+    let role = auth(Platform::Kubernetes, "logs-reader", json!({}));
+    let mut widened = saved(
+        SavedRuleAction::AutoApprove,
+        "ops-agent",
+        Platform::Kubernetes,
+    );
+    widened.authority = Some(role.clone());
+    let agent = AgentRef::named("ops-agent");
+    let (_, r) = routed(
+        &p,
+        agent,
+        Delegation::None,
+        &role,
+        "apps-a",
+        &[widened.clone()],
+    );
+    assert_eq!(r.route.action(), PolicyAction::Approve);
+    let (d, r) = routed(
+        &p,
+        agent,
+        Delegation::None,
+        &role,
+        "apps-system",
+        &[widened.clone()],
+    );
+    assert!(d.pinned && !d.names_resource);
+    assert_eq!(r.route.action(), PolicyAction::Surface);
+    assert_eq!(
+        r.notes,
+        vec!["sensitive capability — routed to human review".to_owned()]
+    );
+    let mut named = widened.clone();
+    named.id = RuleId::new();
+    named.resource_pattern = Glob::new("apps-system");
+    let (d, r) = routed(
+        &p,
+        agent,
+        Delegation::None,
+        &role,
+        "apps-system",
+        &[named, widened],
+    );
+    assert!(d.names_resource);
+    assert_eq!(r.route.action(), PolicyAction::Approve);
+}
+
+/// A pool's sensitive item is the resource's doing: a pinned rule for any
+/// pool does not lease it, one naming the pool does.
+#[test]
+fn a_pinned_rule_for_a_sensitive_item_must_name_the_pool() {
+    let p = Policy::from_value(json!({
+        "platforms": {"pools": {"minecraft": {"items": {
+            "alt-1": {"properties": {"edition": "java"}},
+            "main": {"sensitive": true},
+        }}}}
+    }))
+    .unwrap();
+    let main = auth(Platform::Pool, "lease", json!({"item": "main"}));
+    let mut rule = saved(SavedRuleAction::AutoApprove, "bot-a", Platform::Pool);
+    rule.authority = Some(main.clone());
+    let bot = AgentRef::named("bot-a");
+    let (_, r) = routed(
+        &p,
+        bot,
+        Delegation::None,
+        &main,
+        "minecraft",
+        &[rule.clone()],
+    );
+    assert_eq!(r.route.action(), PolicyAction::Surface);
+    rule.resource_pattern = Glob::new("minecraft");
+    let (_, r) = routed(&p, bot, Delegation::None, &main, "minecraft", &[rule]);
+    assert_eq!(r.route.action(), PolicyAction::Approve);
+}
+
+/// Pools, google and mail-like platforms need a rule naming them; a policy
+/// rule for the platform and capability does.
+#[test]
+fn pool_and_google_need_a_named_rule() {
+    let p = Policy::from_value(json!({
+        "platforms": {"pools": {"shared": {"items": {"box": {}}}}},
+        "rules": [
+            {"match": {"agent": "*"}, "action": "approve"},
+        ],
+    }))
+    .unwrap();
+    let any = auth(Platform::Pool, "lease", json!({}));
+    let (_, r) = routed(
+        &p,
+        AgentRef::named("a"),
+        Delegation::None,
+        &any,
+        "shared",
+        &[],
+    );
+    assert_eq!(r.route.action(), PolicyAction::Surface);
+    let named = Policy::from_value(json!({
+        "rules": [{"match": {"platform": "pool", "capability": "lease"}, "action": "approve"}],
+    }))
+    .unwrap();
+    let (_, r) = routed(
+        &named,
+        AgentRef::named("a"),
+        Delegation::None,
+        &any,
+        "shared",
+        &[],
+    );
+    assert_eq!(r.route.action(), PolicyAction::Approve);
+    let cal = auth(Platform::Google, "calendar.read", json!({}));
+    let (_, r) = routed(
+        &p,
+        AgentRef::named("a"),
+        Delegation::None,
+        &cal,
+        "main",
+        &[],
+    );
+    assert_eq!(r.route.action(), PolicyAction::Surface);
+    let write = auth(Platform::Google, "calendar.write", json!({}));
+    let google = Policy::from_value(json!({
+        "rules": [{"match": {"platform": "google", "capability": "calendar.write"}, "action": "approve"}],
+    }))
+    .unwrap();
+    let (_, r) = routed(
+        &google,
+        AgentRef::named("a"),
+        Delegation::None,
+        &write,
+        "main",
+        &[],
+    );
+    assert_eq!(r.route.action(), PolicyAction::Surface, "sensitive");
+}
+
+#[test]
+fn a_rule_names_a_capability_only_with_its_platform() {
+    let p = Policy::from_value(json!({
+        "rules": [{"match": {"capability": "use"}, "action": "approve"}],
+    }))
+    .unwrap();
+    let d = decide(
+        &p,
+        AgentRef::named("any-agent"),
+        &auth(Platform::Mcp, "use", json!({})),
+        "x",
+    );
+    assert!(!d.explicit);
+}
+
+#[test]
+fn the_wiki_repo_is_never_brokered() {
+    let p = Policy::from_value(json!({"wiki": {"repo": "jrt/Agent-Wiki"}})).unwrap();
+    assert_eq!(p.wiki().repo, "jrt/agent-wiki");
+    let deny: Vec<&str> = p
+        .platforms()
+        .github
+        .repo_denylist
+        .iter()
+        .map(Glob::as_str)
+        .collect();
+    assert_eq!(deny, vec!["jrt/agent-wiki"]);
+    // Listed already (in any case): not twice.
+    let p = Policy::from_value(json!({
+        "wiki": {"repo": "jrt/wiki"},
+        "platforms": {"github": {"repo_denylist": ["JRT/Wiki"]}},
+    }))
+    .unwrap();
+    assert_eq!(p.platforms().github.repo_denylist.len(), 1);
+}
+
+#[test]
+fn github_rule_resources_and_project_repos_are_lowercased() {
+    let p = Policy::from_value(json!({
+        "projects": {"app": {"repos": ["JRT/App"]}},
+        "rules": [
+            {"match": {"platform": "github", "resource": "JRT/Docs"}, "action": "approve"},
+            {"match": {"agent": {"project": "app"}, "resource": "{agent.repos}"}, "action": "llm"},
+            {"match": {"resource": "Other/*"}, "action": "deny"},
+        ],
+    }))
+    .unwrap();
+    assert_eq!(p.rules()[0].matches.resource, "jrt/docs");
+    assert_eq!(p.projects().values().next().unwrap().repos, vec!["jrt/app"]);
+    let repo = auth(Platform::Github, "repo", json!({}));
+    let d = decide(&p, AgentRef::named("a"), &repo, "jrt/docs");
+    assert_eq!(d.action, PolicyAction::Approve);
+    let in_app = AgentRef {
+        project: Some("app"),
+        ..AgentRef::named("b")
+    };
+    let d = decide(&p, in_app, &repo, "jrt/app");
+    assert_eq!(d.action, PolicyAction::Llm);
+    // A rule with no platform is matched lowercased for GitHub requests.
+    let d = decide(&p, AgentRef::named("a"), &repo, "other/x");
+    assert_eq!(d.action, PolicyAction::Deny);
+}
+
+#[test]
+fn google_accounts_and_pools_load() {
+    let p = Policy::from_value(json!({"platforms": {
+        "google": {"accounts": {"main": {
+            "address": "Me@Example.com", "client_secret_file": "/c", "refresh_token_file": "/r",
+        }}},
+        "pools": {"minecraft": {
+            "capacity": 2,
+            "agents": ["bot-*"],
+            "items": {"alt-1": {"properties": {"edition": "java", "tags": ["a"], "n": 1}}},
+        }},
+    }}))
+    .unwrap();
+    assert_eq!(
+        p.platforms().google.accounts["main"].address,
+        "me@example.com"
+    );
+    assert_eq!(p.platforms().pools["minecraft"].capacity, 2);
+    let bad = |v: Value, text: &str| {
+        let e = Policy::from_value(json!({"platforms": v})).unwrap_err();
+        assert!(e.0.contains(text), "{e}");
+    };
+    bad(
+        json!({"google": {"accounts": {"x": {"address": "a@b.example"}}}}),
+        "either client_secret_file",
+    );
+    bad(
+        json!({"google": {"accounts": {"x": {"address": "nope", "service_account_file": "/s"}}}}),
+        "is not an email address",
+    );
+    bad(
+        json!({"google": {"accounts": {"X": {"address": "a@b.c", "service_account_file": "/s"}}}}),
+        "google account name 'X'",
+    );
+    bad(
+        json!({"pools": {"p": {"capacity": 0}}}),
+        "capacity: from 1 to 100",
+    );
+    bad(
+        json!({"pools": {"p": {"max_per_agent": 0}}}),
+        "max_per_agent",
+    );
+    bad(json!({"pools": {"Bad": {}}}), "pool name 'Bad'");
+    bad(
+        json!({"pools": {"p": {"items": {"-x": {}}}}}),
+        "pool item '-x'",
+    );
+    bad(
+        json!({"pools": {"p": {"items": {"x": {"properties": {"a": {"b": 1}}}}}}}),
+        "a property is",
+    );
+    bad(
+        json!({"pools": {"p": {"agents": [{"project": "nope"}]}}}),
+        "is not listed",
+    );
+}

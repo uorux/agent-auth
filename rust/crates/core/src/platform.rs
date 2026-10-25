@@ -20,10 +20,12 @@ pub enum Platform {
     Mcp,
     /// Model calls through the LiteLLM gateway.
     Models,
+    /// Scarce things held by one agent at a time (a pool's items).
+    Pool,
 }
 
 impl Platform {
-    pub const ALL: [Platform; 10] = [
+    pub const ALL: [Platform; 11] = [
         Platform::Github,
         Platform::Homelab,
         Platform::Kubernetes,
@@ -34,6 +36,7 @@ impl Platform {
         Platform::Hostexec,
         Platform::Mcp,
         Platform::Models,
+        Platform::Pool,
     ];
 
     #[must_use]
@@ -49,6 +52,7 @@ impl Platform {
             Platform::Hostexec => "hostexec",
             Platform::Mcp => "mcp",
             Platform::Models => "models",
+            Platform::Pool => "pool",
         }
     }
 

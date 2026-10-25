@@ -32,10 +32,11 @@ pub use eval::{
 };
 pub use schema::{
     AgentsConfig, AuditConfig, Constraints, ContainmentConfig, Defaults, DesktopConfig,
-    GithubConfig, HomelabConfig, HostexecConfig, KubernetesConfig, LlmConfig, MCP_TOOL_NAMES,
-    Match, McpConfig, McpServer, ModelsConfig, NotifyConfig, PlatformsConfig, PolicyRule,
-    REMOTE_MCP_REDIRECT_URIS, REMOTE_MCP_TOOLS, RemoteMcpConfig, RestrictedZone, UiConfig,
-    WikiConfig, redirect_uri_ok,
+    GithubConfig, GoogleAccount, GoogleConfig, HomelabConfig, HostexecConfig, KubernetesConfig,
+    LlmConfig, MAX_POOL_PER_AGENT, MCP_TOOL_NAMES, Match, McpConfig, McpServer, ModelsConfig,
+    NotifyConfig, PlatformsConfig, PolicyRule, PoolConfig, PoolItem, REMOTE_MCP_REDIRECT_URIS,
+    REMOTE_MCP_TOOLS, RemoteMcpConfig, RestrictedZone, UiConfig, WikiConfig, config_name_ok,
+    email_address_ok, redirect_uri_ok,
 };
 
 /// A policy that does not load. The text says where (`rules[3]: ...`).
@@ -82,7 +83,7 @@ const SECTIONS: [&str; 13] = [
     "rules",
 ];
 
-const PLATFORM_SECTIONS: [&str; 7] = [
+const PLATFORM_SECTIONS: [&str; 9] = [
     "github",
     "homelab",
     "kubernetes",
@@ -90,6 +91,8 @@ const PLATFORM_SECTIONS: [&str; 7] = [
     "hostexec",
     "mcp",
     "models",
+    "google",
+    "pools",
 ];
 
 /// Parse one YAML document into a generic value, with limits so a hostile
@@ -277,8 +280,34 @@ impl Policy {
         }
         policy.wiki.validate().map_err(PolicyError)?;
         policy.ui.validate().map_err(PolicyError)?;
+        policy.normalize_case();
         policy.check_references()?;
         Ok(policy)
+    }
+
+    /// GitHub names are case-insensitive and the broker compares them
+    /// lowercased: the wiki's repo, the projects' repos and the resources of
+    /// rules for GitHub are lowercased (a `JRT/App` would never match), and
+    /// the wiki's repo is always on the GitHub denylist (it is written only
+    /// by the broker, by path rules: a GitHub grant on it would write past
+    /// them), whether or not the operator listed it.
+    fn normalize_case(&mut self) {
+        self.wiki.repo = self.wiki.repo.to_lowercase();
+        for project in self.projects.values_mut() {
+            for repo in &mut project.repos {
+                *repo = repo.to_lowercase();
+            }
+        }
+        for rule in &mut self.rules {
+            if rule.matches.platform == Some(crate::platform::Platform::Github) {
+                rule.matches.resource = rule.matches.resource.to_lowercase();
+            }
+        }
+        let wiki = &self.wiki.repo;
+        let deny = &mut self.platforms.github.repo_denylist;
+        if !wiki.is_empty() && !deny.iter().any(|g| g.as_str() == wiki) {
+            deny.push(crate::glob::Glob::new(&crate::glob::escape(wiki)));
+        }
     }
 
     /// `_references`: projects named by agent matches must be declared, the
@@ -303,6 +332,19 @@ impl Policy {
         for (name, list) in lists {
             for (i, p) in list.iter().enumerate() {
                 patterns.push((format!("{name}[{i}]"), p));
+            }
+        }
+        for (name, pool) in &self.platforms.pools {
+            for (i, p) in pool.agents.iter().enumerate() {
+                patterns.push((format!("platforms.pools.{name}.agents[{i}]"), p));
+            }
+            for (item, spec) in &pool.items {
+                for (i, p) in spec.agents.iter().enumerate() {
+                    patterns.push((
+                        format!("platforms.pools.{name}.items.{item}.agents[{i}]"),
+                        p,
+                    ));
+                }
             }
         }
         for (zone_name, zone) in &self.restricted {
@@ -445,6 +487,20 @@ impl Policy {
             kubernetes_sensitive_roles: k8s.sensitive_roles.iter().cloned().collect(),
             kubernetes_sensitive_namespaces: k8s.sensitive_namespaces.clone(),
             kubernetes_cluster_grant_namespace: k8s.cluster_grant_namespace.clone(),
+            pool_sensitive_items: self
+                .platforms
+                .pools
+                .iter()
+                .map(|(name, pool)| {
+                    let sensitive = pool
+                        .items
+                        .iter()
+                        .filter(|(_, item)| item.sensitive)
+                        .map(|(n, _)| n.clone())
+                        .collect();
+                    (name.clone(), sensitive)
+                })
+                .collect(),
         }
     }
 
@@ -493,6 +549,20 @@ fn parse_platforms(value: Value) -> Result<PlatformsConfig, PolicyError> {
     if let Some(v) = map.remove("models") {
         out.models = parse_section("platforms.models", v)?;
         out.models.validate().map_err(PolicyError)?;
+    }
+    if let Some(v) = map.remove("google") {
+        out.google = parse_section("platforms.google", v)?;
+        out.google
+            .normalize()
+            .map_err(|e| PolicyError(format!("platforms.google: {e}")))?;
+    }
+    if let Some(v) = map.remove("pools") {
+        for (name, pool) in take_object("platforms.pools", v)? {
+            let pool: PoolConfig = parse_section(&format!("platforms.pools.{name}"), pool)?;
+            pool.validate(&name)
+                .map_err(|e| PolicyError(format!("platforms.pools: {e}")))?;
+            out.pools.insert(name, pool);
+        }
     }
     Ok(out)
 }

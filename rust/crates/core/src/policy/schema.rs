@@ -12,6 +12,7 @@ use crate::glob::Glob;
 use crate::hostexec::Template;
 use crate::names::{McpServerName, TemplateName};
 use crate::platform::Platform;
+use crate::pool::{PropValue, item_name_ok};
 use crate::pyfmt::repr;
 use crate::routing::PolicyAction;
 
@@ -340,6 +341,165 @@ impl Default for ModelsConfig {
     }
 }
 
+/// One Google account the broker holds a login for: an OAuth client and a
+/// refresh token (any Gmail or Workspace account), or, on Workspace, a
+/// service account with domain-wide delegation acting as `subject`. The
+/// files are secrets (LoadCredential paths); nothing secret is in here.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoogleAccount {
+    /// Lowercased at load.
+    pub address: String,
+    /// The OAuth client JSON from the Google Cloud console.
+    #[serde(default)]
+    pub client_secret_file: String,
+    /// The refresh token `agent-auth admin google-consent` wrote.
+    #[serde(default)]
+    pub refresh_token_file: String,
+    /// Workspace only: a service account key with domain-wide delegation.
+    #[serde(default)]
+    pub service_account_file: String,
+    /// Whom the service account acts as; default: the address.
+    #[serde(default)]
+    pub subject: Option<String>,
+}
+
+/// Google accounts (platform `google`). Calendar and Drive grants are
+/// access tokens for the Google API, account-wide by Google's design;
+/// Gmail is never one.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct GoogleConfig {
+    pub accounts: BTreeMap<String, GoogleAccount>,
+}
+
+/// `[^@\s]+@[^@\s]+\.[^@\s]+`, whole string.
+#[must_use]
+pub fn email_address_ok(address: &str) -> bool {
+    let Some((local, domain)) = address.split_once('@') else {
+        return false;
+    };
+    let plain = |s: &str| !s.is_empty() && !s.chars().any(|c| c == '@' || c.is_whitespace());
+    // The domain's last dot must leave something on both sides.
+    let dotted = domain
+        .rsplit_once('.')
+        .is_some_and(|(a, b)| !a.is_empty() && !b.is_empty());
+    plain(local) && plain(domain) && dotted
+}
+
+/// `[a-z0-9][a-z0-9_-]{0,62}`: a Google account's or a pool's name.
+#[must_use]
+pub fn config_name_ok(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && name.len() <= 63
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-'))
+}
+
+impl GoogleConfig {
+    pub(crate) fn normalize(&mut self) -> Result<(), String> {
+        for (name, account) in &mut self.accounts {
+            if !config_name_ok(name) {
+                return Err(format!(
+                    "google account name {}: lowercase letters, digits, - and _",
+                    repr(name)
+                ));
+            }
+            if !email_address_ok(&account.address) {
+                return Err(format!(
+                    "google account address {} is not an email address",
+                    repr(&account.address)
+                ));
+            }
+            account.address = account.address.to_lowercase();
+            let oauth =
+                !account.client_secret_file.is_empty() && !account.refresh_token_file.is_empty();
+            if oauth == !account.service_account_file.is_empty() {
+                return Err(format!(
+                    "google account {}: either client_secret_file + refresh_token_file, \
+                     or service_account_file (Workspace domain-wide delegation)",
+                    account.address
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One thing in a pool: what it is (properties, shown to agents) and its
+/// secret (what the holder's credential returns).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PoolItem {
+    pub description: String,
+    pub properties: BTreeMap<String, PropValue>,
+    /// Returned to the holder as the credential, verbatim.
+    pub secret_file: String,
+    /// Only leased by name, and always by a human.
+    pub sensitive: bool,
+    /// Who may hold it; empty: whoever the pool admits.
+    pub agents: Vec<AgentPattern>,
+}
+
+/// Scarce things (accounts, licences, devices) an agent holds alone for a
+/// while: platform `pool`, capability `lease`, resource the pool.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PoolConfig {
+    pub description: String,
+    /// By name. "Any" tries them in name order (the policy is read as JSON,
+    /// whose objects keep no order).
+    pub items: BTreeMap<String, PoolItem>,
+    /// Holders of one item at once: 1 to 100.
+    pub capacity: u32,
+    /// Items of this pool one agent may hold at once: at least 1.
+    pub max_per_agent: u32,
+    /// Who may lease from it at all; empty: anyone.
+    pub agents: Vec<AgentPattern>,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        PoolConfig {
+            description: String::new(),
+            items: BTreeMap::new(),
+            capacity: 1,
+            max_per_agent: 1,
+            agents: Vec::new(),
+        }
+    }
+}
+
+/// The largest `max_per_agent` (a slot number is stored as an integer).
+pub const MAX_POOL_PER_AGENT: u32 = 10_000;
+
+impl PoolConfig {
+    pub(crate) fn validate(&self, name: &str) -> Result<(), String> {
+        if !config_name_ok(name) {
+            return Err(format!(
+                "pool name {}: lowercase letters, digits, - and _",
+                repr(name)
+            ));
+        }
+        for item in self.items.keys() {
+            if !item_name_ok(item) {
+                return Err(format!("pool item {}: letters, digits, . _ -", repr(item)));
+            }
+        }
+        if !(1..=100).contains(&self.capacity) {
+            return Err(format!("platforms.pools.{name}.capacity: from 1 to 100"));
+        }
+        if !(1..=MAX_POOL_PER_AGENT).contains(&self.max_per_agent) {
+            return Err(format!(
+                "platforms.pools.{name}.max_per_agent: from 1 to {MAX_POOL_PER_AGENT}"
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct PlatformsConfig {
@@ -350,6 +510,9 @@ pub struct PlatformsConfig {
     pub hostexec: HostexecConfig,
     pub mcp: McpConfig,
     pub models: ModelsConfig,
+    pub google: GoogleConfig,
+    /// Platform `pool`: scarce things, by pool name.
+    pub pools: BTreeMap<String, PoolConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

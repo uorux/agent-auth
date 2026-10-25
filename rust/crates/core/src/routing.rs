@@ -26,7 +26,9 @@
 //! - INV-5  human-only authorities (a host shell) never auto-clear.
 //! - INV-6  a web-UI agent, or a request on one's behalf, never auto-clears.
 //! - INV-7  a sensitive authority auto-clears only via a saved rule pinned
-//!   to (covering) its exact authority.
+//!   to (covering) its exact authority; when only the resource makes it
+//!   sensitive (a sensitive namespace, a pool's sensitive item), only via
+//!   such a rule naming exactly that resource (not a glob reaching it).
 //! - INV-8  an explicit-only authority auto-clears only via a rule naming it.
 //! - INV-9  a restricted zone requiring a human never auto-clears.
 
@@ -85,13 +87,26 @@ pub struct RuleStrength {
     /// The rule names this privilege: pinned, or a policy-file rule whose
     /// `match.capability` is literally the request's capability.
     pub explicit: bool,
+    /// A pinned saved rule whose resource pattern is exactly the request's
+    /// resource (the Python's `rule_resource == request.resource`): the
+    /// only pinned rule that clears a sensitivity coming from the resource.
+    pub names_resource: bool,
 }
 
 impl RuleStrength {
     pub(crate) const NONE: RuleStrength = RuleStrength {
         pinned: false,
         explicit: false,
+        names_resource: false,
     };
+
+    /// Does the rule clear a sensitive request (the Python's
+    /// `pinned_here`)? Pinned, and naming the very resource when the
+    /// resource is what makes it sensitive.
+    #[must_use]
+    pub const fn clears_sensitive(self, facts: GateFacts) -> bool {
+        self.pinned && (self.names_resource || !facts.sensitive_by_resource)
+    }
 }
 
 /// Facts about the request the gates look at, all computed by
@@ -107,6 +122,9 @@ pub struct GateFacts {
     pub web_connector: bool,
     /// `Authority::is_sensitive` for this resource.
     pub sensitive: bool,
+    /// `Authority::sensitive_by_resource`: sensitive only because of the
+    /// resource (where), not the authority (what).
+    pub sensitive_by_resource: bool,
     /// `Authority::needs_explicit_rule`.
     pub needs_explicit_rule: bool,
 }
@@ -246,7 +264,7 @@ pub(crate) fn gate(proposed: PolicyAction, strength: RuleStrength, facts: GateFa
         &mut action,
         &mut strength,
     );
-    let sensitive_blocks = facts.sensitive && !strength.pinned;
+    let sensitive_blocks = facts.sensitive && !strength.clears_sensitive(facts);
     gate(
         sensitive_blocks,
         Downgrade::Sensitive,
@@ -296,23 +314,26 @@ pub fn may_auto_clear(strength: RuleStrength, facts: GateFacts) -> bool {
     !facts.zone_requires_human
         && !facts.human_only
         && !facts.web_connector
-        && (!facts.sensitive || strength.pinned)
+        && (!facts.sensitive
+            || (strength.pinned && (strength.names_resource || !facts.sensitive_by_resource)))
         && (!facts.needs_explicit_rule || strength.explicit)
 }
 
 #[cfg(test)]
 pub(crate) fn all_inputs() -> impl Iterator<Item = (PolicyAction, RuleStrength, GateFacts)> {
-    (0u32..(1 << 7)).flat_map(|bits| {
+    (0u32..(1 << 9)).flat_map(|bits| {
         let b = |i: u32| bits & (1 << i) != 0;
         let strength = RuleStrength {
             pinned: b(0),
             explicit: b(1),
+            names_resource: b(7),
         };
         let facts = GateFacts {
             zone_requires_human: b(2),
             human_only: b(3),
             web_connector: b(4),
             sensitive: b(5),
+            sensitive_by_resource: b(8),
             needs_explicit_rule: b(6),
         };
         PolicyAction::ALL
@@ -330,10 +351,11 @@ mod tests {
         human_only: false,
         web_connector: false,
         sensitive: false,
+        sensitive_by_resource: false,
         needs_explicit_rule: false,
     };
 
-    /// Exhaustive over all 512 inputs: this is a complete proof for the
+    /// Exhaustive over all 2048 inputs: this is a complete proof for the
     /// finite domain, not a sample.
     #[test]
     fn invariants_hold_for_every_input() {
@@ -360,7 +382,7 @@ mod tests {
                 assert!(!result.is_auto());
             }
         }
-        assert_eq!(count, 512);
+        assert_eq!(count, 2048);
     }
 
     #[test]
@@ -376,6 +398,7 @@ mod tests {
             RuleStrength {
                 pinned: true,
                 explicit: true,
+                names_resource: false,
             },
             facts,
         );
@@ -396,6 +419,7 @@ mod tests {
             RuleStrength {
                 pinned: true,
                 explicit: true,
+                names_resource: false,
             },
             facts,
         );
@@ -405,9 +429,45 @@ mod tests {
             RuleStrength {
                 pinned: false,
                 explicit: true,
+                names_resource: false,
             },
             facts,
         );
         assert_eq!(routed.action, PolicyAction::Surface);
+    }
+
+    #[test]
+    fn a_resource_driven_sensitivity_needs_the_rule_to_name_the_resource() {
+        let facts = GateFacts {
+            sensitive: true,
+            sensitive_by_resource: true,
+            ..NO_FACTS
+        };
+        let widened = RuleStrength {
+            pinned: true,
+            explicit: true,
+            names_resource: false,
+        };
+        let named = RuleStrength {
+            names_resource: true,
+            ..widened
+        };
+        assert_eq!(
+            gate(PolicyAction::Approve, widened, facts).action,
+            PolicyAction::Surface
+        );
+        assert_eq!(
+            gate(PolicyAction::Approve, named, facts).action,
+            PolicyAction::Approve
+        );
+        // Sensitive because of what is asked: any pinned rule covering it.
+        let what = GateFacts {
+            sensitive_by_resource: false,
+            ..facts
+        };
+        assert_eq!(
+            gate(PolicyAction::Approve, widened, what).action,
+            PolicyAction::Approve
+        );
     }
 }

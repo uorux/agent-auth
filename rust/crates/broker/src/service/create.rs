@@ -227,15 +227,14 @@ pub async fn create(
     };
     draft.notes.extend(validated.notes.iter().cloned());
 
-    let (saved, rows) = saved_rules(&tx, body.platform, now).await?;
+    let saved = saved_rules(&tx, body.platform, now).await?;
     let input = PolicyInput {
         agent: agent_ref_of(&agent),
         delegation: delegator.as_policy(),
         resource: &validated.resource,
         authority: &validated.authority,
     };
-    let (decision, routed) =
-        evaluate_and_route(&st.policy, draft.id, &input, &saved, &rows, &zone, now);
+    let (decision, routed) = evaluate_and_route(&st.policy, draft.id, &input, &saved, &zone, now);
     draft.notes.extend(routed.notes.iter().cloned());
     let source = decision.source();
     let final_action = routed.route.action();

@@ -29,12 +29,14 @@ fn gates_only_downgrade_and_match_spec() {
     let strength = RuleStrength {
         pinned: kani::any(),
         explicit: kani::any(),
+        names_resource: kani::any(),
     };
     let facts = GateFacts {
         zone_requires_human: kani::any(),
         human_only: kani::any(),
         web_connector: kani::any(),
         sensitive: kani::any(),
+        sensitive_by_resource: kani::any(),
         needs_explicit_rule: kani::any(),
     };
     let result = gate(proposed, strength, facts).action;
@@ -48,6 +50,11 @@ fn gates_only_downgrade_and_match_spec() {
         assert!(!result.is_auto());
     }
     if facts.sensitive && !strength.pinned {
+        assert!(!result.is_auto());
+    }
+    // A sensitivity that comes from the resource is cleared only by a
+    // pinned rule naming exactly that resource.
+    if facts.sensitive && facts.sensitive_by_resource && !strength.names_resource {
         assert!(!result.is_auto());
     }
 }

@@ -1,12 +1,12 @@
 //! From a request to a route: the facts zones need, the saved rules, the
 //! policy evaluation and its gates (spec §4.1 steps 6-9, §5.3, §8.6).
 
-use agent_auth_core::authority::{Authority, SensitivityConfig};
+use agent_auth_core::authority::Authority;
 use agent_auth_core::policy::{
     AgentRef, Delegation, PolicyDecision, PolicyInput, RoutedRequest, SavedRule, SavedRuleAction,
     sort_saved_rules,
 };
-use agent_auth_core::routing::{Downgrade, PolicyAction, Route};
+use agent_auth_core::routing::PolicyAction;
 use agent_auth_core::zones::{self, ZoneDenied, ZoneFacts, ZonePassed};
 use agent_auth_core::{DurationSecs, Glob, Platform, Policy, RequestId};
 use agent_auth_store::agents::{self, AgentRow};
@@ -141,66 +141,30 @@ pub(crate) fn clamp_duration(secs: u32) -> DurationSecs {
         .unwrap_or(DurationSecs::MAX)
 }
 
-/// The live saved rules of a platform, in evaluation order, with the rows
-/// (to find a matched rule's resource pattern).
+/// The live saved rules of a platform, in evaluation order.
 pub(crate) async fn saved_rules(
     tx: &Tx<'_>,
     platform: Platform,
     now: OffsetDateTime,
-) -> Result<(Vec<SavedRule>, Vec<RuleRow>), StoreError> {
+) -> Result<Vec<SavedRule>, StoreError> {
     let rows = rules::live_for(tx, platform, now).await?;
     let mut saved: Vec<SavedRule> = rows.iter().map(saved_rule).collect();
     sort_saved_rules(&mut saved);
-    Ok((saved, rows))
+    Ok(saved)
 }
 
-/// Sensitive because of *where* (a sensitive Kubernetes namespace), not
-/// *what* (the role).
-fn sensitive_by_resource(cfg: &SensitivityConfig, authority: &Authority, resource: &str) -> bool {
-    match authority {
-        Authority::Kubernetes(k) => {
-            !k.cluster
-                && !cfg.kubernetes_sensitive_roles.contains(&k.role)
-                && cfg.namespace_is_sensitive(resource)
-        }
-        _ => false,
-    }
-}
-
-/// Evaluate the policy and apply the gates, for request `request`. A
-/// saved rule pinned to the authority clears a request that is sensitive
-/// only because of its namespace when the rule names that exact resource
-/// (the Python's `pinned_here`, commit 4da3f4e): a pinned `view` rule for
-/// `apps-*` does not open `kube-system`. Otherwise an automatic route
-/// becomes a human's, as the sensitive gate would have made it.
+/// Evaluate the policy and apply the gates, for request `request` (core
+/// does everything, including the rule that a pinned saved rule clears a
+/// sensitivity coming from the resource only when it names that resource).
 pub(crate) fn evaluate_and_route(
     policy: &Policy,
     request: RequestId,
     input: &PolicyInput<'_>,
     saved: &[SavedRule],
-    rows: &[RuleRow],
     zone: &ZonePassed,
     now: OffsetDateTime,
 ) -> (PolicyDecision, RoutedRequest) {
-    let (decision, mut routed) = policy.evaluate_and_route(request, input, saved, zone, now);
-    let names_it = || {
-        decision
-            .rule_id()
-            .and_then(|id| rows.iter().find(|r| r.id == id))
-            .is_some_and(|r| r.resource_pattern == input.resource)
-    };
-    if decision.pinned
-        && routed.route.action().is_auto()
-        && sensitive_by_resource(&policy.sensitivity(), input.authority, input.resource)
-        && !names_it()
-    {
-        routed.route = Route::Surface;
-        routed.downgrades.push(Downgrade::Sensitive);
-        routed
-            .notes
-            .push("sensitive capability — routed to human review".to_owned());
-    }
-    (decision, routed)
+    policy.evaluate_and_route(request, input, saved, zone, now)
 }
 
 /// Everything about routing a stored request again (the LLM-approve path,
@@ -233,7 +197,7 @@ pub(crate) async fn reroute(
         resource,
         authority,
     } = subject;
-    let (saved, rows) = saved_rules(tx, authority.platform(), now).await?;
+    let saved = saved_rules(tx, authority.platform(), now).await?;
     let input = PolicyInput {
         agent: agent_ref_of(agent),
         delegation: delegator.as_policy(),
@@ -243,7 +207,7 @@ pub(crate) async fn reroute(
     match zone_check(policy, tx, agent, authority, resource).await? {
         Ok(zone) => {
             let (decision, routed) =
-                evaluate_and_route(policy, request, &input, &saved, &rows, &zone, now);
+                evaluate_and_route(policy, request, &input, &saved, &zone, now);
             Ok(Rerouted {
                 decision,
                 routed: Some(routed),
@@ -266,7 +230,7 @@ pub async fn disposition(
     authority: &Authority,
     now: OffsetDateTime,
 ) -> Result<Disposition, StoreError> {
-    let (saved, _) = saved_rules(tx, authority.platform(), now).await?;
+    let saved = saved_rules(tx, authority.platform(), now).await?;
     let input = PolicyInput {
         agent: agent_ref_of(agent),
         delegation: Delegation::None,

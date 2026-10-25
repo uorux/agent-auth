@@ -18,6 +18,7 @@ use serde_json::{Map, Value, json};
 
 use crate::glob::Glob;
 use crate::platform::Platform;
+use crate::pool::{MAX_MATCH_KEYS, MAX_PROP_CHARS, PoolChoice, PropMatch, PropValue, match_covers};
 
 /// Structural problems with a request's capability/scope. The text is shown
 /// to the requesting agent (prefixed "validator: ").
@@ -242,7 +243,13 @@ pub enum Authority {
         tools: ToolSet,
     },
     Models,
+    /// A lease of one item of the pool named by the resource.
+    Pool(PoolChoice),
 }
+
+/// The Google capabilities a grant may carry (each one access-token
+/// scope). Gmail is never one: mail goes through the broker.
+pub const GOOGLE_CAPABILITIES: [&str; 3] = ["calendar.read", "calendar.write", "drive.read"];
 
 /// The parts of the policy configuration that sensitivity depends on.
 #[derive(Debug, Clone)]
@@ -252,6 +259,8 @@ pub struct SensitivityConfig {
     pub kubernetes_sensitive_namespaces: Vec<Glob>,
     /// Its ServiceAccounts back cluster-wide grants: always sensitive.
     pub kubernetes_cluster_grant_namespace: String,
+    /// Per pool, its items marked sensitive (leased by name, by a human).
+    pub pool_sensitive_items: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Default for SensitivityConfig {
@@ -268,6 +277,7 @@ impl Default for SensitivityConfig {
             .map(Glob::new)
             .into(),
             kubernetes_cluster_grant_namespace: "default".to_owned(),
+            pool_sensitive_items: BTreeMap::new(),
         }
     }
 }
@@ -297,6 +307,7 @@ impl Authority {
             Authority::Hostexec(_) => Platform::Hostexec,
             Authority::Mcp { .. } => Platform::Mcp,
             Authority::Models => Platform::Models,
+            Authority::Pool(_) => Platform::Pool,
         }
     }
 
@@ -311,6 +322,10 @@ impl Authority {
                 | Authority::Hostexec(_)
                 | Authority::Mcp { .. }
                 | Authority::Models
+                // Someone's accounts, calendar, files: only a rule written
+                // for that platform, never a catch-all for an agent.
+                | Authority::Pool(_)
+                | Authority::Google { .. }
         )
     }
 
@@ -324,6 +339,21 @@ impl Authority {
     /// whatever the policy routing says (unless a human's pinned rule)?
     #[must_use]
     pub fn is_sensitive(&self, cfg: &SensitivityConfig, resource: &str) -> bool {
+        self.sensitive_at(cfg, Some(resource))
+    }
+
+    /// Sensitive because of *where* (the resource: a sensitive namespace, a
+    /// pool's sensitive item), not *what* (the authority itself): only a
+    /// pinned rule naming that very resource clears it (`engine
+    /// .sensitive_by_resource`).
+    #[must_use]
+    pub fn sensitive_by_resource(&self, cfg: &SensitivityConfig, resource: &str) -> bool {
+        self.sensitive_at(cfg, Some(resource)) && !self.sensitive_at(cfg, None)
+    }
+
+    /// `is_sensitive` with the resource, or without one (`None`: what the
+    /// authority alone makes sensitive).
+    fn sensitive_at(&self, cfg: &SensitivityConfig, resource: Option<&str>) -> bool {
         match self {
             Authority::Github(GithubAuthority::Create { visibility }) => {
                 *visibility != Visibility::Private
@@ -333,8 +363,18 @@ impl Authority {
                 .any(|p| cfg.github_sensitive_permissions.contains(p)),
             Authority::Kubernetes(k) => {
                 k.cluster
-                    || cfg.namespace_is_sensitive(resource)
+                    || resource.is_some_and(|r| cfg.namespace_is_sensitive(r))
                     || cfg.kubernetes_sensitive_roles.contains(&k.role)
+            }
+            // A named item marked sensitive.
+            Authority::Pool(PoolChoice::Item(item)) => resource.is_some_and(|pool| {
+                cfg.pool_sensitive_items
+                    .get(pool)
+                    .is_some_and(|items| items.contains(item))
+            }),
+            // Writing a calendar, or reading every file in a Drive.
+            Authority::Google { action } => {
+                matches!(action.as_str(), "calendar.write" | "drive.read")
             }
             Authority::Sandbox { access } => *access == ProjectAccess::Write,
             Authority::Hostexec(h) => {
@@ -363,6 +403,7 @@ impl Authority {
                 HostexecAuthority::Run { .. } | HostexecAuthority::Window { .. },
             ) => "run".to_owned(),
             Authority::Mcp { .. } | Authority::Models => "use".to_owned(),
+            Authority::Pool(_) => "lease".to_owned(),
         }
     }
 
@@ -397,6 +438,11 @@ impl Authority {
                 Value::Object(scope)
             }
             Authority::Mcp { tools } => json!({"tools": tools_json(tools)}),
+            Authority::Pool(PoolChoice::Item(item)) => json!({"item": item}),
+            Authority::Pool(PoolChoice::Previous) => json!({"previous": true}),
+            Authority::Pool(PoolChoice::Any(m)) if !m.is_empty() => {
+                json!({"match": match_json(m)})
+            }
             _ => json!({}),
         };
         match value {
@@ -456,6 +502,19 @@ impl Authority {
                 format!("run:{}", options.tier)
             }
             Authority::Hostexec(HostexecAuthority::Shell { tier }) => format!("shell:{tier}"),
+            Authority::Pool(PoolChoice::Item(item)) => format!("lease:{item}"),
+            Authority::Pool(PoolChoice::Previous) => "lease:previous".to_owned(),
+            Authority::Pool(PoolChoice::Any(m)) => {
+                if m.is_empty() {
+                    "lease:any".to_owned()
+                } else {
+                    let parts: Vec<String> = m
+                        .iter()
+                        .map(|(k, v)| format!("{k}={}", v.py_str()))
+                        .collect();
+                    format!("lease:{}", parts.join(","))
+                }
+            }
             other => {
                 let cap = other.capability();
                 if cap.is_empty() { "*".to_owned() } else { cap }
@@ -592,6 +651,7 @@ impl Authority {
                 only_keys(scope, &[], "a models grant takes no scope")?;
                 Ok(Authority::Models)
             }
+            Platform::Pool => pool_from_wire(capability, scope),
         }
     }
 
@@ -639,6 +699,19 @@ impl Authority {
             }
             Authority::Mcp { tools } => json!({"tools": tools_json(tools)}),
             Authority::Models => json!({"action": "use"}),
+            Authority::Pool(choice) => {
+                let (item, previous, m) = match choice {
+                    PoolChoice::Item(i) => (Some(i.as_str()), false, None),
+                    PoolChoice::Previous => (None, true, None),
+                    PoolChoice::Any(m) => (None, false, Some(m)),
+                };
+                json!({
+                    "action": "lease",
+                    "item": item,
+                    "previous": previous,
+                    "match": m.map_or_else(|| json!({}), match_json),
+                })
+            }
         }
     }
 
@@ -732,6 +805,22 @@ impl Authority {
                 }
             }
             Platform::Models => Authority::Models,
+            Platform::Pool => {
+                let item = match map.get("item") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(i)) => Some(i.clone()),
+                    Some(_) => return err("stored pool item"),
+                };
+                let previous = map.get("previous").and_then(Value::as_bool) == Some(true);
+                let m = match_from_json(map.get("match"))
+                    .map_err(|_| AuthorityError("stored pool match".into()))?;
+                Authority::Pool(match (item, previous) {
+                    (Some(i), false) if m.is_empty() => PoolChoice::Item(i),
+                    (None, true) if m.is_empty() => PoolChoice::Previous,
+                    (None, false) => PoolChoice::Any(m),
+                    _ => return err("stored pool choice"),
+                })
+            }
         };
         // Round-trip check: what we parsed must serialize back to exactly
         // what was stored, or the row held something we would not write.
@@ -764,6 +853,15 @@ pub fn rule_covers(rule: Option<&Authority>, request: &Authority) -> bool {
         ) => h.tier() == *tier,
         (Authority::Mcp { tools: allowed }, Authority::Mcp { tools: wanted }) => {
             allowed.covers(wanted)
+        }
+        // A rule for "any matching X" covers any, or the previous one, with
+        // at least X; never a named item (it may be one only a human
+        // leases). A rule for a named item or "previous" covers only itself.
+        (Authority::Pool(PoolChoice::Any(have)), Authority::Pool(PoolChoice::Any(want))) => {
+            match_covers(have, want)
+        }
+        (Authority::Pool(PoolChoice::Any(have)), Authority::Pool(PoolChoice::Previous)) => {
+            match_covers(have, &PropMatch::new())
         }
         _ => false,
     }
@@ -805,6 +903,76 @@ fn tools_json(tools: &ToolSet) -> Value {
         ToolSet::All => json!(["*"]),
         ToolSet::Some(set) => json!(set),
     }
+}
+
+fn match_json(m: &PropMatch) -> Value {
+    Value::Object(m.iter().map(|(k, v)| (k.clone(), v.to_json())).collect())
+}
+
+fn match_from_json(value: Option<&Value>) -> Result<PropMatch, AuthorityError> {
+    let bad = || AuthorityError("match maps a property to a value (or a list of strings)".into());
+    match value {
+        None | Some(Value::Null) => Ok(PropMatch::new()),
+        Some(Value::Object(map)) if map.len() <= MAX_MATCH_KEYS => map
+            .iter()
+            .map(|(k, v)| {
+                if k.is_empty() || k.chars().count() > MAX_PROP_CHARS {
+                    return Err(bad());
+                }
+                PropValue::from_json(v)
+                    .map(|v| (k.clone(), v))
+                    .ok_or_else(bad)
+            })
+            .collect(),
+        Some(_) => Err(bad()),
+    }
+}
+
+/// A pool lease: `{}` or `{"match": {...}}` for any matching item,
+/// `{"previous": true}`, or `{"item": "<name>"}` (one of them).
+fn pool_from_wire(
+    capability: &str,
+    scope: &Map<String, Value>,
+) -> Result<Authority, AuthorityError> {
+    if capability != "lease" {
+        return err("pool capability is \"lease\"");
+    }
+    let mut extra: Vec<&str> = scope
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !matches!(*k, "item" | "previous" | "match"))
+        .collect();
+    if !extra.is_empty() {
+        extra.sort_unstable();
+        let listed: Vec<String> = extra.iter().map(|k| crate::pyfmt::repr(k)).collect();
+        return err(format!(
+            "a pool scope has \"item\", \"previous\" or \"match\"; not [{}]",
+            listed.join(", ")
+        ));
+    }
+    let item = match scope.get("item") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(i)) if i.is_empty() => None,
+        Some(Value::String(i)) if i.chars().count() <= 128 => Some(i.clone()),
+        Some(_) => return err("item is an item's name"),
+    };
+    let previous = match scope.get("previous") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+        Some(Value::Bool(true)) => true,
+        Some(_) => return err("\"previous\" must be true or false"),
+    };
+    let m = match_from_json(scope.get("match"))?;
+    let choice = match (item, previous) {
+        (None, false) => PoolChoice::Any(m),
+        (Some(i), false) if m.is_empty() => PoolChoice::Item(i),
+        (None, true) if m.is_empty() => PoolChoice::Previous,
+        _ => {
+            return err(
+                "ask for one of: an \"item\" by name, the \"previous\" one, or any (with \"match\")",
+            );
+        }
+    };
+    Ok(Authority::Pool(choice))
 }
 
 fn github_from_wire(
@@ -1090,6 +1258,16 @@ mod tests {
                 tools: ToolSet::Some(["a".to_owned(), "b".to_owned()].into()),
             },
             Authority::Models,
+            Authority::Pool(PoolChoice::Any(PropMatch::new())),
+            Authority::Pool(PoolChoice::Any(
+                [
+                    ("edition".to_owned(), PropValue::Str("java".into())),
+                    ("tags".to_owned(), PropValue::List(vec!["optifine".into()])),
+                ]
+                .into(),
+            )),
+            Authority::Pool(PoolChoice::Previous),
+            Authority::Pool(PoolChoice::Item("alt-1".into())),
         ]
     }
 
@@ -1241,5 +1419,86 @@ mod tests {
             }
             .is_sensitive(&cfg, "p")
         );
+    }
+
+    #[test]
+    fn pool_scopes() {
+        let any = wire(Platform::Pool, "lease", json!({})).expect("any");
+        assert_eq!(any, Authority::Pool(PoolChoice::Any(PropMatch::new())));
+        assert_eq!(any.label(), "lease:any");
+        assert!(wire(Platform::Pool, "take", json!({})).is_err());
+        let both = wire(
+            Platform::Pool,
+            "lease",
+            json!({"item": "a", "previous": true}),
+        );
+        assert!(both.is_err_and(|e| e.0.starts_with("ask for one of")));
+        let extra = wire(Platform::Pool, "lease", json!({"colour": "red"}));
+        assert_eq!(
+            extra,
+            Err(AuthorityError(
+                "a pool scope has \"item\", \"previous\" or \"match\"; not ['colour']".into()
+            ))
+        );
+        assert!(wire(Platform::Pool, "lease", json!({"item": 3})).is_err());
+        assert!(wire(Platform::Pool, "lease", json!({"match": {"a": {"b": 1}}})).is_err());
+        let m = wire(
+            Platform::Pool,
+            "lease",
+            json!({"match": {"tags": ["x"], "n": 2}}),
+        )
+        .expect("match");
+        assert_eq!(m.label(), "lease:n=2,tags=['x']");
+        // An empty item is no item (the Python's `or None`).
+        assert_eq!(wire(Platform::Pool, "lease", json!({"item": ""})), Ok(any));
+    }
+
+    #[test]
+    fn pool_coverage() {
+        let pool = |scope: Value| wire(Platform::Pool, "lease", scope).expect("pool");
+        let rule = pool(json!({"match": {"edition": "java"}}));
+        let narrower = pool(json!({"match": {"edition": "java", "tags": "optifine"}}));
+        let other = pool(json!({"match": {"edition": "bedrock"}}));
+        let named = pool(json!({"item": "main"}));
+        let previous = pool(json!({"previous": true}));
+        assert!(rule_covers(Some(&rule), &narrower));
+        assert!(!rule_covers(Some(&rule), &other));
+        assert!(!rule_covers(Some(&rule), &named));
+        let any_rule = pool(json!({}));
+        assert!(rule_covers(Some(&any_rule), &previous));
+        assert!(!rule_covers(Some(&any_rule), &named));
+        assert!(!rule_covers(Some(&rule), &previous));
+        assert!(rule_covers(Some(&named), &named));
+        assert!(!rule_covers(Some(&previous), &any_rule));
+        assert!(named.needs_explicit_rule());
+    }
+
+    #[test]
+    fn pool_and_google_sensitivity() {
+        let mut cfg = SensitivityConfig::default();
+        cfg.pool_sensitive_items
+            .insert("minecraft".into(), ["main".to_owned()].into());
+        let named = Authority::Pool(PoolChoice::Item("main".into()));
+        assert!(named.is_sensitive(&cfg, "minecraft"));
+        assert!(named.sensitive_by_resource(&cfg, "minecraft"));
+        assert!(!named.is_sensitive(&cfg, "other"));
+        let alt = Authority::Pool(PoolChoice::Item("alt-1".into()));
+        assert!(!alt.is_sensitive(&cfg, "minecraft"));
+        let google = |a: &str| Authority::Google { action: a.into() };
+        assert!(!google("calendar.read").is_sensitive(&cfg, "main"));
+        assert!(google("calendar.write").is_sensitive(&cfg, "main"));
+        assert!(google("drive.read").is_sensitive(&cfg, "main"));
+        assert!(!google("drive.read").sensitive_by_resource(&cfg, "main"));
+        assert!(google("calendar.read").needs_explicit_rule());
+        // A sensitive namespace is the resource's doing; an edit role is not.
+        let k8s = |role: &str| {
+            Authority::Kubernetes(KubernetesAuthority {
+                role: role.into(),
+                cluster: false,
+            })
+        };
+        assert!(k8s("view").sensitive_by_resource(&cfg, "kube-system"));
+        assert!(!k8s("edit").sensitive_by_resource(&cfg, "kube-system"));
+        assert!(!k8s("view").sensitive_by_resource(&cfg, "apps"));
     }
 }

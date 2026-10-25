@@ -119,6 +119,12 @@ pub struct PolicyDecision {
     /// A saved rule pinned to an authority covering this one: the only
     /// thing that clears a sensitive authority without a human.
     pub pinned: bool,
+    /// A pinned saved rule whose resource pattern is exactly the request's
+    /// resource: the only rule that clears a request sensitive because of
+    /// its resource (a sensitive namespace, a pool's sensitive item), so a
+    /// rule saved for `apps-*` never opens `apps-system` (the Python's
+    /// `rule_resource` / `pinned_here`).
+    pub names_resource: bool,
     /// The rule names this privilege (pinned, or a policy rule for this
     /// platform whose capability is literally the request's).
     pub explicit: bool,
@@ -133,6 +139,7 @@ struct Sealed {
     action: PolicyAction,
     pinned: bool,
     explicit: bool,
+    names_resource: bool,
     source: DecisionSource,
     authority: Authority,
     resource: String,
@@ -142,14 +149,14 @@ impl Sealed {
     fn of(
         input: &PolicyInput<'_>,
         action: PolicyAction,
-        pinned: bool,
-        explicit: bool,
+        strength: RuleStrength,
         matched: Matched,
     ) -> Sealed {
         Sealed {
             action,
-            pinned,
-            explicit,
+            pinned: strength.pinned,
+            explicit: strength.explicit,
+            names_resource: strength.names_resource,
             source: match matched {
                 Matched::SavedRule(_) => DecisionSource::Rule,
                 Matched::PolicyRule(_) | Matched::Default => DecisionSource::Policy,
@@ -203,6 +210,31 @@ pub fn default_action(configured: PolicyAction, delegated: bool) -> PolicyAction
     }
 }
 
+/// A rule's resource pattern as matched for `platform`. GitHub names are
+/// case-insensitive and its resources are lowercased, so its patterns are
+/// lowercased too (a rule for `JRT/*`, a project's `JRT/App`, would
+/// otherwise never match `jrt/app`).
+fn resource_glob(platform: Platform, pattern: &str) -> Glob {
+    if platform == Platform::Github {
+        Glob::new(&pattern.to_lowercase())
+    } else {
+        Glob::new(pattern)
+    }
+}
+
+/// Is a saved rule's resource pattern exactly this resource: the resource
+/// as a literal glob (how a decision's "exact" rule stores it, so `team*`
+/// is `team[*]`), compared lowercased for GitHub? A pattern that merely
+/// matches it (`apps-*`) is not.
+fn same_resource(platform: Platform, pattern: &str, resource: &str) -> bool {
+    let literal = crate::glob::escape(resource);
+    if platform == Platform::Github {
+        pattern.to_lowercase() == literal
+    } else {
+        pattern == literal
+    }
+}
+
 /// The request after the gates: the route, which gates fired, and the risk
 /// notes to append (in order).
 #[derive(Debug, PartialEq, Eq)]
@@ -235,7 +267,7 @@ impl Policy {
             let resource_ok = || {
                 resources_for(&m.resource, &input.agent, self.projects())
                     .iter()
-                    .any(|r| Glob::new(r).matches(input.resource))
+                    .any(|r| resource_glob(input.platform(), r).matches(input.resource))
             };
             let matches = m.agent.matches(&input.agent)
                 && m.capability.matches(&capability)
@@ -272,9 +304,18 @@ impl Policy {
                     .unwrap_or_else(|| self.llm().model.clone()),
                 retry_budget: c.retry_budget.unwrap_or(self.llm().retry_budget),
                 pinned: false,
+                names_resource: false,
                 explicit,
                 window: false,
-                sealed: Sealed::of(input, rule.action, false, explicit, Matched::PolicyRule(i)),
+                sealed: Sealed::of(
+                    input,
+                    rule.action,
+                    RuleStrength {
+                        explicit,
+                        ..RuleStrength::NONE
+                    },
+                    Matched::PolicyRule(i),
+                ),
             };
         }
         let action = default_action(self.defaults().action, input.delegation.is_delegated());
@@ -286,9 +327,10 @@ impl Policy {
             llm_model: self.llm().model.clone(),
             retry_budget: self.llm().retry_budget,
             pinned: false,
+            names_resource: false,
             explicit: false,
             window: false,
-            sealed: Sealed::of(input, action, false, false, Matched::Default),
+            sealed: Sealed::of(input, action, RuleStrength::NONE, Matched::Default),
         }
     }
 
@@ -308,7 +350,7 @@ impl Policy {
                 && rule.platform == platform
                 && rule.expires_at.is_none_or(|e| e > now)
                 && rule.agent_pattern.matches(input.agent.name)
-                && rule.resource_pattern.matches(input.resource)
+                && resource_glob(platform, rule.resource_pattern.as_str()).matches(input.resource)
                 && delegator_axis(
                     rule.delegator_pattern.is_some(),
                     fits,
@@ -318,6 +360,12 @@ impl Policy {
                 && rule_covers(rule.authority.as_ref(), input.authority)
         })?;
         let pinned = rule.authority.is_some();
+        let strength = RuleStrength {
+            pinned,
+            explicit: pinned,
+            names_resource: pinned
+                && same_resource(platform, rule.resource_pattern.as_str(), input.resource),
+        };
         let action = match rule.action {
             SavedRuleAction::AutoApprove => PolicyAction::Approve,
             SavedRuleAction::AutoDeny => PolicyAction::Deny,
@@ -334,12 +382,13 @@ impl Policy {
             llm_model: self.llm().model.clone(),
             retry_budget: self.llm().retry_budget,
             pinned,
+            names_resource: strength.names_resource,
             explicit: pinned,
             window: matches!(
                 rule.authority,
                 Some(Authority::Hostexec(HostexecAuthority::Window { .. }))
             ),
-            sealed: Sealed::of(input, action, pinned, pinned, Matched::SavedRule(rule.id)),
+            sealed: Sealed::of(input, action, strength, Matched::SavedRule(rule.id)),
         })
     }
 
@@ -354,6 +403,9 @@ impl Policy {
             sensitive: input
                 .authority
                 .is_sensitive(&self.sensitivity(), input.resource),
+            sensitive_by_resource: input
+                .authority
+                .sensitive_by_resource(&self.sensitivity(), input.resource),
             needs_explicit_rule: input.authority.needs_explicit_rule(),
         }
     }
@@ -380,6 +432,7 @@ impl Policy {
                 RuleStrength {
                     pinned: sealed.pinned,
                     explicit: sealed.explicit,
+                    names_resource: sealed.names_resource,
                 },
             )
         } else if sealed.action == PolicyAction::Deny {

@@ -97,12 +97,14 @@ fn routed_decisions_only_downgrade() {
     let strength = RuleStrength {
         pinned: kani::any(),
         explicit: kani::any(),
+        names_resource: kani::any(),
     };
     let facts = GateFacts {
         zone_requires_human: kani::any(),
         human_only: kani::any(),
         web_connector: kani::any(),
         sensitive: kani::any(),
+        sensitive_by_resource: kani::any(),
         needs_explicit_rule: kani::any(),
     };
     let routed = gate(proposed, strength, facts);
@@ -112,6 +114,7 @@ fn routed_decisions_only_downgrade() {
     if result.is_auto() {
         assert!(!facts.zone_requires_human && !facts.human_only && !facts.web_connector);
         assert!(!facts.sensitive || strength.pinned);
+        assert!(!facts.sensitive || !facts.sensitive_by_resource || strength.names_resource);
         assert!(!facts.needs_explicit_rule || strength.explicit);
     }
 }

@@ -21,6 +21,7 @@ pub mod lifecycle;
 pub mod names;
 pub mod platform;
 pub mod policy;
+pub mod pool;
 #[cfg(kani)]
 mod proofs;
 #[cfg(kani)]
