@@ -51,14 +51,55 @@ where
         .unwrap_or_else(Instant::now);
     // The first slice is exact (no clock read in between).
     let mut left = total;
+    let mut last: Option<T> = None;
+    let mut backoff = RETRY_FIRST;
     loop {
-        let out = fetch(left.min(POLL_SLICE)).await?;
+        let out = match fetch(left.min(POLL_SLICE)).await {
+            Ok(out) => out,
+            // The broker answered once and is now away (a shutdown answers
+            // every long-poll at once, then the broker restarts): keep
+            // waiting through the restart, until the deadline.
+            Err(e) if is_transient(&e) => match last.take() {
+                Some(prev) if Instant::now() < deadline => {
+                    let wait = deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(backoff);
+                    tokio::time::sleep(wait).await;
+                    backoff = backoff.saturating_mul(2).min(RETRY_MAX);
+                    left = deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_secs_f64();
+                    last = Some(prev);
+                    continue;
+                }
+                Some(prev) => return Ok(prev),
+                None => return Err(e),
+            },
+            Err(e) => return Err(e),
+        };
         if settled(&out) || Instant::now() >= deadline {
             return Ok(out);
         }
+        backoff = RETRY_FIRST;
+        last = Some(out);
         left = deadline
             .saturating_duration_since(Instant::now())
             .as_secs_f64();
+    }
+}
+
+/// The first pause before asking a broker that went away again.
+const RETRY_FIRST: Duration = Duration::from_secs(1);
+/// The longest pause between those attempts.
+const RETRY_MAX: Duration = Duration::from_secs(8);
+
+/// The broker is away for now: no connection, or a proxy in front of it
+/// saying so.
+fn is_transient(e: &ClientError) -> bool {
+    match e {
+        ClientError::Transport(_) => true,
+        ClientError::Broker { status, .. } => matches!(status, 502..=504),
+        ClientError::Decode(_) => false,
     }
 }
 
@@ -149,6 +190,71 @@ mod tests {
         let asked = run(f64::INFINITY, None).await;
         assert_eq!(asked.len(), 1440);
         assert!(asked.iter().all(|s| *s <= POLL_SLICE));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_broker_restart_is_waited_through() {
+        // Answered (still waiting), then away twice, then answered settled.
+        let calls = RefCell::new(0usize);
+        let out = sliced(
+            300.0,
+            |_| {
+                *calls.borrow_mut() += 1;
+                let n = *calls.borrow();
+                async move {
+                    match n {
+                        2 => Err(ClientError::Transport("refused".into())),
+                        3 => Err(ClientError::broker(502, "bad gateway")),
+                        _ => Ok(n),
+                    }
+                }
+            },
+            |n| *n >= 4,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unreachable_broker_is_still_an_error() {
+        // Never answered: the error, at once.
+        let r = sliced(
+            300.0,
+            |_| async { Err::<(), _>(ClientError::Transport("refused".into())) },
+            |()| false,
+        )
+        .await;
+        assert!(matches!(r, Err(ClientError::Transport(_))));
+        // Answered, then away until the deadline: the last answer.
+        let calls = RefCell::new(0usize);
+        let started = Instant::now();
+        let r = sliced(
+            30.0,
+            |_| {
+                *calls.borrow_mut() += 1;
+                let n = *calls.borrow();
+                async move {
+                    if n == 1 {
+                        Ok(n)
+                    } else {
+                        Err(ClientError::Transport("refused".into()))
+                    }
+                }
+            },
+            |_| false,
+        )
+        .await;
+        assert_eq!(r.unwrap(), 1);
+        assert!(started.elapsed() >= Duration::from_secs(30));
+        // Other refusals are not retried.
+        let r = sliced(
+            30.0,
+            |_| async { Err::<(), _>(ClientError::broker(403, "no")) },
+            |()| false,
+        )
+        .await;
+        assert!(matches!(r, Err(ClientError::Broker { status: 403, .. })));
     }
 
     #[tokio::test(start_paused = true)]

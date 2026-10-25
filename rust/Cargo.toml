@@ -30,7 +30,6 @@ tokio = { version = "1.54.1", default-features = false }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "form", "tokio", "matched-path"] }
 tower = { version = "0.5.3", default-features = false }
 tower-http = { version = "0.7.1", default-features = false, features = ["limit", "timeout", "set-header"] }
-hyper = { version = "1.12.0", default-features = false }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 webpki-roots = { version = "1.0.11", default-features = false }
@@ -62,7 +61,6 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 # Hidden input for the operator's TOTP and arm codes (termios, /dev/tty).
 rpassword = { version = "7.5.4", default-features = false }
 futures = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
-bytes = { version = "1.12.1", default-features = false, features = ["std"] }
 zeroize = { version = "1.9.1", default-features = false, features = ["alloc", "derive"] }
 rmcp = { version = "3.5.1", default-features = false }
 # Constants only (open flags for no-follow directory handles in sandboxd);

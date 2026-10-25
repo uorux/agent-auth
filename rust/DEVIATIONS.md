@@ -1009,7 +1009,12 @@ and why. Keep entries short. Group by area.
   waiting on them) answers 200 with its current state as soon as the
   signal arrives (`AppState::shutdown`); other open requests get 10 s
   (`server::DRAIN`). Then the broker stops the scheduler, settles LLM
-  evaluations (10 s), releases its lock and exits.
+  evaluations (10 s), releases its lock and exits. The client's sliced
+  waits (`wait`, `wait_for_decision`, a2a polls, host job waits) keep
+  waiting through the restart: once the broker has answered, a refused
+  connection or a proxy's 502–504 is retried (1 s, doubling to 8 s) until
+  the wait's deadline, which returns the last answer. A broker that never
+  answered is still an error at once.
 
 ## Daemons, hostd and hostexec (`crates/daemon`, `crates/hostd`, broker `daemons`, `hostexec`, `desktop`, `attention`)
 

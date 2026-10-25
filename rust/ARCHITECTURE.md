@@ -161,7 +161,7 @@ pod while the old one holds the lock).
 1. Work in your own worktree:
    `git -C /home/jrt/Documents/agent-auth worktree add /home/jrt/Documents/agent-auth/.claude/worktrees/rust-<part> -b rust-<part> rust-port`
    and do everything there (never in another checkout).
-2. Toolchain: prefix commands with `nix develop /home/jrt/Documents/agent-auth/.claude/worktrees/rust-<part>/rust#default -c` (or `#nightly` for miri/fuzz).
+2. Toolchain: prefix commands with `nix develop /home/jrt/Documents/agent-auth/.claude/worktrees/rust-<part>/rust#default -c` (or `#nightly` for miri/fuzz; `scripts/miri.sh` runs core and wire under Miri).
 3. Database: `scripts/pg.sh start` prints a `DATABASE_URL` (one server per worktree).
 4. Before finishing: `scripts/check.sh` must pass (or say exactly what fails
    and why). Commit on your branch with a message saying what and why, ending with
