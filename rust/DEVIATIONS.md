@@ -822,6 +822,13 @@ and why. Keep entries short. Group by area.
   advisory lock; a second one exits — B-19, ARCHITECTURE.md "Deployment").
   `./.env` is read without changing the process environment (no `set_var`):
   parts that read the environment themselves see only the real one.
+- **Shutdown drains for at most 10 s** (found by the e2e suite). On SIGTERM
+  the Python's uvicorn waited for every open request, so one agent's
+  long-poll (`wait`, a2a `poll`/`events`: up to 300 s) held the shutdown
+  past Kubernetes' 30 s grace and the pod was killed. Now open requests get
+  10 s (`server::DRAIN`), then the broker stops the scheduler, settles LLM
+  evaluations (10 s), releases its lock and exits; a cut-off long-poll
+  sees its connection close and polls again.
 
 ## Open questions
 

@@ -27,6 +27,10 @@ use crate::state::AppState;
 
 /// How long shutdown waits for background LLM evaluations.
 const SETTLE: Duration = Duration::from_secs(10);
+/// How long requests still open at a signal may run on (long-polls hold
+/// theirs up to 300 s). DRAIN + SETTLE stays inside Kubernetes' default
+/// 30 s grace period.
+pub const DRAIN: Duration = Duration::from_secs(10);
 
 /// The enabled provisioners (provisioners spec §1.3) and the provisioners'
 /// shared services: a2a always, the others when configured
@@ -142,6 +146,42 @@ async fn shutdown_signal() {
     tracing::info!("shutting down");
 }
 
+/// Serve `app` until `signal`, then let open requests finish for at most
+/// `drain`; then return, leaving requests still open (long-polls) to end
+/// with the runtime when `main` returns. Without the bound, one agent's long-poll held the
+/// shutdown for up to 300 s.
+pub async fn serve_until(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    signal: impl std::future::Future<Output = ()> + Send + 'static,
+    drain: Duration,
+) -> std::io::Result<()> {
+    let (signalled_tx, signalled_rx) = tokio::sync::oneshot::channel::<()>();
+    let served = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        signal.await;
+        let _ = signalled_tx.send(());
+    });
+    let drained = async move {
+        if signalled_rx.await.is_ok() {
+            tokio::time::sleep(drain).await;
+        } else {
+            // The server ended without a signal: its own branch finishes.
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        served = served.into_future() => served,
+        () = drained => {
+            tracing::warn!(?drain, "requests still open after the signal (long-polls); closing them");
+            Ok(())
+        }
+    }
+}
+
 /// Run the broker until a signal (or the server failing).
 pub async fn run(env: Env) -> anyhow::Result<()> {
     let config = Config::from_env(&env)?;
@@ -233,12 +273,7 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
         .with_context(|| format!("binding {addr}"))?;
     tracing::info!(%addr, "agent-auth broker listening");
     let app = crate::http::router(state.clone());
-    let served = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await;
+    let served = serve_until(listener, app, shutdown_signal(), DRAIN).await;
 
     let _ = stop_tx.send(true);
     if let Err(e) = scheduler.await {
@@ -257,4 +292,78 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
         tracing::warn!(error = %e, "releasing the instance lock");
     }
     served.context("HTTP server")
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn server(
+        drain: Duration,
+    ) -> (
+        SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        let app = axum::Router::new()
+            .route(
+                "/slow",
+                axum::routing::get(|| async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    "late"
+                }),
+            )
+            .route("/fast", axum::routing::get(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(serve_until(
+            listener,
+            app,
+            async {
+                let _ = rx.await;
+            },
+            drain,
+        ));
+        (addr, tx, task)
+    }
+
+    #[tokio::test]
+    async fn a_long_poll_does_not_hold_the_shutdown() {
+        let (addr, stop, task) = server(Duration::from_millis(300)).await;
+        let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        conn.write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = std::time::Instant::now();
+        stop.send(()).unwrap();
+        let served = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(served.is_ok());
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        // (Its connection task ends with the runtime, when main returns.)
+    }
+
+    #[tokio::test]
+    async fn finished_requests_stop_at_once() {
+        let (addr, stop, task) = server(Duration::from_secs(30)).await;
+        let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        conn.write_all(b"GET /fast HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answer = Vec::new();
+        conn.read_to_end(&mut answer).await.unwrap();
+        assert!(answer.starts_with(b"HTTP/1.1 200"));
+        stop.send(()).unwrap();
+        let served = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(served.is_ok());
+    }
 }
