@@ -1252,7 +1252,7 @@ fn defaults_are_the_pythons() {
     assert_eq!(p.platforms().agents.lease.get(), 30 * 86_400);
     assert_eq!(p.platforms().hostexec.window_max.get(), 8 * 3600);
     assert_eq!(p.desktop().timeout.get(), 90);
-    assert_eq!(p.remote_mcp().tools.len(), 22);
+    assert_eq!(p.remote_mcp().tools.len(), 23);
     assert_eq!(p.remote_mcp().refresh_ttl.get(), 30 * 86_400);
     assert_eq!(p.wiki().max_page_bytes, 65_536);
     assert!(p.platforms().homelab.managed_accounts);

@@ -230,6 +230,7 @@ mod tests {
             K::ProjectAccess,
             K::HostexecShell,
             K::HostexecJob,
+            K::PoolItem,
         ];
         for k in all {
             match k {
@@ -244,7 +245,8 @@ mod tests {
                 | K::AgentIdentity
                 | K::ProjectAccess
                 | K::HostexecShell
-                | K::HostexecJob => {}
+                | K::HostexecJob
+                | K::PoolItem => {}
             }
         }
         all.to_vec()
@@ -260,6 +262,7 @@ mod tests {
             K::LldapAccount,
             K::McpToken,
             K::ModelGatewayKey,
+            K::PoolItem,
         ];
         for (i, kind) in all_kinds().into_iter().enumerate() {
             let credential = CredentialOut {
@@ -269,6 +272,7 @@ mod tests {
                 url: None,
                 expires_at: None,
                 note: None,
+                properties: None,
             };
             let grant = format!("g-{i}");
             let delivered = deliver(&dir, &grant, credential).unwrap();

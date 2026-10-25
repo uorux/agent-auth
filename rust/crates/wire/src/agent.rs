@@ -181,6 +181,15 @@ pub struct GrantOut {
     pub delegation_thread_id: Option<ThreadId>,
 }
 
+/// `POST /v1/grants/{id}/release`: `{"released": true}`, or
+/// `{"released": false, "status": ...}` for a grant that had already ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseOut {
+    pub released: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<GrantStatus>,
+}
+
 /// What `GET /v1/grants/{id}/credential` hands out, per platform
 /// (provisioners spec).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -210,10 +219,13 @@ pub enum CredentialKind {
     HostexecShell,
     /// A run/tpl job: `value` is a JSON summary ([`crate::hostexec::JobSummary`]).
     HostexecJob,
+    /// A pool item leased: its secret in `value`, its properties in
+    /// `properties`.
+    PoolItem,
 }
 
-/// `GET /v1/grants/{id}/credential` (Python `CredentialOut`). All six keys
-/// always present.
+/// `GET /v1/grants/{id}/credential` (Python `CredentialOut`). All seven
+/// keys always present.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CredentialOut {
     pub kind: CredentialKind,
@@ -225,6 +237,10 @@ pub struct CredentialOut {
     #[serde(default, with = "crate::timestamp::option")]
     pub expires_at: Option<OffsetDateTime>,
     pub note: Option<String>,
+    /// What the credential is for, when that is part of it (a pool item's
+    /// properties).
+    #[serde(default)]
+    pub properties: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl CredentialOut {
@@ -238,6 +254,7 @@ impl CredentialOut {
             url: None,
             expires_at: None,
             note: Some(note.into()),
+            properties: None,
         }
     }
 }

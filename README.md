@@ -25,6 +25,7 @@ agent ──HTTP/MCP/CLI──▶ broker ──policy──▶ deny | approve | 
 | `a2a`     | `talk`        | target agent name   | authorizes OPENING conversation threads to that (service) agent — see [a2a threads](#a2a-threads); no credential is minted |
 | `hostexec` | `run`, `tpl.<name>`, `shell` | host name | one command (or a time-boxed shell) **on a host**, run by that host's daemon — see [Commands on hosts](#commands-on-hosts-hostexec). The host decides, with its own TOTP secrets and policy; root and shells always reach a human |
 | `models`  | `use`         | gateway name (`litellm`) | a LiteLLM virtual key of the agent's own, under a LiteLLM user named after it — see [Model gateway](#model-gateway-litellm). Deleted at revoke (LiteLLM keeps it, with its spend, among its deleted keys); the gateway also ends it at the grant's end |
+| `pool`    | `lease`       | pool name (`minecraft`) | one item of a pool of scarce things (accounts, licences), held by this grant alone: any, one with given properties, the one held last time, or one by name — see [Pools](#pools-scarce-things) |
 | `google`  | `calendar.read`, `calendar.write`, `drive.read` | account name or address | a short-lived Google API token with just that scope (account-wide, by Google's design); a stub when no account is configured. Gmail is never a token — see [Google](#google) |
 
 Note the Gitea flow: the broker grants the homelab agent the `svc-gitea` LLDAP
@@ -81,7 +82,7 @@ interfaces, all wrapping the same HTTP API:
   The server sends orientation instructions on connect (clients that defer
   MCP tools show agents only tool names until loaded, so the workflow lives
   there). Tools: `whoami`, `list_capabilities`, `request_access`, `wait_for_decision`,
-  `retry_request`, `escalate_request`, `get_credential`, `list_grants`,
+  `retry_request`, `escalate_request`, `get_credential`, `list_grants`, `release_grant`,
   `create_session`, `close_session`, `check_a2a`, `a2a_open`, `a2a_send`,
   `a2a_poll`, `a2a_threads`, `a2a_accept`, `a2a_reject`, `a2a_close`,
   `a2a_events`. Runtimes that share ONE MCP process across conversations
@@ -109,6 +110,8 @@ interfaces, all wrapping the same HTTP API:
    the agent's user can read and returns its path (and, for GitHub, a git
    `credential.helper` that reads it), so the token is neither in the
    conversation nor on a command line.
+5. Done early? `release_grant(grant_id)` (`POST /v1/grants/{id}/release`)
+   ends it now: a pool item goes back for the next agent.
 
 ## a2a threads
 
@@ -646,6 +649,50 @@ anything in that tier. Disarmed and without codes it can run only the
 Not yet run on a real host: the systemd-run paths (the user tier's in
 particular). The tests drive the real daemon with a fake executor.
 
+## Pools (scarce things)
+
+Things only one agent should hold at a time (game accounts, licences, a
+test device): platform `pool`, capability `lease`, resource the pool.
+
+```yaml
+platforms:
+  pools:
+    minecraft:
+      description: Minecraft Java accounts for the bots
+      agents: [{project: mc-bots}]      # who may lease at all (empty: anyone)
+      max_per_agent: 1
+      # capacity: 1                     # holders of one item at once
+      items:
+        alt-1:
+          properties: {edition: java, username: AltOne, tags: [survival]}
+          secret_file: /run/credentials/agent-auth.service/mc-alt-1
+        main:
+          properties: {edition: java, username: TheMain}
+          secret_file: /run/credentials/agent-auth.service/mc-main
+          sensitive: true                # only by name, always a human
+rules:
+  - match: {agent: {project: mc-bots}, platform: pool, capability: lease, resource: minecraft}
+    action: approve
+    constraints: {max_duration: 8h}
+```
+
+- **Which one.** Scope `{}` takes any free item (the one the agent held last
+  first), `{"match": {"edition": "java", "tags": "survival"}}` one with those
+  properties (a list property matches a value it contains), `{"previous":
+  true}` the one it held last time, `{"item": "alt-1"}` that one. Sensitive
+  items are never picked unless named. The catalog lists each pool's items,
+  their properties, whether each is free, when a held one frees up, and
+  which one the agent held last.
+- **Holding.** The item is chosen when the grant is provisioned, and a unique
+  (pool, item, slot) lease row keeps two grants from one slot whatever
+  races. Everything taken: provisioning fails with when the first one frees.
+  The credential is the item's `secret_file`, verbatim, with its
+  properties. `release_grant` gives it back early.
+
+What it does not protect against: a credential once handed out can be kept.
+Exclusivity holds for agents that use what the broker hands them; changing
+an account's password after each lease is not done for you.
+
 ## Google
 
 `platforms.google.accounts` are the Google logins the broker holds: an OAuth
@@ -874,7 +921,7 @@ remote_mcp:
   The panel's **Web connectors** tab (or `agent-auth admin connectors`,
   `connector-revoke`) lists them and revokes a connector at once.
 - **Tools.** By default: whoami, the catalog, requesting access and following
-  decisions, a2a threads, reading the wiki, notify_operator. Not
+  decisions, release_grant, a2a threads, reading the wiki, notify_operator. Not
   get_credential: a token would land in a third party's chat history. Not
   host commands or wiki writes. Waiting tools return after 50 s at most here
   (Cloudflare ends longer requests) and tell the model to call again.

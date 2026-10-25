@@ -53,6 +53,8 @@
 //!    writers lock `ORDER BY id FOR NO KEY UPDATE` first);
 //!    Then the **LLDAP membership lock** (`lldap::lock_membership`, an
 //!    advisory lock per agent and group), after the grant it acts for;
+//!    likewise the **pool lock** (`pool::lock_pool`, an advisory lock per
+//!    pool), after the grant being provisioned;
 //! 5. **a2a threads** (a thread is locked after the grants it depends on;
 //!    look the backing grant id up without a lock, lock the grant, then the
 //!    thread);
@@ -83,6 +85,7 @@ pub mod lldap;
 pub mod llm;
 pub mod lockdown;
 pub mod oauth;
+pub mod pool;
 pub mod requests;
 pub mod rules;
 pub mod sandboxes;

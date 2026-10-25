@@ -7,7 +7,8 @@ use agent_auth_core::{GrantId, RequestId};
 use agent_auth_store::grants::{self, NotIssuable};
 use agent_auth_store::requests;
 use agent_auth_wire::agent::{
-    CredentialKind, CredentialOut, GrantOut, Me, RequestCreate, RequestOut, RetryBody, SessionRef,
+    CredentialKind, CredentialOut, GrantOut, Me, ReleaseOut, RequestCreate, RequestOut, RetryBody,
+    SessionRef,
 };
 use agent_auth_wire::query::GrantFilter;
 use agent_auth_wire::secret::WireSecret;
@@ -283,7 +284,47 @@ async fn credential(
         url: cred.url,
         expires_at: cred.expires_at,
         note: cred.note,
+        properties: cred.properties,
     }))
+}
+
+/// `POST /v1/grants/{id}/release`: an agent ends one of its own grants
+/// early (done with it: a pool item others are waiting for, a token).
+/// Ending access is always allowed, contained or not; nothing comes back.
+async fn release(
+    State(st): State<AppState>,
+    caller: AgentCaller,
+    Path(id): Path<String>,
+) -> ApiResult<Json<ReleaseOut>> {
+    let unknown = || ApiError::not_found("unknown grant");
+    let grant_id: GrantId = id.parse().map_err(|_| unknown())?;
+    {
+        let tx = st.store.begin().await?;
+        if grants::get_owned(&tx, caller.id(), grant_id)
+            .await?
+            .is_none()
+        {
+            return Err(unknown());
+        }
+    }
+    match service::revoke_grant(&st, grant_id, "released by the agent", &caller.agent().name).await
+    {
+        Ok(_) => Ok(Json(ReleaseOut {
+            released: true,
+            status: None,
+        })),
+        Err(service::ServiceError::Transition(_)) => {
+            let tx = st.store.begin().await?;
+            let status = grants::get_owned(&tx, caller.id(), grant_id)
+                .await?
+                .map(|g| g.status);
+            Ok(Json(ReleaseOut {
+                released: false,
+                status,
+            }))
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub fn routes() -> Router<AppState> {
@@ -297,4 +338,5 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/requests/{id}/escalate", post(escalate))
         .route("/v1/grants", get(list_grants))
         .route("/v1/grants/{id}/credential", get(credential))
+        .route("/v1/grants/{id}/release", post(release))
 }

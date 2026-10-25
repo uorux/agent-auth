@@ -8,7 +8,9 @@ use agent_auth_store::agents::AgentRow;
 use serde_json::{Map, Value};
 
 use super::serialize::CATALOG_ORDER;
-use crate::provisioners::Provisioner;
+use agent_auth_wire::catalog::PlatformCatalog;
+
+use crate::provisioners::{AnyProvisioner, Provisioner};
 use crate::service::disposition;
 use crate::state::AppState;
 
@@ -37,6 +39,26 @@ pub async fn catalog(st: &AppState, agent: &AgentRow) -> Result<Value, StoreErro
         if platform == Platform::A2a {
             let entry = crate::a2a::catalog_entry(st, &tx, agent, st.now()).await?;
             platforms.push(serde_json::to_value(entry).unwrap_or(Value::Null));
+            continue;
+        }
+        if let AnyProvisioner::Pool(pool) = p {
+            // Listed only when the agent may lease from some pool.
+            let pools = pool.status(&tx, agent).await?;
+            if pools.is_empty() {
+                continue;
+            }
+            let mut c = PlatformCatalog::new(
+                Platform::Pool,
+                "lease (scope {} for any, {\"match\": {...}}, {\"previous\": true}, or {\"item\": name})",
+                "<pool>",
+            );
+            let d = disposition_of(st, &tx, agent, platform, "lease")
+                .await?
+                .and_then(|d| d.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "human review".to_owned());
+            c.capabilities = Some(vec![format!("lease ({d})")]);
+            c.pools = Some(pools);
+            platforms.push(serde_json::to_value(c).unwrap_or(Value::Null));
             continue;
         }
         let Some(Value::Object(mut entry)) = p.catalog(agent) else {

@@ -203,6 +203,7 @@ fn credential_kind() -> impl Strategy<Value = CredentialKind> {
         CredentialKind::ProjectAccess,
         CredentialKind::HostexecShell,
         CredentialKind::HostexecJob,
+        CredentialKind::PoolItem,
     ]
 }
 fn lockdown_scope() -> impl Strategy<Value = LockdownScope> {
@@ -352,6 +353,7 @@ fn credential_out() -> impl Strategy<Value = CredentialOut> {
                 url,
                 expires_at,
                 note,
+                properties: None,
             },
         )
 }
@@ -1292,7 +1294,8 @@ fn credential_out_keeps_null_keys() {
         serde_json::to_value(&a2a).unwrap(),
         json!({"kind": "a2a_grant", "value": null, "username": null, "url": null,
                "expires_at": null,
-               "note": "a2a grants are check-based; open a thread via POST /v1/a2a/threads"})
+               "note": "a2a grants are check-based; open a thread via POST /v1/a2a/threads",
+               "properties": null})
     );
     let token = CredentialOut {
         kind: CredentialKind::GithubInstallationToken,
@@ -1301,6 +1304,7 @@ fn credential_out_keeps_null_keys() {
         url: None,
         expires_at: Some(OffsetDateTime::UNIX_EPOCH),
         note: None,
+        properties: None,
     };
     assert!(!format!("{token:?}").contains("ghs_secret"));
     assert_eq!(

@@ -111,7 +111,7 @@ pub async fn grant_out(
 }
 
 /// The fixed order of the catalog's platforms (http-api §4).
-pub const CATALOG_ORDER: [Platform; 10] = [
+pub const CATALOG_ORDER: [Platform; 11] = [
     Platform::Github,
     Platform::Agents,
     Platform::Sandbox,
@@ -121,6 +121,7 @@ pub const CATALOG_ORDER: [Platform; 10] = [
     Platform::Homelab,
     Platform::Kubernetes,
     Platform::A2a,
+    Platform::Pool,
     Platform::Google,
 ];
 

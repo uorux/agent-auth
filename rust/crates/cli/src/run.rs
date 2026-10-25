@@ -199,6 +199,7 @@ async fn agent(cmd: Command, client: &BrokerClient, io: &mut Io<'_>) -> u8 {
         Command::Escalate { request_id } => show(io, client.escalate(&request_id).await),
         Command::Grants { status } => show(io, client.grants(&status).await),
         Command::Cred { grant_id } => show(io, client.credential(&grant_id).await),
+        Command::Release { grant_id } => show(io, client.release(&grant_id).await),
         Command::Session(_) | Command::A2a(_) | Command::Admin(_) => 2,
     }
 }

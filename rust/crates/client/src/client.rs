@@ -500,6 +500,15 @@ impl BrokerClient {
             .await
     }
 
+    /// `POST /v1/grants/{id}/release`: end one of this agent's grants now.
+    pub async fn release(
+        &self,
+        grant: &str,
+    ) -> Result<agent_auth_wire::agent::ReleaseOut, ClientError> {
+        self.call(Call::post(&["v1", "grants", grant, "release"]))
+            .await
+    }
+
     // -------------------------------------------------------------- sessions
 
     /// `POST /v1/sessions`; the new session is this client's (and its

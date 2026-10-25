@@ -892,3 +892,72 @@ async fn per_agent_limits(pool: sqlx::PgPool) {
     .await;
     assert_eq!(r.status, StatusCode::OK);
 }
+
+/// `POST /v1/grants/{id}/release`: an agent ends its own grant early; any
+/// other agent's is unknown; one already ended says so; a contained agent
+/// may still give access back.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn release_grant(pool: sqlx::PgPool) {
+    let app = router(state(pool, POLICY));
+    let worker = agent(&app, "auto-w", json!({})).await;
+    let other = agent(&app, "auto-o", json!({})).await;
+    let guard = agent(&app, "guard-1", json!({})).await;
+    let body = request("a2a", "talk", "p", json!(600));
+    let make = || call(&app, "POST", "/v1/requests", Some(&worker), Some(&body));
+    let grant_of = |r: Res| r.body["grant_id"].as_str().unwrap().to_owned();
+    let g = grant_of(make().await);
+    let path = format!("/v1/grants/{g}/release");
+    for (who, id) in [
+        (&other, g.as_str()),
+        (&worker, "not-an-id"),
+        (&worker, "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9"),
+    ] {
+        let r = call(
+            &app,
+            "POST",
+            &format!("/v1/grants/{id}/release"),
+            Some(who),
+            None,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{id}");
+        assert_eq!(r.body["detail"], "unknown grant");
+    }
+    let r = call(&app, "POST", &path, Some(&worker), None).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(r.body, json!({"released": true}));
+    let r = call(&app, "POST", &path, Some(&worker), None).await;
+    assert_eq!(r.body, json!({"released": false, "status": "revoked"}));
+    let r = call(&app, "GET", "/v1/grants?status=all", Some(&worker), None).await;
+    let listed = r.body.as_array().unwrap();
+    assert!(
+        listed
+            .iter()
+            .any(|x| x["id"] == g && x["status"] == "revoked")
+    );
+    // Contained: giving access back is still allowed.
+    let g2 = grant_of(make().await);
+    let r = call(
+        &app,
+        "POST",
+        "/v1/containment",
+        Some(&guard),
+        Some(r#"{"match": {"name": "auto-w"}, "reason": "odd"}"#),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let r = call(
+        &app,
+        "POST",
+        &format!("/v1/grants/{g2}/release"),
+        Some(&worker),
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert!(
+        r.body == json!({"released": true}) || r.body["status"] == "revoked",
+        "{:?}",
+        r.body
+    );
+}

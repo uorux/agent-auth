@@ -393,6 +393,7 @@ async fn get_credential_to_file_keeps_the_token_out_of_the_reply() {
             "url",
             "expires_at",
             "note",
+            "properties",
             "file",
             "git_helper",
             "git_example"

@@ -633,7 +633,7 @@ pub struct AuditConfig {
 }
 
 /// The tools a web UI gets by default.
-pub const REMOTE_MCP_TOOLS: [&str; 22] = [
+pub const REMOTE_MCP_TOOLS: [&str; 23] = [
     "whoami",
     "list_capabilities",
     "list_grants",
@@ -656,11 +656,13 @@ pub const REMOTE_MCP_TOOLS: [&str; 22] = [
     "wiki_read",
     "wiki_list",
     "notify_operator",
+    // Ending one's own grant only ever takes access away.
+    "release_grant",
 ];
 
 /// Every MCP tool's name (`mcp_names.TOOL_NAMES`). The MCP crate keeps its
 /// tools and this list the same.
-pub const MCP_TOOL_NAMES: [&str; 30] = [
+pub const MCP_TOOL_NAMES: [&str; 31] = [
     "whoami",
     "list_capabilities",
     "request_access",
@@ -670,6 +672,7 @@ pub const MCP_TOOL_NAMES: [&str; 30] = [
     "escalate_request",
     "list_grants",
     "get_credential",
+    "release_grant",
     "create_session",
     "close_session",
     "check_a2a",

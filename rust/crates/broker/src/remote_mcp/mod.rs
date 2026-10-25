@@ -844,6 +844,10 @@ impl Api<'_> {
                 self.get("/v1/grants", &[("status", a.s("status"))], None)
                     .await
             }
+            "release_grant" => {
+                let path = format!("/v1/grants/{}/release", seg(&a.s("grant_id")));
+                self.post(&path, None, None).await
+            }
             "create_session" => {
                 // As this connector, never as anyone else (Bug-C3).
                 self.post("/v1/sessions", Some(json!({"label": a.s("label")})), None)

@@ -149,12 +149,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn thirty_tools() {
-        assert_eq!(TOOLS.len(), 30);
+    fn thirty_one_tools() {
+        assert_eq!(TOOLS.len(), 31);
         let mut names: Vec<_> = tool_names().collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 30);
+        assert_eq!(names.len(), 31);
     }
 
     #[test]

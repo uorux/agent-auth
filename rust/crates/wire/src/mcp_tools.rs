@@ -204,6 +204,7 @@ pub fn api_routes(tool: &str) -> &'static [ApiRoute] {
         "retry_request" => &[("POST", "/v1/requests/{}/retry")],
         "escalate_request" => &[("POST", "/v1/requests/{}/escalate")],
         "list_grants" => &[("GET", "/v1/grants")],
+        "release_grant" => &[("POST", "/v1/grants/{}/release")],
         "create_session" => &[SESSIONS],
         "close_session" => &[("POST", "/v1/sessions/close")],
         "check_a2a" => &[("GET", "/v1/a2a/check"), SESSIONS],
@@ -323,6 +324,14 @@ capability="shell", resource=<host>, scope={"tier": "user"|"root"}), then
 host_shell_exec(grant_id, argv) per command. Every command is shown to the
 operator before it runs, and there is no terminal: each is run on its own.
 
+Scarce things (platform "pool": accounts, licences, devices): one holder at
+a time. request_access(platform="pool", capability="lease",
+resource=<pool>, scope={} for any, {"match": {"edition": "java"}} for one
+with properties, {"previous": true} for the one you held last, or
+{"item": <name>}); get_credential gives it. list_capabilities shows each
+pool's items and which are free. Give it back with release_grant as soon as
+you are done: someone else may be waiting.
+
 MCP servers (a browser, search, ...): list_capabilities shows the ones this
 broker fronts. Ask for the tools you need with request_access(platform="mcp",
 capability="use", resource=<server>, scope={"tools": [...]}); get_credential
@@ -433,8 +442,14 @@ platform/capability/resource conventions:
   the ones you need, or no scope for all. get_credential gives a
   short-lived bearer token for that server's URL; fetch a new one when it
   runs out.
-- google: not functional yet (decisions are recorded, no credential is
-  issued); don't plan on it.
+- pool: one of a set of scarce things (e.g. game accounts), yours alone
+  for the grant: capability="lease", resource=<pool>, scope={} (any),
+  {"match": {<property>: <value>}}, {"previous": true} (the one you had
+  last time), or {"item": <name>}. get_credential returns it;
+  release_grant when done.
+- google: capability="calendar.read" | "calendar.write" | "drive.read",
+  resource=<account name or address>: a short-lived Google API token,
+  account-wide (every calendar / every file). Gmail is platform "mail".
 
 Write a SPECIFIC justification (what task, why this resource, why this
 duration) — vague justifications get denied. duration examples: "30m", "8h", "2d".
@@ -580,6 +595,9 @@ requesting access you might already have."##,
 - lldap_account (homelab): your service account's username + password, for
   Authelia-protected services. lldap_group: a hand-registered account was
   added to the group; you already have its password.
+- pool_item (pool): the leased item's secret (e.g. an account login) in
+  `value`, its properties in `note`. Yours alone until the grant ends.
+- google_access_token (google): a bearer token for the Calendar/Drive API.
 a2a grants carry no credential.
 
 to_file=True keeps a secret out of your conversation and out of the
@@ -606,6 +624,18 @@ a2a message or result) — it requests its own access."##,
                 default: DefaultValue::Bool(false),
             },
         ],
+    },
+    ToolDef {
+        name: "release_grant",
+        description: r##"End one of your grants now, because you are done with it: a pool item
+someone else may be waiting for, a mail address, a token. Nothing comes
+back: ask again if you need it later."##,
+        params: &[Param {
+            name: "grant_id",
+            ty: Ty::Str,
+            nullable: false,
+            default: DefaultValue::Required,
+        }],
     },
     ToolDef {
         name: "create_session",
@@ -1227,12 +1257,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn one_table_thirty_tools() {
-        assert_eq!(TOOLS.len(), 30);
+    fn one_table_thirty_one_tools() {
+        assert_eq!(TOOLS.len(), 31);
         let mut names: Vec<&str> = tool_names().collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 30);
+        assert_eq!(names.len(), 31);
         // The policy's list (core cannot depend on this crate) is this one.
         let mut policy = agent_auth_core::policy::MCP_TOOL_NAMES.to_vec();
         policy.sort_unstable();

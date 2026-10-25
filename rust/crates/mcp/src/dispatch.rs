@@ -162,6 +162,12 @@ async fn run<C: Caller>(caller: &C, name: &str, a: &Args) -> Result<String, Stri
             })
             .await
         }
+        "release_grant" => {
+            safe(caller, || async {
+                Ok(plain().release(a.str("grant_id")).await?)
+            })
+            .await
+        }
         "create_session" => {
             // A client of its own: minting must not change the session other
             // calls use (conversations may share this server). The caller's

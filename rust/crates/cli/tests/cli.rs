@@ -167,6 +167,7 @@ fn every_agent_command_parses() {
         matches!(parse(&["grants", "--status", "all"]), Command::Grants { status } if status == "all")
     );
     assert!(matches!(parse(&["cred", "g1"]), Command::Cred { grant_id } if grant_id == "g1"));
+    assert!(matches!(parse(&["release", "g1"]), Command::Release { grant_id } if grant_id == "g1"));
     assert!(matches!(
         parse(&["session", "create"]),
         Command::Session(SessionCommand::Create { label: None })

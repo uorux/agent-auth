@@ -24,11 +24,11 @@ pub enum Command {
     Catalog,
     /// Submit an access request.
     Request {
-        /// github | homelab | kubernetes | a2a | google
+        /// github | homelab | kubernetes | a2a | mail | pool | google | ...
         platform: String,
-        /// e.g. repo, create (new github repo), group, view/edit (k8s role), talk, calendar.read
+        /// e.g. repo, create (new github repo / new mail alias), group, view/edit (k8s role), talk, read/send/read+send (mail), lease (pool), calendar.read
         capability: String,
-        /// e.g. jrt/myrepo, svc-gitea, media (k8s namespace), homelab-agent
+        /// e.g. jrt/myrepo, svc-gitea, media (k8s namespace), homelab-agent, airline@my.domain (mail), minecraft (pool)
         resource: String,
         /// Why you need this
         #[arg(long = "why", short = 'j')]
@@ -72,6 +72,8 @@ pub enum Command {
     },
     /// Fetch the credential for an active grant.
     Cred { grant_id: String },
+    /// End one of your grants now (done with it).
+    Release { grant_id: String },
     /// Agent sessions (ephemeral agents need one for a2a; AGENT_AUTH_SESSION)
     #[command(subcommand, arg_required_else_help = true)]
     Session(SessionCommand),

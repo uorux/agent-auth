@@ -21,3 +21,4 @@ mod discord;
 mod lifecycle;
 mod mcp;
 mod operations;
+mod pool;

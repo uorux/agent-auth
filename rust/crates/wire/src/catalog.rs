@@ -55,6 +55,10 @@ pub struct PlatformCatalog {
     /// google: the accounts (name, address).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accounts: Option<Vec<GoogleAccountEntry>>,
+    /// pool: each pool the agent may lease from, its items and who holds
+    /// them now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pools: Option<Vec<PoolEntry>>,
 }
 
 impl PlatformCatalog {
@@ -83,6 +87,7 @@ impl PlatformCatalog {
             servers: None,
             gateway: None,
             accounts: None,
+            pools: None,
         }
     }
 }
@@ -142,6 +147,39 @@ pub struct McpServerEntry {
 pub struct GoogleAccountEntry {
     pub name: String,
     pub address: String,
+}
+
+/// pool: one pool, as the agent asking sees it (items it may not hold are
+/// left out).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PoolEntry {
+    pub name: String,
+    pub description: String,
+    pub capacity: u32,
+    pub max_per_agent: u32,
+    pub items: Vec<PoolItemEntry>,
+    /// The item of this pool the agent held last, if any.
+    pub you_held_last: Option<String>,
+}
+
+/// pool: one item and its availability now.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PoolItemEntry {
+    pub name: String,
+    pub description: String,
+    /// Strings, numbers, booleans, lists of strings.
+    pub properties: serde_json::Map<String, serde_json::Value>,
+    /// Leased by name only, and always by a human.
+    pub sensitive: bool,
+    /// Holders now.
+    pub in_use: u32,
+    /// A slot is free now.
+    pub free: bool,
+    /// When the first of its holders' grants ends.
+    #[serde(default, with = "crate::timestamp::option")]
+    pub frees_at: Option<time::OffsetDateTime>,
+    /// The agent asking holds it.
+    pub yours: bool,
 }
 
 /// models: the gateway.

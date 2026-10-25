@@ -752,6 +752,33 @@ and why. Keep entries short. Group by area.
   `no scope for google grants: the capability is the scope (unknown scope
   keys: ...)`; the stub's 501 reads `no google account is configured on this
   broker` (the Python's).
+- **Pools** (upstream `provisioners/pool.py`, 2026-10 snapshot):
+  - Items are tried in name order (the policy is read as JSON, whose
+    objects keep no order; the Python tried them in file order), the item
+    the agent held last first.
+  - Provisions of one pool are serialized by a transaction advisory lock
+    (`store::pool::lock_pool`) and a lease is inserted `ON CONFLICT DO
+    NOTHING` (a lost race reads again and moves on, at most 8 times) instead
+    of a savepoint per attempt; both caps stay unique constraints
+    (`(pool, item, slot)`, `(pool, agent_id, agent_slot)`). A trigger refuses
+    a lease unless its grant is a `pool` grant on that pool being
+    provisioned, and lease rows never change. Leases whose grant has ended
+    without its revoke are cleared at that pool's next provision.
+  - Scope problems are refused before the pool is looked up (core parses
+    the scope first): unknown keys, two of `item`/`previous`/`match`, a
+    non-string item or malformed `match` give the Python's texts even for an
+    unknown pool. `previous` must be a boolean (the Python took any truthy
+    value); `match` holds at most 32 keys, strings at most 256 characters.
+  - The catalog's `frees_at` is in the one wire timestamp format; the
+    refusal ("the first frees at ...") and the credential note keep the
+    Python's `isoformat(timespec="minutes")` (`2026-10-25T14:30+00:00`).
+  - `CredentialOut` gains `properties` (upstream's addition), so it has
+    seven keys, all always present (`null` unless set).
+- **`release_grant`** (`POST /v1/grants/{id}/release`): an agent ends its
+  own grant: 404 `unknown grant` for anyone else's (or a malformed id),
+  `{"released": true}`, or `{"released": false, "status": ...}` for one
+  already ended (the status is read after the attempt). Allowed while
+  contained.
 
 ## Wiki (`broker/src/wiki`)
 

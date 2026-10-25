@@ -33,6 +33,9 @@ pub mod ldap;
 pub mod lldap;
 pub mod mcp;
 pub mod models;
+pub mod pool;
+#[cfg(test)]
+mod pool_tests;
 pub mod setup;
 pub mod tokens;
 
@@ -85,8 +88,8 @@ impl ProvisionError {
     }
 }
 
-/// What the credential route returns (`CredentialOut` on the wire: all six
-/// keys always present).
+/// What the credential route returns (`CredentialOut` on the wire: all
+/// seven keys always present).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Credential {
     pub kind: String,
@@ -97,6 +100,8 @@ pub struct Credential {
     pub url: Option<String>,
     pub expires_at: Option<OffsetDateTime>,
     pub note: Option<String>,
+    /// What it is for, when that is part of it (a pool item's properties).
+    pub properties: Option<serde_json::Map<String, Value>>,
 }
 
 pub trait Provisioner {
@@ -192,6 +197,7 @@ pub enum AnyProvisioner {
     Hostexec(crate::hostexec::provisioner::HostexecProvisioner),
     /// Google with no account configured (decisions only).
     GoogleStub(google::GoogleStubProvisioner),
+    Pool(pool::PoolProvisioner),
 }
 
 macro_rules! dispatch {
@@ -207,6 +213,7 @@ macro_rules! dispatch {
             AnyProvisioner::Google($p) => $e,
             AnyProvisioner::Hostexec($p) => $e,
             AnyProvisioner::GoogleStub($p) => $e,
+            AnyProvisioner::Pool($p) => $e,
         }
     };
 }

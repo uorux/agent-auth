@@ -17,6 +17,7 @@ use super::kubernetes::KubernetesProvisioner;
 use super::lldap::LldapProvisioner;
 use super::mcp::McpProvisioner;
 use super::models::ModelsProvisioner;
+use super::pool::PoolProvisioner;
 use crate::wiki::Wiki;
 
 /// Configuration the broker cannot start with.
@@ -165,6 +166,14 @@ pub fn build(env: &Env<'_>, policy: &Arc<Policy>, keys: Keys<'_>) -> Result<Buil
             Arc::clone(&issuer),
         )));
         services.tokens = Some(issuer);
+    }
+
+    if !platforms.pools.is_empty() {
+        tracing::info!(
+            pools = %platforms.pools.keys().cloned().collect::<Vec<_>>().join(", "),
+            "pools"
+        );
+        provisioners.push(AnyProvisioner::Pool(PoolProvisioner::new(&platforms.pools)));
     }
 
     let wiki_cfg = policy.wiki();
