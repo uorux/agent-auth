@@ -17,6 +17,7 @@ mod harness;
 mod world;
 
 mod a2a;
+mod discord;
 mod lifecycle;
 mod mcp;
 mod operations;

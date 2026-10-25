@@ -126,10 +126,12 @@ version = "0.1.0"
 dependencies = [
  "agent-auth-tls",
  "axum",
+ "futures",
  "reqwest",
  "serde_json",
  "sqlx",
  "tokio",
+ "tokio-tungstenite",
  "url",
  "uuid",
 ]

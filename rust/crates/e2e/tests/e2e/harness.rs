@@ -76,6 +76,8 @@ pub struct Setup {
     pub policy: String,
     /// Extra environment (GitHub, OpenRouter...).
     pub env: Vec<(String, String)>,
+    /// Lines of the broker's `./.env`.
+    pub dotenv: Vec<(String, String)>,
 }
 
 impl Setup {
@@ -84,7 +86,14 @@ impl Setup {
             database_url,
             policy: policy.to_owned(),
             env: Vec::new(),
+            dotenv: Vec::new(),
         }
+    }
+
+    /// A `KEY=value` line in the broker's `./.env`.
+    pub fn dotenv(mut self, key: &str, value: &str) -> Setup {
+        self.dotenv.push((key.to_owned(), value.to_owned()));
+        self
     }
 
     pub fn env(mut self, key: &str, value: &str) -> Setup {
@@ -144,6 +153,12 @@ impl Broker {
     pub fn spawn(setup: Setup, encryption_key: String, dir: TempDir, port: u16) -> Broker {
         let policy = dir.path().join("policy.yaml");
         std::fs::write(&policy, &setup.policy).unwrap();
+        let dotenv: String = setup
+            .dotenv
+            .iter()
+            .map(|(k, v)| format!("{k}={v}\n"))
+            .collect();
+        std::fs::write(dir.path().join(".env"), dotenv).unwrap();
         let log = dir
             .path()
             .join(format!("broker-{}.log", uuid::Uuid::new_v4().simple()));

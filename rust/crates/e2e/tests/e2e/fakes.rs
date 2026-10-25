@@ -146,3 +146,166 @@ pub async fn openrouter() -> Fake {
     })
     .await
 }
+
+/// Discord: the REST API (cards posted to channel 5 get message id 900;
+/// a card read back has the embeds last posted) and a gateway that says
+/// hello, answers IDENTIFY with READY (application 20), acks heartbeats
+/// and delivers the interactions the test pushes.
+#[derive(Debug)]
+pub struct Discord {
+    pub rest: Fake,
+    pub gateway_url: String,
+    /// What the bot sent the gateway (IDENTIFY, heartbeats).
+    pub received: Arc<Mutex<Vec<Value>>>,
+    push: tokio::sync::mpsc::UnboundedSender<Value>,
+    gateway: tokio::task::JoinHandle<()>,
+    next: AtomicUsize,
+}
+
+impl Drop for Discord {
+    fn drop(&mut self) {
+        self.gateway.abort();
+    }
+}
+
+pub async fn discord() -> Discord {
+    let embeds = Arc::new(Mutex::new(json!([])));
+    let posted = embeds.clone();
+    let rest = Fake::start(move |c| {
+        let path = c.path.strip_prefix("/api/v10").unwrap_or(&c.path);
+        let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+        match (c.method.as_str(), parts.as_slice()) {
+            ("GET", ["channels", ch]) => (200, json!({"id": ch, "guild_id": "77"})),
+            ("POST", ["channels", ch, "messages"]) => {
+                *posted.lock().unwrap() = c.body["embeds"].clone();
+                (200, json!({"id": "900", "channel_id": ch}))
+            }
+            ("GET", ["channels", ch, "messages", m]) => (
+                200,
+                json!({"id": m, "channel_id": ch, "embeds": posted.lock().unwrap().clone()}),
+            ),
+            ("POST", ["interactions", ..]) => (204, Value::Null),
+            ("PUT", ["applications", ..]) => (200, json!([])),
+            _ => (200, json!({"id": "901", "channel_id": "5"})),
+        }
+    })
+    .await;
+    drop(embeds);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_url = format!("ws://{}", listener.local_addr().unwrap());
+    let received: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let (push, pushed) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let pushed = Arc::new(tokio::sync::Mutex::new(pushed));
+    let seen = received.clone();
+    let gateway = tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let seen = seen.clone();
+            let pushed = pushed.clone();
+            tokio::spawn(async move {
+                let _ = gateway_connection(tcp, seen, pushed).await;
+            });
+        }
+    });
+    Discord {
+        rest,
+        gateway_url,
+        received,
+        push,
+        gateway,
+        next: AtomicUsize::new(1000),
+    }
+}
+
+async fn gateway_connection(
+    tcp: tokio::net::TcpStream,
+    seen: Arc<Mutex<Vec<Value>>>,
+    pushed: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Value>>>,
+) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let mut ws = tokio_tungstenite::accept_async(tcp).await?;
+    let text = |v: Value| Message::Text(v.to_string().into());
+    ws.send(text(json!({"op": 10, "d": {"heartbeat_interval": 45000}})))
+        .await?;
+    let mut seq: u64 = 0;
+    let mut pushed = pushed.lock().await;
+    loop {
+        tokio::select! {
+            frame = ws.next() => {
+                let Some(Ok(Message::Text(t))) = frame else { return Ok(()) };
+                let v: Value = serde_json::from_str(t.as_str()).unwrap_or(Value::Null);
+                seen.lock().unwrap().push(v.clone());
+                match v["op"].as_u64() {
+                    Some(2) => {
+                        seq += 1;
+                        ws.send(text(json!({"op": 0, "t": "READY", "s": seq, "d": {
+                            "session_id": "e2e-session",
+                            "resume_gateway_url": "wss://127.0.0.1:1",
+                            "application": {"id": "20"},
+                            "user": {"id": "20", "username": "agent-auth"},
+                        }}))).await?;
+                    }
+                    Some(1) => ws.send(text(json!({"op": 11}))).await?,
+                    _ => {}
+                }
+            }
+            interaction = pushed.recv() => {
+                let Some(d) = interaction else { return Ok(()) };
+                seq += 1;
+                ws.send(text(json!({"op": 0, "t": "INTERACTION_CREATE", "s": seq, "d": d}))).await?;
+            }
+        }
+    }
+}
+
+impl Discord {
+    /// Deliver an interaction from `user`; its id (the callback goes to
+    /// `/interactions/<id>/tok-<id>/callback`).
+    pub fn interact(&self, user: u64, kind: u8, data: Value) -> String {
+        let id = self.next.fetch_add(1, Ordering::SeqCst).to_string();
+        let interaction = json!({
+            "id": id,
+            "application_id": "20",
+            "type": kind,
+            "token": format!("tok-{id}"),
+            "channel_id": "5",
+            "data": data,
+            "user": {"id": user.to_string(), "username": "jrt", "discriminator": "0", "avatar": null},
+            "entitlements": [],
+            "authorizing_integration_owners": {},
+            "version": 1,
+            "locale": "en-US",
+        });
+        self.push.send(interaction).unwrap();
+        id
+    }
+
+    /// A button click.
+    pub fn click(&self, user: u64, custom_id: &str) -> String {
+        self.interact(user, 3, json!({"custom_id": custom_id, "component_type": 2}))
+    }
+
+    /// A modal submitted with these text inputs.
+    pub fn submit(&self, user: u64, custom_id: &str, fields: &[(&str, &str)]) -> String {
+        let components: Vec<Value> = fields
+            .iter()
+            .enumerate()
+            .map(|(i, (k, v))| {
+                json!({"type": 18, "id": i, "component": {"type": 4, "id": i + 10, "custom_id": k, "value": v}})
+            })
+            .collect();
+        self.interact(user, 5, json!({"custom_id": custom_id, "components": components}))
+    }
+
+    /// The bodies of the interaction callbacks to interaction `id`.
+    pub fn callbacks(&self, id: &str) -> Vec<Value> {
+        self.rest
+            .calls()
+            .into_iter()
+            .filter(|c| c.path.ends_with(&format!("/interactions/{id}/tok-{id}/callback")))
+            .map(|c| c.body)
+            .collect()
+    }
+}

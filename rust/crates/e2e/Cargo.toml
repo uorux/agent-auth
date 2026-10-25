@@ -21,9 +21,11 @@ doctest = false
 [dev-dependencies]
 agent-auth-tls = { workspace = true, features = ["reqwest"] }
 axum.workspace = true
+futures.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "process", "io-util"] }
+tokio-tungstenite.workspace = true
 url.workspace = true
 uuid.workspace = true
