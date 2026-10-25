@@ -297,20 +297,8 @@ async fn serve_conn<A: LocalApi>(
 }
 
 async fn handle<A: LocalApi>(api: &A, line: &[u8], peer: Peer) -> Result<Value, LocalError> {
-    let req: Value = serde_json::from_slice(line).map_err(|_| LocalError::new("bad request"))?;
-    let Value::Object(mut req) = req else {
-        return Err(LocalError::new("bad request"));
-    };
-    let Some(Value::String(method)) = req.remove("method") else {
-        return Err(LocalError::new("bad request"));
-    };
-    let params = match req.remove("params") {
-        None | Some(Value::Null) => Map::new(),
-        Some(Value::Object(p)) => p,
-        Some(_) => return Err(LocalError::new("params must be an object")),
-    };
-    let token = req.remove("token").filter(|t| !t.is_null());
-    api.call(&method, params, token, peer).await
+    let req = agent_auth_wire::daemon::local::parse_request(line).map_err(LocalError)?;
+    api.call(&req.method, req.params, req.token, peer).await
 }
 
 /// A failed client call.

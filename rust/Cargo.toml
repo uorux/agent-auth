@@ -21,6 +21,8 @@ agent-auth-store = { path = "crates/store", version = "0.1.0" }
 agent-auth-client = { path = "crates/client", version = "0.1.0" }
 agent-auth-daemon = { path = "crates/daemon", version = "0.1.0" }
 agent-auth-hostd = { path = "crates/hostd", version = "0.1.0" }
+agent-auth-sandboxd = { path = "crates/sandboxd", version = "0.1.0" }
+agent-auth-mcp = { path = "crates/mcp", version = "0.1.0" }
 agent-auth-tls = { path = "crates/tls", version = "0.1.0" }
 agent-auth-mail = { path = "crates/mail", version = "0.1.0" }
 
@@ -63,6 +65,9 @@ futures = { version = "0.3.34", default-features = false, features = ["std", "as
 bytes = { version = "1.12.1", default-features = false, features = ["std"] }
 zeroize = { version = "1.9.1", default-features = false, features = ["alloc", "derive"] }
 rmcp = { version = "3.5.1", default-features = false }
+# Constants only (open flags for no-follow directory handles in sandboxd);
+# never its unsafe functions.
+libc = { version = "0.2.190", default-features = false }
 # Discord types only (serde). twilight-http and twilight-gateway are not
 # used: twilight-http always enables HTTP/2 (h2), and both bring their own
 # TLS roots. The broker speaks REST over reqwest and the gateway over

@@ -10,6 +10,7 @@
 pub mod channel;
 pub mod handshake;
 pub mod host;
+pub mod local;
 pub mod pairing;
 pub mod sandbox;
 

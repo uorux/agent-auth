@@ -214,15 +214,29 @@ name = "agent-auth-sandboxd"
 version = "0.1.0"
 dependencies = [
  "agent-auth-client",
+ "agent-auth-core",
  "agent-auth-crypto",
  "agent-auth-daemon",
+ "agent-auth-mcp",
+ "agent-auth-sandboxd",
+ "agent-auth-tls",
  "agent-auth-wire",
  "anyhow",
  "clap",
+ "futures",
+ "libc",
+ "proptest",
+ "reqwest",
+ "rmcp",
  "serde",
  "serde_json",
+ "thiserror",
+ "time",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

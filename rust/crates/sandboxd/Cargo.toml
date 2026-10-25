@@ -9,14 +9,48 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[[bin]]
+name = "agent-auth-sandboxd"
+path = "src/bin/agent-auth-sandboxd.rs"
+
+[[bin]]
+name = "agent-auth-sandboxctl"
+path = "src/bin/agent-auth-sandboxctl.rs"
+
+[[bin]]
+name = "agent-auth-sandbox-mcp"
+path = "src/bin/agent-auth-sandbox-mcp.rs"
+
+[features]
+# A host double for tests (here and in the broker's end-to-end tests):
+# units are in-process fakes, nothing needs root or systemd.
+testing = []
+
 [dependencies]
+agent-auth-core.workspace = true
 agent-auth-daemon.workspace = true
 agent-auth-crypto.workspace = true
 agent-auth-wire.workspace = true
 agent-auth-client.workspace = true
-tokio.workspace = true
+agent-auth-mcp.workspace = true
+agent-auth-tls = { workspace = true, features = ["reqwest"] }
+tokio = { workspace = true, features = ["net", "time", "sync", "rt", "rt-multi-thread", "io-util", "io-std", "macros", "fs", "process", "signal"] }
+tokio-tungstenite.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+rmcp = { workspace = true, features = ["server", "transport-io"] }
 serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
+time.workspace = true
+uuid.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+agent-auth-sandboxd = { path = ".", features = ["testing"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+proptest.workspace = true
