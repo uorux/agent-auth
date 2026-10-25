@@ -884,16 +884,20 @@ pub async fn ended_on(
 }
 
 /// Granted at or after `since`, oldest first (audit feed).
+/// Keyset-paginated: with `after`, rows at exactly `since` only past
+/// that id; ordered by (time, id), so a page boundary is exact.
 pub async fn granted_since(
     tx: &Tx<'_>,
     since: OffsetDateTime,
+    after: Option<Uuid>,
     limit: i64,
 ) -> Result<Vec<GrantRow>, StoreError> {
     let mut c = tx.conn().await;
     let raw = sqlx::query_as!(
         RawGrant,
-        "SELECT * FROM grants WHERE granted_at >= $1 ORDER BY granted_at LIMIT $2",
+        "SELECT * FROM grants WHERE granted_at > $1 OR (granted_at = $1 AND ($2::uuid IS NULL OR id > $2)) ORDER BY granted_at, id LIMIT $3",
         since,
+        after,
         limit
     )
     .fetch_all(&mut **c)
@@ -902,16 +906,20 @@ pub async fn granted_since(
 }
 
 /// Ended at or after `since`, oldest first (audit feed).
+/// Keyset-paginated: with `after`, rows at exactly `since` only past
+/// that id; ordered by (time, id), so a page boundary is exact.
 pub async fn ended_since(
     tx: &Tx<'_>,
     since: OffsetDateTime,
+    after: Option<Uuid>,
     limit: i64,
 ) -> Result<Vec<GrantRow>, StoreError> {
     let mut c = tx.conn().await;
     let raw = sqlx::query_as!(
         RawGrant,
-        "SELECT * FROM grants WHERE revoked_at >= $1 ORDER BY revoked_at LIMIT $2",
+        "SELECT * FROM grants WHERE revoked_at > $1 OR (revoked_at = $1 AND ($2::uuid IS NULL OR id > $2)) ORDER BY revoked_at, id LIMIT $3",
         since,
+        after,
         limit
     )
     .fetch_all(&mut **c)

@@ -4,8 +4,10 @@
 //! OpenID provider; agents' calls to the broker; daemons' channel.
 //!
 //! - rustls with the `ring` provider only, TLS 1.2 and 1.3.
-//! - Roots: the Mozilla bundle (`webpki-roots`) minus [`DISTRUSTED`], plus
-//!   any extra CA the deployment names (a cluster CA, a private LLDAP CA).
+//! - Roots: the Mozilla bundle (`webpki-roots`) minus [`DISTRUSTED`]; or,
+//!   for a service with its own CA (the cluster CA), only that CA
+//!   ([`private_root_store`]); or, for mail only, the bundle plus a
+//!   private CA ([`root_store_plus`]).
 //!   Not the system store: what is trusted is pinned by Cargo.lock and
 //!   reviewed, as the Python pinned certifi.
 
@@ -51,12 +53,32 @@ pub fn root_store() -> RootCertStore {
     }
 }
 
-/// `root_store()` plus the certificates in `extra_pem` (a deployment's own
-/// CA, e.g. the Kubernetes service-account `ca.crt`).
-pub fn root_store_with(extra_pem: &[u8]) -> Result<RootCertStore, TlsError> {
+/// Only the certificates in `pem`: the roots for a service that has its
+/// own CA (the Kubernetes API server's cluster CA). The public roots are
+/// not trusted for it, so a publicly trusted certificate for that name
+/// (the API server's name may be a public one) cannot receive what the
+/// broker sends there (a service-account token). This is what a private
+/// CA means unless the caller says otherwise ([`root_store_plus`]); the
+/// Python's `httpx.AsyncClient(verify=ca_file)` trusted only that file too.
+pub fn private_root_store(pem: &[u8]) -> Result<RootCertStore, TlsError> {
+    let mut store = RootCertStore::empty();
+    add_pem(&mut store, pem)?;
+    Ok(store)
+}
+
+/// `root_store()` plus the certificates in `extra_pem`. Only for a client
+/// whose one config also talks to public services (mail: a private IMAP
+/// server next to Gmail and SimpleLogin); a client for one private
+/// service takes [`private_root_store`].
+pub fn root_store_plus(extra_pem: &[u8]) -> Result<RootCertStore, TlsError> {
     let mut store = root_store();
+    add_pem(&mut store, extra_pem)?;
+    Ok(store)
+}
+
+fn add_pem(store: &mut RootCertStore, pem: &[u8]) -> Result<(), TlsError> {
     let mut added = 0usize;
-    for cert in CertificateDer::pem_slice_iter(extra_pem) {
+    for cert in CertificateDer::pem_slice_iter(pem) {
         let cert = cert.map_err(|e| TlsError::Pem(e.to_string()))?;
         store
             .add(cert)
@@ -66,7 +88,7 @@ pub fn root_store_with(extra_pem: &[u8]) -> Result<RootCertStore, TlsError> {
     if added == 0 {
         return Err(TlsError::NoCertificates);
     }
-    Ok(store)
+    Ok(())
 }
 
 /// A client config over `roots` with the ring provider.
@@ -136,8 +158,76 @@ mod tests {
     fn config_builds() {
         assert!(default_client_config().is_ok());
         assert!(matches!(
-            root_store_with(b"not pem"),
+            root_store_plus(b"not pem"),
             Err(TlsError::NoCertificates)
         ));
+        assert!(matches!(
+            private_root_store(b"not pem"),
+            Err(TlsError::NoCertificates)
+        ));
+    }
+
+    const PUBLIC_CHAIN: &[u8] = include_bytes!("../tests/data/public-chain.pem");
+    const PRIVATE_CA: &[u8] = include_bytes!("../tests/data/private-ca.pem");
+    const PRIVATE_LEAF: &[u8] = include_bytes!("../tests/data/private-leaf.pem");
+
+    /// Verifies `chain` (leaf first) for `name` against `roots`, at
+    /// 2026-11-01 (inside both fixtures' validity).
+    fn verify(roots: RootCertStore, chain: &[u8], name: &str) -> Result<(), rustls::Error> {
+        use rustls::pki_types::{ServerName, UnixTime};
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier =
+            rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+                .build()
+                .unwrap();
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(chain)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let (leaf, intermediates) = certs.split_first().unwrap();
+        let now = UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_793_491_200));
+        rustls::client::danger::ServerCertVerifier::verify_server_cert(
+            verifier.as_ref(),
+            leaf,
+            intermediates,
+            &ServerName::try_from(name.to_owned()).unwrap(),
+            &[],
+            now,
+        )
+        .map(|_| ())
+    }
+
+    #[test]
+    fn public_chain_is_trusted_by_the_public_roots() {
+        // The fixture really chains to a root in our bundle, so the
+        // refusal below is the private store's doing.
+        verify(root_store(), PUBLIC_CHAIN, "letsencrypt.org").unwrap();
+        verify(
+            root_store_plus(PRIVATE_CA).unwrap(),
+            PUBLIC_CHAIN,
+            "letsencrypt.org",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn private_ca_refuses_a_publicly_trusted_certificate() {
+        let roots = private_root_store(PRIVATE_CA).unwrap();
+        assert_eq!(roots.len(), 1, "only the private CA");
+        let err = verify(roots, PUBLIC_CHAIN, "letsencrypt.org").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer)
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn private_ca_trusts_its_own_certificates() {
+        let roots = private_root_store(PRIVATE_CA).unwrap();
+        verify(roots, PRIVATE_LEAF, "kubernetes.default.svc").unwrap();
+        // ... which the public roots do not.
+        assert!(verify(root_store(), PRIVATE_LEAF, "kubernetes.default.svc").is_err());
     }
 }

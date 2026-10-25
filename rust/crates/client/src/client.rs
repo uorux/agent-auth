@@ -785,14 +785,19 @@ impl BrokerClient {
 
     // --------------------------------------------------- audit, containment
 
-    /// `GET /v1/audit/events[?since=][&limit=]` (policy `audit.readers`).
+    /// `GET /v1/audit/events[?since=|?after=][&limit=]` (policy
+    /// `audit.readers`). `after` is a page's `cursor` (exact, exclusive);
+    /// it wins over `since`.
     pub async fn audit_events(
         &self,
         since: Option<&str>,
+        after: Option<&str>,
         limit: Option<i64>,
     ) -> Result<agent_auth_wire::audit::AuditPage, ClientError> {
         let mut call = Call::get(&["v1", "audit", "events"]);
-        if let Some(since) = since {
+        if let Some(after) = after {
+            call = call.query("after", after);
+        } else if let Some(since) = since {
             call = call.query("since", since);
         }
         if let Some(limit) = limit {

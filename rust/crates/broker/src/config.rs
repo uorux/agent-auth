@@ -168,22 +168,25 @@ fn loopback_host(url: &url::Url) -> bool {
 /// `DATABASE_URL`: a Unix socket or loopback, or TLS with the server's
 /// certificate and name verified (`sslmode=verify-full`).
 /// `DATABASE_ALLOW_INSECURE=1` lifts the rule (development only).
+///
+/// The URL is judged by what the store will connect to: it is parsed by
+/// the parser the store uses (`PgConnectOptions::from_str`), so a later
+/// `host=`, `hostaddr=`, `ssl-mode=`, a repeated `sslmode=` or a `PG*`
+/// environment variable cannot make the checked host or mode differ from
+/// the one used.
 pub fn check_database_url(text: &str, allow_insecure: bool) -> Result<(), ConfigError> {
-    let url =
-        url::Url::parse(text).map_err(|_| ConfigError("DATABASE_URL is not a URL".to_owned()))?;
-    let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
-    let param = |k: &str| {
-        pairs
-            .iter()
-            .find(|(key, _)| key == k)
-            .map(|(_, v)| v.clone())
-    };
-    let host = url.host_str().unwrap_or("");
-    let socket = host.is_empty() || param("host").is_some_and(|h| h.starts_with('/'));
-    if socket || LOOPBACK.contains(&host) {
+    use sqlx::postgres::{PgConnectOptions, PgSslMode};
+    let options: PgConnectOptions = text
+        .parse()
+        .map_err(|_| ConfigError("DATABASE_URL is not a valid Postgres URL".to_owned()))?;
+    let host = options.get_host();
+    // The store connects over a Unix socket when one is set or the host is
+    // a directory (sqlx's `fetch_socket`), else over TCP to `host`.
+    let socket = options.get_socket().is_some() || host.starts_with('/');
+    if socket || LOOPBACK.contains(&host) || host == "::1" {
         return Ok(());
     }
-    if param("sslmode").as_deref() == Some("verify-full") {
+    if matches!(options.get_ssl_mode(), PgSslMode::VerifyFull) {
         return Ok(());
     }
     if allow_insecure {
@@ -194,7 +197,7 @@ pub fn check_database_url(text: &str, allow_insecure: bool) -> Result<(), Config
         return Ok(());
     }
     Err(ConfigError(format!(
-        "DATABASE_URL: a database on {host} needs sslmode=verify-full (or a local socket); \
+        "DATABASE_URL: a database on {host:?} needs sslmode=verify-full (or a local socket); \
          set DATABASE_ALLOW_INSECURE=1 only for development"
     )))
 }
@@ -524,9 +527,21 @@ mod tests {
         assert!(
             check_database_url("postgres://u@db.internal/db?sslmode=verify-full", false).is_ok()
         );
+        // Spellings sqlx accepts for verify-full count too.
+        assert!(
+            check_database_url("postgres://u@db.internal/db?ssl-mode=verify-full", false).is_ok()
+        );
         for bad in [
             "postgres://u@db.internal/db",
             "postgres://u@db.internal/db?sslmode=require",
+            // The checked host is the one connected to: a query `host` or
+            // `hostaddr` overrides the URL's loopback host...
+            "postgres://u@localhost/db?host=db.internal",
+            "postgres://u@127.0.0.1/db?hostaddr=192.0.2.7",
+            // ...and the last ssl mode wins, whatever its spelling.
+            "postgres://u@db.internal/db?sslmode=verify-full&ssl-mode=disable",
+            "postgres://u@db.internal/db?sslmode=verify-full&sslmode=prefer",
+            "postgres://u@db.internal/db?sslmode=verify-full&ssl-mode=require",
         ] {
             assert!(check_database_url(bad, false).is_err(), "{bad}");
             assert!(check_database_url(bad, true).is_ok(), "{bad}");

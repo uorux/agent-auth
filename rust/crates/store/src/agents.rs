@@ -390,16 +390,20 @@ pub async fn list_web(tx: &Tx<'_>) -> Result<Vec<AgentRow>, StoreError> {
 }
 
 /// Agents created at or after `since`, oldest first (audit feed).
+/// Keyset-paginated: with `after`, rows at exactly `since` only past
+/// that id; ordered by (time, id), so a page boundary is exact.
 pub async fn created_since(
     tx: &Tx<'_>,
     since: OffsetDateTime,
+    after: Option<Uuid>,
     limit: i64,
 ) -> Result<Vec<AgentRow>, StoreError> {
     let mut c = tx.conn().await;
     let raw = sqlx::query_as!(
         RawAgent,
-        "SELECT * FROM agents WHERE created_at >= $1 ORDER BY created_at LIMIT $2",
+        "SELECT * FROM agents WHERE created_at > $1 OR (created_at = $1 AND ($2::uuid IS NULL OR id > $2)) ORDER BY created_at, id LIMIT $3",
         since,
+        after,
         limit
     )
     .fetch_all(&mut **c)

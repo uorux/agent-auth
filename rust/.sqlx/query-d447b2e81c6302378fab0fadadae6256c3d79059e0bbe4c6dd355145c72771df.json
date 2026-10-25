@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT * FROM a2a_threads WHERE created_at >= $1 ORDER BY created_at LIMIT $2",
+  "query": "SELECT * FROM a2a_threads WHERE closed_at > $1 OR (closed_at = $1 AND ($2::uuid IS NULL OR id > $2)) ORDER BY closed_at, id LIMIT $3",
   "describe": {
     "columns": [
       {
@@ -183,6 +183,7 @@
     "parameters": {
       "Left": [
         "Timestamptz",
+        "Uuid",
         "Int8"
       ]
     },
@@ -205,5 +206,5 @@
       false
     ]
   },
-  "hash": "b2f66d3fc19a882667a44e5d50eff5eca1d59075b4554b0771a04a37e43021a3"
+  "hash": "d447b2e81c6302378fab0fadadae6256c3d79059e0bbe4c6dd355145c72771df"
 }

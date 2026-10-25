@@ -159,7 +159,8 @@ pub struct KubernetesProvisioner {
 impl KubernetesProvisioner {
     /// `KUBERNETES_API_URL` (`in-cluster` or a comma-separated list; none:
     /// off), `KUBERNETES_TOKEN`, `KUBERNETES_TOKEN_FILE`,
-    /// `KUBERNETES_CA_FILE`, `KUBERNETES_INSECURE_SKIP_VERIFY`.
+    /// `KUBERNETES_CA_FILE` (the only CA trusted for the API server: the
+    /// public roots are not), `KUBERNETES_INSECURE_SKIP_VERIFY`.
     pub fn from_env(
         env: &Env<'_>,
         config: &KubernetesConfig,
@@ -202,7 +203,7 @@ impl KubernetesProvisioner {
         } else {
             let pem = std::fs::read(&ca_file)
                 .map_err(|e| ConfigError(format!("KUBERNETES_CA_FILE {ca_file}: {e}")))?;
-            let roots = agent_auth_tls::root_store_with(&pem)
+            let roots = agent_auth_tls::private_root_store(&pem)
                 .map_err(|e| ConfigError(format!("KUBERNETES_CA_FILE {ca_file}: {e}")))?;
             agent_auth_tls::client_config(roots)
                 .map_err(|e| ConfigError(format!("kubernetes TLS: {e}")))?

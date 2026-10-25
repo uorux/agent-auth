@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT * FROM grants WHERE revoked_at >= $1 ORDER BY revoked_at LIMIT $2",
+  "query": "SELECT * FROM a2a_threads WHERE created_at > $1 OR (created_at = $1 AND ($2::uuid IS NULL OR id > $2)) ORDER BY created_at, id LIMIT $3",
   "describe": {
     "columns": [
       {
@@ -9,162 +9,162 @@
         "type_info": "Uuid",
         "origin": {
           "Table": {
-            "table": "grants",
+            "table": "a2a_threads",
             "name": "id"
           }
         }
       },
       {
         "ordinal": 1,
-        "name": "request_id",
+        "name": "initiator_agent_id",
         "type_info": "Uuid",
         "origin": {
           "Table": {
-            "table": "grants",
-            "name": "request_id"
+            "table": "a2a_threads",
+            "name": "initiator_agent_id"
           }
         }
       },
       {
         "ordinal": 2,
-        "name": "agent_id",
+        "name": "initiator_session_id",
         "type_info": "Uuid",
         "origin": {
           "Table": {
-            "table": "grants",
-            "name": "agent_id"
+            "table": "a2a_threads",
+            "name": "initiator_session_id"
           }
         }
       },
       {
         "ordinal": 3,
-        "name": "session_id",
+        "name": "responder_agent_id",
         "type_info": "Uuid",
         "origin": {
           "Table": {
-            "table": "grants",
-            "name": "session_id"
+            "table": "a2a_threads",
+            "name": "responder_agent_id"
           }
         }
       },
       {
         "ordinal": 4,
-        "name": "delegation_thread_id",
+        "name": "responder_session_id",
         "type_info": "Uuid",
         "origin": {
           "Table": {
-            "table": "grants",
-            "name": "delegation_thread_id"
+            "table": "a2a_threads",
+            "name": "responder_session_id"
           }
         }
       },
       {
         "ordinal": 5,
-        "name": "delegator_agent_id",
-        "type_info": "Uuid",
+        "name": "topic",
+        "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "grants",
-            "name": "delegator_agent_id"
+            "table": "a2a_threads",
+            "name": "topic"
           }
         }
       },
       {
         "ordinal": 6,
-        "name": "platform",
-        "type_info": "Text",
+        "name": "grant_id",
+        "type_info": "Uuid",
         "origin": {
           "Table": {
-            "table": "grants",
-            "name": "platform"
+            "table": "a2a_threads",
+            "name": "grant_id"
           }
         }
       },
       {
         "ordinal": 7,
-        "name": "resource",
+        "name": "state",
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "grants",
-            "name": "resource"
+            "table": "a2a_threads",
+            "name": "state"
           }
         }
       },
       {
         "ordinal": 8,
-        "name": "authority",
-        "type_info": "Jsonb",
+        "name": "accepted_at",
+        "type_info": "Timestamptz",
         "origin": {
           "Table": {
-            "table": "grants",
-            "name": "authority"
+            "table": "a2a_threads",
+            "name": "accepted_at"
           }
         }
       },
       {
         "ordinal": 9,
-        "name": "granted_at",
+        "name": "closed_at",
         "type_info": "Timestamptz",
         "origin": {
           "Table": {
-            "table": "grants",
-            "name": "granted_at"
+            "table": "a2a_threads",
+            "name": "closed_at"
           }
         }
       },
       {
         "ordinal": 10,
-        "name": "expires_at",
+        "name": "last_activity_at",
         "type_info": "Timestamptz",
         "origin": {
           "Table": {
-            "table": "grants",
-            "name": "expires_at"
+            "table": "a2a_threads",
+            "name": "last_activity_at"
           }
         }
       },
       {
         "ordinal": 11,
-        "name": "status",
-        "type_info": "Text",
+        "name": "last_seq",
+        "type_info": "Int4",
         "origin": {
           "Table": {
-            "table": "grants",
-            "name": "status"
+            "table": "a2a_threads",
+            "name": "last_seq"
           }
         }
       },
       {
         "ordinal": 12,
-        "name": "provisioner_state",
-        "type_info": "Jsonb",
+        "name": "closed_by",
+        "type_info": "Uuid",
         "origin": {
           "Table": {
-            "table": "grants",
-            "name": "provisioner_state"
+            "table": "a2a_threads",
+            "name": "closed_by"
           }
         }
       },
       {
         "ordinal": 13,
-        "name": "revoked_at",
-        "type_info": "Timestamptz",
+        "name": "close_reason",
+        "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "grants",
-            "name": "revoked_at"
+            "table": "a2a_threads",
+            "name": "close_reason"
           }
         }
       },
       {
         "ordinal": 14,
-        "name": "revoke_reason",
+        "name": "close_note",
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "grants",
-            "name": "revoke_reason"
+            "table": "a2a_threads",
+            "name": "close_note"
           }
         }
       },
@@ -174,7 +174,7 @@
         "type_info": "Timestamptz",
         "origin": {
           "Table": {
-            "table": "grants",
+            "table": "a2a_threads",
             "name": "created_at"
           }
         }
@@ -183,27 +183,28 @@
     "parameters": {
       "Left": [
         "Timestamptz",
+        "Uuid",
         "Int8"
       ]
     },
     "nullable": [
       false,
       false,
+      true,
       false,
       true,
       true,
       true,
       false,
+      true,
+      true,
       false,
       false,
-      false,
-      false,
-      false,
-      false,
+      true,
       true,
       true,
       false
     ]
   },
-  "hash": "2e363da4bb9cfd01b1b4150696e94fc64690093f6c2012975d4caa3a40ab3860"
+  "hash": "c98b9a180e0e2ee3a589373b4fb02c35fb643d1407fbe8e5133355b5e8bda87e"
 }

@@ -881,16 +881,20 @@ pub async fn message_counts(
 }
 
 /// Opened at or after `since`, oldest first (audit feed).
+/// Keyset-paginated: with `after`, rows at exactly `since` only past
+/// that id; ordered by (time, id), so a page boundary is exact.
 pub async fn created_since(
     tx: &Tx<'_>,
     since: OffsetDateTime,
+    after: Option<Uuid>,
     limit: i64,
 ) -> Result<Vec<ThreadRow>, StoreError> {
     let mut c = tx.conn().await;
     let raw = sqlx::query_as!(
         RawThread,
-        "SELECT * FROM a2a_threads WHERE created_at >= $1 ORDER BY created_at LIMIT $2",
+        "SELECT * FROM a2a_threads WHERE created_at > $1 OR (created_at = $1 AND ($2::uuid IS NULL OR id > $2)) ORDER BY created_at, id LIMIT $3",
         since,
+        after,
         limit
     )
     .fetch_all(&mut **c)
@@ -899,16 +903,20 @@ pub async fn created_since(
 }
 
 /// Closed at or after `since`, oldest first (audit feed).
+/// Keyset-paginated: with `after`, rows at exactly `since` only past
+/// that id; ordered by (time, id), so a page boundary is exact.
 pub async fn closed_since(
     tx: &Tx<'_>,
     since: OffsetDateTime,
+    after: Option<Uuid>,
     limit: i64,
 ) -> Result<Vec<ThreadRow>, StoreError> {
     let mut c = tx.conn().await;
     let raw = sqlx::query_as!(
         RawThread,
-        "SELECT * FROM a2a_threads WHERE closed_at >= $1 ORDER BY closed_at LIMIT $2",
+        "SELECT * FROM a2a_threads WHERE closed_at > $1 OR (closed_at = $1 AND ($2::uuid IS NULL OR id > $2)) ORDER BY closed_at, id LIMIT $3",
         since,
+        after,
         limit
     )
     .fetch_all(&mut **c)
