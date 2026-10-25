@@ -51,8 +51,12 @@ pub use routes::routes;
 /// Connections that haven't authenticated yet are anyone's: at most this
 /// many handshakes at once.
 pub const MAX_PENDING_HANDSHAKES: usize = 32;
-/// Waiting for the hello.
-pub const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Unauthenticated handshakes at once from one peer address (review
+/// 2026-10: sockets must not starve a host's reconnect).
+pub const MAX_PENDING_PER_PEER: usize = 4;
+/// Waiting for the hello (the Python waited 10 s; a short wait frees a
+/// slot held by a socket that says nothing).
+pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// A connection silent for this many heartbeat intervals is dropped.
 pub const MISSED_HEARTBEATS: u32 = 3;
 /// Heartbeat status is daemon-supplied: at most this much of it is stored.
@@ -222,6 +226,8 @@ pub struct DaemonHub {
     config: DaemonsConfig,
     registry: Mutex<Registry>,
     pending: Arc<Semaphore>,
+    /// Pending handshakes per peer address.
+    pending_peers: Arc<Mutex<HashMap<String, usize>>>,
     calls: Mutex<HashMap<String, (Key, oneshot::Sender<Reply>)>>,
     hooks: RwLock<Hooks>,
 }
@@ -250,6 +256,7 @@ impl DaemonHub {
             config,
             registry: Mutex::new(Registry::default()),
             pending: Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES)),
+            pending_peers: Arc::new(Mutex::new(HashMap::new())),
             calls: Mutex::new(HashMap::new()),
             hooks: RwLock::new(Hooks::default()),
         }
@@ -463,6 +470,44 @@ impl DaemonHub {
         for l in live {
             l.close(1001, reason);
         }
+    }
+}
+
+/// One peer's handshake slot, given back on drop.
+pub(crate) struct PeerSlot {
+    peers: Arc<Mutex<HashMap<String, usize>>>,
+    peer: String,
+}
+
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        let mut peers = self.peers.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(n) = peers.get_mut(&self.peer) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                peers.remove(&self.peer);
+            }
+        }
+    }
+}
+
+impl DaemonHub {
+    /// A handshake slot for `peer`, if it has fewer than
+    /// [`MAX_PENDING_PER_PEER`] in progress.
+    pub(crate) fn peer_slot(&self, peer: &str) -> Option<PeerSlot> {
+        let mut peers = self
+            .pending_peers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let n = peers.entry(peer.to_owned()).or_insert(0);
+        if *n >= MAX_PENDING_PER_PEER {
+            return None;
+        }
+        *n = n.saturating_add(1);
+        Some(PeerSlot {
+            peers: Arc::clone(&self.pending_peers),
+            peer: peer.to_owned(),
+        })
     }
 }
 

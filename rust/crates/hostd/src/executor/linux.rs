@@ -145,13 +145,45 @@ impl LinuxConfig {
             args.push(format!("--setenv={k}={v}"));
         }
         args.push("--".into());
-        args.extend(job.argv.iter().cloned());
+        // The service manager expands `$VAR`/`${VAR}` in a transient unit's
+        // command as in ExecStart=, so what ran would differ from the argv
+        // that was approved and matched: every `$` goes as `$$` (review
+        // 2026-10; `--expand-environment=no` needs systemd 254).
+        args.extend(job.argv.iter().map(|a| systemd_escape(a)));
         Ok(SystemdCommand {
             program: self.systemd_run.clone(),
             args,
             env: vec![("PATH".into(), path), ("LANG".into(), "C.UTF-8".into())],
         })
     }
+}
+
+/// An argument as systemd's ExecStart= takes it literally: `$` as `$$`.
+#[must_use]
+pub fn systemd_escape(arg: &str) -> String {
+    arg.replace('$', "$$")
+}
+
+/// What systemd makes of a command argument (its documented ExecStart=
+/// rules for `$`): `$$` is a `$`; any other `$` starts a variable
+/// reference. `None` when something would be expanded.
+#[must_use]
+pub fn systemd_literal(arg: &str) -> Option<String> {
+    let mut out = String::with_capacity(arg.len());
+    let mut chars = arg.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '$' {
+            if chars.peek() == Some(&'$') {
+                chars.next();
+                out.push('$');
+            } else {
+                return None;
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
 }
 
 /// The start time field of `/proc/<pid>/stat` (the 20th after the `)`
@@ -424,6 +456,26 @@ mod tests {
     }
 
     #[test]
+    fn dollars_reach_the_job_literally() {
+        let mut p = parts(Tier::Root, None);
+        p.argv = vec!["sh".into(), "-c".into(), "echo $HOME ${PATH} $$".into()];
+        let c = cfg().command(&p, None).unwrap();
+        assert_eq!(c.args.last().unwrap(), "echo $$HOME $${PATH} $$$$");
+        assert_eq!(systemd_literal("echo $$HOME"), Some("echo $HOME".into()));
+        assert_eq!(systemd_literal("echo $HOME"), None);
+        assert_eq!(systemd_literal("a$"), None);
+    }
+
+    proptest::proptest! {
+        /// Any argument survives systemd's `$` rules unchanged once escaped.
+        #[test]
+        fn escaping_round_trips(arg in "\\PC*", dollars in proptest::collection::vec("[$a-z{}]{0,4}", 0..6)) {
+            let s = format!("{arg}{}", dollars.concat());
+            proptest::prop_assert_eq!(systemd_literal(&systemd_escape(&s)), Some(s));
+        }
+    }
+
+    #[test]
     fn parsers() {
         let stat = "1234 (my (odd) prog) S 1 1234 1234 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654 1000 200";
         assert_eq!(proc_start_time(stat).as_deref(), Some("987654"));
@@ -471,7 +523,7 @@ mod tests {
         )
         .unwrap();
         let raw = serde_json::json!({"kind": "run", "host": "h", "tier": "root",
-            "argv": ["sh", "-c", "cat; echo $HOME; exit 7"], "cwd": null, "env": {},
+            "argv": ["sh", "-c", "cat; printenv HOME; exit 7"], "cwd": null, "env": {},
             "timeout": 60, "stdin": "in\n"});
         let job = normalize(&policy, &raw, false).unwrap();
         let digest = agent_auth_core::hostd::SpecDigest::parse(&"0".repeat(64)).unwrap();

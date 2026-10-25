@@ -37,9 +37,9 @@ use serde_json::Value;
 pub use admission::{
     AUTHZ_TTL_SECS, AdmissionFacts, AdmittedJob, ApprovalVia, ArmProof, ArmState, Authorizations,
     AuthzFacts, DeskApproval, DeskPrompt, Evidence, HostView, LocalCaller, Normalized, OpenShell,
-    PolkitConfirmed, RefusalKind, TotpApproval, admit, admit_shell_command, check_tier, decide,
-    desk_approval, desk_prompt, loggable, normalize, open_shell, parse_shell_request, precheck_job,
-    precheck_shell,
+    PolkitConfirmed, RefusalKind, TotpApproval, admit, admit_shell_command, auto_matches,
+    check_tier, decide, deny_matches, desk_approval, desk_prompt, loggable, normalize, open_shell,
+    parse_shell_request, precheck_job, precheck_shell,
 };
 pub use policy::{HostPolicy, TierPolicy};
 

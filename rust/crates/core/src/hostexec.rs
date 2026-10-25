@@ -731,6 +731,11 @@ pub struct Template {
     argv: Vec<String>,
     pub params: BTreeMap<String, ParamPattern>,
     pub description: String,
+    /// What the template pins besides its argv (on a host, a template job
+    /// takes these and refuses request-supplied ones; review 2026-10).
+    pub cwd: Option<String>,
+    pub env: BTreeMap<String, String>,
+    pub stdin: Option<String>,
 }
 
 impl Template {
@@ -748,6 +753,9 @@ impl Template {
             argv,
             params,
             description,
+            cwd: None,
+            env: BTreeMap::new(),
+            stdin: None,
         })
     }
 
@@ -828,6 +836,12 @@ struct RawTemplate {
     params: BTreeMap<String, ParamPattern>,
     #[serde(default)]
     description: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default)]
+    stdin: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for Template {
@@ -835,7 +849,27 @@ impl<'de> Deserialize<'de> for Template {
         let raw = RawTemplate::deserialize(d)?;
         let tier = Tier::parse(&raw.tier)
             .ok_or_else(|| serde::de::Error::custom("tier must be \"user\" or \"root\""))?;
-        Template::new(tier, raw.argv, raw.params, raw.description).map_err(serde::de::Error::custom)
+        let cwd =
+            validate_cwd(raw.cwd.map(Value::String).as_ref()).map_err(serde::de::Error::custom)?;
+        let env_value = Value::Object(
+            raw.env
+                .into_iter()
+                .map(|(k, v)| (k, Value::String(v)))
+                .collect(),
+        );
+        let env = validate_env(Some(&env_value))
+            .map_err(serde::de::Error::custom)?
+            .into_iter()
+            .map(|(k, v)| (k.into_string(), v))
+            .collect();
+        let stdin = validate_stdin(raw.stdin.map(Value::String).as_ref())
+            .map_err(serde::de::Error::custom)?;
+        let mut t = Template::new(tier, raw.argv, raw.params, raw.description)
+            .map_err(serde::de::Error::custom)?;
+        t.cwd = cwd;
+        t.env = env;
+        t.stdin = stdin;
+        Ok(t)
     }
 }
 

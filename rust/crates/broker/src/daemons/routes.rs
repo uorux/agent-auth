@@ -75,12 +75,18 @@ async fn pair(State(state): State<AppState>, bytes: Bytes) -> ApiResult<Json<Pai
     }))
 }
 
-async fn connect(State(state): State<AppState>, ws: WebSocketUpgrade) -> ApiResult<Response> {
+async fn connect(
+    State(state): State<AppState>,
+    parts: axum::http::request::Parts,
+    ws: WebSocketUpgrade,
+) -> ApiResult<Response> {
     let hub = hub(&state)?;
+    let peer = crate::auth::client_address(&parts, state.auth.trust_x_real_ip)
+        .unwrap_or_else(|| "unknown".to_owned());
     Ok(ws
         .max_message_size(MAX_FRAME_BYTES)
         .max_frame_size(MAX_FRAME_BYTES)
-        .on_upgrade(move |socket| hub.serve(socket)))
+        .on_upgrade(move |socket| hub.serve(socket, peer)))
 }
 
 async fn create_code(

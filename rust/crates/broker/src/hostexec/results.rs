@@ -80,29 +80,50 @@ impl HostExec {
             return;
         }
         // The job's row may not be committed yet (it is written in its
-        // grant's provisioning transaction): retry briefly before treating
-        // it as someone else's.
-        let mut stored = self.store_result(peer.name(), &done, &output).await;
-        for _ in 0..10 {
-            if !matches!(stored, Ok(None)) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            stored = self.store_result(peer.name(), &done, &output).await;
+        // grant's provisioning transaction): retried for a while in the
+        // background, without holding up the channel, before it is treated
+        // as another host's.
+        let host = peer.name().to_owned();
+        let first = self.store_result(&host, &done, &output).await;
+        if !matches!(first, Ok(None)) {
+            self.result_stored(&host, &done, first).await;
+            return;
         }
+        let Some(me) = self.self_arc() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let mut stored = Ok(None);
+            for _ in 0..120 {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                stored = me.store_result(&host, &done, &output).await;
+                if !matches!(stored, Ok(None)) {
+                    break;
+                }
+            }
+            me.result_stored(&host, &done, stored).await;
+        });
+    }
+
+    async fn result_stored(
+        &self,
+        host: &str,
+        done: &JobDone,
+        stored: Result<Option<(bool, JobRow)>, agent_auth_store::StoreError>,
+    ) {
         match stored {
             Ok(Some((fresh, job))) => {
                 let mut ack = Map::new();
                 ack.insert("type".into(), json!("job.ack"));
                 ack.insert("job_id".into(), json!(done.job_id.to_string()));
-                self.hub.send_default(Role::Host, peer.name(), &ack).await;
+                self.hub.send_default(Role::Host, host, &ack).await;
                 if fresh {
                     self.job_events.notify(&job.id);
                     self.job_finished(&job).await;
                 }
             }
             Ok(None) => {
-                tracing::warn!(host = peer.name(), job = %done.job_id, "a host reported a job that isn't its own");
+                tracing::warn!(host, job = %done.job_id, "a host reported a job that isn't its own");
             }
             Err(e) => tracing::error!(job = %done.job_id, error = %e, "result not stored"),
         }
@@ -161,6 +182,17 @@ impl HostExec {
         tx.commit().await?;
         Ok(match finished {
             Finished::NotThisHosts => None,
+            // Not final after all: the row became visible (its provisioning
+            // transaction committed) between the update and the read. Try
+            // again.
+            Finished::AlreadyFinal(j)
+                if matches!(
+                    j.status,
+                    store::JobStatus::Starting | store::JobStatus::Running
+                ) =>
+            {
+                None
+            }
             Finished::AlreadyFinal(j) => Some((false, j)),
             Finished::Stored(j) => Some((true, j)),
         })

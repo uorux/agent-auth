@@ -395,6 +395,9 @@ pub struct LockdownResult {
     /// Per `role:name`: `locked[ · vm ...]`, or why it was not reached.
     pub daemons: BTreeMap<String, String>,
     pub grants_revoked: u32,
+    /// Waiting requests of the affected agents, denied.
+    #[serde(default)]
+    pub requests_denied: u32,
     pub threads_closed: u32,
 }
 

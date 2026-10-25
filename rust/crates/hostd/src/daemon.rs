@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use agent_auth_core::Tier;
-use agent_auth_core::hostd::display::{command_extras, display_argv, fit, one_line};
+use agent_auth_core::hostd::display::{command_extras, display_argv, one_line};
 use agent_auth_core::hostd::output::OutputTail;
 use agent_auth_core::hostd::totp::{Purpose, SecretName};
 use agent_auth_core::hostd::{
@@ -55,6 +55,8 @@ pub const PROMPT_WHO_MAX: usize = 120;
 pub const PROMPT_WHAT_MAX: usize = 600;
 pub const PROMPT_DETAIL_MAX: usize = 800;
 pub const POLKIT_MESSAGE_MAX: usize = 700;
+/// Messages queued for hostd-user before it counts as stalled.
+pub const HELPER_QUEUE: usize = 32;
 
 /// Seconds since the epoch, as a float (the wire's timestamps).
 #[must_use]
@@ -99,7 +101,7 @@ struct RunningJob {
 struct Helper {
     conn: u64,
     pid: i32,
-    tx: mpsc::UnboundedSender<String>,
+    tx: mpsc::Sender<String>,
 }
 
 #[derive(Debug, Default)]
@@ -412,7 +414,7 @@ impl<E: Executor> Hostd<E> {
                     st.helper.as_ref().map(|h| h.tx.clone())
                 };
                 if let Some(tx) = tx {
-                    let _ = tx.send(json!({"type": "cancel", "id": id.as_str()}).to_string());
+                    let _ = tx.try_send(json!({"type": "cancel", "id": id.as_str()}).to_string());
                 }
                 Ok(Map::new())
             }
@@ -478,6 +480,9 @@ impl<E: Executor> Hostd<E> {
         match self.totp.verify(name, code, self.totp_now()) {
             Ok(c) => Ok(c),
             Err(e) => {
+                // Every refusal is an alert: whoever relays codes may be
+                // guessing.
+                tracing::warn!(secret = %name, "TOTP code refused: {e}");
                 self.audit(
                     "totp.refused",
                     json!({"secret": name.as_str(), "job": job.map(LocalId::as_str), "why": e.to_string()}),
@@ -610,7 +615,12 @@ impl<E: Executor> Hostd<E> {
     ) {
         let started = Instant::now();
         let mut tail = OutputTail::new(MAX_OUTPUT_BYTES);
-        let outcome = self.executor.run(&job, &mut tail, kill).await;
+        // A lockdown that landed after admission: it must not start.
+        let outcome = if self.lock_state().is_locked() {
+            Err("locked down before it started".to_owned())
+        } else {
+            self.executor.run(&job, &mut tail, kill).await
+        };
         let id = job.id().clone();
         let (killed, stopping) = {
             let st = self.state();
@@ -618,12 +628,15 @@ impl<E: Executor> Hostd<E> {
         };
         let (exit_code, mut error) = match outcome {
             Ok(code) => (Some(code), None),
+            Err(e) if e.ends_with("before it started") => (None, Some(e)),
             Err(e) => (None, Some(format!("could not run: {e}"))),
         };
         if stopping {
             error = Some("hostd stopped while the job was running".to_owned());
-        } else if killed {
+        } else if killed && exit_code.is_some() {
             error = Some("killed".to_owned());
+        } else if killed && error.is_none() {
+            error = Some("killed before it started".to_owned());
         }
         let kept = tail.finish();
         let secs = (started.elapsed().as_secs_f64() * 1000.0).round() / 1000.0;
@@ -973,15 +986,31 @@ impl<E: Executor> Hostd<E> {
         self.away_reason(&self.state()).is_none()
     }
 
+    /// To hostd-user, never waiting: a helper that stopped reading is
+    /// dropped rather than holding up the broker channel (review 2026-10).
     fn to_helper(&self, msg: &Value) -> bool {
-        let st = self.state();
-        st.helper
-            .as_ref()
-            .is_some_and(|h| h.tx.send(msg.to_string()).is_ok())
+        let mut st = self.state();
+        let Some(h) = st.helper.as_ref() else {
+            return false;
+        };
+        match h.tx.try_send(msg.to_string()) {
+            Ok(()) => true,
+            Err(_) => {
+                tracing::warn!("the desktop helper is not reading; dropping it");
+                st.helper = None;
+                st.presence.connected = false;
+                false
+            }
+        }
     }
 
     async fn prompt(&self, p: wire::Prompt) -> HandlerResult {
         let prompt_id = LocalId::parse(&p.prompt_id.to_string()).map_err(refused)?;
+        if self.state().desk_prompts.contains_key(&prompt_id) {
+            // An Allow on the dialog already up must not authorize another
+            // job (review 2026-10).
+            return Err("that prompt is already up".to_owned());
+        }
         if !self.present() {
             return Err("nobody is at this desktop".to_owned());
         }
@@ -1051,25 +1080,23 @@ impl<E: Executor> Hostd<E> {
                 .clone()
                 .unwrap_or_else(|| "your user".to_owned()),
         };
-        let spec = normalized.spec();
-        let env: BTreeMap<String, String> = spec
-            .env()
-            .iter()
-            .map(|(k, v)| (k.as_str().to_owned(), v.clone()))
-            .collect();
-        let full_what = format!(
+        let what = format!(
             "run on {} as {as_whom}: {}",
             self.name(),
             display_argv(normalized.argv())
         );
-        let extras = command_extras(spec.cwd(), &env, spec.stdin()).join(" · ");
-        let what = fit(&full_what, PROMPT_WHAT_MAX, d.as_str());
-        let extra = fit(&extras, PROMPT_DETAIL_MAX, d.as_str());
-        let message = fit(
-            &format!("{who} asks to {full_what} {extras}"),
-            POLKIT_MESSAGE_MAX,
-            d.as_str(),
-        );
+        let extra =
+            command_extras(normalized.cwd(), normalized.env(), normalized.stdin()).join(" · ");
+        // Exactly what runs, nothing cut: what doesn't fit is not asked at a
+        // desk (it stays on Discord; daemons bug 5, review 2026-10).
+        if what.chars().count() > PROMPT_WHAT_MAX || extra.chars().count() > PROMPT_DETAIL_MAX {
+            return Err("too long to show in full at a desk".to_owned());
+        }
+        let message = if extra.is_empty() {
+            format!("{who} asks to {what}")
+        } else {
+            format!("{who} asks to {what} ({extra})")
+        };
         let mut guard = self.state();
         let st: &mut State = &mut guard;
         let prompt = core_hostd::desk_prompt(self.view(&st.arm), job_id, d, &normalized, message)
@@ -1106,8 +1133,8 @@ impl<E: Executor> Hostd<E> {
 
     /// hostd-user attached (its uid was checked): it replaces any earlier
     /// helper connection. Returns the connection's id and its outbox.
-    pub async fn helper_attached(&self, conn: u64, pid: i32) -> mpsc::UnboundedReceiver<String> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    pub async fn helper_attached(&self, conn: u64, pid: i32) -> mpsc::Receiver<String> {
+        let (tx, rx) = mpsc::channel(HELPER_QUEUE);
         {
             let mut st = self.state();
             st.helper = Some(Helper { conn, pid, tx });
@@ -1211,11 +1238,15 @@ impl<E: Executor> Hostd<E> {
             let tier = desk.tier();
             // Still the current helper and still unlocked, after the password.
             let still_current = self.state().helper.as_ref().is_some_and(|h| h.conn == conn);
-            match core_hostd::desk_approval(desk, still_current, self.lock_state(), polkit) {
+            // Decided and recorded under the state lock: a lockdown that
+            // landed during the password dialog either is seen here or
+            // clears this approval after (review 2026-10).
+            let mut st = self.state();
+            let decided = core_hostd::desk_approval(desk, still_current, self.lock_state(), polkit);
+            match decided {
                 Ok((job, approval)) => {
-                    self.state()
-                        .auths
-                        .record_desk(job.clone(), approval, now_millis());
+                    st.auths.record_desk(job.clone(), approval, now_millis());
+                    drop(st);
                     authorized = true;
                     self.audit(
                         "desk.accepted",
@@ -1223,6 +1254,7 @@ impl<E: Executor> Hostd<E> {
                     );
                 }
                 Err(_) => {
+                    drop(st);
                     // No password, or things changed meanwhile: not a
                     // denial; the request stays where it was (Discord).
                     answer = "discord".to_owned();

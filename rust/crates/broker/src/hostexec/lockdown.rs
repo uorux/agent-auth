@@ -105,6 +105,24 @@ pub async fn lockdown(
         })
         .collect();
 
+    // Held first (as containment does): a request approved while the
+    // grants below are revoked finds the hold and gets nothing; the same
+    // agents are refused new requests until it is lifted (review 2026-10).
+    let r#match = match scope {
+        LockdownScope::All => json!({}),
+        LockdownScope::Sandboxes => json!({"placement": "sandbox"}),
+        LockdownScope::Host => json!({"host": host}),
+    };
+    let reason = format!(
+        "lockdown ({}{})",
+        scope_word(scope),
+        host.as_deref().map(|h| format!(" {h}")).unwrap_or_default()
+    );
+    let entry = record_entry(st, &r#match, &reason, by).await;
+    if let Err(e) = &entry {
+        tracing::error!(error = %e, "lockdown: containment entry not recorded");
+    }
+
     // Stop what runs before tidying the records. Sandboxes first, briefly:
     // once its host froze the VM a sandbox can't answer any more.
     let hub = &hostexec.hub;
@@ -166,6 +184,13 @@ pub async fn lockdown(
     // Revoke the affected agents' grants (falling back to expiring them
     // now, for the scheduler), orphan their inbound threads.
     let ids: Vec<AgentId> = affected.iter().map(|a| a.id).collect();
+    let denied = match crate::service::deny_pending(st, &ids, &reason, by).await {
+        Ok(n) => u32::try_from(n).unwrap_or(u32::MAX),
+        Err(e) => {
+            tracing::error!(error = %e, "lockdown: denying waiting requests failed");
+            0
+        }
+    };
     let grant_ids = if ids.is_empty() {
         Vec::new()
     } else {
@@ -213,21 +238,11 @@ pub async fn lockdown(
         host: host.clone(),
         daemons: reports,
         grants_revoked: revoked,
+        requests_denied: denied,
         threads_closed: closed,
     };
-    // The same agents are refused new requests until it is lifted.
-    let r#match = match scope {
-        LockdownScope::All => json!({}),
-        LockdownScope::Sandboxes => json!({"placement": "sandbox"}),
-        LockdownScope::Host => json!({"host": host}),
-    };
-    let reason = format!(
-        "lockdown ({}{})",
-        scope_word(scope),
-        host.as_deref().map(|h| format!(" {h}")).unwrap_or_default()
-    );
-    match record_entry(st, &r#match, &reason, by).await {
-        Ok(entry) => {
+    if let Ok(entry) = entry {
+        {
             let mut event = serde_json::to_value(&out).unwrap_or_else(|_| json!({}));
             if let Value::Object(m) = &mut event {
                 m.insert("id".into(), json!(entry));
@@ -242,7 +257,6 @@ pub async fn lockdown(
             }
             st.notifier.contained(&event).await;
         }
-        Err(e) => tracing::error!(error = %e, "lockdown: containment entry not recorded"),
     }
     Ok(out)
 }

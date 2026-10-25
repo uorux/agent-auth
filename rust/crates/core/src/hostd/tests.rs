@@ -941,3 +941,95 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn auto_patterns_do_not_cross_paths_and_deny_sees_through_them() {
+    let p: Vec<String> = vec!["cat".into(), "/var/log/*".into()];
+    assert!(auto_matches(&p, &["cat", "/var/log/syslog"]));
+    assert!(!auto_matches(
+        &p,
+        &["cat", "/var/log/../../home/jrt/.ssh/id_ed25519"]
+    ));
+    assert!(!auto_matches(&p, &["cat", "/var/log/a/b"]));
+    assert!(auto_matches(
+        &["ls".to_owned(), "*".to_owned()],
+        &["ls", "a/b"]
+    ));
+    assert!(!auto_matches(
+        &["ls".to_owned(), "**".to_owned()],
+        &["ls", "x/../../etc"]
+    ));
+    let deny: Vec<String> = vec!["/bin/rm".into(), "**".into()];
+    assert!(deny_matches(&deny, &["/usr/../bin/rm", "-rf"]));
+    assert!(deny_matches(
+        &["rm".to_owned(), "**".to_owned()],
+        &["/x/y/rm"]
+    ));
+    assert!(!deny_matches(&deny, &["/bin/ls"]));
+    // Through admission: the `..` argv is not auto.
+    let mut h = Host::new();
+    h.policy.auto_commands = vec![vec!["cat".into(), "/var/log/*".into()]];
+    assert_eq!(
+        h.start(
+            &id(1),
+            &run("user", &["cat", "/var/log/syslog"]),
+            &digest(1),
+            None,
+            false
+        ),
+        Ok(Via::Auto)
+    );
+    assert!(
+        h.start(
+            &id(2),
+            &run("user", &["cat", "/var/log/../../etc/shadow"]),
+            &digest(1),
+            None,
+            false
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn templates_pin_cwd_env_and_stdin() {
+    let mut p = policy();
+    let t: crate::hostexec::Template = serde_json::from_value(json!({
+        "tier": "user", "argv": ["make", "deploy"], "cwd": "/srv/app/../app",
+        "env": {"LANG": "C"}, "stdin": "yes\n"
+    }))
+    .unwrap();
+    assert_eq!(t.cwd.as_deref(), Some("/srv/app"));
+    p.templates.insert("deploy".into(), t);
+    let tpl = |extra: Value| {
+        let mut v = json!({"kind": "tpl", "host": HOST, "tier": "user", "template": "deploy",
+               "params": {}, "cwd": null, "env": {}, "timeout": 600, "stdin": null});
+        for (k, x) in extra.as_object().unwrap() {
+            v[k] = x.clone();
+        }
+        v
+    };
+    let n = normalize(&p, &tpl(json!({})), false).unwrap();
+    assert_eq!(n.cwd(), Some("/srv/app"));
+    assert_eq!(n.env().get("LANG").map(String::as_str), Some("C"));
+    assert_eq!(n.stdin(), Some("yes\n"));
+    for (extra, why) in [
+        (json!({"cwd": "/tmp"}), "template 'deploy' takes no cwd"),
+        (
+            json!({"env": {"LANG": "x"}}),
+            "template 'deploy' takes no environment",
+        ),
+        (
+            json!({"stdin": "rm -rf ~\n"}),
+            "template 'deploy' takes no stdin",
+        ),
+    ] {
+        assert_eq!(normalize(&p, &tpl(extra), false).unwrap_err().0, why);
+    }
+    assert!(
+        serde_json::from_value::<crate::hostexec::Template>(
+            json!({"tier": "user", "argv": ["x"], "cwd": "rel"})
+        )
+        .is_err()
+    );
+}

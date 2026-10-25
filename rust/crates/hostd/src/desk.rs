@@ -52,7 +52,11 @@ async fn connection<E: Executor>(stream: UnixStream, hostd: Arc<Hostd<E>>) {
         while let Some(line) = outbox.recv().await {
             let mut bytes = line.into_bytes();
             bytes.push(b'\n');
-            if write.write_all(&bytes).await.is_err() {
+            // A helper that stops reading is dropped (drain timeout).
+            let sent =
+                tokio::time::timeout(std::time::Duration::from_secs(5), write.write_all(&bytes))
+                    .await;
+            if !matches!(sent, Ok(Ok(()))) {
                 break;
             }
         }

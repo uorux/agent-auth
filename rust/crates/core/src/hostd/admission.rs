@@ -12,7 +12,10 @@ use super::{
     tier_word,
 };
 use crate::authority::Tier;
-use crate::hostexec::{Command, CommandSpec, JobSpec, ShellSpec, match_argv, shell_spec};
+use crate::glob::fnmatch;
+use crate::hostexec::{
+    Command, CommandSpec, JobSpec, ShellSpec, match_argv, posix_normpath, shell_spec,
+};
 
 /// How long a TOTP code's or a desk answer's approval waits for its job.
 pub const AUTHZ_TTL_SECS: u64 = 300;
@@ -63,6 +66,80 @@ fn locked_refusal(policy: &HostPolicy) -> Refused {
     Refused(format!("{} is locked down", policy.name))
 }
 
+/// An argument holding a `..` path segment.
+fn has_dotdot(arg: &str) -> bool {
+    arg.split('/').any(|seg| seg == "..")
+}
+
+/// One glob against one argument, path-aware: a glob holding a `/`
+/// matches segment by segment, so `*` and `?` never cross a `/`.
+fn segments_match(glob: &str, arg: &str) -> bool {
+    if !glob.contains('/') {
+        return fnmatch(arg, glob);
+    }
+    let globs: Vec<&str> = glob.split('/').collect();
+    let args: Vec<&str> = arg.split('/').collect();
+    globs.len() == args.len() && globs.iter().zip(&args).all(|(g, a)| fnmatch(a, g))
+}
+
+/// `match_argv`'s shape (a final `**` takes any number of arguments) with
+/// a per-argument test.
+fn shape_matches<P: AsRef<str>, A: AsRef<str>>(
+    pattern: &[P],
+    argv: &[A],
+    one: impl Fn(&str, &str) -> bool,
+) -> bool {
+    let rest = pattern.last().is_some_and(|p| p.as_ref() == "**");
+    let fixed = if rest {
+        pattern
+            .get(..pattern.len().saturating_sub(1))
+            .unwrap_or(&[])
+    } else {
+        pattern
+    };
+    if argv.len() < fixed.len() || (!rest && argv.len() != fixed.len()) {
+        return false;
+    }
+    fixed
+        .iter()
+        .zip(argv)
+        .all(|(g, a)| one(g.as_ref(), a.as_ref()))
+}
+
+/// Does an `auto_commands` pattern match? Strictly: the program as given,
+/// path globs segment by segment, and never an argv with a `..` path
+/// segment (`cat /var/log/*` must not reach `/var/log/../../home/...`;
+/// review 2026-10).
+#[must_use]
+pub fn auto_matches<P: AsRef<str>, A: AsRef<str>>(pattern: &[P], argv: &[A]) -> bool {
+    if argv.iter().any(|a| has_dotdot(a.as_ref())) {
+        return false;
+    }
+    shape_matches(pattern, argv, segments_match)
+}
+
+/// Does a `deny_commands` pattern match? Broadly: as written (globs cross
+/// `/`, the program also by its basename), and again with every path
+/// argument lexically normalized (`/usr/../bin/rm` is `/bin/rm`).
+#[must_use]
+pub fn deny_matches<P: AsRef<str>, A: AsRef<str>>(pattern: &[P], argv: &[A]) -> bool {
+    if match_argv(pattern, argv, true) {
+        return true;
+    }
+    let normalized: Vec<String> = argv
+        .iter()
+        .map(|a| {
+            let a = a.as_ref();
+            if a.contains('/') {
+                posix_normpath(a)
+            } else {
+                a.to_owned()
+            }
+        })
+        .collect();
+    match_argv(pattern, &normalized, true)
+}
+
 /// A broker spec re-validated from scratch against this host's policy, and
 /// resolved to what would run (a template expanded from this host's own
 /// copy).
@@ -70,6 +147,10 @@ fn locked_refusal(policy: &HostPolicy) -> Refused {
 pub struct Normalized {
     spec: CommandSpec,
     argv: Vec<String>,
+    /// What runs: the spec's, or for a template the ones it pins.
+    cwd: Option<String>,
+    env: BTreeMap<String, String>,
+    stdin: Option<String>,
 }
 
 impl Normalized {
@@ -89,6 +170,24 @@ impl Normalized {
         self.spec.tier()
     }
 
+    /// The working directory that applies.
+    #[must_use]
+    pub fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+
+    /// The environment that applies.
+    #[must_use]
+    pub fn env(&self) -> &BTreeMap<String, String> {
+        &self.env
+    }
+
+    /// What goes on stdin.
+    #[must_use]
+    pub fn stdin(&self) -> Option<&str> {
+        self.stdin.as_deref()
+    }
+
     #[must_use]
     pub fn is_run(&self) -> bool {
         matches!(self.spec.command(), Command::Run { .. })
@@ -98,7 +197,16 @@ impl Normalized {
     /// size only (its content is never logged).
     #[must_use]
     pub fn loggable(&self) -> Value {
-        loggable(&self.spec.to_json(), Some(&self.argv))
+        let mut v = loggable(&self.spec.to_json(), Some(&self.argv));
+        if let Value::Object(m) = &mut v {
+            m.insert("cwd".into(), serde_json::json!(self.cwd));
+            m.insert("env".into(), serde_json::json!(self.env));
+            if let Some(stdin) = &self.stdin {
+                let n = stdin.chars().count();
+                m.insert("stdin".into(), Value::String(format!("<{n} chars>")));
+            }
+        }
+        v
     }
 }
 
@@ -146,6 +254,14 @@ pub fn normalize(
     let JobSpec::Command(spec) = JobSpec::from_json(raw, policy.default_timeout_secs)? else {
         return Err(Refused::new("not a runnable job"));
     };
+    let spec_env: BTreeMap<String, String> = spec
+        .env()
+        .iter()
+        .map(|(k, v)| (k.as_str().to_owned(), v.clone()))
+        .collect();
+    let mut cwd = spec.cwd().map(str::to_owned);
+    let mut env = spec_env.clone();
+    let mut stdin = spec.stdin().map(str::to_owned);
     let argv = match spec.command() {
         Command::Run { argv } => argv.clone(),
         Command::Template { template, params } => {
@@ -166,6 +282,21 @@ pub fn normalize(
                     tier_word(host_template.tier)
                 )));
             }
+            // A template's command is its own: what the request may add
+            // to it is only its parameters (review 2026-10).
+            let name = crate::pyfmt::repr(template.as_str());
+            if spec.cwd().is_some() {
+                return Err(Refused(format!("template {name} takes no cwd")));
+            }
+            if !spec_env.is_empty() {
+                return Err(Refused(format!("template {name} takes no environment")));
+            }
+            if spec.stdin().is_some() {
+                return Err(Refused(format!("template {name} takes no stdin")));
+            }
+            cwd = host_template.cwd.clone();
+            env = host_template.env.clone();
+            stdin = host_template.stdin.clone();
             host_template.expand(params)?
         }
     };
@@ -176,10 +307,9 @@ pub fn normalize(
             policy.max_timeout_secs
         )));
     }
-    let extra: Vec<&str> = spec
-        .env()
+    let extra: Vec<&str> = spec_env
         .keys()
-        .map(|k| k.as_str())
+        .map(String::as_str)
         .filter(|k| !policy.env_allow.contains(*k))
         .collect();
     if !extra.is_empty() {
@@ -188,14 +318,16 @@ pub fn normalize(
             extra.join(", ")
         )));
     }
-    if policy
-        .deny_commands
-        .iter()
-        .any(|p| match_argv(p, &argv, true))
-    {
+    if policy.deny_commands.iter().any(|p| deny_matches(p, &argv)) {
         return Err(Refused::new("that command is denied by this host's policy"));
     }
-    Ok(Normalized { spec, argv })
+    Ok(Normalized {
+        spec,
+        argv,
+        cwd,
+        env,
+        stdin,
+    })
 }
 
 // ----------------------------------------------------- the host's approvals
@@ -684,7 +816,7 @@ fn facts(
         auto_match: policy
             .auto_commands
             .iter()
-            .any(|p| match_argv(p, job.argv(), false)),
+            .any(|p| auto_matches(p, job.argv())),
         source: evidence.source,
         window: evidence.window,
         armed: arm.armed(tier, now),
@@ -716,14 +848,10 @@ impl AdmittedJob {
         AdmittedJob {
             id,
             tier: spec.tier(),
-            cwd: spec.cwd().map(str::to_owned),
-            env: spec
-                .env()
-                .iter()
-                .map(|(k, v)| (k.as_str().to_owned(), v.clone()))
-                .collect(),
+            cwd: job.cwd,
+            env: job.env,
             timeout: spec.timeout(),
-            stdin: spec.stdin().map(str::to_owned),
+            stdin: job.stdin,
             argv: job.argv,
             via,
             shell,

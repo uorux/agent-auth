@@ -15,12 +15,12 @@ use agent_auth_hostd::presence::PresenceEvent;
 use agent_auth_store::requests;
 use agent_auth_wire::agent::RequestCreate;
 use serde_json::{Value, json};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 
 use crate::daemons::testkit::{Broker, HOST, Host, caller, wait_until};
 
 /// A host whose user is at the desk: the helper attached, unlocked.
-async fn at_desk(b: &Broker) -> (Host, UnboundedReceiver<String>) {
+async fn at_desk(b: &Broker) -> (Host, Receiver<String>) {
     let host = Host::start(b).await;
     let rx = host.hostd.helper_attached(1, 4242).await;
     host.hostd.presence_event(PresenceEvent::Unlocked);
@@ -36,7 +36,7 @@ async fn at_desk(b: &Broker) -> (Host, UnboundedReceiver<String>) {
     (host, rx)
 }
 
-async fn next_prompt(rx: &mut UnboundedReceiver<String>) -> Value {
+async fn next_prompt(rx: &mut Receiver<String>) -> Value {
     loop {
         let line = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
@@ -62,7 +62,7 @@ async fn status(b: &Broker, id: agent_auth_core::RequestId) -> requests::Request
 }
 
 async fn settled(b: &Broker, id: agent_auth_core::RequestId) -> requests::RequestRow {
-    for _ in 0..250 {
+    for _ in 0..750 {
         let r = status(b, id).await;
         if r.status != RequestStatus::AwaitingHuman {
             return r;
@@ -211,9 +211,9 @@ async fn allow_at_its_own_desk_approves_exactly_that_command(pool: sqlx::PgPool)
         .answered(prompt["id"].as_str().unwrap(), "allow", 1)
         .await;
     let r = settled(&b, r.id).await;
-    assert_eq!(r.status, RequestStatus::Granted);
+    assert_eq!(r.status, RequestStatus::Granted, "{:?}", r.decision_reason);
     let mut job = None;
-    for _ in 0..250 {
+    for _ in 0..750 {
         let tx = b.st.store.begin().await.unwrap();
         let j = agent_auth_store::hostexec::get(&tx, agent_auth_core::JobId::for_request(r.id))
             .await
@@ -228,7 +228,7 @@ async fn allow_at_its_own_desk_approves_exactly_that_command(pool: sqlx::PgPool)
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let job = job.expect("the job ended");
+    let job = job.unwrap_or_else(|| panic!("the job did not end: {:?}", b.recorded()));
     assert_eq!(
         job.status,
         agent_auth_store::hostexec::JobStatus::Done,

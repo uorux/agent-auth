@@ -1063,7 +1063,7 @@ round_trips! {
         }).collect(),
     });
     rt_lockdown_result: (lockdown_scope(), os(), btree_map(s(), s(), 0..3), any::<u32>(), any::<u32>())
-        .prop_map(|(scope, host, daemons, grants_revoked, threads_closed)| LockdownResult { scope, host, daemons, grants_revoked, threads_closed });
+        .prop_map(|(scope, host, daemons, grants_revoked, threads_closed)| LockdownResult { scope, host, daemons, grants_revoked, requests_denied: 0, threads_closed });
     rt_unlock_result: (os(), btree_map(s(), s(), 0..3), strings()).prop_map(|(host, daemons, broker_locked)| UnlockResult { host, daemons, broker_locked });
     rt_decision_item: (
         (request_id(), ts(), option::of(ts()), s(), os(), platform(), s(), s()),

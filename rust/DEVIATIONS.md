@@ -921,8 +921,50 @@ and why. Keep entries short. Group by area.
 - **hostctl prints times in UTC** (no local time zone without libc).
 - **Job rows are written in the grant's provisioning transaction** (it holds
   the grant row; a separate transaction deadlocked on the foreign key). A
-  `job.done` that arrives before that commits is retried for up to 2 s
-  before being treated as another host's.
+  `job.done` that arrives before that commits (or is still seen as
+  starting/running) is retried in the background for up to 30 s, without
+  holding up the channel, before being treated as another host's.
+
+Upstream fixes of review 2026-10, adopted:
+- **systemd-run argv `$` escaping** (HIGH): every `$` goes to systemd as
+  `$$`, so `$VAR`/`${VAR}` are not expanded and what runs is what was
+  approved; a proptest checks any argv round-trips through systemd's
+  documented `$` rules.
+- **Desk dialog shows everything or isn't asked** (HIGH): arguments in
+  `$'..'` escapes, env values and stdin content shown; a command or its
+  details longer than the dialog limits is refused at the desk ("too long
+  to show in full at a desk") and stays on Discord, instead of being shown
+  cut with a digest. A prompt id already up is refused ("that prompt is
+  already up").
+- **Lockdown order**: the containment entry is recorded first, then the
+  affected agents' waiting requests are denied (`requests_denied` in
+  `LockdownResult`, new field), then grants are revoked. On a host, the
+  in-memory lock is set before the lockdown file is written; a write
+  failure doesn't stop disarming or kills. A job whose kill or lockdown
+  lands before it is spawned never runs ("killed before it started" /
+  "locked down before it started"). A desk root Allow is decided and
+  recorded under the state lock, so a lockdown during the polkit dialog
+  either is seen or clears the approval.
+- **hostd-user stalls**: messages to the desktop helper go through a
+  bounded queue (32) with `try_send`; a full queue drops the helper, and a
+  socket write that takes over 5 s ends its connection. Neither can block
+  the broker channel.
+- **No host TOTP code spent on a contained or disabled agent**: the
+  spine's gate runner skips the approval gate when the agent's lockdown or
+  containment check fails, so provisioning fails without a code relayed.
+- **auto/deny globs and paths**: `auto_commands` match path globs segment
+  by segment (`*` never crosses `/`) and never match an argv with a `..`
+  path segment; `deny_commands` match as before and again with path
+  arguments lexically normalized (`/usr/../bin/rm`).
+- **Templates may pin `cwd`, `env` and `stdin`** (validated as a
+  request's would be); a template request carrying any of them is refused
+  on the host ("template 'x' takes no cwd/environment/stdin"). The broker
+  still validates the request shape; the host is authoritative.
+- **Handshake slots**: at most 4 unauthenticated handshakes per peer
+  address (X-Real-IP when trusted) and 32 overall; the hello timeout is
+  5 s (was 10 s).
+- **Every TOTP refusal is logged as a warning** besides its audit record;
+  lockouts escalate as before.
 
 ## Open questions
 

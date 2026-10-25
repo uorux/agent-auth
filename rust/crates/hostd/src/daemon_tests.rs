@@ -153,6 +153,15 @@ impl T {
     }
 }
 
+/// Killed while running, or before it started (a kill that lands first
+/// keeps it from starting at all).
+fn stopped(error: &Value) -> bool {
+    matches!(
+        error.as_str(),
+        Some("killed" | "killed before it started" | "locked down before it started")
+    )
+}
+
 fn job_id(n: u32) -> String {
     format!("00000000-0000-4000-8000-{n:012x}")
 }
@@ -379,7 +388,7 @@ async fn output_keeps_its_end_and_a_killed_job_says_so() {
         .unwrap();
     assert_eq!(killed["killed"], json!(true));
     let done = t.done(&job_id(41)).await;
-    assert_eq!(done["error"], json!("killed"));
+    assert!(stopped(&done["error"]), "{}", done["error"]);
     assert_eq!(
         t.call(json!({"type": "job.kill", "job_id": job_id(41)}))
             .await
@@ -460,7 +469,7 @@ async fn shells_take_a_totp_code_and_stay_bounded() {
         .await
         .unwrap();
     assert_eq!(closed["closed"], json!(true));
-    assert_eq!(t.done(&job_id(54)).await["error"], json!("killed"));
+    assert!(stopped(&t.done(&job_id(54)).await["error"]));
     assert!(
         t.call(exec(55, &["ls"], "user"))
             .await
@@ -487,7 +496,7 @@ async fn lockdown_stops_everything_and_only_the_root_arm_code_unlocks() {
         .await
         .unwrap();
     assert_eq!(locked["vm"], json!("freeze: ok"));
-    assert_eq!(t.done(&job_id(60)).await["error"], json!("killed"));
+    assert!(stopped(&t.done(&job_id(60)).await["error"]));
     assert_eq!(
         t.call(start(&job_id(61), &run_spec("user", &["true"]), None))
             .await
@@ -763,5 +772,41 @@ async fn nobody_at_the_desk_means_no_prompt() {
     assert_eq!(
         t.call(prompt).await.unwrap_err(),
         "nobody is at this desktop"
+    );
+}
+
+#[tokio::test]
+async fn a_desk_is_shown_everything_or_not_asked_and_prompt_ids_are_single() {
+    let t = T::new();
+    let _rx = t.hostd.helper_attached(7, 1234).await;
+    t.ctl(USER_UID, "presence", json!({"state": "unlocked"}))
+        .await
+        .unwrap();
+    let prompt = |id: &str, spec: &Value| {
+        json!({"type": "prompt", "prompt_id": id, "request_id": job_id(96), "who": "a",
+               "what": "", "detail": "", "timeout": 30,
+               "job": {"job_id": job_id(96), "spec": spec}})
+    };
+    let p1 = "11111111-2222-4333-8444-555555555551";
+    t.call(prompt(p1, &run_spec("user", &["true"])))
+        .await
+        .unwrap();
+    // The same id again (a swapped job behind an open dialog): refused.
+    assert_eq!(
+        t.call(prompt(p1, &run_spec("user", &["rm", "-r", "x"])))
+            .await
+            .unwrap_err(),
+        "that prompt is already up"
+    );
+    // A command too long to show whole is not asked at the desk.
+    let long = "x".repeat(700);
+    assert_eq!(
+        t.call(prompt(
+            "11111111-2222-4333-8444-555555555552",
+            &run_spec("user", &["echo", &long])
+        ))
+        .await
+        .unwrap_err(),
+        "too long to show in full at a desk"
     );
 }
