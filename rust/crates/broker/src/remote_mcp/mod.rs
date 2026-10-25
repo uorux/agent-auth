@@ -848,6 +848,31 @@ impl Api<'_> {
                 let path = format!("/v1/grants/{}/release", seg(&a.s("grant_id")));
                 self.post(&path, None, None).await
             }
+            "mail_list" => {
+                let path = format!("/v1/mail/{}/messages", seg(&a.s("grant_id")));
+                let mut q = vec![("limit", a.v("limit").to_string())];
+                if let Some(page) = a.opt_s("page").filter(|p| !p.is_empty()) {
+                    q.push(("page", page));
+                }
+                if let Some(search) = a.opt_s("search").filter(|p| !p.is_empty()) {
+                    q.push(("search", search));
+                }
+                self.get(&path, &q, None).await
+            }
+            "mail_read" => {
+                let path = format!(
+                    "/v1/mail/{}/messages/{}",
+                    seg(&a.s("grant_id")),
+                    seg(&a.s("message_id"))
+                );
+                self.get(&path, &[], None).await
+            }
+            "mail_send" => {
+                let path = format!("/v1/mail/{}/send", seg(&a.s("grant_id")));
+                let body = json!({"to": a.v("to"), "subject": a.v("subject"),
+                                  "body": a.v("body"), "reply_to": a.v("reply_to")});
+                self.post(&path, Some(body), None).await
+            }
             "create_session" => {
                 // As this connector, never as anyone else (Bug-C3).
                 self.post("/v1/sessions", Some(json!({"label": a.s("label")})), None)

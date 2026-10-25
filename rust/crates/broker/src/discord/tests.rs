@@ -1087,6 +1087,7 @@ fn bot_with(base: &str, owner: u64, store: Store, ops: &Arc<FakeOps>) -> Discord
         containment: Some(containment),
         hosts: None,
         app: None,
+        mail: None,
     });
     d
 }

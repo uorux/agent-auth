@@ -513,6 +513,7 @@ pub struct PlatformsConfig {
     pub google: GoogleConfig,
     /// Platform `pool`: scarce things, by pool name.
     pub pools: BTreeMap<String, PoolConfig>,
+    pub mail: super::mail::MailConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -662,7 +663,7 @@ pub const REMOTE_MCP_TOOLS: [&str; 23] = [
 
 /// Every MCP tool's name (`mcp_names.TOOL_NAMES`). The MCP crate keeps its
 /// tools and this list the same.
-pub const MCP_TOOL_NAMES: [&str; 31] = [
+pub const MCP_TOOL_NAMES: [&str; 35] = [
     "whoami",
     "list_capabilities",
     "request_access",
@@ -673,6 +674,10 @@ pub const MCP_TOOL_NAMES: [&str; 31] = [
     "list_grants",
     "get_credential",
     "release_grant",
+    "mail_list",
+    "mail_read",
+    "mail_attachment",
+    "mail_send",
     "create_session",
     "close_session",
     "check_a2a",

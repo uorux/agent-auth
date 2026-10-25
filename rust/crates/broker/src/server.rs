@@ -71,6 +71,38 @@ pub fn register_provisioners(
     Ok((registry, built.services))
 }
 
+/// The mail gateway (`mail::setup`), when mail is configured.
+fn mail_gateway(
+    env: &Env,
+    config: &Config,
+    policy: &Arc<Policy>,
+    store: &Store,
+    services: &PlatformServices,
+) -> anyhow::Result<Option<Arc<crate::mail::Mail>>> {
+    let secret_box = match &config.encryption_key {
+        Some(k) => Some(Arc::new(
+            SecretBox::from_base64(k.expose())
+                .map_err(|e| anyhow::anyhow!("ENCRYPTION_KEY: {e}"))?,
+        )),
+        None => None,
+    };
+    let extra_ca_pem = match env.get("MAIL_CA_FILE") {
+        Some(path) => Some(std::fs::read(path).with_context(|| format!("MAIL_CA_FILE {path}"))?),
+        None => None,
+    };
+    let settings = crate::mail::setup::MailSettings {
+        secret_box,
+        openrouter_api_key: config
+            .openrouter_api_key
+            .as_ref()
+            .map(|k| k.expose().clone()),
+        openrouter_base_url: config.openrouter_base_url.clone(),
+        extra_ca_pem,
+        gmail_api: env.get("GMAIL_API_URL").map(str::to_owned),
+    };
+    crate::mail::setup::build(policy, store, &settings, services.google_tokens.as_ref())
+}
+
 /// The spine's own state: the LLM reviewer and the risk summarizer.
 pub fn spine(config: &Config, policy: &Policy) -> anyhow::Result<Spine> {
     let mut spine = Spine::default();
@@ -266,6 +298,14 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
 
     let policy = Arc::new(policy);
     let (mut registry, platform_services) = register_provisioners(&env, &config, &policy)?;
+    let mail = mail_gateway(&env, &config, &policy, &store, &platform_services)?;
+    if let Some(m) = &mail {
+        registry.register(AnyProvisioner::Mail(
+            crate::mail::provisioner::MailProvisioner {
+                gateway: Arc::clone(m),
+            },
+        ));
+    }
     let mut spine = spine(&config, &policy)?;
     let hostd = hostd_part(&config, &store, &policy)?;
     if let Some(p) = hostd.provisioner() {
@@ -317,6 +357,10 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
     }
     let primary = Arc::try_unwrap(state.notifier).unwrap_or_default();
     state.notifier = Arc::new(hostd.wrap_notifier(primary));
+    if let Some(m) = &mail {
+        m.set_notifier(Arc::clone(&state.notifier));
+    }
+    state.mail = mail.clone();
     let hostd = Arc::new(hostd);
     state.hostd = Some(Arc::clone(&hostd));
     let state = crate::webui::install(state, web);
@@ -335,6 +379,7 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
             containment: Some(ops),
             hosts: Some(hosts),
             app: Some(state.clone()),
+            mail: mail.clone().map(|m| -> Arc<dyn crate::mail::MailOps> { m }),
         });
         tasks.push(tokio::spawn(d.run()));
     }

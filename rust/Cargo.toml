@@ -22,6 +22,7 @@ agent-auth-client = { path = "crates/client", version = "0.1.0" }
 agent-auth-daemon = { path = "crates/daemon", version = "0.1.0" }
 agent-auth-hostd = { path = "crates/hostd", version = "0.1.0" }
 agent-auth-tls = { path = "crates/tls", version = "0.1.0" }
+agent-auth-mail = { path = "crates/mail", version = "0.1.0" }
 
 tokio = { version = "1.54.1", default-features = false }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "form", "tokio", "matched-path"] }
@@ -35,7 +36,8 @@ rustls-pki-types = { version = "1.15.1", default-features = false, features = ["
 # `__rustls-tls`: TLS through a rustls config we pass in (agent-auth-tls),
 # with no bundled root store of its own.
 tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect", "handshake", "__rustls-tls"] }
-# TLS for the daemons' channel, over the shared rustls config (agent-auth-tls).
+# TLS for the daemons' channel and the mail gateway's IMAP/SMTP, over the
+# shared rustls config (agent-auth-tls).
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["tls12"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "macros", "migrate", "json", "time", "uuid", "tls-rustls-ring-webpki"] }
 ring = { version = "0.17.14", default-features = false, features = ["alloc", "std"] }
@@ -66,10 +68,15 @@ rmcp = { version = "3.5.1", default-features = false }
 # TLS roots. The broker speaks REST over reqwest and the gateway over
 # tokio-tungstenite, both through agent-auth-tls.
 twilight-model = { version = "0.17.1", default-features = false }
+# MIME parsing of untrusted mail (Stalwart's; pure Rust, no unsafe). No
+# `full_encoding`: no encoding_rs (CJK multi-byte charsets decode lossily).
+mail-parser = { version = "0.11.9", default-features = false }
 
 # dev/test only
 http-body-util = { version = "0.1.3", default-features = false }
 proptest = { version = "1.12.0", default-features = false, features = ["std"] }
+# Test certificates for the IMAP/SMTP fakes (ring, no aws-lc).
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

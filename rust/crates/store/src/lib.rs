@@ -84,6 +84,7 @@ pub mod instance;
 pub mod lldap;
 pub mod llm;
 pub mod lockdown;
+pub mod mail;
 pub mod oauth;
 pub mod pool;
 pub mod requests;

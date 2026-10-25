@@ -18,6 +18,7 @@ pub mod hostd;
 pub mod hostexec;
 pub mod ids;
 pub mod lifecycle;
+pub mod mail;
 pub mod names;
 pub mod platform;
 pub mod policy;
@@ -26,6 +27,8 @@ pub mod pool;
 mod proofs;
 #[cfg(kani)]
 mod proofs_hostd;
+#[cfg(kani)]
+mod proofs_mail;
 #[cfg(kani)]
 mod proofs_policy;
 pub mod pyfmt;

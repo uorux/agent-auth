@@ -113,6 +113,10 @@ id_type!(
     RuleId
 );
 id_type!(
+    /// `mail_items.id`
+    MailItemId
+);
+id_type!(
     /// `a2a_threads.id`
     ThreadId
 );

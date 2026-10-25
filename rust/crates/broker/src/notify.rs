@@ -64,6 +64,9 @@ pub trait Notify {
     ) -> impl Future<Output = ()> + Send;
     /// Agents were contained or locked down: always a ping.
     fn contained(&self, event: &Value) -> impl Future<Output = ()> + Send;
+    /// The mail gateway held a message (inbound, or one an agent wants to
+    /// send): the card with Release / Discard.
+    fn mail_held(&self, item: &agent_auth_wire::mail::MailItem) -> impl Future<Output = ()> + Send;
 }
 
 #[derive(Debug, Default)]
@@ -129,6 +132,10 @@ impl Notify for Notifier {
         dispatch!(self, n => n.contained(event).await,
             null => tracing::warn!(?event, "contained (no notifier)"))
     }
+    async fn mail_held(&self, item: &agent_auth_wire::mail::MailItem) {
+        dispatch!(self, n => n.mail_held(item).await,
+            null => tracing::warn!(item = %item.id, "mail held for the operator (no notifier): agent-auth admin mail-held"))
+    }
 }
 
 /// Test notifier: records `"<method> <id>"` lines.
@@ -189,5 +196,13 @@ impl Notify for Recorder {
     }
     async fn contained(&self, _event: &Value) {
         self.record("contained".to_owned());
+    }
+    async fn mail_held(&self, item: &agent_auth_wire::mail::MailItem) {
+        self.record(format!(
+            "mail_held {} {} {}",
+            item.id,
+            item.direction,
+            item.excerpt.as_deref().unwrap_or("")
+        ));
     }
 }

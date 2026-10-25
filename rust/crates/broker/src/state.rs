@@ -44,6 +44,8 @@ pub struct AppState {
     /// Paired daemons, commands on hosts, desk prompts, attention
     /// (`daemons::HostdPart`); none: those routes answer 503/501.
     pub hostd: Option<Arc<crate::daemons::HostdPart>>,
+    /// The mail gateway (`mail`); none: `/v1/mail` answers 501.
+    pub mail: Option<Arc<crate::mail::Mail>>,
 }
 
 impl AppState {
@@ -73,6 +75,7 @@ impl AppState {
             platform_services: Arc::default(),
             spine: Arc::default(),
             hostd: None,
+            mail: None,
         }
     }
 }

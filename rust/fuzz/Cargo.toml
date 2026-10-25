@@ -18,6 +18,7 @@ libfuzzer-sys = "=0.4.13"
 agent-auth-core = { path = "../crates/core" }
 agent-auth-wire = { path = "../crates/wire" }
 agent-auth-crypto = { path = "../crates/crypto" }
+agent-auth-mail = { path = "../crates/mail" }
 ring = { version = "=0.17.14", default-features = false, features = ["alloc", "std"] }
 # float_roundtrip: so a re-parsed f64 (`wait`) compares equal in the round trips.
 serde_json = { version = "1.0.152", default-features = false, features = ["std", "float_roundtrip"] }
@@ -75,6 +76,34 @@ bench = false
 [[bin]]
 name = "job_spec"
 path = "fuzz_targets/job_spec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mail_authority"
+path = "fuzz_targets/mail_authority.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mail_html"
+path = "fuzz_targets/mail_html.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mail_message"
+path = "fuzz_targets/mail_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mail_protocols"
+path = "fuzz_targets/mail_protocols.rs"
 test = false
 doc = false
 bench = false

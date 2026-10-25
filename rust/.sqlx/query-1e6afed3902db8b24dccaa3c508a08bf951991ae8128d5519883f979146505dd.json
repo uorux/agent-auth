@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE grants SET resource = $2 WHERE id = $1 AND status = 'provisioning'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1e6afed3902db8b24dccaa3c508a08bf951991ae8128d5519883f979146505dd"
+}

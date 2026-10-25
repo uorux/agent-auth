@@ -95,6 +95,16 @@ impl Args {
         self.get(name).as_object().cloned()
     }
 
+    /// A nullable list of strings: None when null or absent.
+    #[must_use]
+    pub fn opt_list(&self, name: &str) -> Option<Vec<String>> {
+        self.get(name).as_array().map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+    }
+
     #[must_use]
     pub fn str_list(&self, name: &str) -> Vec<String> {
         self.get(name)
@@ -149,12 +159,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn thirty_one_tools() {
-        assert_eq!(TOOLS.len(), 31);
+    fn thirty_five_tools() {
+        assert_eq!(TOOLS.len(), 35);
         let mut names: Vec<_> = tool_names().collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 31);
+        assert_eq!(names.len(), 35);
     }
 
     #[test]

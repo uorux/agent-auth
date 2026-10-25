@@ -88,6 +88,20 @@ pub async fn catalog(st: &AppState, agent: &AgentRow) -> Result<Value, StoreErro
                     entry.insert("roles".to_owned(), Value::Array(out));
                 }
             }
+            // `read (human review)`: each capability with its usual routing.
+            Platform::Mail => {
+                if let Some(Value::Array(caps)) = entry.get("capabilities").cloned() {
+                    let mut out = Vec::with_capacity(caps.len());
+                    for cap in caps.iter().filter_map(Value::as_str) {
+                        let d = disposition_of(st, &tx, agent, platform, cap)
+                            .await?
+                            .and_then(|d| d.as_str().map(str::to_owned))
+                            .unwrap_or_else(|| "human review".to_owned());
+                        out.push(Value::String(format!("{cap} ({d})")));
+                    }
+                    entry.insert("capabilities".to_owned(), Value::Array(out));
+                }
+            }
             _ => {}
         }
         platforms.push(Value::Object(entry));

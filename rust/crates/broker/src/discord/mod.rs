@@ -26,6 +26,7 @@ pub mod embeds;
 pub mod gateway;
 pub mod hostexec;
 pub mod interactions;
+pub mod mail;
 pub mod model;
 pub mod notifier;
 pub mod ops;
@@ -147,6 +148,8 @@ pub struct Services {
     /// arm, disarm, open_window, lockdown, unlock; the desktop's DND; the
     /// daemon list).
     pub app: Option<crate::state::AppState>,
+    /// The mail gateway: Release / Discard on held mail.
+    pub mail: Option<Arc<dyn crate::mail::MailOps>>,
 }
 
 impl std::fmt::Debug for Services {
@@ -156,6 +159,7 @@ impl std::fmt::Debug for Services {
             .field("containment", &self.containment.is_some())
             .field("hosts", &self.hosts.is_some())
             .field("app", &self.app.is_some())
+            .field("mail", &self.mail.is_some())
             .finish()
     }
 }

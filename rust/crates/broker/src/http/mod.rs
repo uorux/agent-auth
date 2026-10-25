@@ -85,7 +85,8 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::wiki::routes::routes())
         .merge(crate::daemons::routes())
         .merge(crate::hostexec::routes())
-        .merge(crate::attention::routes());
+        .merge(crate::attention::routes())
+        .merge(crate::mail::routes::routes());
     // The remote MCP's tools call the agent API in process.
     if let Some(mcp) = &state.web.remote_mcp {
         mcp.set_agent_api(all.clone().with_state(state.clone()));

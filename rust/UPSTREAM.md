@@ -25,3 +25,9 @@ signatures without a broker-wide key, the `GoogleTokens` lock, the
 stub-era Google rules warning, lowercase GitHub rule resources and project
 repos, one `AgentKind`/`Placement`. Not here: `mail` (and
 `grant_access.require_web_tool` for mail routes), hostd/hostexec, sandboxd.
+
+Ported from that snapshot (branch `rust-mail`): platform `mail` (`mail/`,
+`provisioners/mail.py`, `api/mail_routes.py`, `discord_bot/mail.py`, the
+mail parts of `authority.py`, `policy/schema.py`, `schemas.py`,
+`mcp_server.py`, `client.py`, `cli.py` and the migration), with every mail
+item of the review log, and `require_web_tool` for the mail routes.

@@ -18,6 +18,7 @@ agent-auth-core.workspace = true
 agent-auth-crypto.workspace = true
 agent-auth-wire.workspace = true
 agent-auth-store.workspace = true
+agent-auth-mail.workspace = true
 agent-auth-tls = { workspace = true, features = ["reqwest"] }
 ring.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "sync", "macros", "net", "signal"] }
@@ -49,6 +50,7 @@ hex.workspace = true
 regex.workspace = true
 
 [dev-dependencies]
+agent-auth-mail = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "sync", "io-util"] }
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true

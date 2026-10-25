@@ -17,6 +17,7 @@ use std::fmt;
 use serde_json::{Map, Value, json};
 
 use crate::glob::Glob;
+use crate::mail::MailAuthority;
 use crate::platform::Platform;
 use crate::pool::{MAX_MATCH_KEYS, MAX_PROP_CHARS, PoolChoice, PropMatch, PropValue, match_covers};
 
@@ -245,6 +246,9 @@ pub enum Authority {
     Models,
     /// A lease of one item of the pool named by the resource.
     Pool(PoolChoice),
+    /// Mail the broker reads and sends for the agent on the resource
+    /// address (`crate::mail`).
+    Mail(MailAuthority),
 }
 
 /// The Google capabilities a grant may carry (each one access-token
@@ -280,6 +284,9 @@ pub struct SensitivityConfig {
     pub kubernetes_cluster_grant_namespace: String,
     /// Per pool, its items marked sensitive (leased by name, by a human).
     pub pool_sensitive_items: BTreeMap<String, BTreeSet<String>>,
+    /// Mailboxes' own addresses (lowercase): a grant on one is for a
+    /// mailbox itself, not an alias forwarding into it.
+    pub mail_mailboxes: BTreeSet<String>,
 }
 
 impl Default for SensitivityConfig {
@@ -297,6 +304,7 @@ impl Default for SensitivityConfig {
             .into(),
             kubernetes_cluster_grant_namespace: "default".to_owned(),
             pool_sensitive_items: BTreeMap::new(),
+            mail_mailboxes: BTreeSet::new(),
         }
     }
 }
@@ -327,6 +335,7 @@ impl Authority {
             Authority::Mcp { .. } => Platform::Mcp,
             Authority::Models => Platform::Models,
             Authority::Pool(_) => Platform::Pool,
+            Authority::Mail(_) => Platform::Mail,
         }
     }
 
@@ -345,6 +354,8 @@ impl Authority {
                 // for that platform, never a catch-all for an agent.
                 | Authority::Pool(_)
                 | Authority::Google { .. }
+                // Someone's mail likewise.
+                | Authority::Mail(_)
         )
     }
 
@@ -391,6 +402,12 @@ impl Authority {
                     .get(pool)
                     .is_some_and(|items| items.contains(item))
             }),
+            // A mailbox itself (not an alias that forwards into it), and
+            // sending as someone with neither a topic nor correspondents.
+            Authority::Mail(m) => {
+                resource.is_some_and(|r| cfg.mail_mailboxes.contains(&r.to_lowercase()))
+                    || m.sends_unconstrained()
+            }
             // Writing a calendar, or reading every file in a Drive.
             Authority::Google { action } => {
                 matches!(action.as_str(), "calendar.write" | "drive.read")
@@ -423,6 +440,7 @@ impl Authority {
             ) => "run".to_owned(),
             Authority::Mcp { .. } | Authority::Models => "use".to_owned(),
             Authority::Pool(_) => "lease".to_owned(),
+            Authority::Mail(m) => m.action.as_str().to_owned(),
         }
     }
 
@@ -462,6 +480,7 @@ impl Authority {
             Authority::Pool(PoolChoice::Any(m)) if !m.is_empty() => {
                 json!({"match": match_json(m)})
             }
+            Authority::Mail(m) => Value::Object(m.scope()),
             _ => json!({}),
         };
         match value {
@@ -521,6 +540,7 @@ impl Authority {
                 format!("run:{}", options.tier)
             }
             Authority::Hostexec(HostexecAuthority::Shell { tier }) => format!("shell:{tier}"),
+            Authority::Mail(m) => m.label(),
             Authority::Pool(PoolChoice::Item(item)) => format!("lease:{item}"),
             Authority::Pool(PoolChoice::Previous) => "lease:previous".to_owned(),
             Authority::Pool(PoolChoice::Any(m)) => {
@@ -675,6 +695,9 @@ impl Authority {
                 Ok(Authority::Models)
             }
             Platform::Pool => pool_from_wire(capability, scope),
+            Platform::Mail => Ok(Authority::Mail(MailAuthority::from_wire(
+                capability, scope,
+            )?)),
         }
     }
 
@@ -735,6 +758,7 @@ impl Authority {
                     "match": m.map_or_else(|| json!({}), match_json),
                 })
             }
+            Authority::Mail(m) => m.to_json(),
         }
     }
 
@@ -844,6 +868,7 @@ impl Authority {
                     _ => return err("stored pool choice"),
                 })
             }
+            Platform::Mail => Authority::Mail(MailAuthority::from_json(map)?),
         };
         // Round-trip check: what we parsed must serialize back to exactly
         // what was stored, or the row held something we would not write.
@@ -886,6 +911,8 @@ pub fn rule_covers(rule: Option<&Authority>, request: &Authority) -> bool {
         (Authority::Pool(PoolChoice::Any(have)), Authority::Pool(PoolChoice::Previous)) => {
             match_covers(have, &PropMatch::new())
         }
+        // A mail rule covers a request that asks for no more.
+        (Authority::Mail(rule), Authority::Mail(wanted)) => rule.covers(wanted),
         _ => false,
     }
 }

@@ -35,6 +35,7 @@ change in `DEVIATIONS.md`.
 | `agent-auth-tls` | the one rustls client config (ring, TLS 1.2/1.3, Mozilla roots minus distrusted ones, optional extra CA) and a reqwest builder with no proxy/redirects/compression. Every outbound connection uses it. | rustls, webpki-roots, reqwest |
 | `agent-auth-wire` | serde types of every JSON body on the wire: agent API, admin API, daemon channel messages, credential shapes. Shared by broker, client, CLI, MCP, daemons. | core |
 | `agent-auth-store` | Postgres: migrations (`crates/store/migrations`), row types, **all SQL**, and the state-transition kernel (guarded transitions, `IssuableGrant`, containment checks inside the transaction). | core, sqlx |
+| `agent-auth-mail` | reading untrusted mail (MIME via mail-parser, HTML, injection hints), composing what is sent, minimal IMAP and SMTP clients over TLS (tokio-rustls with the shared config); test doubles behind feature `testing`. | core, mail-parser, rustls, tokio-rustls |
 | `agent-auth-broker` | the server binary `agent-auth-server`: config, HTTP API (axum), auth extractors, request service, LLM review, provisioners, a2a, wiki, desktop, Discord bot, admin panel, OAuth + remote MCP, daemon hub, hostexec, sandboxes, scheduler. | everything above |
 | `agent-auth-client` | the agents' HTTP client library. | wire |
 | `agent-auth-cli` | binary `agent-auth` (agent and admin commands). | client |

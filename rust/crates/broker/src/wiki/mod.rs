@@ -75,7 +75,7 @@ static SECRET_PATTERNS: LazyLock<Vec<(&'static str, Option<Regex>)>> = LazyLock:
 });
 
 /// What credential `text` looks like it contains, if any.
-fn secret_in(text: &str) -> Option<&'static str> {
+pub(crate) fn secret_in(text: &str) -> Option<&'static str> {
     SECRET_PATTERNS
         .iter()
         .find(|(_, re)| re.as_ref().is_none_or(|re| re.is_match(text)))

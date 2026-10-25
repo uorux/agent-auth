@@ -22,10 +22,12 @@ pub enum Platform {
     Models,
     /// Scarce things held by one agent at a time (a pool's items).
     Pool,
+    /// Mail the broker reads and sends for the agent (an address).
+    Mail,
 }
 
 impl Platform {
-    pub const ALL: [Platform; 11] = [
+    pub const ALL: [Platform; 12] = [
         Platform::Github,
         Platform::Homelab,
         Platform::Kubernetes,
@@ -37,6 +39,7 @@ impl Platform {
         Platform::Mcp,
         Platform::Models,
         Platform::Pool,
+        Platform::Mail,
     ];
 
     #[must_use]
@@ -53,6 +56,7 @@ impl Platform {
             Platform::Mcp => "mcp",
             Platform::Models => "models",
             Platform::Pool => "pool",
+            Platform::Mail => "mail",
         }
     }
 

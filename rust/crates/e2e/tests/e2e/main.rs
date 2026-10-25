@@ -19,6 +19,7 @@ mod world;
 mod a2a;
 mod discord;
 mod lifecycle;
+mod mail;
 mod mcp;
 mod operations;
 mod pool;

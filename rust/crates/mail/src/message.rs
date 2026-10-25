@@ -1,0 +1,443 @@
+//! One email, parsed into what the gateway filters on and what an agent is
+//! shown (`message.py` `parse`): addresses, subject, date, a plain-text body
+//! with hidden text taken out, attachments by name, plus the cheap checks
+//! for prompt injection that run before (and alongside) the judge.
+//!
+//! Nothing here is trusted: the headers SimpleLogin adds can be forged by
+//! anyone who mails the mailbox directly, which only ever adds an
+//! outsider's message to what an agent sees.
+
+use std::sync::OnceLock;
+
+use mail_parser::{Address, HeaderValue, MessageParser, MimeHeaders, PartType};
+use regex::Regex;
+use time::OffsetDateTime;
+
+use crate::html::{html_to_text, never};
+use crate::text::{chars, clean};
+
+/// The largest message read (`MAX_RAW_BYTES`); the rest is cut off.
+pub const MAX_RAW_BYTES: usize = 25 * 1024 * 1024;
+/// Most message ids kept from References/In-Reply-To.
+pub const MAX_REFERENCES: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub index: usize,
+    pub filename: String,
+    pub content_type: String,
+    pub size: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedMessage {
+    /// The first `<msg-id>` token of Message-ID, if any.
+    pub message_id: Option<String>,
+    /// `<msg-id>` tokens of In-Reply-To.
+    pub in_reply_to: Vec<String>,
+    /// `<msg-id>` tokens of References.
+    pub references: Vec<String>,
+    pub date: Option<OffsetDateTime>,
+    pub subject: String,
+    pub from_addr: String,
+    pub from_name: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub reply_to: Vec<String>,
+    pub text: String,
+    pub attachments: Vec<Attachment>,
+    /// SimpleLogin: the alias it was sent to. Empty when not a forward.
+    pub sl_envelope_to: Vec<String>,
+    /// SimpleLogin: the sender before the From was rewritten.
+    pub sl_original_from: Option<String>,
+    /// Did the mailbox's own provider (its topmost Authentication-Results)
+    /// see DMARC/DKIM pass for the From domain?
+    pub authenticated: Option<bool>,
+    pub hidden_text: String,
+    pub hints: Vec<String>,
+    pub raw_size: usize,
+}
+
+impl ParsedMessage {
+    /// The thread a message belongs to: the first reference, else what it
+    /// answers, else itself.
+    #[must_use]
+    pub fn thread_root(&self) -> Option<&str> {
+        self.references
+            .first()
+            .or_else(|| self.in_reply_to.first())
+            .or(self.message_id.as_ref())
+            .map(String::as_str)
+    }
+
+    /// Whom it is really from: SimpleLogin's original sender if it was a
+    /// forward, the From address otherwise. (The gateway trusts the
+    /// SimpleLogin header only on an alias.)
+    #[must_use]
+    pub fn sender(&self) -> &str {
+        self.sl_original_from.as_deref().unwrap_or(&self.from_addr)
+    }
+}
+
+fn parser() -> MessageParser {
+    MessageParser::new()
+        .with_mime_headers()
+        .with_date_headers()
+        .with_address_headers()
+        .header_text("Subject")
+        .header_text("X-SimpleLogin-Type")
+        .header_address("X-SimpleLogin-Envelope-To")
+        .header_address("X-SimpleLogin-Original-From")
+        .header_raw("Message-ID")
+        .header_raw("In-Reply-To")
+        .header_raw("References")
+        .header_raw("Authentication-Results")
+}
+
+/// `<msg-id>` tokens (`_msg_ids`): a decoded or hostile header can hold
+/// anything (a newline would break a reply), so only these are kept.
+#[must_use]
+pub fn msg_ids(text: &str) -> Vec<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"<[^<>\s]{1,250}>").unwrap_or_else(|_| never()));
+    re.find_iter(text)
+        .take(MAX_REFERENCES)
+        .map(|m| m.as_str().to_owned())
+        .collect()
+}
+
+fn addresses<'a>(values: impl Iterator<Item = &'a Address<'a>>) -> Vec<String> {
+    let mut out = Vec::new();
+    for a in values {
+        for addr in a.iter() {
+            if let Some(email) = addr.address()
+                && email.contains('@')
+                && out.len() < 1000
+            {
+                out.push(clean(email).to_lowercase());
+            }
+        }
+    }
+    out
+}
+
+fn header_values<'a>(
+    msg: &'a mail_parser::Message<'a>,
+    name: &'a str,
+) -> impl Iterator<Item = &'a HeaderValue<'a>> {
+    msg.header_values(name)
+}
+
+fn header_addresses<'a>(msg: &'a mail_parser::Message<'a>, name: &'a str) -> Vec<String> {
+    addresses(header_values(msg, name).filter_map(HeaderValue::as_address))
+}
+
+fn first_text(msg: &mail_parser::Message<'_>, name: &str) -> String {
+    match msg.header_values(name).next() {
+        Some(HeaderValue::Text(t)) => clean(t),
+        Some(HeaderValue::TextList(l)) => clean(&l.join(", ")),
+        _ => String::new(),
+    }
+}
+
+fn first_raw(msg: &mail_parser::Message<'_>, name: &str) -> String {
+    msg.header_values(name)
+        .next()
+        .and_then(|v| match v {
+            HeaderValue::Text(t) => Some(t.to_string()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn to_datetime(d: &mail_parser::DateTime) -> Option<OffsetDateTime> {
+    let month = time::Month::try_from(d.month).ok()?;
+    let date = time::Date::from_calendar_date(i32::from(d.year), month, d.day).ok()?;
+    let t = time::Time::from_hms(d.hour, d.minute, d.second).ok()?;
+    let secs = i32::from(d.tz_hour)
+        .checked_mul(3600)?
+        .checked_add(i32::from(d.tz_minute).checked_mul(60)?)?;
+    let secs = if d.tz_before_gmt {
+        secs.checked_neg()?
+    } else {
+        secs
+    };
+    let offset = time::UtcOffset::from_whole_seconds(secs).ok()?;
+    Some(
+        time::PrimitiveDateTime::new(date, t)
+            .assume_offset(offset)
+            .to_offset(time::UtcOffset::UTC),
+    )
+}
+
+/// `_authenticated`: the topmost Authentication-Results is the one the
+/// mailbox's own provider added (each hop prepends), so it is the only one
+/// read: `dmarc=pass` for the From's own domain (`header.from=`), or
+/// `dkim=pass` for it (or a parent domain).
+#[must_use]
+pub fn authenticated(top: Option<&str>, from_addr: &str) -> Option<bool> {
+    static DMARC: OnceLock<Regex> = OnceLock::new();
+    static DKIM: OnceLock<Regex> = OnceLock::new();
+    static FAIL: OnceLock<Regex> = OnceLock::new();
+    let top = top?.to_lowercase();
+    let domain = from_addr.rsplit('@').next().unwrap_or("");
+    let dmarc = DMARC.get_or_init(|| {
+        Regex::new(r"\bdmarc=pass\b[^;]*?header\.from=([a-z0-9.-]+)").unwrap_or_else(|_| never())
+    });
+    for c in dmarc.captures_iter(&top) {
+        if c.get(1).is_some_and(|m| m.as_str() == domain) {
+            return Some(true);
+        }
+    }
+    let dkim = DKIM.get_or_init(|| {
+        Regex::new(r"\bdkim=(\w+)[^;]*?header\.(?:d|i)=@?([a-z0-9.-]+)").unwrap_or_else(|_| never())
+    });
+    for c in dkim.captures_iter(&top) {
+        let result = c.get(1).map_or("", |m| m.as_str());
+        let d = c.get(2).map_or("", |m| m.as_str());
+        if result == "pass" && (d == domain || domain.ends_with(&format!(".{d}"))) {
+            return Some(true);
+        }
+    }
+    let fail = FAIL.get_or_init(|| {
+        Regex::new(r"\bdmarc=(?:fail|none)\b|\bdkim=fail\b|\bspf=fail\b")
+            .unwrap_or_else(|_| never())
+    });
+    if fail.is_match(&top) {
+        return Some(false);
+    }
+    None
+}
+
+fn part_type(part: &mail_parser::MessagePart<'_>) -> String {
+    match part.content_type() {
+        Some(ct) => match ct.subtype() {
+            Some(sub) => format!("{}/{}", ct.ctype(), sub).to_lowercase(),
+            None => ct.ctype().to_lowercase(),
+        },
+        None => "text/plain".to_owned(),
+    }
+}
+
+fn attachment_meta(i: usize, part: &mail_parser::MessagePart<'_>) -> Attachment {
+    let name = part
+        .attachment_name()
+        .map(clean)
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| format!("attachment-{i}"));
+    Attachment {
+        index: i,
+        filename: chars(&name, 200),
+        content_type: chars(&part_type(part), 200),
+        size: part.len(),
+    }
+}
+
+fn body_text(part: &mail_parser::MessagePart<'_>) -> Option<String> {
+    match &part.body {
+        PartType::Text(t) | PartType::Html(t) => Some(t.to_string()),
+        PartType::Binary(b) | PartType::InlineBinary(b) => {
+            Some(String::from_utf8_lossy(b).into_owned())
+        }
+        _ => None,
+    }
+}
+
+/// Parse one RFC 5322 message. Never fails: what can't be read comes out
+/// empty.
+#[must_use]
+pub fn parse(raw: &[u8]) -> ParsedMessage {
+    let raw = raw.get(..MAX_RAW_BYTES).unwrap_or(raw);
+    let mut out = ParsedMessage {
+        message_id: None,
+        in_reply_to: Vec::new(),
+        references: Vec::new(),
+        date: None,
+        subject: String::new(),
+        from_addr: String::new(),
+        from_name: String::new(),
+        to: Vec::new(),
+        cc: Vec::new(),
+        reply_to: Vec::new(),
+        text: String::new(),
+        attachments: Vec::new(),
+        sl_envelope_to: Vec::new(),
+        sl_original_from: None,
+        authenticated: None,
+        hidden_text: String::new(),
+        hints: Vec::new(),
+        raw_size: raw.len(),
+    };
+    let Some(msg) = parser().parse(raw) else {
+        return out;
+    };
+    out.message_id = msg_ids(&first_raw(&msg, "Message-ID")).into_iter().next();
+    out.in_reply_to = msg_ids(&first_raw(&msg, "In-Reply-To"));
+    out.references = msg_ids(&first_raw(&msg, "References"));
+    out.date = msg.date().and_then(to_datetime);
+    out.subject = chars(&clean(msg.subject().unwrap_or("")), 500);
+    if let Some(first) = msg.from().and_then(|a| a.first()) {
+        out.from_addr = first
+            .address()
+            .map(|a| clean(a).to_lowercase())
+            .unwrap_or_default();
+        out.from_name = chars(&clean(first.name().unwrap_or("")), 200);
+    }
+    out.to = addresses(msg.header_values("To").filter_map(HeaderValue::as_address));
+    out.cc = addresses(msg.header_values("Cc").filter_map(HeaderValue::as_address));
+    out.reply_to = addresses(
+        msg.header_values("Reply-To")
+            .filter_map(HeaderValue::as_address),
+    );
+    out.sl_envelope_to = header_addresses(&msg, "X-SimpleLogin-Envelope-To");
+    let forwarded = first_text(&msg, "X-SimpleLogin-Type").to_lowercase() == "forward"
+        || !out.sl_envelope_to.is_empty()
+        || msg
+            .header_values("X-SimpleLogin-Envelope-To")
+            .next()
+            .is_some();
+    if forwarded {
+        out.sl_original_from = header_addresses(&msg, "X-SimpleLogin-Original-From")
+            .into_iter()
+            .next();
+    }
+    let auth = msg
+        .header_values("Authentication-Results")
+        .next()
+        .and_then(|v| match v {
+            HeaderValue::Text(t) => Some(t.to_string()),
+            _ => None,
+        });
+    out.authenticated = authenticated(auth.as_deref(), &out.from_addr);
+
+    let plain = msg
+        .text_bodies()
+        .find(|p| matches!(p.body, PartType::Text(_)) && part_type(p) == "text/plain");
+    let html = msg
+        .html_bodies()
+        .find(|p| matches!(p.body, PartType::Html(_)));
+    let (html_text, hidden) = html
+        .and_then(body_text)
+        .map(|h| html_to_text(&h))
+        .unwrap_or_default();
+    out.text = match plain.and_then(body_text) {
+        Some(p) => clean(&p),
+        None => html_text,
+    };
+    out.attachments = msg
+        .attachments()
+        .enumerate()
+        .map(|(i, p)| attachment_meta(i, p))
+        .collect();
+    out.hidden_text = chars(&hidden, 4000);
+    out.hints = injection_hints(&out);
+    out
+}
+
+/// Attachment `index`, with its bytes.
+#[must_use]
+pub fn attachment_bytes(raw: &[u8], index: usize) -> Option<(Attachment, Vec<u8>)> {
+    let raw = raw.get(..MAX_RAW_BYTES).unwrap_or(raw);
+    let msg = parser().parse(raw)?;
+    let part = msg.attachments().nth(index)?;
+    Some((attachment_meta(index, part), part.contents().to_vec()))
+}
+
+// ---------------------------------------------------------------- hints
+
+/// Phrases aimed at a model rather than a person. One is a hint; the judge
+/// decides. Ordinary mail almost never says these.
+const INJECTION_PATTERNS: [&str; 11] = [
+    r"\b(?:ignore|disregard|forget|override)\b[^.\n]{0,40}\b(?:previous|prior|above|earlier|all|any|your)\b[^.\n]{0,20}\b(?:instructions?|prompts?|rules|directives)",
+    r"\b(?:you are|you're|act as)\b[^.\n]{0,20}\b(?:an?|the)\s+(?:ai|assistant|agent|language model|llm|chatbot)\b",
+    r"\b(?:as an? (?:ai|assistant|language model))\b",
+    r"\bsystem\s*prompt\b",
+    r"<\s*/?\s*(?:system|assistant|instructions?|tool_call|im_start|im_end)\b",
+    r"\[\s*/?\s*(?:INST|SYS)\s*\]",
+    r"\b(?:new|updated|important)\s+instructions?\s*(?:for|to)\s+(?:the\s+)?(?:ai|assistant|agent|model)",
+    r"\b(?:do not|don't|never)\s+(?:tell|inform|mention (?:this )?to)\s+(?:the\s+)?(?:user|human|owner|operator)",
+    r"\b(?:request_access|get_credential|host_run|a2a_send|mail_send|wiki_write|notify_operator)\b",
+    r"\bagent-auth\b",
+    r"\b(?:api[_ -]?key|access token|password|credentials?)\b[^.\n]{0,40}\b(?:send|forward|reply|email|paste)\b[^.\n]{0,20}\b(?:to|back)\b",
+];
+
+fn patterns() -> &'static [Regex] {
+    static RES: OnceLock<Vec<Regex>> = OnceLock::new();
+    RES.get_or_init(|| {
+        INJECTION_PATTERNS
+            .iter()
+            .map(|p| Regex::new(&format!("(?i){p}")).unwrap_or_else(|_| never()))
+            .collect()
+    })
+}
+
+fn first_hit(text: &str) -> Option<String> {
+    patterns()
+        .iter()
+        .find_map(|p| p.find(text))
+        .map(|m| agent_auth_core::pyfmt::repr(&chars(m.as_str(), 80)))
+}
+
+/// What looks aimed at a model: phrases in what an agent would read, and
+/// instructions in text hidden from a person. Hints for the judge (and the
+/// operator), not a verdict: hidden preheaders are ordinary in newsletters.
+#[must_use]
+pub fn injection_hints(m: &ParsedMessage) -> Vec<String> {
+    let mut hints = Vec::new();
+    for (place, text) in [("body", &m.text), ("subject", &m.subject)] {
+        if let Some(hit) = first_hit(text) {
+            hints.push(format!("{place} says {hit}"));
+        }
+    }
+    if !m.hidden_text.is_empty()
+        && let Some(hit) = first_hit(&m.hidden_text)
+    {
+        hints.push(format!("hidden text says {hit}"));
+    }
+    hints
+}
+
+/// The injection level the hints alone suggest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Level {
+    None,
+    Suspected,
+    Likely,
+}
+
+impl Level {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Level::None => "none",
+            Level::Suspected => "suspected",
+            Level::Likely => "likely",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Level> {
+        match s {
+            "none" => Some(Level::None),
+            "suspected" => Some(Level::Suspected),
+            "likely" => Some(Level::Likely),
+            _ => None,
+        }
+    }
+}
+
+/// `hint_level`: instructions hidden from a person, or several kinds at
+/// once, are likely; one is suspected.
+#[must_use]
+pub fn hint_level(hints: &[String]) -> Level {
+    if hints.is_empty() {
+        Level::None
+    } else if hints.iter().any(|h| h.starts_with("hidden text")) || hints.len() >= 2 {
+        Level::Likely
+    } else {
+        Level::Suspected
+    }
+}
+
+#[cfg(test)]
+mod tests;

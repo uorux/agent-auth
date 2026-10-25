@@ -8,6 +8,7 @@
 
 pub mod agents;
 mod eval;
+pub mod mail;
 pub mod schema;
 #[cfg(test)]
 mod tests;
@@ -83,7 +84,7 @@ const SECTIONS: [&str; 13] = [
     "rules",
 ];
 
-const PLATFORM_SECTIONS: [&str; 9] = [
+const PLATFORM_SECTIONS: [&str; 10] = [
     "github",
     "homelab",
     "kubernetes",
@@ -93,6 +94,7 @@ const PLATFORM_SECTIONS: [&str; 9] = [
     "models",
     "google",
     "pools",
+    "mail",
 ];
 
 /// Parse one YAML document into a generic value, with limits so a hostile
@@ -501,6 +503,7 @@ impl Policy {
                     (name.clone(), sensitive)
                 })
                 .collect(),
+            mail_mailboxes: self.platforms.mail.mailbox_addresses(),
         }
     }
 
@@ -564,5 +567,10 @@ fn parse_platforms(value: Value) -> Result<PlatformsConfig, PolicyError> {
             out.pools.insert(name, pool);
         }
     }
+    if let Some(v) = map.remove("mail") {
+        out.mail = parse_section("platforms.mail", v)?;
+        out.mail.validate().map_err(PolicyError)?;
+    }
+    mail::cross_check(&out.mail, &out.google).map_err(PolicyError)?;
     Ok(out)
 }

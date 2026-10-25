@@ -1105,6 +1105,85 @@ Security review 2026-10 (hostd/hostexec), fixed:
   daemon session shorter than 30 s backs off like a failure (no 1 Hz
   reconnect loop against a broker that welcomes and drops).
 
+## Mail (`crates/mail`, broker `mail`, `discord/mail.rs`; upstream snapshot 2026-10-25)
+
+Ported from the snapshot with every fix its review log lists (judge reads
+exactly what is delivered; compare-and-set release/discard; mailbox mode
+trusts the From, DMARC only for `header.from=` the From's domain; only
+`<msg-id>` tokens in replies, a failed send marks the item failed; zero /
+sub-pixel font sizes only; verdicts carry a constraints fingerprint; the
+worse of judge and hints; create domains resolve; no counts while
+searching; backend errors are agent-safe errors, not 500s; escaped Discord
+cards with unbreakable fences; release re-checks containment, thread,
+grant and the draft; unconstrained `create` is sensitive; one-line
+subjects; no mail to the person's own alias domains; one denial text for
+unknown aliases; case-insensitive tag breaking and Unicode tag
+characters stripped; `mail_attachment` never served remotely). Beyond it:
+
+- **No Python mail stack.** MIME through `mail-parser` (no `full_encoding`:
+  CJK multi-byte charsets such as Shift_JIS, GBK, Big5, EUC-KR,
+  ISO-2022-JP decode lossily); HTML through our own tokenizer (HTML5 tag,
+  attribute, comment and raw-text rules as Python 3.14's `html.parser`;
+  references decoded with the full HTML5 entity table generated from
+  Python's `html.entities.html5`). Attachments are every attachment part,
+  nested ones included (Python's `iter_attachments` saw only the top
+  level's). IMAP and SMTP are our own minimal clients.
+- **TLS only, our roots.** IMAP is implicit TLS; SMTP on 465 is implicit
+  TLS and on any other port STARTTLS, which must be offered (no plaintext
+  fallback; bytes the server sent ahead of the handshake are refused).
+  Certificates are checked against the shared root store (Mozilla minus
+  the distrusted roots), not the system store; `MAIL_CA_FILE` (new,
+  optional) adds a CA for private mail servers (and SimpleLogin, Gmail).
+  SMTP authenticates with PLAIN or LOGIN only (smtplib also tried
+  CRAM-MD5); the EHLO name is our address literal.
+- **Bounded parsing.** A message is cut at 25 MiB (as the Python); IMAP
+  lines at 8 MiB, literals at 64 MiB (kept up to 25 MiB), SEARCH at 10^6
+  UIDs, SMTP replies at 8 KiB × 256 lines; HTML nesting past 4096 makes the
+  rest of the document hidden text (never shown as visible), and end tags
+  find their element through an index (the Python was quadratic on deep
+  nesting).
+- **Agent-visible errors carry no server text** (as the provisioners):
+  `imap <host>: login refused`, `gmail: GET /messages answered 500`,
+  `simplelogin unreachable (see broker logs)`; details go to the log. The
+  Python put imaplib/smtplib exception text and API bodies into them.
+- **Timestamps** in mail summaries are the one wire format (RFC 3339 `Z`,
+  microseconds); the judge's JSON keys come sorted (no insertion order).
+- **`since`** is `YYYY-MM-DD` only (Python's `date.fromisoformat` also took
+  `20260101` and ISO week dates). Correspondent globs are at most 320
+  characters.
+- **Policy is checked at load** (B-1 style): unknown keys refused;
+  mailbox `folders` are 1–255 characters without control characters;
+  `imap_host`/`smtp_host` are host names; `simplelogin.api_url` must be
+  `https` (plain `http` only to a loopback host: the tests' fake);
+  `create_domains` must be domains; `max_body_chars` at least 1. Globs
+  (`aliases`, restriction `address`/`correspondents`) are lowercased at
+  load. `platforms.mail` is its own section; a gmail mailbox's
+  `google_account` must exist.
+- **The store enforces the item machine** (migration 0014): inbound items
+  may be judged again until released or discarded; held → released |
+  discarded (in), held → sending | discarded and sending → sent | failed
+  (out); a decided item is never re-judged; a draft exists only while held
+  or sending, sealed with `SecretBox` bound to its row. A mail grant's
+  resource is immutable except the one move `create` makes (domain → the
+  alias on it), while provisioning.
+- **The mail validator may call SimpleLogin** (to tell an alias that
+  exists from one that does not, as the Python did; cached an hour). The
+  provisioner contract otherwise keeps validators off the network.
+- **Discord**: Release/Discard answer in a deferred ephemeral message and
+  rebuild the card from the item (with its outcome line) instead of
+  editing the old embed; custom ids `aa:mlrel:<id>` / `aa:mldis:<id>` as
+  the Python's. Without a notifier, a held item is logged.
+- **Web connectors**: a `runtime: web` agent reaches a mail route only for
+  tools in `remote_mcp.tools` (`not available to a web UI connector
+  (<tool> is not in remote_mcp.tools)`); an OAuth connector token reaches
+  only `mail_list`/`mail_read`/`mail_send`'s routes (`api_routes`);
+  `mail_attachment` is in `REMOTE_NEVER_SERVED` (the Python served it and
+  answered an error).
+- **`GMAIL_API_URL`** (new, optional): where the Gmail API is (the e2e
+  suite's fake). Gmail logins are the google part's `GoogleTokens`.
+- **CLI `mail-send`** reads the body from `--body-file` or stdin, as the
+  Python; `mail-list --limit` is an integer (clap usage error otherwise).
+
 ## Open questions
 
 (for Jacob; nothing here is implemented until decided)
@@ -1165,6 +1244,11 @@ Security review 2026-10 (hostd/hostexec), fixed:
   (from the Python tests), `https://claude.com/api/mcp/auth_callback` and
   `https://chatgpt.com/connector_platform_oauth_redirect` (not verified
   against the live services). Confirm or correct them.
+
+- **Mail**: Gmail's search cannot see `X-SimpleLogin-Envelope-To`, so mail
+  where an alias was only Bcc'd is not found (IMAP finds it). The judge's
+  model provider reads every message and draft. Both by upstream's design;
+  flagged there.
 
 ## To do (engineering, tracked here until done)
 

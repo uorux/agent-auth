@@ -19,6 +19,7 @@ test = false
 doctest = false
 
 [dev-dependencies]
+agent-auth-mail = { workspace = true, features = ["testing"] }
 agent-auth-tls = { workspace = true, features = ["reqwest"] }
 axum.workspace = true
 futures.workspace = true

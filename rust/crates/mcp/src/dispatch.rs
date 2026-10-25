@@ -86,6 +86,23 @@ struct HostRun {
     job: Option<JobOut>,
 }
 
+/// What mail_attachment answers: the attachment's description and where
+/// it was saved (its content stays out of the conversation).
+#[derive(Debug, Serialize)]
+struct SavedAttachment {
+    index: u64,
+    filename: String,
+    content_type: String,
+    size: u64,
+    notice: String,
+    file: String,
+}
+
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.decode(text).ok()
+}
+
 /// The longest wait host_run spends on a decision, then on the job.
 const HOST_RUN_MAX_WAIT: f64 = 300.0;
 
@@ -159,6 +176,85 @@ async fn run<C: Caller>(caller: &C, name: &str, a: &Args) -> Result<String, Stri
                     .credential_dir()
                     .map_err(|e| Failure::Other(e.to_string()))?;
                 to_file::deliver(&dir, grant, out).map_err(|e| Failure::Other(e.to_string()))
+            })
+            .await
+        }
+        "mail_list" => {
+            safe(caller, || async {
+                Ok(plain()
+                    .mail_list(
+                        a.str("grant_id"),
+                        a.int("limit"),
+                        a.opt_str("page"),
+                        a.opt_str("search"),
+                    )
+                    .await?)
+            })
+            .await
+        }
+        "mail_read" => {
+            safe(caller, || async {
+                Ok(plain()
+                    .mail_read(a.str("grant_id"), a.str("message_id"))
+                    .await?)
+            })
+            .await
+        }
+        "mail_attachment" => {
+            safe(caller, || async {
+                let message = a.str("message_id");
+                let index = u64::try_from(a.int("index")).unwrap_or(u64::MAX);
+                let out = plain()
+                    .mail_attachment(a.str("grant_id"), message, index)
+                    .await?;
+                let bytes = base64_decode(&out.content_base64)
+                    .ok_or_else(|| Failure::Other("the attachment did not decode".to_owned()))?;
+                let dir = caller
+                    .credential_dir()
+                    .map_err(|e| Failure::Other(e.to_string()))?;
+                let dir = dir.parent().map_or_else(|| dir.clone(), |p| p.join("mail"));
+                let name: String = out
+                    .filename
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c))
+                    .take(100)
+                    .collect();
+                let name = if name.is_empty() {
+                    "attachment".to_owned()
+                } else {
+                    name
+                };
+                let prefix: String = message
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+                    .take(8)
+                    .collect();
+                let path =
+                    to_file::write_private(&dir, &format!("{prefix}-{index}-{name}"), &bytes)
+                        .map_err(|e| Failure::Other(e.to_string()))?;
+                Ok(SavedAttachment {
+                    index: out.index,
+                    filename: out.filename,
+                    content_type: out.content_type,
+                    size: out.size,
+                    notice: out.notice,
+                    file: path.to_string_lossy().into_owned(),
+                })
+            })
+            .await
+        }
+        "mail_send" => {
+            safe(caller, || async {
+                let to = a.opt_list("to");
+                Ok(plain()
+                    .mail_send(
+                        a.str("grant_id"),
+                        a.str("body"),
+                        to.as_deref(),
+                        a.opt_str("subject"),
+                        a.opt_str("reply_to"),
+                    )
+                    .await?)
             })
             .await
         }

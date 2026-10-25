@@ -861,6 +861,10 @@ impl Notify for Fanout {
         primary!(self, n => n.contained(event).await,
             null => tracing::warn!(?event, "contained (no notifier)"));
     }
+    async fn mail_held(&self, item: &agent_auth_wire::mail::MailItem) {
+        primary!(self, n => n.mail_held(item).await,
+            null => tracing::warn!(item = %item.id, "mail held for the operator (no notifier)"));
+    }
 }
 
 #[cfg(test)]

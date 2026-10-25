@@ -65,6 +65,10 @@ pub enum CustomId {
         page: i64,
         rule: RuleId,
     },
+    /// Held mail: let it through (send it, for outbound).
+    MailRelease(agent_auth_core::MailItemId),
+    /// Held mail: keep it back.
+    MailDiscard(agent_auth_core::MailItemId),
 }
 
 impl CustomId {
@@ -115,6 +119,8 @@ impl CustomId {
                 page: page(p)?,
                 rule: r.parse().ok()?,
             },
+            ("mlrel", [m]) => CustomId::MailRelease(m.parse().ok()?),
+            ("mldis", [m]) => CustomId::MailDiscard(m.parse().ok()?),
             _ => return None,
         };
         Some(id)
@@ -146,6 +152,8 @@ impl CustomId {
             CustomId::RulesPage { target } => format!("aa:rules:page:{target}"),
             CustomId::RulesToggle { page, rule } => format!("aa:rules:toggle:{page}:{rule}"),
             CustomId::RulesDelete { page, rule } => format!("aa:rules:del:{page}:{rule}"),
+            CustomId::MailRelease(m) => format!("aa:mlrel:{m}"),
+            CustomId::MailDiscard(m) => format!("aa:mldis:{m}"),
         }
     }
 }

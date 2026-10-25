@@ -18,6 +18,7 @@ name = "agent-auth-mcp-bridge"
 path = "src/bin/agent-auth-mcp-bridge.rs"
 
 [dependencies]
+base64.workspace = true
 agent-auth-client.workspace = true
 agent-auth-core.workspace = true
 agent-auth-tls = { workspace = true, features = ["reqwest"] }

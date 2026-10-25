@@ -1,0 +1,39 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO mail_items (id, grant_id, agent_id, address, direction, message_key,\n                                 thread_key, summary, verdict, injection, reason, status, created_at)\n         VALUES ($1, $2, $3, $4, 'in', $5, $6, $7, $8, $9, $10, $11, $12)\n         ON CONFLICT (grant_id, direction, message_key) DO UPDATE\n         SET thread_key = EXCLUDED.thread_key, summary = EXCLUDED.summary,\n             verdict = EXCLUDED.verdict, injection = EXCLUDED.injection,\n             reason = EXCLUDED.reason, status = EXCLUDED.status\n         WHERE mail_items.status NOT IN ('released', 'discarded')\n         RETURNING id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "mail_items",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "684129703e34b16c5072150adf6d54873537e6f99e66df7f6dfe405b48fc79f2"
+}

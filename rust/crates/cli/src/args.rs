@@ -74,6 +74,39 @@ pub enum Command {
     Cred { grant_id: String },
     /// End one of your grants now (done with it).
     Release { grant_id: String },
+    /// Messages on a mail grant's address, screened.
+    MailList {
+        grant_id: String,
+        /// at most 50
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
+        /// next_page from the previous list
+        #[arg(long)]
+        page: Option<String>,
+        /// plain words
+        #[arg(long)]
+        search: Option<String>,
+    },
+    /// One message, in full.
+    MailRead {
+        grant_id: String,
+        message_id: String,
+    },
+    /// Send as the grant's address (reviewed first).
+    MailSend {
+        grant_id: String,
+        /// recipient (repeat for more, from a mailbox)
+        #[arg(long = "to")]
+        to: Vec<String>,
+        #[arg(long)]
+        subject: Option<String>,
+        /// a message id to answer
+        #[arg(long = "reply-to")]
+        reply_to: Option<String>,
+        /// the text; default: stdin
+        #[arg(long = "body-file")]
+        body_file: Option<PathBuf>,
+    },
     /// Agent sessions (ephemeral agents need one for a2a; AGENT_AUTH_SESSION)
     #[command(subcommand, arg_required_else_help = true)]
     Session(SessionCommand),
@@ -337,6 +370,21 @@ pub enum AdminCommand {
         grant_id: String,
         #[arg(long, default_value = "revoked by admin")]
         reason: String,
+    },
+    /// Mail the gateway is holding for you: messages it wouldn't show an
+    /// agent unasked, and messages agents want sent.
+    MailHeld,
+    /// Let a held message through (an outbound one is sent now).
+    MailRelease {
+        item_id: String,
+        #[arg(long, default_value = "admin")]
+        by: String,
+    },
+    /// Keep a held message from the agent (or never send it).
+    MailDiscard {
+        item_id: String,
+        #[arg(long, default_value = "admin")]
+        by: String,
     },
     /// Generate BROKER_SIGNING_KEY (ed25519 seed) and print its public key,
     /// which every daemon pins as brokerPublicKey. The seed is a secret:

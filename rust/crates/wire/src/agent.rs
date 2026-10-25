@@ -222,6 +222,8 @@ pub enum CredentialKind {
     /// A pool item leased: its secret in `value`, its properties in
     /// `properties`.
     PoolItem,
+    /// Mail: no secret; the broker reads and sends for the agent.
+    MailGateway,
 }
 
 /// `GET /v1/grants/{id}/credential` (Python `CredentialOut`). All seven

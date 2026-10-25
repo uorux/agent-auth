@@ -200,6 +200,53 @@ async fn agent(cmd: Command, client: &BrokerClient, io: &mut Io<'_>) -> u8 {
         Command::Grants { status } => show(io, client.grants(&status).await),
         Command::Cred { grant_id } => show(io, client.credential(&grant_id).await),
         Command::Release { grant_id } => show(io, client.release(&grant_id).await),
+        Command::MailList {
+            grant_id,
+            limit,
+            page,
+            search,
+        } => show(
+            io,
+            client
+                .mail_list(&grant_id, limit, page.as_deref(), search.as_deref())
+                .await,
+        ),
+        Command::MailRead {
+            grant_id,
+            message_id,
+        } => show(io, client.mail_read(&grant_id, &message_id).await),
+        Command::MailSend {
+            grant_id,
+            to,
+            subject,
+            reply_to,
+            body_file,
+        } => {
+            let body = match &body_file {
+                Some(path) => std::fs::read_to_string(path),
+                None => io::read_to_string(io::stdin()),
+            };
+            let body = match body {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = writeln!(io.err, "cannot read the message body: {e}");
+                    return 1;
+                }
+            };
+            let to = (!to.is_empty()).then_some(to);
+            show(
+                io,
+                client
+                    .mail_send(
+                        &grant_id,
+                        &body,
+                        to.as_deref(),
+                        subject.as_deref(),
+                        reply_to.as_deref(),
+                    )
+                    .await,
+            )
+        }
         Command::Session(_) | Command::A2a(_) | Command::Admin(_) => 2,
     }
 }
@@ -494,6 +541,13 @@ async fn admin(cmd: AdminCommand, client: &BrokerClient, io: &mut Io<'_>) -> u8 
         }
         AdminCommand::Revoke { grant_id, reason } => {
             show(io, client.admin_revoke_grant(&grant_id, &reason).await)
+        }
+        AdminCommand::MailHeld => show(io, client.admin_mail_held().await),
+        AdminCommand::MailRelease { item_id, by } => {
+            show(io, client.admin_mail_decide(&item_id, true, &by).await)
+        }
+        AdminCommand::MailDiscard { item_id, by } => {
+            show(io, client.admin_mail_decide(&item_id, false, &by).await)
         }
         AdminCommand::GoogleConsent {
             client_secret_file,

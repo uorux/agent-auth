@@ -187,7 +187,17 @@ async fn dispatch(
             Some(InteractionData::ApplicationCommand(c)),
         ) => autocomplete(bot, reply, &c).await,
         (InteractionType::MessageComponent, Some(InteractionData::MessageComponent(c))) => {
+            let card = interaction
+                .message
+                .as_ref()
+                .map(|m| (m.channel_id.get(), m.id.get()));
             match CustomId::parse(&c.custom_id) {
+                Some(CustomId::MailRelease(m)) => {
+                    mail_decide(bot, reply, &who, m, true, card).await
+                }
+                Some(CustomId::MailDiscard(m)) => {
+                    mail_decide(bot, reply, &who, m, false, card).await
+                }
                 Some(id) => component(bot, reply, &who, id, &c.values).await,
                 None => {
                     tracing::debug!("discord: a component that is not ours");
@@ -271,12 +281,68 @@ async fn component(
             tx.commit().await?;
             reply.update(&rules_page(bot, page, None).await?).await?;
         }
-        // Modal ids never arrive as components.
+        // Modal ids never arrive as components; mail is handled above.
         CustomId::DecisionModal { .. }
         | CustomId::EditModal(_)
         | CustomId::TotpModal(_)
-        | CustomId::WindowModal(_) => {}
+        | CustomId::WindowModal(_)
+        | CustomId::MailRelease(_)
+        | CustomId::MailDiscard(_) => {}
     }
+    Ok(())
+}
+
+/// Release or Discard on a held-mail card (`discord_bot/mail.py` `_decide`):
+/// the gateway decides (once: a second click is told "Nothing done"), the
+/// card shows the outcome and loses its buttons.
+async fn mail_decide(
+    bot: &Bot,
+    reply: &Reply<'_>,
+    who: &HumanDecider,
+    item: agent_auth_core::MailItemId,
+    release: bool,
+    card: Option<(u64, u64)>,
+) -> Result<(), Failure> {
+    let Some(mail) = bot.services().mail else {
+        reply
+            .ephemeral("Mail is not enabled on this broker.")
+            .await?;
+        return Ok(());
+    };
+    reply.defer().await?;
+    let out = if release {
+        mail.release(item, who.label()).await
+    } else {
+        mail.discard(item, who.label()).await
+    };
+    let d = match out {
+        Ok(d) => d,
+        Err(e) => {
+            reply
+                .followup(&format!("Nothing done: {}", escape(&e.detail)))
+                .await?;
+            return Ok(());
+        }
+    };
+    let (line, color) = super::mail::outcome(&d, release);
+    if let Some((channel, message)) = card {
+        let edited = Message {
+            embeds: Some(vec![super::mail::held_embed(
+                &d,
+                Some((
+                    &format!("{line} — {}", super::text::said(who.label(), 100)),
+                    color,
+                )),
+            )]),
+            components: Some(Vec::new()),
+            allowed_mentions: Some(super::model::mentions(None)),
+            ..Message::default()
+        };
+        if let Err(e) = bot.rest.edit_message(channel, message, &edited).await {
+            tracing::warn!("discord: could not update the held-mail card: {e}");
+        }
+    }
+    reply.followup(&line).await?;
     Ok(())
 }
 

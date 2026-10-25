@@ -618,4 +618,12 @@ impl Notify for DiscordNotifier {
             self.try_contained(event).await
         );
     }
+
+    async fn mail_held(&self, item: &agent_auth_wire::mail::MailItem) {
+        let msg = super::mail::held_message(item, self.bot.cfg.owner());
+        swallow!(
+            "post a held-mail card",
+            self.send(self.bot.cfg.channel_id, &msg).await.map(|_| ())
+        );
+    }
 }

@@ -30,6 +30,7 @@ pub const NOT_SECRET_KINDS: &[CredentialKind] = &[
     CredentialKind::ProjectAccess,
     CredentialKind::HostexecShell,
     CredentialKind::HostexecJob,
+    CredentialKind::MailGateway,
 ];
 
 /// Whether `kind`'s value is a secret (secret unless known otherwise).
@@ -140,6 +141,19 @@ pub fn write_secret(dir: &Path, grant_id: &str, value: &str) -> io::Result<PathB
             format!("not a grant id: {grant_id:?}"),
         ));
     }
+    write_private(dir, &name, value.as_bytes())
+}
+
+/// Write `value` to `dir`/`name` (a plain file name), mode 0600, in a
+/// directory of the user's own made 0700, without following a link, through
+/// a new temporary file renamed into place; the file's path.
+pub fn write_private(dir: &Path, name: &str, value: &[u8]) -> io::Result<PathBuf> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("not a file name: {name:?}"),
+        ));
+    }
     DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     let dir_meta = fs::symlink_metadata(dir)?;
     if !dir_meta.is_dir() {
@@ -148,7 +162,7 @@ pub fn write_secret(dir: &Path, grant_id: &str, value: &str) -> io::Result<PathB
     if dir_meta.permissions().mode() & 0o777 != 0o700 {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
-    let path = dir.join(&name);
+    let path = dir.join(name);
     match fs::symlink_metadata(&path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             return Err(refuse(format!(
@@ -163,14 +177,14 @@ pub fn write_secret(dir: &Path, grant_id: &str, value: &str) -> io::Result<PathB
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    let (tmp, mut file) = temp_file(dir, &name)?;
+    let (tmp, mut file) = temp_file(dir, name)?;
     let written = (|| {
         // The directory must be the user's own (compared with the file just
         // made, which is: there is no getuid without libc).
         if file.metadata()?.uid() != dir_meta.uid() {
             return Err(refuse(format!("{} belongs to another user", dir.display())));
         }
-        file.write_all(value.as_bytes())?;
+        file.write_all(value)?;
         file.sync_all()?;
         fs::rename(&tmp, &path)
     })();
@@ -231,6 +245,7 @@ mod tests {
             K::HostexecShell,
             K::HostexecJob,
             K::PoolItem,
+            K::MailGateway,
         ];
         for k in all {
             match k {
@@ -246,7 +261,8 @@ mod tests {
                 | K::ProjectAccess
                 | K::HostexecShell
                 | K::HostexecJob
-                | K::PoolItem => {}
+                | K::PoolItem
+                | K::MailGateway => {}
             }
         }
         all.to_vec()

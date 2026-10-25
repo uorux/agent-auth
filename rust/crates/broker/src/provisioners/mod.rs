@@ -198,6 +198,8 @@ pub enum AnyProvisioner {
     /// Google with no account configured (decisions only).
     GoogleStub(google::GoogleStubProvisioner),
     Pool(pool::PoolProvisioner),
+    /// The mail gateway's platform (`crate::mail::provisioner`).
+    Mail(crate::mail::provisioner::MailProvisioner),
 }
 
 macro_rules! dispatch {
@@ -214,6 +216,7 @@ macro_rules! dispatch {
             AnyProvisioner::Hostexec($p) => $e,
             AnyProvisioner::GoogleStub($p) => $e,
             AnyProvisioner::Pool($p) => $e,
+            AnyProvisioner::Mail($p) => $e,
         }
     };
 }

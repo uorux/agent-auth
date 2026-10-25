@@ -36,6 +36,7 @@ pub mod hostexec;
 pub mod http;
 pub mod limits;
 pub mod llm;
+pub mod mail;
 pub mod notify;
 pub mod oauth;
 pub mod provisioners;

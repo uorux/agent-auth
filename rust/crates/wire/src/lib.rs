@@ -32,6 +32,7 @@ pub mod error;
 pub mod hostexec;
 pub mod json;
 pub mod literal;
+pub mod mail;
 pub mod mcp_tools;
 pub mod oauth;
 pub mod payload;

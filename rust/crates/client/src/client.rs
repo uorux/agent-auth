@@ -509,6 +509,109 @@ impl BrokerClient {
             .await
     }
 
+    // ------------------------------------------------------------------ mail
+
+    /// `GET /v1/mail/{grant}/messages`. Each new message is screened by a
+    /// model first: allow for that (180 s).
+    pub async fn mail_list(
+        &self,
+        grant: &str,
+        limit: i64,
+        page: Option<&str>,
+        search: Option<&str>,
+    ) -> Result<agent_auth_wire::mail::MailList, ClientError> {
+        let mut call = Call::get(&["v1", "mail", grant, "messages"])
+            .query("limit", limit.to_string())
+            .timeout_secs(180.0);
+        if let Some(p) = page.filter(|p| !p.is_empty()) {
+            call = call.query("page", p);
+        }
+        if let Some(s) = search.filter(|s| !s.is_empty()) {
+            call = call.query("search", s);
+        }
+        self.call(call).await
+    }
+
+    /// `GET /v1/mail/{grant}/messages/{id}`.
+    pub async fn mail_read(
+        &self,
+        grant: &str,
+        message: &str,
+    ) -> Result<agent_auth_wire::mail::MailMessage, ClientError> {
+        self.call(Call::get(&["v1", "mail", grant, "messages", message]).timeout_secs(60.0))
+            .await
+    }
+
+    /// `GET /v1/mail/{grant}/messages/{id}/attachments/{index}`.
+    pub async fn mail_attachment(
+        &self,
+        grant: &str,
+        message: &str,
+        index: u64,
+    ) -> Result<agent_auth_wire::mail::MailAttachment, ClientError> {
+        let index = index.to_string();
+        self.call(
+            Call::get(&[
+                "v1",
+                "mail",
+                grant,
+                "messages",
+                message,
+                "attachments",
+                &index,
+            ])
+            .timeout_secs(60.0),
+        )
+        .await
+    }
+
+    /// `POST /v1/mail/{grant}/send`: reviewed before it leaves.
+    pub async fn mail_send(
+        &self,
+        grant: &str,
+        body: &str,
+        to: Option<&[String]>,
+        subject: Option<&str>,
+        reply_to: Option<&str>,
+    ) -> Result<agent_auth_wire::mail::SendOut, ClientError> {
+        self.ready(Auth::Agent)?;
+        let body = checked::<agent_auth_wire::mail::SendBody>(
+            json!({"to": to, "subject": subject, "body": body, "reply_to": reply_to}),
+        )?;
+        self.call(
+            Call::post(&["v1", "mail", grant, "send"])
+                .body(body)
+                .timeout_secs(120.0),
+        )
+        .await
+    }
+
+    /// `GET /admin/mail/held`.
+    pub async fn admin_mail_held(
+        &self,
+    ) -> Result<Vec<agent_auth_wire::mail::MailItem>, ClientError> {
+        self.call(Call::get(&["admin", "mail", "held"]).admin())
+            .await
+    }
+
+    /// `POST /admin/mail/items/{id}/release|discard`.
+    pub async fn admin_mail_decide(
+        &self,
+        item: &str,
+        release: bool,
+        by: &str,
+    ) -> Result<agent_auth_wire::mail::MailItem, ClientError> {
+        let action = if release { "release" } else { "discard" };
+        let body = checked::<agent_auth_wire::mail::DecideBody>(json!({ "by": by }))?;
+        self.call(
+            Call::post(&["admin", "mail", "items", item, action])
+                .admin()
+                .body(body)
+                .timeout_secs(120.0),
+        )
+        .await
+    }
+
     // -------------------------------------------------------------- sessions
 
     /// `POST /v1/sessions`; the new session is this client's (and its

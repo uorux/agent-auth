@@ -52,6 +52,10 @@ pub struct PlatformCatalog {
     pub servers: Option<Vec<McpServerEntry>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway: Option<GatewayEntry>,
+    /// mail: what can be asked for (SimpleLogin, domains to create aliases
+    /// on, mailboxes given directly, whether a model screens).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mail: Option<MailCatalog>,
     /// google: the accounts (name, address).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accounts: Option<Vec<GoogleAccountEntry>>,
@@ -59,6 +63,16 @@ pub struct PlatformCatalog {
     /// them now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pools: Option<Vec<PoolEntry>>,
+}
+
+/// The mail platform's menu. The aliases themselves are not listed: which
+/// services the person uses is theirs to tell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailCatalog {
+    pub simplelogin: bool,
+    pub create_domains: Vec<String>,
+    pub direct: Vec<String>,
+    pub screened_by_model: bool,
 }
 
 impl PlatformCatalog {
@@ -86,6 +100,7 @@ impl PlatformCatalog {
             hosts: None,
             servers: None,
             gateway: None,
+            mail: None,
             accounts: None,
             pools: None,
         }

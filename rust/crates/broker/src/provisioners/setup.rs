@@ -86,6 +86,8 @@ pub struct PlatformServices {
     pub tokens: Option<Arc<TokenIssuer>>,
     pub wiki: Option<Arc<Wiki>>,
     pub github: Option<Arc<GithubApp>>,
+    /// The Google logins (also the mail gateway's Gmail backend).
+    pub google_tokens: Option<Arc<GoogleTokens>>,
 }
 
 /// What [`build`] made: the provisioners to register, and the services.
@@ -119,6 +121,7 @@ pub fn build(env: &Env<'_>, policy: &Arc<Policy>, keys: Keys<'_>) -> Result<Buil
         provisioners.push(AnyProvisioner::GoogleStub(GoogleStubProvisioner));
     } else {
         let tokens = Arc::new(GoogleTokens::new(&platforms.google)?);
+        services.google_tokens = Some(Arc::clone(&tokens));
         provisioners.push(AnyProvisioner::Google(GoogleProvisioner::new(
             &platforms.google,
             tokens,
