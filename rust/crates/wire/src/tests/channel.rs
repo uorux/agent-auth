@@ -177,7 +177,8 @@ fn host_to_broker_every_type() {
 fn sandbox_every_type() {
     let to_sandbox = [
         json!({"type": "key", "agent_id": AGENT, "name": "orchestrator-galaxy-sandbox",
-               "runtime": "orchestrator", "project": null, "api_key": "aa_0123456789ab_secret"}),
+               "runtime": "orchestrator", "project": null, "api_key": "aa_0123456789ab_secret",
+               "key_id": "0123456789ab"}),
         json!({"type": "project.grant", "grant_id": GRANT, "project": "a", "target": "b",
                "access": "project.read", "call_id": CALL}),
         json!({"type": "project.revoke", "grant_id": GRANT, "project": "a", "target": "b",
@@ -198,12 +199,17 @@ fn sandbox_every_type() {
                "processes": 1}}),
         json!({"type": "reply", "call_id": CALL, "ok": true}),
         json!({"type": "reply", "call_id": null, "ok": false, "error": "no such project"}),
-        json!({"type": "key.ack", "agent_id": AGENT}),
+        json!({"type": "key.ack", "agent_id": AGENT, "key_id": "0123456789ab"}),
         json!({"type": "key.rotate", "name": "claude-a-galaxy-sandbox"}),
     ];
     for sample in from_sandbox {
         let _: SandboxToBroker = known(sample);
     }
+    // An ack names the key it acknowledges (sandboxd B-6).
+    assert!(
+        malformed::<SandboxToBroker>(json!({"type": "key.ack", "agent_id": AGENT}))
+            .contains("key_id")
+    );
     assert!(
         malformed::<BrokerToSandbox>(json!({"type": "project.grant", "grant_id": GRANT,
             "project": "a", "target": "b", "access": "project.admin"}))

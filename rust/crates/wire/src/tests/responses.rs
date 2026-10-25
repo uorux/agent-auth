@@ -1171,8 +1171,8 @@ round_trips! {
             .prop_map(|(title, text, urgency, call_id)| BrokerToHost::Notify(Notify { title, text, urgency, call_id })),
     ];
     rt_broker_to_sandbox: prop_oneof![
-        (agent_id(), name::<1, 128>(), option::of(name::<0, 64>()), option::of(name::<0, 64>()), secret::<512>(), call_id())
-            .prop_map(|(agent_id, name, runtime, project, api_key, call_id)| BrokerToSandbox::Key(KeyDelivery { agent_id, name, runtime, project, api_key, call_id })),
+        (agent_id(), name::<1, 16>(), name::<1, 128>(), option::of(name::<0, 64>()), option::of(name::<0, 64>()), secret::<512>(), call_id())
+            .prop_map(|(agent_id, key_id, name, runtime, project, api_key, call_id)| BrokerToSandbox::Key(KeyDelivery { agent_id, key_id, name, runtime, project, api_key, call_id })),
         (grant_id(), name::<1, 64>(), name::<1, 64>(), pick![ProjectAccessName::Read, ProjectAccessName::Write], call_id())
             .prop_map(|(grant_id, project, target, access, call_id)| BrokerToSandbox::ProjectGrant(ProjectGrant { grant_id, project, target, access, call_id })),
         (grant_id(), name::<1, 64>(), name::<1, 64>(), call_id())
@@ -1183,7 +1183,7 @@ round_trips! {
     rt_sandbox_to_broker: prop_oneof![
         status_object().prop_map(|status| SandboxToBroker::Heartbeat(crate::daemon::Heartbeat { status })),
         reply().prop_map(SandboxToBroker::Reply),
-        agent_id().prop_map(|agent_id| SandboxToBroker::KeyAck(KeyAck { agent_id })),
+        (agent_id(), name::<1, 16>()).prop_map(|(agent_id, key_id)| SandboxToBroker::KeyAck(KeyAck { agent_id, key_id })),
         name::<1, 128>().prop_map(|name| SandboxToBroker::KeyRotate(KeyRotate { name })),
     ];
 }

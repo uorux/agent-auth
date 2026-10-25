@@ -31,8 +31,11 @@ mod proofs_hostd;
 mod proofs_mail;
 #[cfg(kani)]
 mod proofs_policy;
+#[cfg(kani)]
+mod proofs_sandbox;
 pub mod pyfmt;
 pub mod routing;
+pub mod sandbox;
 pub mod zones;
 
 pub use approval::HumanApproval;

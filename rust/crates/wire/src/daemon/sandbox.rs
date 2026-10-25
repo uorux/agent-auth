@@ -82,6 +82,9 @@ impl ChannelMessage for SandboxToBroker {
 #[serde(deny_unknown_fields)]
 pub struct KeyDelivery {
     pub agent_id: AgentId,
+    /// Which key this is (its `aa_<key_id>_…` part); the ack names it, so an
+    /// ack for a key since replaced deletes nothing (sandboxd B-6).
+    pub key_id: Text<1, 16>,
     pub name: Text<1, 128>,
     pub runtime: Option<Text<0, 64>>,
     pub project: Option<Text<0, 64>>,
@@ -143,6 +146,8 @@ pub struct AgentsContained {
 #[serde(deny_unknown_fields)]
 pub struct KeyAck {
     pub agent_id: AgentId,
+    /// The `key_id` of the delivery acknowledged (sandboxd B-6).
+    pub key_id: Text<1, 16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
