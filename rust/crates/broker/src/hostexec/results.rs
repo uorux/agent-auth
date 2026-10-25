@@ -5,7 +5,6 @@
 
 use std::sync::PoisonError;
 
-use agent_auth_core::JobId;
 use agent_auth_crypto::daemon::Role;
 use agent_auth_crypto::digest::sha256_hex;
 use agent_auth_store::hostexec::{self as store, Finished, JobResult, JobRow};
@@ -213,30 +212,6 @@ impl HostExec {
             Err(e) => {
                 tracing::error!(job = %job.id, error = %e, "job_finished: request not loaded")
             }
-        }
-    }
-
-    /// Move a job that is still `starting` (never over a result that
-    /// already arrived); wake waiters unless it is now running.
-    pub(crate) async fn set_status(
-        &self,
-        job: JobId,
-        host: &str,
-        status: store::JobStatus,
-        error: Option<&str>,
-        via: Option<&str>,
-    ) {
-        let result = async {
-            let tx = self.store.begin().await?;
-            store::set_status(&tx, job, host, status, error, via).await?;
-            tx.commit().await
-        }
-        .await;
-        if let Err(e) = result {
-            tracing::error!(job = %job, error = %e, "job status not stored");
-        }
-        if status != store::JobStatus::Running {
-            self.job_events.notify(&job);
         }
     }
 }

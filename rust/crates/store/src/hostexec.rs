@@ -125,6 +125,35 @@ pub struct NewJob<'a> {
     pub now: OffsetDateTime,
 }
 
+impl NewJob<'_> {
+    /// The row [`insert`] will write (shown before it is written).
+    #[must_use]
+    pub fn to_row(&self) -> JobRow {
+        JobRow {
+            id: self.id,
+            grant_id: self.grant_id,
+            request_id: self.request_id,
+            agent_id: self.agent_id,
+            host: self.host.to_owned(),
+            tier: self.tier,
+            shell_id: self.shell_id,
+            spec: self.spec.clone(),
+            status: JobStatus::Starting,
+            via: None,
+            exit_code: None,
+            error: None,
+            output: None,
+            output_bytes: None,
+            output_sha256: None,
+            truncated: false,
+            duration_ms: None,
+            finished_at: None,
+            created_at: self.now,
+            updated_at: self.now,
+        }
+    }
+}
+
 /// Insert a job as `starting` (committed before the host is asked).
 pub async fn insert(tx: &Tx<'_>, n: &NewJob<'_>) -> Result<JobRow, StoreError> {
     let mut c = tx.conn().await;

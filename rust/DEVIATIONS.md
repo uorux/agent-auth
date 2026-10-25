@@ -1194,6 +1194,29 @@ Security review 2026-10 (hostd/hostexec), fixed:
   daemon session shorter than 30 s backs off like a failure (no 1 Hz
   reconnect loop against a broker that welcomes and drops).
 
+Final hostexec review (2026-10), fixed:
+- **Shell commands are checked where they act.** `shell_exec` takes the
+  grant through `grants::issuable` (so a delegated shell stops when its
+  thread closes, as credentials do), and after the Discord post checks it
+  again (issuable, containment, the host's lockdown flag) in the
+  transaction that writes the job, holding its locks while hostd is asked;
+  a revoke, containment or disabling that lands during the post stops it.
+  The command is shown (with the row it will be) before the row is written.
+- **A revoke the host didn't confirm fails.** `HostExec::stop` returns an
+  error unless hostd answered `shell.close`/`job.kill`; `revoke_grant` then
+  leaves the grant ACTIVE but expires it now (every platform: nothing more
+  is issued for it), and the expiry pass retries until the provisioner
+  succeeds. A `job.kill` for a job whose start timed out is sent every 2 s
+  until hostd answers or the job's row ends (a day at most).
+- **Job environments stay off the command line** (Linux): written to a
+  root-only `{runtime_dir}/env/aa-job-<id>.env` (dir 0700, file 0600,
+  systemd's double-quote syntax; a value with a line break is refused at
+  run time) passed as `EnvironmentFile=`, and removed when the run ends.
+  Files a crashed hostd left are in `/run`, root-only, gone at reboot.
+- **Unlock takes the containment lock before the lockdown flag's row**
+  (the store's lock order); the old order could deadlock with a
+  containment writer that then read the flag.
+
 ## Mail (`crates/mail`, broker `mail`, `discord/mail.rs`; upstream snapshot 2026-10-25)
 
 Ported from the snapshot with every fix its review log lists (judge reads
