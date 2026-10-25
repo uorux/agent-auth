@@ -284,7 +284,11 @@ impl Discord {
 
     /// A button click.
     pub fn click(&self, user: u64, custom_id: &str) -> String {
-        self.interact(user, 3, json!({"custom_id": custom_id, "component_type": 2}))
+        self.interact(
+            user,
+            3,
+            json!({"custom_id": custom_id, "component_type": 2}),
+        )
     }
 
     /// A modal submitted with these text inputs.
@@ -296,7 +300,11 @@ impl Discord {
                 json!({"type": 18, "id": i, "component": {"type": 4, "id": i + 10, "custom_id": k, "value": v}})
             })
             .collect();
-        self.interact(user, 5, json!({"custom_id": custom_id, "components": components}))
+        self.interact(
+            user,
+            5,
+            json!({"custom_id": custom_id, "components": components}),
+        )
     }
 
     /// The bodies of the interaction callbacks to interaction `id`.
@@ -304,7 +312,10 @@ impl Discord {
         self.rest
             .calls()
             .into_iter()
-            .filter(|c| c.path.ends_with(&format!("/interactions/{id}/tok-{id}/callback")))
+            .filter(|c| {
+                c.path
+                    .ends_with(&format!("/interactions/{id}/tok-{id}/callback"))
+            })
             .map(|c| c.body)
             .collect()
     }

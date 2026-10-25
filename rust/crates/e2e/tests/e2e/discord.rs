@@ -39,12 +39,19 @@ async fn the_owner_approves_on_discord(_: PgPoolOptions, opts: PgConnectOptions)
     })
     .await;
     eventually(Duration::from_secs(10), "slash commands synced", || {
-        let synced = !discord.rest.calls_to("PUT", "/guilds/77/commands").is_empty();
+        let synced = !discord
+            .rest
+            .calls_to("PUT", "/guilds/77/commands")
+            .is_empty();
         async move { synced }
     })
     .await;
     assert!(
-        discord.rest.calls().iter().all(|c| c.authorization == "Bot e2e-discord-token"),
+        discord
+            .rest
+            .calls()
+            .iter()
+            .all(|c| c.authorization == "Bot e2e-discord-token"),
         "{:?}",
         discord.rest.calls()
     );
@@ -53,8 +60,16 @@ async fn the_owner_approves_on_discord(_: PgPoolOptions, opts: PgConnectOptions)
     let r = b
         .cli(
             agent.who(),
-            &["request", "github", "repo", "acme/site", "--why", "fix the footer",
-              "-s", r#"{"permissions": {"contents": "write"}}"#],
+            &[
+                "request",
+                "github",
+                "repo",
+                "acme/site",
+                "--why",
+                "fix the footer",
+                "-s",
+                r#"{"permissions": {"contents": "write"}}"#,
+            ],
         )
         .await
         .ok();
@@ -62,13 +77,23 @@ async fn the_owner_approves_on_discord(_: PgPoolOptions, opts: PgConnectOptions)
     let rid = r["id"].as_str().unwrap().to_owned();
 
     eventually(Duration::from_secs(10), "the card is posted", || {
-        let posted = !discord.rest.calls_to("POST", "/channels/5/messages").is_empty();
+        let posted = !discord
+            .rest
+            .calls_to("POST", "/channels/5/messages")
+            .is_empty();
         async move { posted }
     })
     .await;
-    let card = discord.rest.calls_to("POST", "/channels/5/messages").remove(0).body;
+    let card = discord
+        .rest
+        .calls_to("POST", "/channels/5/messages")
+        .remove(0)
+        .body;
     // (Names are markdown-escaped; Discord shows `sde-d`.)
-    assert_eq!(card["content"], r"<@42> access request from **sde\-d**", "{card}");
+    assert_eq!(
+        card["content"], r"<@42> access request from **sde\-d**",
+        "{card}"
+    );
     assert_eq!(
         card["components"][0]["components"][0]["custom_id"],
         json!(format!("aa:approve:{rid}")),
@@ -95,24 +120,36 @@ async fn the_owner_approves_on_discord(_: PgPoolOptions, opts: PgConnectOptions)
     .await;
     let modal = discord.callbacks(&click).remove(0);
     assert_eq!(modal["type"], 9, "{modal}");
-    assert_eq!(modal["data"]["custom_id"], json!(format!("aa:decision:approve:{rid}")));
+    assert_eq!(
+        modal["data"]["custom_id"],
+        json!(format!("aa:decision:approve:{rid}"))
+    );
     discord.submit(
         OWNER,
         &format!("aa:decision:approve:{rid}"),
         &[("reason", "ok for today"), ("duration", "2h")],
     );
-    let r = b.cli(agent.who(), &["wait", &rid, "--timeout", "10"]).await.ok();
+    let r = b
+        .cli(agent.who(), &["wait", &rid, "--timeout", "10"])
+        .await
+        .ok();
     assert_eq!(r["status"], "granted", "{r}");
     assert_eq!(r["decision_source"], "human");
     assert_eq!(r["decision_reason"], "ok for today");
     assert_eq!(r["approved_duration_secs"], 7200);
     let grant = r["grant_id"].as_str().unwrap().to_owned();
     let cred = b.cli(agent.who(), &["cred", &grant]).await.ok();
-    assert!(cred["value"].as_str().unwrap().starts_with("ghs_e2e_"), "{cred}");
+    assert!(
+        cred["value"].as_str().unwrap().starts_with("ghs_e2e_"),
+        "{cred}"
+    );
 
     // The card shows the outcome.
     eventually(Duration::from_secs(10), "the card is updated", || {
-        let edited = !discord.rest.calls_to("PATCH", "/channels/5/messages/900").is_empty();
+        let edited = !discord
+            .rest
+            .calls_to("PATCH", "/channels/5/messages/900")
+            .is_empty();
         async move { edited }
     })
     .await;

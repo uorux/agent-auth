@@ -4,7 +4,7 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{Value, json};
 use sqlx::postgres::PgConnectOptions;
@@ -15,17 +15,85 @@ pub const ADMIN_TOKEN: &str = "e2e-admin-token-0123456789abcdef";
 
 /// A binary of the workspace, from the target directory this test was
 /// built into (`target/<profile>/deps/<test>` → `target/<profile>/<name>`).
+/// Cargo does not build other packages' binaries for this crate's tests,
+/// so a binary older than the workspace's sources fails the test rather
+/// than testing yesterday's code.
 pub fn bin(name: &str) -> PathBuf {
     let exe = std::env::current_exe().unwrap();
     let dir = exe.parent().unwrap().parent().unwrap();
     let path = dir.join(name);
+    let built = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .unwrap_or_else(|_| {
+            panic!(
+                "{} is missing: run `cargo build --workspace --bins` first \
+                 (scripts/check.sh does)",
+                path.display()
+            )
+        });
+    let (newest, source) = newest_source(name);
     assert!(
-        path.is_file(),
-        "{} is missing: run `cargo build --workspace --bins` first \
-         (`scripts/check.sh e2e` does)",
-        path.display()
+        built >= newest,
+        "{} is older than {}: run `cargo build --workspace --bins` first \
+         (scripts/check.sh does)",
+        path.display(),
+        source.display()
     );
     path
+}
+
+/// The most recently modified source (`.rs`, `.sql`, `Cargo.toml`) of the
+/// package that builds `bin` and of the workspace packages it depends on.
+fn newest_source(bin: &str) -> (SystemTime, PathBuf) {
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let package = match bin {
+        "agent-auth-server" => "broker",
+        "agent-auth" => "cli",
+        "agent-auth-mcp" => "mcp",
+        other => panic!("which package builds {other}?"),
+    };
+    // The package and its workspace dependencies (`agent-auth-<dir>`).
+    let mut packages = vec![package.to_owned()];
+    let mut i = 0;
+    while let Some(p) = packages.get(i).cloned() {
+        i += 1;
+        let manifest = std::fs::read_to_string(crates.join(&p).join("Cargo.toml")).unwrap();
+        let deps = manifest
+            .split("\n[")
+            .find(|section| section.starts_with("dependencies]"))
+            .unwrap_or_default();
+        for line in deps.lines() {
+            if let Some(dep) = line
+                .strip_prefix("agent-auth-")
+                .and_then(|rest| rest.split(|c: char| !c.is_ascii_alphanumeric()).next())
+                && !packages.iter().any(|q| q == dep)
+            {
+                packages.push(dep.to_owned());
+            }
+        }
+    }
+    let mut newest = (SystemTime::UNIX_EPOCH, crates.to_path_buf());
+    let mut dirs: Vec<PathBuf> = packages.iter().map(|p| crates.join(p)).collect();
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                // Tests and benches are not part of the binaries.
+                if !path.ends_with("tests") && !path.ends_with("benches") {
+                    dirs.push(path);
+                }
+            } else if path
+                .extension()
+                .is_some_and(|e| e == "rs" || e == "sql" || e == "toml")
+                && let Ok(modified) = meta.modified()
+                && modified > newest.0
+            {
+                newest = (modified, path);
+            }
+        }
+    }
+    newest
 }
 
 /// A directory removed on drop.
@@ -282,6 +350,10 @@ impl Broker {
             Who::Agent(key) => {
                 cmd.env("AGENT_AUTH_API_KEY", key);
             }
+            Who::Session(key, session) => {
+                cmd.env("AGENT_AUTH_API_KEY", key)
+                    .env("AGENT_AUTH_SESSION", session);
+            }
             Who::Nobody => {}
         }
         let out = tokio::time::timeout(Duration::from_secs(120), cmd.output())
@@ -333,7 +405,7 @@ impl Broker {
 
 impl Drop for Broker {
     fn drop(&mut self) {
-        if std::thread::panicking() {
+        if std::thread::panicking() || std::env::var_os("E2E_BROKER_LOGS").is_some() {
             eprintln!("---- broker log ({}) ----\n{}", self.url, self.log());
         }
         if let Some(child) = self.child.as_mut() {
@@ -346,6 +418,8 @@ impl Drop for Broker {
 pub enum Who<'a> {
     Admin,
     Agent(&'a str),
+    /// An agent in a session (`AGENT_AUTH_SESSION`).
+    Session(&'a str, &'a str),
     Nobody,
 }
 
