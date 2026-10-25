@@ -214,7 +214,9 @@ fn effective_uid(dir: &Path) -> Result<u32, KeyFileError> {
     }
 }
 
+// Real files, FIFOs and a subprocess: not under Miri.
 #[cfg(test)]
+#[cfg(not(miri))]
 #[cfg(not(miri))]
 mod tests {
     use super::*;

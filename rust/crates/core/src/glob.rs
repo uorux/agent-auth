@@ -363,6 +363,7 @@ mod tests {
     /// `python3` on PATH (the dev shell has it); without it the test says
     /// so and passes.
     #[test]
+    #[cfg_attr(miri, ignore = "spawns python3")]
     fn agrees_with_cpython() {
         use std::io::Write as _;
         use std::process::{Command, Stdio};
