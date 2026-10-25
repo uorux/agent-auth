@@ -1,7 +1,6 @@
 //! The slash commands (spec A.7) and their registration: in the approvals
 //! channel's guild (instant), else globally. A bulk overwrite, so this
-//! list is every command the bot has; the hostexec ones (/arm, /disarm,
-//! /lockdown, /unlock, /dnd, /hosts) join it when that part is ported.
+//! list is every command the bot has.
 
 use serde_json::{Value, json};
 
@@ -37,12 +36,74 @@ pub fn definitions() -> Value {
                 {
                     "type": STRING,
                     "name": "entry",
-                    "description": "which one; leave empty to lift every containment",
+                    "description": "which one",
                     "autocomplete": true,
                 },
+                {"type": BOOLEAN, "name": "all", "description": "lift every containment"},
+            ],
+        },
+        {"type": 1, "name": "hosts", "description": "Paired host and sandbox daemons"},
+        {
+            "type": 1,
+            "name": "arm",
+            "description": "Let approvals made here count on a host, for a while",
+            "options": [
+                {"type": STRING, "name": "host", "description": "the host", "required": true, "autocomplete": true},
+                {"type": STRING, "name": "tier", "description": "user or root", "required": true, "choices": tiers()},
+                {"type": STRING, "name": "code", "description": "a code from that host's <tier>-arm TOTP secret", "required": true},
+                {"type": STRING, "name": "duration", "description": "e.g. 30m, 2h (the host caps it)"},
+            ],
+        },
+        {
+            "type": 1,
+            "name": "disarm",
+            "description": "Stop approvals made here from counting on a host",
+            "options": [
+                {"type": STRING, "name": "host", "description": "the host", "required": true, "autocomplete": true},
+                {"type": STRING, "name": "tier", "description": "user or root (default: both)", "choices": tiers()},
+            ],
+        },
+        {
+            "type": 1,
+            "name": "lockdown",
+            "description": "Kill switch: revoke agents' grants, stop hosts, freeze VMs",
+            "options": [
+                {
+                    "type": STRING,
+                    "name": "scope",
+                    "description": "sandboxes: agent-VM agents (default) · all: every agent · host: one host",
+                    "choices": [
+                        {"name": "sandboxes", "value": "sandboxes"},
+                        {"name": "all", "value": "all"},
+                        {"name": "host", "value": "host"},
+                    ],
+                },
+                {"type": STRING, "name": "host", "description": "with scope host", "autocomplete": true},
+                {"type": BOOLEAN, "name": "kill_vm", "description": "stop the agent VMs instead of freezing them"},
+            ],
+        },
+        {
+            "type": 1,
+            "name": "unlock",
+            "description": "Lift a lockdown (a host needs its own root arm code)",
+            "options": [
+                {"type": STRING, "name": "host", "description": "the host", "autocomplete": true},
+                {"type": STRING, "name": "code", "description": "the host's root-arm code"},
+            ],
+        },
+        {
+            "type": 1,
+            "name": "dnd",
+            "description": "No approval prompts on your desktops for a while",
+            "options": [
+                {"type": STRING, "name": "duration", "description": "e.g. 2h; leave empty to turn it off"},
             ],
         },
     ])
+}
+
+fn tiers() -> Value {
+    json!([{"name": "user", "value": "user"}, {"name": "root", "value": "root"}])
 }
 
 /// Register the commands; true when done (else the next READY retries).

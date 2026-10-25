@@ -41,12 +41,12 @@ use super::{Discord, DiscordConfig, Services, interactions};
 use crate::auth::{DiscordOwner, HumanDecider};
 use crate::notify::Notify;
 
-const OWNER: u64 = 42;
+pub(super) const OWNER: u64 = 42;
 const T0: OffsetDateTime = datetime!(2026-10-25 12:00 UTC);
 
 // ------------------------------------------------------------- fixtures
 
-fn agent(name: &str) -> AgentRow {
+pub(super) fn agent(name: &str) -> AgentRow {
     AgentRow {
         id: AgentId::new(),
         name: name.to_owned(),
@@ -592,7 +592,13 @@ fn views() {
     let all = buttons(&hostexec_pending_view(&run));
     assert_eq!(
         all.iter().map(|b| b.0.as_str()).collect::<Vec<_>>(),
-        ["Approve", "Approve with TOTP", "Deny", "Edit"]
+        [
+            "Approve",
+            "Approve all…",
+            "Approve with TOTP",
+            "Deny",
+            "Edit"
+        ]
     );
     assert!(
         all.iter()
@@ -913,23 +919,23 @@ proptest::proptest! {
 // ----------------------------------------------------- the fake Discord
 
 #[derive(Debug, Clone)]
-struct Call {
-    method: Method,
-    path: String,
-    body: Value,
-    raw: String,
+pub(super) struct Call {
+    pub(super) method: Method,
+    pub(super) path: String,
+    pub(super) body: Value,
+    pub(super) raw: String,
 }
 
 #[derive(Clone, Default)]
-struct Fake {
-    calls: Arc<Mutex<Vec<Call>>>,
-    rate_limit_once: Arc<AtomicBool>,
+pub(super) struct Fake {
+    pub(super) calls: Arc<Mutex<Vec<Call>>>,
+    pub(super) rate_limit_once: Arc<AtomicBool>,
     /// Embeds a GET of a message returns.
-    embeds: Arc<Mutex<Value>>,
+    pub(super) embeds: Arc<Mutex<Value>>,
 }
 
 impl Fake {
-    fn calls(&self) -> Vec<Call> {
+    pub(super) fn calls(&self) -> Vec<Call> {
         self.calls.lock().unwrap().clone()
     }
 }
@@ -964,7 +970,7 @@ async fn fake_handler(State(f): State<Fake>, method: Method, uri: Uri, body: Byt
     axum::Json(body).into_response()
 }
 
-async fn fake() -> (Fake, String) {
+pub(super) async fn fake() -> (Fake, String) {
     let f = Fake::default();
     *f.embeds.lock().unwrap() = json!([]);
     let app = Router::new().fallback(fake_handler).with_state(f.clone());
@@ -974,7 +980,7 @@ async fn fake() -> (Fake, String) {
     (f, format!("http://{addr}/api"))
 }
 
-fn config(base: &str, owner: u64) -> DiscordConfig {
+pub(super) fn config(base: &str, owner: u64) -> DiscordConfig {
     DiscordConfig {
         token: Secret::new("test-token".to_owned()),
         channel_id: 5,
@@ -986,7 +992,7 @@ fn config(base: &str, owner: u64) -> DiscordConfig {
     }
 }
 
-fn lazy_store() -> Store {
+pub(super) fn lazy_store() -> Store {
     Store::from_pool(
         sqlx::postgres::PgPoolOptions::new()
             .acquire_timeout(std::time::Duration::from_millis(200))
@@ -1080,11 +1086,12 @@ fn bot_with(base: &str, owner: u64, store: Store, ops: &Arc<FakeOps>) -> Discord
         requests: Some(requests),
         containment: Some(containment),
         hosts: None,
+        app: None,
     });
     d
 }
 
-fn interaction(kind: u8, user: u64, data: Value) -> Interaction {
+pub(super) fn interaction(kind: u8, user: u64, data: Value) -> Interaction {
     serde_json::from_value(json!({
         "id": "10",
         "application_id": "20",
@@ -1101,7 +1108,7 @@ fn interaction(kind: u8, user: u64, data: Value) -> Interaction {
     .expect("interaction")
 }
 
-fn button_click(user: u64, custom_id: &str) -> Interaction {
+pub(super) fn button_click(user: u64, custom_id: &str) -> Interaction {
     interaction(
         3,
         user,
@@ -1109,7 +1116,7 @@ fn button_click(user: u64, custom_id: &str) -> Interaction {
     )
 }
 
-fn modal_submit(user: u64, custom_id: &str, fields: &[(&str, &str)]) -> Interaction {
+pub(super) fn modal_submit(user: u64, custom_id: &str, fields: &[(&str, &str)]) -> Interaction {
     let components: Vec<Value> = fields
         .iter()
         .enumerate()
@@ -1122,7 +1129,7 @@ fn modal_submit(user: u64, custom_id: &str, fields: &[(&str, &str)]) -> Interact
     )
 }
 
-fn command(user: u64, name: &str, options: Value) -> Interaction {
+pub(super) fn command(user: u64, name: &str, options: Value) -> Interaction {
     interaction(
         2,
         user,
@@ -1130,10 +1137,10 @@ fn command(user: u64, name: &str, options: Value) -> Interaction {
     )
 }
 
-const CALLBACK: &str = "/interactions/10/itok/callback";
-const FOLLOWUP: &str = "/webhooks/20/itok";
+pub(super) const CALLBACK: &str = "/interactions/10/itok/callback";
+pub(super) const FOLLOWUP: &str = "/webhooks/20/itok";
 
-fn ephemeral_reply(c: &Call) -> &str {
+pub(super) fn ephemeral_reply(c: &Call) -> &str {
     assert_eq!(c.path, CALLBACK);
     assert_eq!(c.body["type"], 4);
     assert_eq!(c.body["data"]["flags"], 64);

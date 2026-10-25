@@ -301,6 +301,7 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
             requests: Some(ops.clone()),
             containment: Some(ops),
             hosts: Some(hosts),
+            app: Some(state.clone()),
         });
         tasks.push(tokio::spawn(d.run()));
     }

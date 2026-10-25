@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use agent_auth_core::pyfmt::shlex_join;
+use agent_auth_core::pyfmt::{escape_unprintable, shlex_join, shlex_quote};
 use agent_auth_core::{GrantStatus, Platform, RequestStatus};
 use agent_auth_store::agents::{self, AgentRow};
 use agent_auth_store::grants::{self, GrantRow};
@@ -25,7 +25,7 @@ use super::embeds::{
 };
 use super::model::{File, Message, MessageReference, add_field, embed, mentions, resendable};
 use super::rest::RestError;
-use super::text::{code, code_block, cut, escape, said};
+use super::text::{code, code_block, cut, display_lines, escape, said};
 use super::views::{disabled_view, hostexec_pending_view, pending_view, shell_view};
 use crate::notify::Notify;
 
@@ -75,7 +75,9 @@ fn job_argv(job: &JobRow) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Everything that runs, for the shell's thread: argv, cwd, env, stdin.
+/// Everything that runs, for the shell's thread: argv, cwd, env, stdin,
+/// in full and display-safe (core's quoting: nothing hidden, reordered or
+/// faked as another line). Too long for a message, it goes as a file.
 #[must_use]
 pub fn shell_command_text(job: &JobRow) -> String {
     let spec = &job.spec;
@@ -85,19 +87,24 @@ pub fn shell_command_text(job: &JobRow) -> String {
         .and_then(Value::as_str)
         .filter(|c| !c.is_empty())
     {
-        full.push_str(&format!("\n# cwd: {cwd}"));
+        full.push_str(&format!("\n# cwd: {}", escape_unprintable(cwd)));
     }
     if let Some(env) = spec.get("env").and_then(Value::as_object) {
         let mut pairs: Vec<(&String, &Value)> = env.iter().collect();
         pairs.sort_by(|a, b| a.0.cmp(b.0));
         for (k, v) in pairs {
-            full.push_str(&format!("\n# env: {k}={}", v.as_str().unwrap_or("")));
+            full.push_str(&format!(
+                "\n# env: {}={}",
+                escape_unprintable(k),
+                shlex_quote(v.as_str().unwrap_or(""))
+            ));
         }
     }
     if let Some(stdin) = spec.get("stdin").and_then(Value::as_str) {
         full.push_str(&format!(
-            "\n# stdin ({} chars):\n{stdin}",
-            stdin.chars().count()
+            "\n# stdin ({} chars):\n{}",
+            stdin.chars().count(),
+            display_lines(stdin)
         ));
     }
     full
