@@ -31,7 +31,9 @@ use time::OffsetDateTime;
 use super::common::{at, parse_time, repr, store_failed};
 use super::http::{self, Http, MAX_BODY, Reply};
 use super::setup::{ConfigError, Env};
-use super::{Credential, ProvisionError, Provisioner, Refused, RequestSpec, Validated};
+use super::{
+    Credential, CredentialKind, ProvisionError, Provisioner, Refused, RequestSpec, Validated,
+};
 
 /// Re-mint a cached token when less than this much validity remains.
 const MIN_TOKEN_VALIDITY: time::Duration = time::Duration::minutes(5);
@@ -689,18 +691,20 @@ impl GithubProvisioner {
         }
     }
 
-    /// Mint for an issuable repo grant and replace its cached token.
-    async fn mint_and_cache(
+    /// Mint under the grant's mint lock and record the token (earlier ones
+    /// stay recorded until they run out, so a revoke reaches each).
+    async fn mint_and_record(
         &self,
         tx: &Tx<'_>,
-        issuable: &IssuableGrant<'_>,
+        lock: &credentials::MintLock<'_>,
+        grant: &GrantRow,
         permissions: &GithubPermissions,
         now: OffsetDateTime,
     ) -> Result<(Secret<String>, OffsetDateTime), ProvisionError> {
-        let (token, expires) = self.mint_for(issuable.grant(), permissions, now).await?;
+        let (token, expires) = self.mint_for(grant, permissions, now).await?;
         let id = CredentialId::new();
         let sealed = self.seal(id, &token)?;
-        credentials::replace(tx, id, issuable, TOKEN_KIND, &sealed, expires, now)
+        credentials::record(tx, lock, id, TOKEN_KIND, &sealed, expires, now)
             .await
             .map_err(|e| store_failed(&e))?;
         Ok((token, expires))
@@ -1030,13 +1034,14 @@ impl Provisioner for GithubProvisioner {
         if Self::permissions_of(grant).is_none() {
             return Ok(()); // a create: the broker never deletes repos
         }
-        let cached = credentials::latest(tx, grant.id)
+        // Every token recorded for the grant that has not run out: two
+        // fetches racing before the mint lock existed, or a refresh, can
+        // leave more than one alive (B8).
+        let live = credentials::live(tx, grant.id, now)
             .await
             .map_err(|e| store_failed(&e))?;
-        if let Some(cred) = cached
-            // One that has run out needs no revoking.
-            && cred.expires_at > now
-        {
+        let mut failed = None;
+        for cred in live {
             let row = cred.id.to_string();
             let token = self.secret_box.open_str(
                 &cred.value_encrypted,
@@ -1044,29 +1049,32 @@ impl Provisioner for GithubProvisioner {
             );
             match token {
                 // Revoked (204), or already dead (401): done. Anything
-                // else is retried: the grant stays ACTIVE and the token
-                // cached until GitHub confirms.
+                // else is retried: the grant stays ACTIVE and the tokens
+                // recorded until GitHub confirms each.
                 Ok(token) => match self.app.revoke_token(token.expose()).await {
                     Some(204 | 401) => {}
                     Some(status) => {
-                        tracing::warn!(grant = %grant.id, status, "revoking the cached token failed");
-                        return Err(ProvisionError::failed(format!(
-                            "GitHub token revoke failed ({status})"
-                        )));
+                        tracing::warn!(grant = %grant.id, credential = %cred.id, status, "revoking a cached token failed");
+                        failed.get_or_insert_with(|| {
+                            ProvisionError::failed(format!("GitHub token revoke failed ({status})"))
+                        });
                     }
                     None => {
-                        tracing::warn!(grant = %grant.id, "revoking the cached token failed");
-                        return Err(ProvisionError::failed(
-                            "GitHub API unreachable (see broker logs)",
-                        ));
+                        tracing::warn!(grant = %grant.id, credential = %cred.id, "revoking a cached token failed");
+                        failed.get_or_insert_with(|| {
+                            ProvisionError::failed("GitHub API unreachable (see broker logs)")
+                        });
                     }
                 },
                 // Unreadable (the key changed): nothing to send; retrying
                 // would never succeed.
                 Err(_) => {
-                    tracing::warn!(grant = %grant.id, "cached token does not open; not revoked")
+                    tracing::warn!(grant = %grant.id, credential = %cred.id, "cached token does not open; not revoked");
                 }
             }
+        }
+        if let Some(e) = failed {
+            return Err(e);
         }
         credentials::delete_for(tx, grant.id)
             .await
@@ -1103,13 +1111,12 @@ impl Provisioner for GithubProvisioner {
                 note.push_str(" The broker's GitHub App installation does not cover it yet, so repo grants on it will fail until it is added to the installation.");
             }
             return Ok(Credential {
-                kind: "github_repo".to_owned(),
                 value: state
                     .get("html_url")
                     .and_then(Value::as_str)
                     .map(|u| Secret::new(u.to_owned())),
                 note: Some(note),
-                ..Credential::default()
+                ..Credential::of(CredentialKind::GithubRepo)
             });
         };
         // A policy tightened since the grant (and a restart) stops the
@@ -1119,6 +1126,11 @@ impl Provisioner for GithubProvisioner {
                 "policy no longer allows this grant ({why}); refusing to mint a token"
             )));
         }
+        // One fetch at a time mints for a grant: a concurrent one waits
+        // here, then finds this one's token in the cache (B8).
+        let lock = credentials::lock_minting(tx, issuable)
+            .await
+            .map_err(|e| store_failed(&e))?;
         let cached = credentials::latest(tx, grant.id)
             .await
             .map_err(|e| store_failed(&e))?;
@@ -1131,20 +1143,20 @@ impl Provisioner for GithubProvisioner {
                 &Binding::new("credentials", "value_encrypted", &row),
             ) {
                 return Ok(Credential {
-                    kind: TOKEN_KIND.to_owned(),
                     value: Some(token),
                     expires_at: Some(cred.expires_at),
-                    ..Credential::default()
+                    ..Credential::of(CredentialKind::GithubInstallationToken)
                 });
             }
             tracing::warn!(grant = %grant.id, "cached token does not open; minting a new one");
         }
-        let (token, expires) = self.mint_and_cache(tx, issuable, permissions, now).await?;
+        let (token, expires) = self
+            .mint_and_record(tx, &lock, grant, permissions, now)
+            .await?;
         Ok(Credential {
-            kind: TOKEN_KIND.to_owned(),
             value: Some(token),
             expires_at: Some(expires),
-            ..Credential::default()
+            ..Credential::of(CredentialKind::GithubInstallationToken)
         })
     }
 

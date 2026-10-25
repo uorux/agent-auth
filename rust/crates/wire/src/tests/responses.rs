@@ -198,12 +198,14 @@ fn credential_kind() -> impl Strategy<Value = CredentialKind> {
         CredentialKind::LldapGroup,
         CredentialKind::McpToken,
         CredentialKind::ModelGatewayKey,
+        CredentialKind::GoogleAccessToken,
         CredentialKind::A2aGrant,
         CredentialKind::AgentIdentity,
         CredentialKind::ProjectAccess,
         CredentialKind::HostexecShell,
         CredentialKind::HostexecJob,
         CredentialKind::PoolItem,
+        CredentialKind::MailGateway,
     ]
 }
 fn lockdown_scope() -> impl Strategy<Value = LockdownScope> {
@@ -339,7 +341,7 @@ fn grant_out() -> impl Strategy<Value = GrantOut> {
 fn credential_out() -> impl Strategy<Value = CredentialOut> {
     (
         credential_kind(),
-        option::of(secret::<16384>()),
+        option::of(secret::<{ crate::agent::CREDENTIAL_VALUE_MAX }>()),
         os(),
         os(),
         option::of(ts()),

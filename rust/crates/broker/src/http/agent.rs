@@ -7,11 +7,11 @@ use agent_auth_core::{GrantId, RequestId};
 use agent_auth_store::grants::{self, NotIssuable};
 use agent_auth_store::requests;
 use agent_auth_wire::agent::{
-    CredentialKind, CredentialOut, GrantOut, Me, ReleaseOut, RequestCreate, RequestOut, RetryBody,
+    CredentialOut, CredentialValue, GrantOut, Me, ReleaseOut, RequestCreate, RequestOut, RetryBody,
     SessionRef,
 };
 use agent_auth_wire::query::GrantFilter;
-use agent_auth_wire::secret::WireSecret;
+
 use axum::extract::{Path, State};
 use axum::http::Uri;
 use axum::routing::{get, post};
@@ -284,14 +284,14 @@ async fn credential(
     };
     drop(issuable);
     tx.commit().await?;
-    let kind: CredentialKind = super::serialize::by_name(&cred.kind)
-        .ok_or_else(|| ApiError::internal(&format!("unknown credential kind {:?}", cred.kind)))?;
     let value = match cred.value {
-        Some(v) => Some(WireSecret::new(v.expose().clone()).map_err(|e| ApiError::internal(&e))?),
+        Some(v) => {
+            Some(CredentialValue::new(v.expose().clone()).map_err(|e| ApiError::internal(&e))?)
+        }
         None => None,
     };
     Ok(Json(CredentialOut {
-        kind,
+        kind: cred.kind,
         value,
         username: cred.username,
         url: cred.url,
@@ -352,4 +352,40 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/grants", get(list_grants))
         .route("/v1/grants/{id}/credential", get(credential))
         .route("/v1/grants/{id}/release", post(release))
+}
+
+/// For tests: `GET /v1/grants/{id}/credential` through the whole router as
+/// `agent` (a fresh API key is set for it), so a test sees what the agent
+/// gets, the route's conversion to the wire shape included.
+#[cfg(test)]
+pub(crate) async fn credential_over_route(
+    st: &AppState,
+    agent: agent_auth_core::AgentId,
+    grant: GrantId,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let key = agent_auth_crypto::api_key::generate().unwrap();
+    let tx = st.store.begin().await.unwrap();
+    assert!(
+        agent_auth_store::agents::set_key(&tx, agent, key.key_id.as_str(), key.hash.as_str())
+            .await
+            .unwrap()
+    );
+    tx.commit().await.unwrap();
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/v1/grants/{grant}/credential"))
+        .header("authorization", format!("Bearer {}", key.full_key.expose()))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = super::router(st.clone()).oneshot(req).await.unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
 }

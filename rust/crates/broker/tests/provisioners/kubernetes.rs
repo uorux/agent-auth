@@ -334,7 +334,7 @@ async fn full_cycle(pool: PgPool) {
     std::fs::write(&t.token_file, "sa-token-2").unwrap();
     let c = credential(&t.store, &t.p, &g).await.unwrap();
     assert_eq!(
-        (c.kind.as_str(), expose(&c)),
+        (kind_name(&c).as_str(), expose(&c)),
         ("kubernetes_token", "k8s-tok")
     );
     let tr = t.fake.find(
@@ -559,4 +559,20 @@ async fn the_catalog_shows_roles_and_cluster_roles(pool: PgPool) {
     assert_eq!(c["roles"], json!([{"name": "view"}, {"name": "edit"}]));
     assert_eq!(c["cluster_roles"], json!(["view"]));
     assert_eq!(c["resource_hint"], "<namespace>, or \"*\" for cluster-wide");
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn the_credential_route_serves_a_service_account_token(pool: PgPool) {
+    let t = setup(pool).await;
+    let a = agent(&t.store, "k8s-agent").await;
+    let g = granted(&t.store, &t.p, a.id, &role("view", false), "apps-a").await;
+    let out = credentials_over_http(
+        &t.store,
+        agent_auth_broker::provisioners::AnyProvisioner::Kubernetes(t.p),
+        &[&g],
+    )
+    .await;
+    assert_eq!(out[0].0, axum::http::StatusCode::OK, "{}", out[0].1);
+    assert_eq!(out[0].1["kind"], "kubernetes_token");
+    assert_eq!(out[0].1["value"], "k8s-tok");
 }

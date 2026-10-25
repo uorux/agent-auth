@@ -16,7 +16,6 @@ use std::time::Duration;
 use agent_auth_client::{BrokerClient, ClientError, pyjson};
 use agent_auth_core::Platform;
 use agent_auth_core::pyfmt::repr;
-use agent_auth_wire::secret::WireSecret;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -42,7 +41,7 @@ pub enum BridgeError {
 }
 
 struct Token {
-    value: WireSecret,
+    value: agent_auth_wire::agent::CredentialValue,
     /// None: the broker gave no expiry; fetched again for every message
     /// (the Python crashed on it).
     expires_at: Option<OffsetDateTime>,

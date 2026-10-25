@@ -27,7 +27,7 @@ use time::OffsetDateTime;
 
 use super::{QueueError, Sandboxes};
 use crate::provisioners::{
-    Credential, ProvisionError, Provisioner, Refused, RequestSpec, Validated,
+    Credential, CredentialKind, ProvisionError, Provisioner, Refused, RequestSpec, Validated,
 };
 
 pub const NOT_IN_VM: &str = "only agents running in an agent VM can mint identities";
@@ -315,14 +315,13 @@ impl Provisioner for AgentsProvisioner {
             }
         });
         Ok(Credential {
-            kind: "agent_identity".into(),
             value: s("name").map(agent_auth_crypto::Secret::new),
             note: Some(format!(
                 "{outcome}; lease until {}. Its key went to the sandbox daemon, which runs it — \
                  you never hold it.",
                 s("lease_expires_at").unwrap_or_else(|| "None".to_owned())
             )),
-            ..Credential::default()
+            ..Credential::of(CredentialKind::AgentIdentity)
         })
     }
 

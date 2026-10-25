@@ -25,7 +25,7 @@ use time::OffsetDateTime;
 
 use super::{CALL_TIMEOUT, HostExec, KILL_RETRY, SHORT_CALL_TIMEOUT, job_out, tail};
 use crate::provisioners::{
-    Credential, ProvisionError, Provisioner, Refused, RequestSpec, Validated,
+    Credential, CredentialKind, ProvisionError, Provisioner, Refused, RequestSpec, Validated,
 };
 
 /// The hostexec provisioner (an `AnyProvisioner` variant).
@@ -264,7 +264,6 @@ impl Provisioner for HostexecProvisioner {
         let g = grant.grant();
         if let Authority::Hostexec(HostexecAuthority::Shell { tier }) = &g.authority {
             return Ok(Credential {
-                kind: "hostexec_shell".into(),
                 value: Some(agent_auth_crypto::Secret::new(g.id.to_string())),
                 expires_at: Some(g.expires_at),
                 note: Some(format!(
@@ -273,7 +272,7 @@ impl Provisioner for HostexecProvisioner {
                      host_shell_close(grant_id).",
                     g.resource
                 )),
-                ..Credential::default()
+                ..Credential::of(CredentialKind::HostexecShell)
             });
         }
         let job = store::get(tx, JobId::for_request(g.request_id))
@@ -287,14 +286,13 @@ impl Provisioner for HostexecProvisioner {
             m.insert("output_tail".into(), json!(tail(job.output.as_deref())));
         }
         Ok(Credential {
-            kind: "hostexec_job".into(),
             value: Some(agent_auth_crypto::Secret::new(summary.to_string())),
             note: Some(format!(
                 "The command ran once; this grant does not run it again. Full output: \
                  host_job(\"{}\") / GET /v1/hostexec/jobs/{} (which also waits while it runs).",
                 job.id, job.id
             )),
-            ..Credential::default()
+            ..Credential::of(CredentialKind::HostexecJob)
         })
     }
 

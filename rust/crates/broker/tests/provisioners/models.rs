@@ -131,7 +131,7 @@ async fn a_key_per_grant_under_the_agents_user(pool: PgPool) {
 
     let c = credential(&t.store, &t.p, &g).await.unwrap();
     assert_eq!(
-        (c.kind.as_str(), expose(&c), c.url.as_deref()),
+        (kind_name(&c).as_str(), expose(&c), c.url.as_deref()),
         (
             "model_gateway_key",
             "sk-agent-1",
@@ -393,4 +393,21 @@ async fn usage_and_catalog(pool: PgPool) {
     );
     assert_eq!(c["capabilities"], json!(["use"]));
     assert!(!c.to_string().contains("by_runtime"));
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn the_credential_route_serves_a_gateway_key(pool: PgPool) {
+    let t = setup_with(pool, |_| {}).await;
+    let a = agent(&t.store, "model-agent").await;
+    let g = granted(&t.store, &t.p, a.id, &Authority::Models, "litellm").await;
+    let out = credentials_over_http(
+        &t.store,
+        agent_auth_broker::provisioners::AnyProvisioner::Models(t.p),
+        &[&g],
+    )
+    .await;
+    assert_eq!(out[0].0, axum::http::StatusCode::OK, "{}", out[0].1);
+    assert_eq!(out[0].1["kind"], "model_gateway_key");
+    assert_eq!(out[0].1["value"], "sk-agent-1");
+    assert_eq!(out[0].1["url"], "https://llm.example");
 }

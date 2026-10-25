@@ -25,7 +25,7 @@ use time::OffsetDateTime;
 
 use super::Sandboxes;
 use crate::provisioners::{
-    Credential, ProvisionError, Provisioner, Refused, RequestSpec, Validated,
+    Credential, CredentialKind, ProvisionError, Provisioner, Refused, RequestSpec, Validated,
 };
 
 /// A call to the daemon waits this long (the hub's default).
@@ -200,14 +200,13 @@ impl Provisioner for SandboxProvisioner {
     ) -> Result<Credential, ProvisionError> {
         let g = grant.grant();
         Ok(Credential {
-            kind: "project_access".into(),
             note: Some(format!(
                 "{} on /var/lib/sandbox/projects/{} is applied to your project's user; it ends \
                  with the grant.",
                 access_of(g),
                 g.resource
             )),
-            ..Credential::default()
+            ..Credential::of(CredentialKind::ProjectAccess)
         })
     }
 

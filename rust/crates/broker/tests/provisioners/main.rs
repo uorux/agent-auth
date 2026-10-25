@@ -20,5 +20,6 @@ mod kubernetes;
 mod lldap;
 mod mcp;
 mod models;
+mod routes;
 mod setup;
 mod wiki;

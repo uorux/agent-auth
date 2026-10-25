@@ -54,7 +54,11 @@
 //!    Then the **LLDAP membership lock** (`lldap::lock_membership`, an
 //!    advisory lock per agent and group), after the grant it acts for;
 //!    likewise the **pool lock** (`pool::lock_pool`, an advisory lock per
-//!    pool), after the grant being provisioned;
+//!    pool), after the grant being provisioned; and the **mint lock**
+//!    (`credentials::lock_minting`, an advisory lock per grant), last of
+//!    all: a credential fetch takes it after everything `grants::issuable`
+//!    locked (a delegation's thread included), and its holder locks nothing
+//!    more, so waiting on it closes no cycle;
 //! 5. **a2a threads** (a thread is locked after the grants it depends on;
 //!    look the backing grant id up without a lock, lock the grant, then the
 //!    thread);

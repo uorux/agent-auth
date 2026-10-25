@@ -360,6 +360,75 @@ impl CredErr {
     }
 }
 
+/// `GET /v1/grants/{id}/credential` for each grant through the whole
+/// router, with `p` the only enabled provisioner and a fresh API key for
+/// each grant's agent: what the agents get back (status, body). Calling the
+/// provisioner directly skips the route's conversion to the wire shape,
+/// which is where a kind the wire did not know, or a value over the wire
+/// cap, used to fail with a 500.
+pub async fn credentials_over_http(
+    store: &Store,
+    p: agent_auth_broker::provisioners::AnyProvisioner,
+    grants: &[&GrantRow],
+) -> Vec<(StatusCode, Value)> {
+    use agent_auth_broker::auth::AuthConfig;
+    use agent_auth_broker::provisioners::Registry;
+    use agent_auth_broker::state::AppState;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let mut st = AppState::new(
+        store.clone(),
+        agent_auth_core::policy::Policy::from_yaml(
+            "defaults: {action: surface, max_duration: 24h}\n",
+        )
+        .unwrap(),
+        AuthConfig {
+            admin_token: None,
+            oauth_enabled: false,
+            trust_x_real_ip: false,
+        },
+    );
+    let mut registry = Registry::default();
+    registry.register(p);
+    st.registry = Arc::new(registry);
+    let app = agent_auth_broker::http::router(st);
+    let mut out = Vec::new();
+    for g in grants {
+        let key = agent_auth_crypto::api_key::generate().unwrap();
+        let tx = store.begin().await.unwrap();
+        assert!(
+            agents::set_key(&tx, g.agent_id, key.key_id.as_str(), key.hash.as_str())
+                .await
+                .unwrap()
+        );
+        tx.commit().await.unwrap();
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(format!("/v1/grants/{}/credential", g.id))
+            .header("authorization", format!("Bearer {}", key.full_key.expose()))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        out.push((
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        ));
+    }
+    out
+}
+
+/// A credential's kind as the wire names it.
+pub fn kind_name(c: &Credential) -> String {
+    serde_json::to_value(c.kind)
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
 /// What the credential route does: the store's issuance check, then the
 /// provisioner.
 pub async fn credential<P: Provisioner>(

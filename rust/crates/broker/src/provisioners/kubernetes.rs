@@ -32,7 +32,9 @@ use super::common::{
 };
 use super::http::{Http, MAX_BODY, Reply};
 use super::setup::{ConfigError, Env};
-use super::{Credential, ProvisionError, Provisioner, Refused, RequestSpec, Validated};
+use super::{
+    Credential, CredentialKind, ProvisionError, Provisioner, Refused, RequestSpec, Validated,
+};
 
 const IN_CLUSTER_TOKEN: &str = "/var/run/secrets/kubernetes.io/serviceaccount/token";
 const IN_CLUSTER_CA: &str = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
@@ -664,7 +666,6 @@ impl KubernetesProvisioner {
             format!("in namespace {target}")
         };
         Ok(Credential {
-            kind: "kubernetes_token".to_owned(),
             value: at(status, &["token"])
                 .as_str()
                 .map(|t| Secret::new(t.to_owned())),
@@ -675,7 +676,7 @@ impl KubernetesProvisioner {
                 "bearer token for ServiceAccount {ns}/{name} ({role} {bound}) against {}; re-fetch rather than caching — the account is deleted when the grant ends",
                 self.api_url()
             )),
-            ..Credential::default()
+            ..Credential::of(CredentialKind::KubernetesToken)
         })
     }
 

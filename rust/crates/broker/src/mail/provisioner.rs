@@ -299,7 +299,7 @@ impl Provisioner for MailProvisioner {
             }
         );
         Ok(Credential {
-            kind: "mail_gateway".to_owned(),
+            kind: crate::provisioners::CredentialKind::MailGateway,
             value: None,
             username: Some(g.resource.clone()),
             url: None,

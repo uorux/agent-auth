@@ -46,6 +46,7 @@ use agent_auth_crypto::Secret;
 use agent_auth_store::Tx;
 use agent_auth_store::agents::AgentRow;
 use agent_auth_store::grants::{GrantRow, IssuableGrant, ProvisioningGrant};
+pub use agent_auth_wire::agent::CredentialKind;
 use serde_json::Value;
 use time::OffsetDateTime;
 
@@ -89,10 +90,11 @@ impl ProvisionError {
 }
 
 /// What the credential route returns (`CredentialOut` on the wire: all
-/// seven keys always present).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// seven keys always present). The kind is the wire's enum, so a
+/// provisioner cannot hand out a kind the route cannot serve.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Credential {
-    pub kind: String,
+    pub kind: CredentialKind,
     /// The secret itself, when there is one (or a non-secret value such as
     /// a repo URL); never printed.
     pub value: Option<Secret<String>>,
@@ -102,6 +104,22 @@ pub struct Credential {
     pub note: Option<String>,
     /// What it is for, when that is part of it (a pool item's properties).
     pub properties: Option<serde_json::Map<String, Value>>,
+}
+
+impl Credential {
+    /// A credential of `kind` with nothing else set yet.
+    #[must_use]
+    pub fn of(kind: CredentialKind) -> Credential {
+        Credential {
+            kind,
+            value: None,
+            username: None,
+            url: None,
+            expires_at: None,
+            note: None,
+            properties: None,
+        }
+    }
 }
 
 pub trait Provisioner {
@@ -414,9 +432,8 @@ impl Provisioner for FakeProvisioner {
     ) -> Result<Credential, ProvisionError> {
         Ok(Credential {
             // A real kind, so the credential route can serve it in tests.
-            kind: "a2a_grant".to_owned(),
             note: Some(grant.grant().resource.clone()),
-            ..Credential::default()
+            ..Credential::of(CredentialKind::A2aGrant)
         })
     }
     fn catalog(&self, _agent: &AgentRow) -> Option<Value> {
