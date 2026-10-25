@@ -1217,7 +1217,10 @@ fn alias_bombs_are_refused() {
     }
     let started = std::time::Instant::now();
     assert!(parse_yaml(&doc).is_err());
-    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    // Wall-clock bound: meaningless under Miri's interpreter.
+    if !cfg!(miri) {
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
     // Deep nesting too.
     let deep = format!("{}{}", "[".repeat(10_000), "]".repeat(10_000));
     assert!(parse_yaml(&deep).is_err());
