@@ -197,32 +197,83 @@ and why. Keep entries short. Group by area.
   except that unassigned code points print as themselves (Python escapes
   them; needs the Unicode database).
 
+## Crypto (`agent-auth-crypto`)
+
+- **API keys parse strictly** (core-lifecycle-policy §10.1). Only the shape
+  ever issued parses: `aa_` + 12 lowercase hex + `_` + 43 URL-safe base64
+  characters. The Python split on `_` and accepted any parts (`aa__x`),
+  which then failed the lookup as "invalid API key"; such keys are now
+  "malformed API key".
+- **Encryption at rest is ChaCha20-Poly1305, not Fernet** (§10.2). Format
+  (`secretbox.rs`): base64url(`0x01` ‖ 96-bit random nonce ‖ ciphertext ‖
+  tag), with associated data binding the value to its table, column and row,
+  so a ciphertext copied to another row does not open. `ENCRYPTION_KEY` keeps
+  its shape (32 bytes, base64), so an existing Fernet key still parses; old
+  ciphertexts do not open (the database is new).
+- **Envelope sealing refuses what the Python let through** (daemons-hostd
+  §4.3, §17 item 14): a payload using a reserved key (`id iss aud seq iat
+  exp`) is an error instead of being overwritten, and a ttl outside
+  (0, 3600] s is an error instead of producing an envelope the peer refuses.
+- **Envelope bodies are read strictly** (§4.3): `iat`/`exp` must be JSON
+  numbers (Python's `float()` also took numeric strings and booleans), and a
+  `seq` above 2^64 − 1 is "malformed envelope body".
+- **Hello nonces must be 32 bytes of URL-safe base64** (§4.2). The Python
+  broker accepted any string as the daemon's nonce; every Python daemon
+  sends this shape.
+- **Base64 is decoded strictly** (§2.1): URL-safe alphabet only, padding
+  optional, non-zero trailing bits refused. Python skipped stray characters.
+- **Pairing proofs cover the canonical public key text** (§3.1). The Python
+  broker MACed the key text as received; the Rust re-encodes the parsed key,
+  so a peer sending a padded or otherwise non-canonical text fails the
+  proof. Honest peers send the canonical form.
+- **Key file symlink check without `O_NOFOLLOW`** (§2.3): `lstat` must show
+  a regular file and the opened file must be that inode (no libc, so no
+  `O_NOFOLLOW`). A symlinked key is refused with "is not a regular file"
+  (the Python failed with the OS's ELOOP error). The effective uid comes
+  from `/proc/self/status` on Linux (other systems: the owner of a probe
+  file created next to the key).
+- **Broker JWT verification** (§10.4) takes the time as an argument and
+  reports PyJWT's messages; `iat`/`nbf`/`exp` must be JSON numbers (PyJWT's
+  `int()` also took numeric strings). Tokens and the JWKS (`kid`, `x`, `y`)
+  are the Python's for the same `BROKER_SIGNING_KEY`.
+- **Note, not a change: ES256 key derivation uses a deprecated ring helper.** ring has no
+  "P-256 scalar → key pair" constructor and its PKCS#8 parser needs the
+  public key, so `jwt::TokenIssuer` feeds the derived scalar to ring's own
+  key generation through `ring::test::rand::FixedSliceRandom` (deprecated,
+  "will be removed"). Correct on ring 0.17.14 (checked against the Python's
+  `kid`/JWKS); a ring upgrade may need another route (the `p256` crate, or
+  storing the derived key as PKCS#8 once).
+- **Spec correction, not a change** (daemons-hostd §6.3): Python's
+  `ensure_ascii` escapes DEL (0x7f) as `\u007f`; the spec said raw. The Rust
+  canonical JSON (`core::canonical_json`) matches the Python, checked
+  against a vector from Python's `json.dumps`.
+
 ## Open questions
 
 (for Jacob; nothing here is implemented until decided)
 
-- **A missing base policy file** (bug B-12). `Policy::load` takes the
-  file's text, so whether a missing `POLICY_FILE` is an error is the
-  broker's call; the spec recommends refusing to start.
-- **Spec erratum, daemons-hostd §6.3**: Python's `json.dumps(...,
-  ensure_ascii=True)` escapes DEL (0x7f) as `\u007f`; the spec says it is
-  emitted raw. The canonical-JSON digest must escape it to stay compatible.
-- **Operator-thread delegation** (a2a B1): `grants::begin` keeps the
-  Python behavior (a thread without a backing grant cannot carry a
-  delegated grant: provision fails "delegation thread is no longer
-  open"). Allow it with some other expiry cap, or refuse it up front?
-- **Events cursor** (a2a B3): `last_activity_at` from the application clock
-  can commit out of order. Not addressed in the schema yet; options are a
-  commit-ordered sequence or an overlap window in the reader.
-- **a2a payload cap measure** (wire): the 16384 cap is measured with
-  Python's `json.dumps` length, whose encoder is core's
-  (`core::canonical_json`, not merged when wire was written).
-  `wire::payload::Payload::sized` takes that function as an argument; once
-  it lands, the check can move into `Payload`'s deserializer.
-- **Not modelled in wire**: the local unix-socket protocols (hostctl,
-  hostd-user, sandboxd's local API, JSON lines) belong to the daemon crate;
-  the containment `match` stays bounded JSON until policy's `AgentMatch`
-  type exists.
-- **Python client bug** (for the client port): `host_shell_exec` continues
-  waiting only if `job.get("id")`, but a job carries `job_id`, so a long
-  `wait` stops after the first slice.
+- **Operator-thread delegation** (a2a B1). The README says an agent can
+  request access on the operator's behalf from an admin-panel chat thread,
+  but the Python refuses it at provisioning (such a thread has no backing
+  grant, and provisioning requires one), so it never worked. The port keeps
+  that refusal (it now fails up front with a clear reason). Allowing it
+  would mean a delegated grant capped only by its own duration and revoked
+  when the chat thread closes.
+
+## To do (engineering, tracked here until done)
+
+- Events cursor (a2a B3): `last_activity_at` from the application clock can
+  commit out of order; the reader will use an overlap window and dedupe.
+- a2a payload cap: move the `python_dumps_len` check into `wire::payload`'s
+  deserializer now that `core::canonical_json` is merged. (`float_roundtrip`
+  is now on for the workspace's serde_json, so floats count exactly;
+  integers beyond ±2^64 still become floats — refuse them in payloads.)
+- Local unix-socket protocols (hostctl, hostd-user, sandboxd local API) are
+  typed in the daemon crate, not wire.
+- Python client bug to not port: `host_shell_exec` keeps waiting only if
+  `job.get("id")`, but jobs carry `job_id`.
+- A missing `POLICY_FILE` (B-12): the broker refuses to start.
+- ES256 MCP token key: derived from `BROKER_SIGNING_KEY` via ring's
+  deprecated `test::rand::FixedSliceRandom` (ring has no scalar-to-key
+  constructor). Pinned by known-answer tests against the Python; revisit
+  (a dedicated PKCS#8 key) in review.
