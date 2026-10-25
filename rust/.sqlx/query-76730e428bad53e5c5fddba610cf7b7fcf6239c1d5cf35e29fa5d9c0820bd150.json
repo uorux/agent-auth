@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM oauth_clients WHERE id IN (\n             SELECT c.id FROM oauth_clients c\n             WHERE c.agent_id IS NULL AND c.revoked_at IS NULL\n               AND NOT EXISTS (SELECT 1 FROM oauth_tokens t WHERE t.client_id = c.id)\n             ORDER BY c.created_at DESC, c.id DESC\n             OFFSET $1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "76730e428bad53e5c5fddba610cf7b7fcf6239c1d5cf35e29fa5d9c0820bd150"
+}

@@ -206,12 +206,20 @@ async fn authorization_server(
 
 // --------------------------------------------------------- registration
 
-async fn register(State(state): State<AppState>, body: Bytes) -> Response {
+async fn register(
+    State(state): State<AppState>,
+    parts: axum::http::request::Parts,
+    body: Bytes,
+) -> Response {
     let oauth = match server(&state) {
         Ok(o) => o,
         Err(e) => return e.into_response(),
     };
-    match oauth.register(&state.store, &body, state.now()).await {
+    let address = crate::auth::client_address(&parts, state.auth.trust_x_real_ip);
+    match oauth
+        .register(&state.store, &body, address.as_deref(), state.now())
+        .await
+    {
         Ok(out) => (StatusCode::CREATED, no_store(), Json(out)).into_response(),
         Err(f) => failure(f),
     }

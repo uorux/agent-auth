@@ -34,7 +34,8 @@ pub use schema::{
     AgentsConfig, AuditConfig, Constraints, ContainmentConfig, Defaults, DesktopConfig,
     GithubConfig, HomelabConfig, HostexecConfig, KubernetesConfig, LlmConfig, MCP_TOOL_NAMES,
     Match, McpConfig, McpServer, ModelsConfig, NotifyConfig, PlatformsConfig, PolicyRule,
-    REMOTE_MCP_TOOLS, RemoteMcpConfig, RestrictedZone, UiConfig, WikiConfig,
+    REMOTE_MCP_REDIRECT_URIS, REMOTE_MCP_TOOLS, RemoteMcpConfig, RestrictedZone, UiConfig,
+    WikiConfig, redirect_uri_ok,
 };
 
 /// A policy that does not load. The text says where (`rules[3]: ...`).
@@ -341,6 +342,17 @@ impl Policy {
                 return Err(PolicyError(format!(
                     "remote_mcp.tools: no such tools: {}",
                     unknown.join(", ")
+                )));
+            }
+            if let Some(bad) = self
+                .remote_mcp
+                .redirect_uris
+                .iter()
+                .find(|u| !schema::redirect_uri_ok(u))
+            {
+                return Err(PolicyError(format!(
+                    "remote_mcp.redirect_uris: {} is not an https URL without a fragment",
+                    crate::pyfmt::repr(bad)
                 )));
             }
         }

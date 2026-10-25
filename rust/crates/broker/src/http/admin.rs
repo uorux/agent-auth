@@ -223,6 +223,14 @@ async fn attributes(
         )));
     }
     let runtime = patched(body.runtime, a.runtime.clone());
+    // A web UI connector's agent is always a human's call, keyed on its
+    // runtime: it stays `web` (migration 0006 refuses it too).
+    if runtime != a.runtime && agent_auth_store::oauth::is_bound(&tx, a.id).await? {
+        return Err(ApiError::conflict(format!(
+            "{} is a web UI connector's agent; its runtime stays web",
+            a.name
+        )));
+    }
     let project = patched(body.project, a.project.clone());
     let host = patched(body.host, a.host.clone());
     agents::set_attributes(

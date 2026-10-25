@@ -182,6 +182,49 @@ pub async fn delete_unbound_clients(
     .rows_affected())
 }
 
+/// Live clients someone authorized (bound to their agent): what
+/// `remote_mcp.max_clients` caps. Registration alone cannot fill it.
+pub async fn count_live_bound_clients(tx: &Tx<'_>) -> Result<i64, StoreError> {
+    let mut c = tx.conn().await;
+    Ok(sqlx::query_scalar!(
+        r#"SELECT count(*) AS "n!" FROM oauth_clients
+           WHERE revoked_at IS NULL AND agent_id IS NOT NULL"#
+    )
+    .fetch_one(&mut **c)
+    .await?)
+}
+
+/// Deletes unbound registrations (no tokens) beyond the newest `keep`,
+/// oldest first; returns how many. Registration calls it with one less
+/// than its cap before adding a client, so floods only evict each other.
+pub async fn evict_unbound_clients(tx: &Tx<'_>, keep: i64) -> Result<u64, StoreError> {
+    let mut c = tx.conn().await;
+    Ok(sqlx::query!(
+        "DELETE FROM oauth_clients WHERE id IN (
+             SELECT c.id FROM oauth_clients c
+             WHERE c.agent_id IS NULL AND c.revoked_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM oauth_tokens t WHERE t.client_id = c.id)
+             ORDER BY c.created_at DESC, c.id DESC
+             OFFSET $1)",
+        keep
+    )
+    .execute(&mut **c)
+    .await?
+    .rows_affected())
+}
+
+/// Whether an agent is bound to an OAuth client: a web UI connector's
+/// agent (its runtime stays `web`; migration 0006).
+pub async fn is_bound(tx: &Tx<'_>, agent: AgentId) -> Result<bool, StoreError> {
+    let mut c = tx.conn().await;
+    Ok(sqlx::query_scalar!(
+        r#"SELECT EXISTS (SELECT 1 FROM oauth_clients WHERE agent_id = $1) AS "bound!""#,
+        Uuid::from(agent)
+    )
+    .fetch_one(&mut **c)
+    .await?)
+}
+
 #[derive(Debug, Clone)]
 pub struct NewClient<'a> {
     pub id: &'a str,

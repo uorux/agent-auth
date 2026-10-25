@@ -19,7 +19,7 @@ use axum::Router;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, LOCATION};
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::{Deserialize, Serialize};
@@ -87,18 +87,7 @@ pub const ALLOWED: [(&str, &str); 28] = [
 #[must_use]
 pub fn allowed(method: &str, path: &str) -> bool {
     ALLOWED.iter().any(|(m, pattern)| {
-        *m == method && {
-            let mut want = pattern.split('/');
-            let mut have = path.split('/');
-            loop {
-                match (want.next(), have.next()) {
-                    (None, None) => break true,
-                    (Some("{}"), Some(seg)) if !seg.is_empty() => {}
-                    (Some(w), Some(h)) if w == h => {}
-                    _ => break false,
-                }
-            }
-        }
+        *m == method && agent_auth_wire::mcp_tools::route_matches(pattern, path)
     })
 }
 
@@ -149,47 +138,57 @@ impl Panel {
     /// `X-Forwarded-Host` (first value) are each absent, the panel's own
     /// `host[:port]` (default ports ignored), or loopback.
     #[must_use]
-    pub fn serves(&self, headers: &HeaderMap) -> bool {
+    pub fn serves(&self, headers: &HeaderMap, uri: &Uri) -> bool {
+        let first = |text: &str| {
+            text.split(',')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        };
+        // `Host`, else the request target's authority (HTTP/2 `:authority`
+        // or an absolute-form target); neither: not for the panel.
+        let host = match headers.get("host") {
+            Some(raw) => raw.to_str().ok().map(first),
+            None => uri.authority().map(|a| a.as_str().to_ascii_lowercase()),
+        };
+        if !host.is_some_and(|h| !h.is_empty() && self.own_name(&h)) {
+            return false;
+        }
+        match headers.get("x-forwarded-host") {
+            None => true,
+            Some(raw) => raw.to_str().is_ok_and(|t| {
+                let value = first(t);
+                value.is_empty() || self.own_name(&value)
+            }),
+        }
+    }
+
+    /// `host`, `host:port`, `[v6]`, `[v6]:port`: the panel's own name
+    /// (default port or none), or loopback.
+    fn own_name(&self, value: &str) -> bool {
         let default_port = if self.base.starts_with("http://") {
             "80"
         } else {
             "443"
         };
-        ["host", "x-forwarded-host"].iter().all(|name| {
-            let Some(raw) = headers.get(*name) else {
-                return true;
-            };
-            let Ok(text) = raw.to_str() else {
-                return false;
-            };
-            let value = text
-                .split(',')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_ascii_lowercase();
-            if value.is_empty() {
-                return true;
-            }
-            // `host`, `host:port`, `[v6]`, `[v6]:port`.
-            let split = if value.starts_with('[') {
-                value.find(']').map(|i| i.saturating_add(1))
-            } else {
-                value.find(':')
-            };
-            let (host, port) = match split {
-                Some(i) => value.split_at_checked(i).unwrap_or((value.as_str(), "")),
-                None => (value.as_str(), ""),
-            };
-            if matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
-                return true;
-            }
-            let normalized = match port.strip_prefix(':') {
-                Some(p) if p == default_port => host,
-                _ => value.as_str(),
-            };
-            self.own.as_deref() == Some(normalized)
-        })
+        let split = if value.starts_with('[') {
+            value.find(']').map(|i| i.saturating_add(1))
+        } else {
+            value.find(':')
+        };
+        let (host, port) = match split {
+            Some(i) => value.split_at_checked(i).unwrap_or((value, "")),
+            None => (value, ""),
+        };
+        if matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
+            return true;
+        }
+        let normalized = match port.strip_prefix(':') {
+            Some(p) if p == default_port => host,
+            _ => value,
+        };
+        self.own.as_deref() == Some(normalized)
     }
 
     /// The signed-in session the request's cookie holds, if any.
@@ -235,7 +234,7 @@ pub(crate) fn admin_session(state: &AppState, parts: &Parts) -> Option<Result<St
     if parts
         .headers
         .contains_key(axum::http::header::AUTHORIZATION)
-        || !panel.serves(&parts.headers)
+        || !panel.serves(&parts.headers, &parts.uri)
     {
         return None;
     }
@@ -287,12 +286,12 @@ fn not_found() -> Response {
 }
 
 /// The panel, if it is on and this request is for its address.
-fn panel_for(state: &AppState, headers: &HeaderMap) -> Option<Arc<Panel>> {
+fn panel_for(state: &AppState, headers: &HeaderMap, uri: &Uri) -> Option<Arc<Panel>> {
     state
         .web
         .panel
         .as_ref()
-        .filter(|p| p.serves(headers))
+        .filter(|p| p.serves(headers, uri))
         .cloned()
 }
 
@@ -332,8 +331,8 @@ fn with_cookie(mut res: Response, (name, value): (HeaderName, HeaderValue)) -> R
     res
 }
 
-async fn page(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(panel) = panel_for(&state, &headers) else {
+async fn page(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
+    let Some(panel) = panel_for(&state, &headers, &uri) else {
         return not_found();
     };
     if panel.session(&headers, state.now()).is_none() {
@@ -344,8 +343,8 @@ async fn page(State(state): State<AppState>, headers: HeaderMap) -> Response {
 
 const UNREACHABLE: &str = "The sign-in provider could not be reached.";
 
-async fn login(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(panel) = panel_for(&state, &headers) else {
+async fn login(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
+    let Some(panel) = panel_for(&state, &headers, &uri) else {
         return not_found();
     };
     let now = state.now();
@@ -367,9 +366,10 @@ async fn login(State(state): State<AppState>, headers: HeaderMap) -> Response {
 async fn callback(
     State(state): State<AppState>,
     headers: HeaderMap,
+    uri: Uri,
     RawQuery(query): RawQuery,
 ) -> Response {
-    let Some(panel) = panel_for(&state, &headers) else {
+    let Some(panel) = panel_for(&state, &headers, &uri) else {
         return not_found();
     };
     let params: std::collections::HashMap<String, String> =
@@ -410,8 +410,8 @@ async fn callback(
 
 /// Who is signed in and the CSRF token the page sends back with every
 /// change.
-async fn session(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(panel) = panel_for(&state, &headers) else {
+async fn session(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
+    let Some(panel) = panel_for(&state, &headers, &uri) else {
         return not_found();
     };
     match panel.session(&headers, state.now()) {
@@ -427,9 +427,10 @@ async fn session(State(state): State<AppState>, headers: HeaderMap) -> Response 
 async fn asset(
     State(state): State<AppState>,
     headers: HeaderMap,
+    uri: Uri,
     Path(name): Path<String>,
 ) -> Response {
-    if panel_for(&state, &headers).is_none() {
+    if panel_for(&state, &headers, &uri).is_none() {
         return not_found();
     }
     let (body, mime) = match name.as_str() {
@@ -445,8 +446,8 @@ async fn asset(
         .into_response()
 }
 
-async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(panel) = panel_for(&state, &headers) else {
+async fn logout(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
+    let Some(panel) = panel_for(&state, &headers, &uri) else {
         return not_found();
     };
     if let Some(current) = panel.session(&headers, state.now()) {

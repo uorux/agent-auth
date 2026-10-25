@@ -249,8 +249,15 @@ async fn send(
     body: Option<(&str, String)>,
 ) -> Resp {
     let mut req = Request::builder().method(method).uri(uri);
+    // As a browser reaches the panel: at its own address, unless the test
+    // names another (or `host: -` for none).
+    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+        req = req.header("host", "broker.test");
+    }
     for (k, v) in headers {
-        req = req.header(*k, *v);
+        if !(k.eq_ignore_ascii_case("host") && *v == "-") {
+            req = req.header(*k, *v);
+        }
     }
     let req = match body {
         Some((ct, b)) => req.header("content-type", ct).body(Body::from(b)),
@@ -285,6 +292,7 @@ struct Setup {
     provider: Provider,
     /// The queries `/v1/requests/{id}/wait` saw.
     waits: Arc<Mutex<Vec<String>>>,
+    seen: Seen,
 }
 
 async fn admin_echo(caller: AdminCaller) -> Json<Value> {
@@ -334,14 +342,35 @@ async fn threads(caller: AgentCaller) -> Json<Value> {
 
 /// The broker with the panel and (optionally) the OAuth server and `/mcp`.
 async fn setup(pool: sqlx::PgPool, panel: bool, remote: bool) -> Setup {
+    setup_with(pool, panel, remote, |_| {}).await
+}
+
+/// Every agent-API request seen (method, path), before authentication.
+type Seen = Arc<Mutex<Vec<(String, String)>>>;
+
+async fn catch_all(caller: AgentCaller) -> Json<Value> {
+    let _ = caller;
+    Json(json!({"status": "done", "id": "r-1", "job_id": "r-1", "messages": [], "threads": []}))
+}
+
+async fn setup_with(
+    pool: sqlx::PgPool,
+    panel: bool,
+    remote: bool,
+    tweak: impl FnOnce(&mut RemoteMcpConfig),
+) -> Setup {
     let provider = Provider::start().await;
     let sealer = Arc::new(Sealer::new(&encryption_key()).unwrap());
     let sign_in = Arc::new(OidcClient::new(&provider.issuer, CLIENT, GROUP).unwrap());
-    let config = RemoteMcpConfig {
+    let mut config = RemoteMcpConfig {
         enabled: true,
         base_url: BASE.to_owned(),
         ..RemoteMcpConfig::default()
     };
+    config
+        .redirect_uris
+        .push("https://claude.ai/other".to_owned());
+    tweak(&mut config);
     let web = Web {
         panel: panel.then(|| Arc::new(Panel::new(BASE, 8 * 3600, sealer.clone(), sign_in.clone()))),
         oauth: remote
@@ -354,17 +383,31 @@ async fn setup(pool: sqlx::PgPool, panel: bool, remote: bool) -> Setup {
         AuthConfig {
             admin_token: Some(Secret::new("admin-secret".to_owned())),
             oauth_enabled: false,
-            trust_x_real_ip: false,
+            trust_x_real_ip: true,
         },
     );
     let state = webui::install(state, web);
     let waits = Arc::new(Mutex::new(Vec::new()));
+    let seen: Seen = Arc::default();
     let v1: Router<AppState> = Router::new()
         .route("/v1/me", get(me))
         .route("/v1/sessions", post(new_session))
         .route("/v1/requests/{id}/wait", get(wait))
         .route("/v1/a2a/threads", get(threads))
-        .layer(Extension(waits.clone()));
+        .route("/v1/{*rest}", any(catch_all))
+        .layer(Extension(waits.clone()))
+        .layer(axum::middleware::from_fn({
+            let seen = seen.clone();
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock()
+                        .unwrap()
+                        .push((req.method().to_string(), req.uri().path().to_owned()));
+                    next.run(req).await
+                }
+            }
+        }));
     if let Some(mcp) = &state.web.remote_mcp {
         mcp.set_agent_api(v1.clone().with_state(state.clone()));
     }
@@ -377,6 +420,7 @@ async fn setup(pool: sqlx::PgPool, panel: bool, remote: bool) -> Setup {
         app,
         provider,
         waits,
+        seen,
     }
 }
 
@@ -510,6 +554,7 @@ async fn a_change_needs_the_csrf_token(pool: sqlx::PgPool) {
     let req = Request::builder()
         .method("POST")
         .uri("/admin/agents")
+        .header("host", "broker.test")
         .header("cookie", &cookie)
         .header(CSRF_HEADER, "gu\u{e9}ss".as_bytes())
         .body(Body::empty())
@@ -1188,10 +1233,16 @@ async fn discovery_documents(pool: sqlx::PgPool) {
 #[sqlx::test(migrations = "../store/migrations")]
 async fn registration(pool: sqlx::PgPool) {
     let s = setup(pool, false, true).await;
+    // Exact callbacks only: another path, port, case, scheme or a query
+    // on an allowed host is refused.
     for uri in [
         "https://evil.test/cb",
-        "http://claude.ai/cb",
-        "https://claude.ai/cb#frag",
+        "http://claude.ai/api/mcp/auth_callback",
+        "https://claude.ai/api/mcp/auth_callback#frag",
+        "https://claude.ai/api/mcp/auth_callback?x=1",
+        "https://claude.ai:8443/api/mcp/auth_callback",
+        "https://Claude.AI/api/mcp/auth_callback",
+        "https://claude.ai/cb",
         "not a url",
     ] {
         let r = register(&s, json!({"redirect_uris": [uri]})).await;
@@ -1199,7 +1250,9 @@ async fn registration(pool: sqlx::PgPool) {
         assert_eq!(r.json()["error"], "invalid_redirect_uri");
         assert_eq!(
             r.json()["error_description"],
-            "this broker sends the browser back only to claude.ai, claude.com, chatgpt.com, chat.openai.com (https)"
+            "this broker sends the browser back only to https://claude.ai/api/mcp/auth_callback, \
+https://claude.com/api/mcp/auth_callback, https://chatgpt.com/connector_platform_oauth_redirect, \
+https://claude.ai/other"
         );
     }
     // Longer than the column took in the Python (a 500 there; Bug-C7).
@@ -1215,8 +1268,11 @@ async fn registration(pool: sqlx::PgPool) {
     )
     .await;
     assert_eq!(r.json()["error"], "invalid_client_metadata");
-    // Ports and paths are free; the host is matched without case.
-    let (_, secret) = new_client(&s, json!({"redirect_uris": ["https://Claude.AI:8443/x"]})).await;
+    let (_, secret) = new_client(
+        &s,
+        json!({"redirect_uris": ["https://chatgpt.com/connector_platform_oauth_redirect"]}),
+    )
+    .await;
     assert!(secret.is_none());
     let r = register(&s, json!({"redirect_uris": [REDIRECT], "token_endpoint_auth_method": "client_secret_post", "client_name": "C"})).await;
     let j = r.json();
@@ -1229,27 +1285,73 @@ async fn registration(pool: sqlx::PgPool) {
     );
 }
 
+async fn register_from(s: &Setup, address: &str) -> Resp {
+    send(
+        &s.app,
+        "POST",
+        "/oauth/register",
+        &[("x-real-ip", address)],
+        Some((
+            "application/json",
+            json!({"redirect_uris": [REDIRECT]}).to_string(),
+        )),
+    )
+    .await
+}
+
+async fn count(pool: &sqlx::PgPool, sql: &'static str) -> i64 {
+    sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+}
+
 #[sqlx::test(migrations = "../store/migrations")]
-async fn registrations_nobody_authorized_expire(pool: sqlx::PgPool) {
-    let s = setup(pool.clone(), false, true).await;
-    for _ in 0..50 {
-        new_client(&s, json!({"redirect_uris": [REDIRECT]})).await;
+async fn registration_cannot_lock_connectors_out(pool: sqlx::PgPool) {
+    let s = setup_with(pool.clone(), false, true, |c| c.max_clients = 2).await;
+    // One address: 20 an hour, then 429.
+    for _ in 0..20 {
+        assert_eq!(
+            register_from(&s, "203.0.113.1").await.status,
+            StatusCode::CREATED
+        );
     }
-    let full = register(&s, json!({"redirect_uris": [REDIRECT]})).await;
+    let r = register_from(&s, "203.0.113.1").await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        r.json()["error_description"],
+        "too many registrations from this address; try again later"
+    );
+    // Many addresses: registrations nobody authorized evict each other
+    // (at most 20 kept); they never fill max_clients.
+    for i in 0..30 {
+        let r = register_from(&s, &format!("198.51.100.{i}")).await;
+        assert_eq!(r.status, StatusCode::CREATED);
+    }
+    assert_eq!(count(&pool, "SELECT count(*) FROM oauth_clients").await, 20);
+    // max_clients counts authorized clients.
+    code_for(&s).await;
+    code_for(&s).await;
+    let full = register_from(&s, "192.0.2.9").await;
     assert_eq!(
         full.json()["error_description"],
         "too many registered clients; the operator can revoke some"
     );
-    sqlx::query("UPDATE oauth_clients SET created_at = created_at - interval '2 hours'")
+    // An hour later, the unauthorized ones are gone.
+    sqlx::query("UPDATE oauth_clients SET created_at = created_at - interval '2 hours' WHERE agent_id IS NULL")
         .execute(&pool)
         .await
         .unwrap();
-    new_client(&s, json!({"redirect_uris": [REDIRECT]})).await;
-    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM oauth_clients")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(left, 1);
+    let s2 = setup_with(pool.clone(), false, true, |c| c.max_clients = 3).await;
+    assert_eq!(
+        register_from(&s2, "192.0.2.10").await.status,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM oauth_clients WHERE agent_id IS NULL"
+        )
+        .await,
+        1
+    );
 }
 
 #[sqlx::test(migrations = "../store/migrations")]
@@ -1947,12 +2049,9 @@ async fn mcp_tools_end_to_end(pool: sqlx::PgPool) {
     assert_eq!(r.json()["result"]["isError"], true);
     let r = mcp(&s, Some(&access), call_body(6, "check_status", json!({}))).await;
     assert_eq!(r.json()["result"]["isError"], true);
-    // A broker refusal is the tool's text, as the Python's (no route here).
+    // The agent API answers in process.
     let r = mcp(&s, Some(&access), call_body(7, "list_grants", json!({}))).await;
-    assert_eq!(
-        tool_text(&r),
-        r#"{"error": "Not Found", "status_code": 404}"#
-    );
+    assert!(tool_text(&r).contains("\"status\": \"done\""));
 
     // a2a without a session_key: one session minted for this authorization,
     // kept across calls and across a refresh (Bug-C4).
@@ -2021,4 +2120,240 @@ async fn mcp_tools_end_to_end(pool: sqlx::PgPool) {
             .unwrap()
             .starts_with("chat-")
     );
+}
+
+// -------------------------------------------- what a connector's token reaches
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_connector_token_reaches_only_its_tools_routes(pool: sqlx::PgPool) {
+    let s = setup(pool.clone(), false, true).await;
+    let (_, access, _) = connector_tokens(&s).await;
+    let auth = format!("Bearer {access}");
+    let call = async |method: &str, path: &str| {
+        send(
+            &s.app,
+            method,
+            path,
+            &[("authorization", &auth)],
+            Some(("application/json", "{}".into())),
+        )
+        .await
+    };
+    assert_eq!(call("GET", "/v1/me").await.status, StatusCode::OK);
+    assert_eq!(call("GET", "/v1/a2a/threads").await.status, StatusCode::OK);
+    for (m, p) in [
+        ("PUT", "/v1/wiki/page"),
+        ("POST", "/v1/wiki/delete"),
+        ("GET", "/v1/grants/g-1/credential"),
+        ("POST", "/v1/hostexec/shells/g/exec"),
+        ("GET", "/v1/a2a/events"),
+        ("GET", "/v1/me/"),
+        ("GET", "/v1/some-route-added-later"),
+    ] {
+        let r = call(m, p).await;
+        assert_eq!(
+            (r.status, r.json()["detail"].clone()),
+            (
+                StatusCode::FORBIDDEN,
+                json!("not available to a web UI connector")
+            ),
+            "{m} {p}"
+        );
+    }
+    // What the operator adds to remote_mcp.tools, the token reaches.
+    let wide = setup_with(pool, false, true, |c| c.tools.push("wiki_write".into())).await;
+    let (_, access, _) = connector_tokens(&wide).await;
+    let r = send(
+        &wide.app,
+        "PUT",
+        "/v1/wiki/page",
+        &[("authorization", &format!("Bearer {access}"))],
+        Some(("application/json", "{}".into())),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+}
+
+/// A value of each required parameter, and no wait.
+fn arguments_for(def: &agent_auth_wire::mcp_tools::ToolDef) -> Value {
+    use agent_auth_wire::mcp_tools::{DefaultValue, Ty};
+    let mut args = serde_json::Map::new();
+    for p in def.params {
+        if agent_auth_wire::mcp_tools::wait_param(def.name) == Some(p.name) {
+            args.insert(p.name.into(), json!(0));
+        } else if p.default == DefaultValue::Required {
+            let v = match p.ty {
+                Ty::StrList => json!(["true"]),
+                Ty::Obj | Ty::StrMap => json!({}),
+                Ty::Int | Ty::Num => json!(1),
+                Ty::Bool => json!(false),
+                Ty::Str => json!("x"),
+            };
+            args.insert(p.name.into(), v);
+        }
+    }
+    Value::Object(args)
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn every_tool_calls_only_its_routes(pool: sqlx::PgPool) {
+    use agent_auth_wire::mcp_tools::{REMOTE_NEVER_SERVED, TOOLS, api_routes, route_matches};
+    let s = setup_with(pool, false, true, |c| {
+        c.tools = TOOLS
+            .iter()
+            .map(|t| t.name.to_owned())
+            .filter(|n| !REMOTE_NEVER_SERVED.contains(&n.as_str()))
+            .collect();
+    })
+    .await;
+    let (_, access, _) = connector_tokens(&s).await;
+    for (i, def) in TOOLS.iter().enumerate() {
+        if REMOTE_NEVER_SERVED.contains(&def.name) {
+            continue;
+        }
+        s.seen.lock().unwrap().clear();
+        let r = mcp(
+            &s,
+            Some(&access),
+            call_body(
+                100 + u32::try_from(i).unwrap(),
+                def.name,
+                arguments_for(def),
+            ),
+        )
+        .await;
+        let text = tool_text(&r);
+        assert!(
+            !text.contains("not available to a web UI connector"),
+            "{}: {text}",
+            def.name
+        );
+        let seen = s.seen.lock().unwrap().clone();
+        assert!(!seen.is_empty(), "{} called nothing", def.name);
+        for (m, p) in &seen {
+            assert!(
+                api_routes(def.name)
+                    .iter()
+                    .any(|(rm, rp)| rm == m && route_matches(rp, p)),
+                "{} called {m} {p}, not in its routes",
+                def.name
+            );
+        }
+    }
+}
+
+// ------------------------------------------------ a web agent stays web
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_connectors_agent_keeps_its_runtime(pool: sqlx::PgPool) {
+    let s = setup(pool.clone(), false, true).await;
+    code_for(&s).await;
+    let tx = s.state.store.begin().await.unwrap();
+    let agent = agents::by_name(&tx, "web-claude").await.unwrap().unwrap();
+    tx.commit().await.unwrap();
+    // The admin API refuses it (a panel session could otherwise clear the
+    // runtime that keeps the connector a human's call)...
+    let app = agent_auth_broker::http::router(s.state.clone());
+    let r = send(
+        &app,
+        "PATCH",
+        &format!("/admin/agents/{}/attributes", agent.id),
+        &[("authorization", ADMIN)],
+        Some(("application/json", json!({"runtime": "claude"}).to_string())),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.body);
+    assert!(
+        r.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("its runtime stays web")
+    );
+    let r = send(
+        &app,
+        "PATCH",
+        &format!("/admin/agents/{}/attributes", agent.id),
+        &[("authorization", ADMIN)],
+        Some(("application/json", json!({"project": "x"}).to_string())),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    // ... and so does the database.
+    let tx = s.state.store.begin().await.unwrap();
+    let e = agents::set_attributes(&tx, agent.id, None, None, None, Placement::Host)
+        .await
+        .unwrap_err();
+    assert!(e.is_check_violation(), "{e}");
+    drop(tx);
+    // A client binds only to a web agent, and only once.
+    let key = api_key::generate().unwrap();
+    let tx = s.state.store.begin().await.unwrap();
+    let other = agents::insert(
+        &tx,
+        &agents::NewAgent {
+            id: AgentId::new(),
+            name: "hermes",
+            description: "",
+            key_id: key.key_id.as_str(),
+            api_key_hash: key.hash.as_str(),
+            kind: AgentKind::Service,
+            webhook_url: None,
+            webhook_secret: None,
+            lldap_username: None,
+            parent_agent_id: None,
+            sandbox_id: None,
+            runtime: Some("hermes"),
+            project: None,
+            host: None,
+            placement: Placement::Host,
+            lease_expires_at: None,
+            last_seen_at: None,
+            now: OffsetDateTime::now_utc(),
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    for target in [other.id] {
+        let r = sqlx::query("UPDATE oauth_clients SET agent_id = $1")
+            .bind(uuid::Uuid::from(target))
+            .execute(&pool)
+            .await;
+        assert!(r.is_err());
+    }
+    let r = sqlx::query("UPDATE oauth_clients SET agent_id = NULL")
+        .execute(&pool)
+        .await;
+    assert!(r.is_err(), "a bound client stays bound");
+}
+
+// ------------------------------------------------------------- host check
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn no_host_no_panel(pool: sqlx::PgPool) {
+    let s = setup(pool, true, false).await;
+    let r = send(&s.app, "GET", "/ui/login", &[("host", "-")], None).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    // The request target's authority stands for Host (HTTP/2 :authority).
+    let r = send(
+        &s.app,
+        "GET",
+        "https://broker.test/ui/login",
+        &[("host", "-")],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER);
+    let r = send(
+        &s.app,
+        "GET",
+        "https://elsewhere.test/ui/login",
+        &[("host", "-")],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    // An empty Host is no address either.
+    let r = send(&s.app, "GET", "/ui/login", &[("host", "")], None).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
 }

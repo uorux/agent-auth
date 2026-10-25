@@ -311,7 +311,10 @@ and why. Keep entries short. Group by area.
   unless Secure and (for `__Host-`) host-only. Python-issued cookies are not
   read (they expire within 8 h).
 - **Default ports in `Host`** (Bug-B2): `Host: panel.example:443` is the
-  panel's own address; any other port still is not.
+  panel's own address; any other port still is not. Without a `Host`
+  header the request target's authority (HTTP/2 `:authority`) stands in;
+  with neither, or an empty one, the request is not the panel's (the
+  Python served it).
 - **CSRF compares bytes** (Bug-B3): a non-ASCII `X-CSRF-Token` is a 403,
   not a 500.
 - **The session cookie is looked at only without an `Authorization`
@@ -329,10 +332,24 @@ and why. Keep entries short. Group by area.
   the Python stored them and Postgres answered 500), and `/oauth/authorize`
   refuses a `state` over 1024 characters (a page: "state: at most 1024
   characters"; it is sealed into a cookie, which browsers drop past ~4 KiB).
-- **Clients nobody authorized expire** (Bug-C6): an unbound client is
-  "unknown client" one hour after registering, and such clients (with no
-  tokens) are deleted at the next registration, so they no longer fill
-  `max_clients` for good. No rate limit yet.
+- **Registration cannot lock connectors out** (Bug-C6). Registrations
+  nobody authorized have their own cap of 20: a new one evicts the oldest
+  (store `oauth::evict_unbound_clients`), they expire after an hour
+  ("unknown client"), and `max_clients` counts only authorized (bound)
+  clients (`oauth::count_live_bound_clients`). One client address may
+  register 20 times an hour, then 429 `invalid_client_metadata` "too many
+  registrations from this address; try again later" (the address is the
+  peer, or `X-Real-IP` with `TRUST_PROXY_HEADERS`; behind an untrusting
+  proxy every caller shares one allowance).
+- **Redirect URIs are exact** (policy `remote_mcp.redirect_uris` replaces
+  `redirect_hosts`; a policy still naming `redirect_hosts` no longer
+  loads). The default is Claude's and ChatGPT's callbacks
+  (`https://claude.ai/api/mcp/auth_callback`,
+  `https://claude.com/api/mcp/auth_callback`,
+  `https://chatgpt.com/connector_platform_oauth_redirect`); each entry must
+  be https without a fragment. The Python accepted any https URI on a
+  listed host, so any page there could receive a code. The error reads
+  "this broker sends the browser back only to <the list>".
 - **Codes and refresh tokens are consumed atomically** (Bug-C2,
   `store::oauth::consume`): of concurrent exchanges of one code exactly one
   succeeds; the others see a replay and revoke the family (including what
@@ -340,8 +357,22 @@ and why. Keep entries short. Group by area.
 - **A code exchange checks the agent is enabled** too ("the connector's
   agent is disabled"; the Python checked only at refresh).
 - **`get_credential` is never served on `/mcp`**, even if listed in
-  `remote_mcp.tools` (a warning at startup). The agent API must also refuse
-  a connector's token on the credential route (spine; Bug-C1).
+  `remote_mcp.tools` (a warning at startup).
+- **A connector's token reaches only its tools' routes** (Bug-C1). The
+  `AgentCaller` extractor admits an OAuth access token only on the `/v1`
+  routes the served tools call (`wire::mcp_tools::api_routes`, a table
+  next to the tool table; tested: each tool calls nothing else), and
+  answers 403 "not available to a web UI connector" elsewhere, so a route
+  added later is closed by default and trimming `remote_mcp.tools` trims
+  the token's reach. The Python accepted it on every `/v1` route.
+- **A connector's agent stays `web`** (§C.7, INV-C8). "Always a human"
+  keys on `runtime == "web"`; migration 0006 ties that to the
+  `oauth_clients` binding: a bound agent's runtime cannot change (trigger;
+  the admin PATCH answers 409 "<agent> is a web UI connector's agent; its
+  runtime stays web"), a client binds only to a `web` agent, and a binding
+  never changes. So every agent bound to a client is a web agent. The
+  Python let `PATCH /admin/agents/{}/attributes` (on the panel's list)
+  clear it.
 - **Tools call the agent API in process** (the `/v1` router through
   `tower::oneshot`) with the connector's own token, instead of over HTTP on
   `REMOTE_MCP_LOOPBACK_URL` (no longer read). `create_session` and

@@ -99,6 +99,27 @@ impl FromRequestParts<AppState> for AgentCaller {
             };
             match agent {
                 Some(a) if !a.disabled && a.kind != AgentKind::Operator => {
+                    // A connector's token reaches only the routes its remote
+                    // tools call (surfaces Bug-C1): new routes stay closed.
+                    let path = parts.uri.path();
+                    let permitted = state
+                        .web
+                        .remote_mcp
+                        .as_ref()
+                        .is_some_and(|m| m.allows(parts.method.as_str(), path));
+                    if !permitted {
+                        record(
+                            state,
+                            parts,
+                            "connector_route",
+                            now,
+                            &[
+                                ("agent", Some(a.name.as_str())),
+                                ("method", Some(parts.method.as_str())),
+                            ],
+                        );
+                        return Err(ApiError::forbidden("not available to a web UI connector"));
+                    }
                     (a, AgentCredentialKind::OAuthConnector)
                 }
                 other => {

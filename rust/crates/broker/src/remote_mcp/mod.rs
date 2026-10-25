@@ -274,6 +274,18 @@ impl RemoteMcp {
         }
     }
 
+    /// Whether a connector's token may call `method path` on the agent API:
+    /// only the routes of the tools served here (`tools::api_routes`), so
+    /// trimming `remote_mcp.tools` trims what the token reaches (Bug-C1).
+    #[must_use]
+    pub fn allows(&self, method: &str, path: &str) -> bool {
+        self.shared.tools.iter().any(|t| {
+            tools::api_routes(t.name)
+                .iter()
+                .any(|(m, p)| *m == method && tools::route_matches(p, path))
+        })
+    }
+
     /// The names of the tools served.
     #[must_use]
     pub fn tool_names(&self) -> Vec<&'static str> {
