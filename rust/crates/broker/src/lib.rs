@@ -28,6 +28,7 @@ pub mod discord;
 pub mod error;
 pub mod events;
 pub mod http;
+pub mod limits;
 pub mod llm;
 pub mod notify;
 pub mod oauth;

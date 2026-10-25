@@ -13,7 +13,7 @@ use agent_auth_wire::agent::RequestCreate;
 use serde_json::Value;
 use time::OffsetDateTime;
 
-use super::provision::{begin_provision, finish_provision, step};
+use super::provision::{begin_provision, finish_detached, step};
 use super::routing::{Delegator, clamp_duration, evaluate_and_route, saved_rules, zone_check};
 use super::{ServiceError, ServiceResult, agent_ref_of, llm_task};
 use crate::auth::AgentCaller;
@@ -338,7 +338,7 @@ pub async fn create(
     let id = row.id;
     let mut row = row;
     if let Some(grant) = grant {
-        finish_provision(st, grant).await;
+        finish_detached(st, grant).await;
         if let Some(r) = super::decide::reload(st, id).await? {
             row = r;
         }

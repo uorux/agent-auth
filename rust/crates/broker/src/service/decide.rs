@@ -16,7 +16,7 @@ use agent_auth_store::rules::{self, NewRule, RuleAction};
 use agent_auth_store::{StoreError, Tx, lockdown};
 use time::OffsetDateTime;
 
-use super::provision::{begin_provision, finish_provision, step};
+use super::provision::{begin_provision, finish_detached, step};
 use super::routing::{Delegator, Subject, clamp_duration, delegator_of, reroute, zone_check};
 use super::{HumanDecider, HumanDecision, ServiceError, ServiceResult};
 use crate::notify::Notify;
@@ -131,12 +131,32 @@ async fn run_gate(st: &AppState, id: RequestId, decision: &HumanDecision) -> Ser
         if !request.status.is_human_decidable() {
             return Err(resolved(request.status));
         }
+        // A shell is never approved without a code for the host's own
+        // secret, whatever gate is (or is not) registered.
+        let shell = matches!(
+            request.authority,
+            Some(Authority::Hostexec(
+                agent_auth_core::authority::HostexecAuthority::Shell { .. }
+            ))
+        );
+        if shell && decision.totp.as_deref().is_none_or(|t| t.trim().is_empty()) {
+            return Err(ServiceError::transition(
+                "a shell is approved with a TOTP code only (Approve with TOTP)",
+            ));
+        }
         if !st
             .spine
             .hooks
             .approval_gates
             .contains_key(&request.platform)
         {
+            // hostexec approvals always go through the host: without its
+            // gate there is nothing to approve with (fail closed).
+            if request.platform == agent_auth_core::Platform::Hostexec {
+                return Err(ServiceError::transition(
+                    "host approvals are unavailable: this broker has no hostexec gate running",
+                ));
+            }
             return Ok(());
         }
         // Nothing for the gate to spend (a TOTP code) on an agent that
@@ -339,7 +359,7 @@ async fn decide_inner(
     tx.commit().await?;
 
     if let Some(g) = grant {
-        finish_provision(st, g).await;
+        finish_detached(st, g).await;
     }
     let (request, grant) = reload_with_grant(st, id)
         .await?
@@ -422,7 +442,7 @@ pub async fn apply_rule_to_pending(
             }
         };
         if let Some(g) = grant {
-            finish_provision(st, g).await;
+            finish_detached(st, g).await;
         }
         if let Some((request, grant)) = reload_with_grant(st, id).await? {
             st.request_events.notify(&id);

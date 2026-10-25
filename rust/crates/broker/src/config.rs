@@ -14,9 +14,20 @@ use agent_auth_crypto::Secret;
 
 /// The process environment over `./.env` (no `set_var`: that is `unsafe`
 /// in this edition). Keys upper-cased.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Env {
     vars: HashMap<String, String>,
+}
+
+/// Names only: the values include secrets.
+impl std::fmt::Debug for Env {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut keys: Vec<&String> = self.vars.keys().collect();
+        keys.sort();
+        f.debug_struct("Env")
+            .field("keys", &keys)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One `KEY=VALUE` line of a dotenv file (`export ` prefix, quotes and
@@ -140,6 +151,10 @@ pub struct Config {
     /// the risk summarizer has something to summarize.
     pub daemons_enabled: bool,
     pub log_level: String,
+    /// New access requests per agent per hour (0: unlimited).
+    pub requests_per_hour: u32,
+    /// Concurrent decision long-polls per agent (0: unlimited).
+    pub max_waits_per_agent: u32,
     /// Trust `X-Real-IP` for the security log (a reverse proxy that sets
     /// it is in front).
     pub trust_proxy_headers: bool,
@@ -175,6 +190,8 @@ impl Config {
             daemons_enabled: env.get("BROKER_SIGNING_KEY").is_some(),
             log_level: env.string("LOG_LEVEL", "INFO"),
             trust_proxy_headers: env.flag("TRUST_PROXY_HEADERS", false)?,
+            requests_per_hour: env.number("REQUESTS_PER_AGENT_PER_HOUR", 60)?,
+            max_waits_per_agent: env.number("MAX_WAITS_PER_AGENT", 16)?,
         })
     }
 

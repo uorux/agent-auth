@@ -703,6 +703,32 @@ and why. Keep entries short. Group by area.
   any long-poll), and `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy:
   no-referrer`, `Cache-Control: no-store` and a deny-all CSP on every
   response that does not set its own. 404/405 answer `{"detail": ...}`.
+- **Containment acts durably** (review #2): the transaction that records
+  an entry also moves every active grant of the held agents to expire now,
+  so the scheduler revokes them even if nothing else runs; the rest
+  (denials, reverting PROVISIONING grants, revocations, threads, agent
+  VMs) runs as a tracked task each of whose steps runs even if an earlier
+  one failed. Each scheduler tick also revokes any active grant of a held
+  agent.
+- **Provisioning outlives its caller**: phase two runs in a tracked task
+  the handler awaits, so a dropped connection does not strand it.
+- **Host approvals fail closed**: approving a hostexec request needs the
+  hostexec approval gate (409 without it), and a shell needs a TOTP code in
+  the decision (`a shell is approved with a TOTP code only (Approve with
+  TOTP)`), whatever the gate does.
+- **Per-agent limits** (new): at most `REQUESTS_PER_AGENT_PER_HOUR` (60)
+  new access requests an hour and `MAX_WAITS_PER_AGENT` (16) concurrent
+  decision long-polls, else 429. The long-poll re-reads the database every
+  10 s (wake-ups do the rest); the Python polled every 2 s.
+- **Provisioner transport errors** reach the agent as `the platform could
+  not be reached; try again later` (the detail is logged); other
+  provisioner texts are cut to 300 characters.
+- **The reviewer's history** quotes earlier reasoning as a JSON string
+  labelled model output, and the system prompt says not to follow it.
+- **Security log**: failed authentications have a ring of their own, so a
+  flood of them cannot evict the other events.
+- **The boot tick** (reaper catch-up, stalled LLM work) completes before
+  the HTTP listener and the Discord bot start.
 - **Startup**: a missing `POLICY_FILE` stops the broker (core B-12);
   `DATABASE_URL` must be a postgres URL; one broker per database (a session
   advisory lock; a second one exits — B-19, ARCHITECTURE.md "Deployment").
