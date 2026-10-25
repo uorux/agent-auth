@@ -16,6 +16,15 @@ and why. Keep entries short. Group by area.
   rather than being read loosely.
 - **Database**: Postgres only; a new schema (no migration from the Python's).
 
+## Credentials
+
+- **One issuance check for every platform** (provisioners §1.5). The
+  credential route builds an `IssuableGrant` (own grant, `active`,
+  unexpired, agent not held, delegation thread open) before any provisioner
+  runs; the Python left status/expiry to each provisioner and several
+  checked nothing. Consequence: an expired hostexec run grant no longer
+  returns its job summary here; `GET /v1/hostexec/jobs/{id}` still does.
+
 ## Open questions
 
 (for Jacob; nothing here is implemented until decided)
