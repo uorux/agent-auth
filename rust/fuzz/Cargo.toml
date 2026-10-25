@@ -66,6 +66,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "hostd_admission"
+path = "fuzz_targets/hostd_admission.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "job_spec"
 path = "fuzz_targets/job_spec.rs"
 test = false

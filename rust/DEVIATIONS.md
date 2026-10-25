@@ -837,9 +837,107 @@ and why. Keep entries short. Group by area.
   evaluations (10 s), releases its lock and exits; a cut-off long-poll
   sees its connection close and polls again.
 
+## Daemons, hostd and hostexec (`crates/daemon`, `crates/hostd`, broker `daemons`, `hostexec`, `desktop`, `attention`)
+
+- **TOTP lockout escalates and ends in a hard lock** (daemons-hostd §7, bug
+  6). Five wrong codes in a row lock a secret for 5 min, then 10, 20, …
+  (doubling up to ~21 h) until a code is accepted; 20 wrong codes within 30
+  days hard-lock it until root on the host runs `agent-auth-hostctl
+  totp-unlock NAME` (new, root only). Accepted codes reset the escalation,
+  not the 30-day count. Python: 5 per 300 s forever (≈79 %/year for whoever
+  relays codes). A state file that exists but does not read hard-locks its
+  secret (Python: read as empty, which forgot the last used step); clearing
+  it then refuses the current window. Lock state shows as
+  `tiers.<t>.totp_locked` in the heartbeat status. Logic in
+  `core::hostd::totp`, model-checked (replay, lock).
+- **Durable state files** (bug 7): TOTP state, the lockdown flag, the spool
+  and `paired.json` are written to a temp file, fsynced, renamed, and the
+  directory fsynced. A lockdown flag whose existence cannot be checked
+  counts as locked.
+- **Remote `arm` checks the tier and the lockdown before the code** (bug 8):
+  a valid arm code is no longer burned on a locked host.
+- **`truncated` is exact** (bug 1): true iff the job wrote more than the
+  1 MiB kept (`core::hostd::output::OutputTail`, property-tested). `bytes`
+  is still the kept size.
+- **No answer to `job.start` is not a refusal** (bug 2): on a call timeout
+  the job row stays `starting` (its result is stored if it comes, else it
+  becomes `lost`), the host is told to kill it, and provisioning fails
+  with `… did not answer within 20s; the host was told to stop the job in
+  case it started`. An explicit refusal or an offline host is `refused`
+  as before. Same for `shell.exec`.
+- **`lost` is produced** (bug 3): a job running when hostd stopped is
+  reported with `lost: true` (an additive field of `job.done`, omitted when
+  false) and stored as `lost` with the restart message; the scheduler step
+  marks jobs still `starting`/`running` one hour past their timeout `lost`
+  (`no result from the host; its outcome is unknown`).
+- **Orphaned job units are tracked** (bug 4): at startup hostd lists its
+  running `aa-job-*` units; `job.kill` and lockdown stop them, and their
+  ids never start again.
+- **A kill that arrives before the job's process exists still stops it**:
+  each running job has a kill signal its executor watches (the Python's
+  `systemctl stop` could miss a unit not created yet).
+- **Approval prompts show the whole command or say they don't** (bug 5,
+  review finding 6): the desk prompt and the polkit message render the
+  argv with control/bidi/zero-width characters escaped (`$'…'`), show stdin
+  (escaped) with cwd and env, and when that exceeds the field, show its
+  head plus `… [cut: N of M characters shown; the approval covers all of
+  it, sha256 <digest prefix>…]`. Whitespace is no longer collapsed in what
+  hostd builds (only in broker-supplied text). Helpers for the Discord
+  follow-up: `core::hostd::display`.
+- **Linux root jobs get `HOME=/root`, `USER`, `LOGNAME`** (bug 21).
+- **The watcher sees templates** (bug 10): `template:<name>` and its
+  parameters instead of `[]`.
+- **Desk rate slots are taken when the offer is accepted** (a2a-wiki-desktop
+  B16), so simultaneous requests can't all pass the burst/hour checks.
+- **A desk answer is its own principal**: `auth::DeskAnswer`
+  (`decided_by` `desktop:<host>`), made only by `desktop`, converted into a
+  `HumanDecider`; the request service attests the approval as for any
+  human surface.
+- **A shell command checks containment** (`lockdown::check`) besides the
+  grant being live; Python relied on the grant having been revoked.
+- **hostd config is strict**: unknown keys are refused, values must have
+  their JSON types, `desktop.approve` needs `desktop.enable`, the desktop
+  needs `user`, `vm_unit` must look like a unit (Python: lenient
+  `bool()`/defaults; the nix module asserted some of these).
+- **Malformed broker messages are answered**: a known type that does not
+  parse (wire types are strict) gets `{"ok": false, "error": "malformed
+  <type> message"}` when it carries a `call_id` (Python raised inside the
+  handler, with the same effect for most shapes).
+- **macOS user tier without libc** (`docs/hostd-macos.md`): the `asuser`
+  step (`agent-auth-hostd asuser <json>`, still behind `launchctl asuser`)
+  drops privileges with `CommandExt::gid`/`uid` and execs; supplementary
+  groups are dropped rather than set with `initgroups`, and the "root can
+  be regained" probe is gone (setuid as root sets the real, effective and
+  saved uid; there is no safe `setuid(0)` to try). The account (uid, gid,
+  home, shell) comes from `dscl` on macOS and `getent`/`/etc/passwd` on
+  Linux. Process groups are signalled with `kill(1)`.
+- **Lockdown kills in parallel** (bug 17, partly): every job and orphan of
+  a host is stopped concurrently; handlers are still inline per connection.
+- **Daemon reconnect backoff resets after a session** (bug 15), and the
+  daemon drops a broker that stays silent for two ping intervals (40 s).
+- **Daemon-supplied status is re-validated on the broker** (review finding
+  3): `hosts()`/`/admin/hosts` and the desktop keep only plausible times,
+  valid template names and version strings, and escape and bound free text.
+- **hostctl prints times in UTC** (no local time zone without libc).
+- **Job rows are written in the grant's provisioning transaction** (it holds
+  the grant row; a separate transaction deadlocked on the foreign key). A
+  `job.done` that arrives before that commits is retried for up to 2 s
+  before being treated as another host's.
+
 ## Open questions
 
 (for Jacob; nothing here is implemented until decided)
+
+- **Shells "one at a time"** (daemons bug 11): neither side enforces it
+  (as in the Python); enforce on hostd (refuse a command while another of
+  the same shell runs)?
+- **Re-locking after a local unlock** (daemons bug 9): a host unlocked
+  locally (or with its code) while the broker's flag is `*` is locked again
+  at its next reconnect. Kept; intended?
+- **Run grants kill their job at expiry** (bug 22) and **the window probe
+  passes on an auto pattern** (bug 13): kept as in the Python.
+- **TOTP hard-lock thresholds** (20 wrong codes in 30 days) are a guess at
+  the right balance between typos and relayed guessing; tune?
 
 - **Operator-thread delegation** (a2a B1). The README says an agent can
   request access on the operator's behalf from an admin-panel chat thread,
