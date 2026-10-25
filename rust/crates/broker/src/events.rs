@@ -29,7 +29,9 @@ pub struct KeyedEvents<K: Eq + Hash + Clone> {
 
 impl<K: Eq + Hash + Clone> Default for KeyedEvents<K> {
     fn default() -> Self {
-        KeyedEvents { channels: Mutex::new(HashMap::new()) }
+        KeyedEvents {
+            channels: Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -45,8 +47,15 @@ impl<K: Eq + Hash + Clone> KeyedEvents<K> {
     /// Start listening on `key`. Changes from now on are seen by `wait`.
     pub fn listen(self: &Arc<Self>, key: &K) -> Listener<K> {
         let mut map = self.channels.lock().unwrap_or_else(PoisonError::into_inner);
-        let rx = map.entry(key.clone()).or_insert_with(|| watch::channel(0).0).subscribe();
-        Listener { events: Arc::clone(self), key: key.clone(), rx }
+        let rx = map
+            .entry(key.clone())
+            .or_insert_with(|| watch::channel(0).0)
+            .subscribe();
+        Listener {
+            events: Arc::clone(self),
+            key: key.clone(),
+            rx,
+        }
     }
 }
 
@@ -61,15 +70,25 @@ impl<K: Eq + Hash + Clone> Listener<K> {
     /// Sleep until a notify since the last `wait` (or `listen`), at most
     /// `timeout`. True if woken by a change.
     pub async fn wait(&mut self, timeout: Duration) -> bool {
-        matches!(tokio::time::timeout(timeout, self.rx.changed()).await, Ok(Ok(())))
+        matches!(
+            tokio::time::timeout(timeout, self.rx.changed()).await,
+            Ok(Ok(()))
+        )
     }
 }
 
 impl<K: Eq + Hash + Clone> Drop for Listener<K> {
     fn drop(&mut self) {
-        let mut map = self.events.channels.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut map = self
+            .events
+            .channels
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         // This receiver still counts until the end of drop: 1 = only us.
-        if map.get(&self.key).is_some_and(|tx| tx.receiver_count() <= 1) {
+        if map
+            .get(&self.key)
+            .is_some_and(|tx| tx.receiver_count() <= 1)
+        {
             map.remove(&self.key);
         }
     }
@@ -79,7 +98,11 @@ impl<K: Eq + Hash + Clone> Drop for Listener<K> {
 /// wait (a NaN timer would otherwise poison the runtime's timer).
 #[must_use]
 pub fn clamp_wait(secs: f64, lo: f64, hi: f64) -> Duration {
-    let secs = if secs.is_nan() { lo } else { secs.clamp(lo, hi) };
+    let secs = if secs.is_nan() {
+        lo
+    } else {
+        secs.clamp(lo, hi)
+    };
     Duration::try_from_secs_f64(secs).unwrap_or(Duration::ZERO)
 }
 
@@ -90,7 +113,10 @@ mod tests {
     #[test]
     fn clamp_handles_nan_and_infinities() {
         assert_eq!(clamp_wait(f64::NAN, 0.0, 60.0), Duration::ZERO);
-        assert_eq!(clamp_wait(f64::INFINITY, 0.0, 60.0), Duration::from_secs(60));
+        assert_eq!(
+            clamp_wait(f64::INFINITY, 0.0, 60.0),
+            Duration::from_secs(60)
+        );
         assert_eq!(clamp_wait(f64::NEG_INFINITY, 0.0, 60.0), Duration::ZERO);
         assert_eq!(clamp_wait(-5.0, 0.0, 60.0), Duration::ZERO);
         assert_eq!(clamp_wait(1.5, 0.0, 60.0), Duration::from_millis(1500));

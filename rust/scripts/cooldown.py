@@ -34,10 +34,13 @@ import tomllib
 import urllib.request
 
 COOLDOWN_DAYS = 14
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# COOLDOWN_ROOT: another Cargo project to check (e.g. rust/fuzz, which has
+# its own lockfile). Exceptions and the cache stay with the main workspace.
+ROOT = os.path.abspath(os.environ.get("COOLDOWN_ROOT", HERE))
 LOCK = os.path.join(ROOT, "Cargo.lock")
-EXCEPTIONS = os.path.join(ROOT, "cooldown-exceptions.toml")
-CACHE = os.path.join(ROOT, "target", "cooldown-cache.json")
+EXCEPTIONS = os.path.join(HERE, "cooldown-exceptions.toml")
+CACHE = os.path.join(HERE, "target", "cooldown-cache.json")
 CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
 USER_AGENT = "agent-auth-cooldown (jacob@otisroot.com)"
 

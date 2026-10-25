@@ -34,3 +34,4 @@ cargo deny check
 
 echo "== cooldown"
 python3 -I scripts/cooldown.py check
+COOLDOWN_ROOT=fuzz python3 -I scripts/cooldown.py check

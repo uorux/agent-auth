@@ -18,9 +18,17 @@ pub trait Notify {
     /// A request awaits a human: post the approval card.
     fn surface(&self, request: &RequestRow, agent: &AgentRow) -> impl Future<Output = ()> + Send;
     /// A decision landed (approved/denied/failed): update the card.
-    fn update_outcome(&self, request: &RequestRow, grant: Option<&GrantRow>) -> impl Future<Output = ()> + Send;
+    fn update_outcome(
+        &self,
+        request: &RequestRow,
+        grant: Option<&GrantRow>,
+    ) -> impl Future<Output = ()> + Send;
     /// A grant expired or was revoked: update the card.
-    fn update_grant_ended(&self, request: &RequestRow, grant: &GrantRow) -> impl Future<Output = ()> + Send;
+    fn update_grant_ended(
+        &self,
+        request: &RequestRow,
+        grant: &GrantRow,
+    ) -> impl Future<Output = ()> + Send;
     /// Something was decided without a human (a saved rule, the policy file,
     /// the LLM): an audit line in the activity channel.
     fn rule_applied(
@@ -34,11 +42,26 @@ pub trait Notify {
     fn job_finished(&self, request: &RequestRow, job: &JobRow) -> impl Future<Output = ()> + Send;
     /// A shell command is about to go to its host. False: it could not be
     /// shown to a human, and then it must not run.
-    fn shell_command(&self, request: &RequestRow, job: &JobRow) -> impl Future<Output = bool> + Send;
+    fn shell_command(
+        &self,
+        request: &RequestRow,
+        job: &JobRow,
+    ) -> impl Future<Output = bool> + Send;
     /// The watcher found a running command alarming (advisory).
-    fn watch_alert(&self, request: &RequestRow, job: &JobRow, text: &str) -> impl Future<Output = ()> + Send;
+    fn watch_alert(
+        &self,
+        request: &RequestRow,
+        job: &JobRow,
+        text: &str,
+    ) -> impl Future<Output = ()> + Send;
     /// An agent wants the operator's attention; `desks` already showed it.
-    fn attention(&self, agent: &AgentRow, text: &str, urgency: &str, desks: &[String]) -> impl Future<Output = ()> + Send;
+    fn attention(
+        &self,
+        agent: &AgentRow,
+        text: &str,
+        urgency: &str,
+        desks: &[String],
+    ) -> impl Future<Output = ()> + Send;
     /// Agents were contained or locked down: always a ping.
     fn contained(&self, event: &Value) -> impl Future<Output = ()> + Send;
 }
@@ -72,7 +95,13 @@ impl Notify for Notifier {
     async fn update_grant_ended(&self, request: &RequestRow, grant: &GrantRow) {
         dispatch!(self, n => n.update_grant_ended(request, grant).await, null => ())
     }
-    async fn rule_applied(&self, request: &RequestRow, agent: &AgentRow, rule: Option<&RuleRow>, grant: Option<&GrantRow>) {
+    async fn rule_applied(
+        &self,
+        request: &RequestRow,
+        agent: &AgentRow,
+        rule: Option<&RuleRow>,
+        grant: Option<&GrantRow>,
+    ) {
         dispatch!(self, n => n.rule_applied(request, agent, rule, grant).await, null => ())
     }
     async fn job_finished(&self, request: &RequestRow, job: &JobRow) {
@@ -106,11 +135,17 @@ pub struct Recorder {
 
 impl Recorder {
     fn record(&self, line: String) {
-        self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(line);
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(line);
     }
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
-        self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -124,7 +159,13 @@ impl Notify for Recorder {
     async fn update_grant_ended(&self, request: &RequestRow, _grant: &GrantRow) {
         self.record(format!("update_grant_ended {}", request.id));
     }
-    async fn rule_applied(&self, request: &RequestRow, _agent: &AgentRow, _rule: Option<&RuleRow>, _grant: Option<&GrantRow>) {
+    async fn rule_applied(
+        &self,
+        request: &RequestRow,
+        _agent: &AgentRow,
+        _rule: Option<&RuleRow>,
+        _grant: Option<&GrantRow>,
+    ) {
         self.record(format!("rule_applied {}", request.id));
     }
     async fn job_finished(&self, _request: &RequestRow, job: &JobRow) {

@@ -177,10 +177,12 @@ name = "agent-auth-wire"
 version = "0.1.0"
 dependencies = [
  "agent-auth-core",
+ "proptest",
  "serde",
  "serde_json",
  "time",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

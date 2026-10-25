@@ -100,7 +100,12 @@ pub trait Provisioner {
         now: OffsetDateTime,
     ) -> impl Future<Output = Result<Value, ProvisionError>> + Send;
 
-    fn revoke(&self, tx: &Tx<'_>, grant: &GrantRow, now: OffsetDateTime) -> impl Future<Output = Result<(), ProvisionError>> + Send;
+    fn revoke(
+        &self,
+        tx: &Tx<'_>,
+        grant: &GrantRow,
+        now: OffsetDateTime,
+    ) -> impl Future<Output = Result<(), ProvisionError>> + Send;
 
     fn credential(
         &self,
@@ -178,13 +183,28 @@ impl Provisioner for AnyProvisioner {
     ) -> Result<Result<Validated, Refused>, agent_auth_store::StoreError> {
         dispatch!(self, p => p.validate(tx, spec, now).await)
     }
-    async fn provision(&self, tx: &Tx<'_>, grant: &GrantRow, now: OffsetDateTime) -> Result<Value, ProvisionError> {
+    async fn provision(
+        &self,
+        tx: &Tx<'_>,
+        grant: &GrantRow,
+        now: OffsetDateTime,
+    ) -> Result<Value, ProvisionError> {
         dispatch!(self, p => p.provision(tx, grant, now).await)
     }
-    async fn revoke(&self, tx: &Tx<'_>, grant: &GrantRow, now: OffsetDateTime) -> Result<(), ProvisionError> {
+    async fn revoke(
+        &self,
+        tx: &Tx<'_>,
+        grant: &GrantRow,
+        now: OffsetDateTime,
+    ) -> Result<(), ProvisionError> {
         dispatch!(self, p => p.revoke(tx, grant, now).await)
     }
-    async fn credential(&self, tx: &Tx<'_>, grant: &IssuableGrant<'_>, now: OffsetDateTime) -> Result<Credential, ProvisionError> {
+    async fn credential(
+        &self,
+        tx: &Tx<'_>,
+        grant: &IssuableGrant<'_>,
+        now: OffsetDateTime,
+    ) -> Result<Credential, ProvisionError> {
         dispatch!(self, p => p.credential(tx, grant, now).await)
     }
     fn catalog(&self, agent: &AgentRow) -> Option<Value> {
@@ -205,10 +225,17 @@ pub struct FakeProvisioner {
 impl FakeProvisioner {
     #[must_use]
     pub fn new(platform: Platform) -> FakeProvisioner {
-        FakeProvisioner { platform, calls: std::sync::Mutex::new(Vec::new()), fail_provision: None }
+        FakeProvisioner {
+            platform,
+            calls: std::sync::Mutex::new(Vec::new()),
+            fail_provision: None,
+        }
     }
     fn record(&self, what: String) {
-        self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(what);
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(what);
     }
 }
 
@@ -222,21 +249,44 @@ impl Provisioner for FakeProvisioner {
         spec: RequestSpec<'_>,
         _now: OffsetDateTime,
     ) -> Result<Result<Validated, Refused>, agent_auth_store::StoreError> {
-        Ok(Ok(Validated { resource: spec.resource, authority: spec.authority, notes: Vec::new() }))
+        Ok(Ok(Validated {
+            resource: spec.resource,
+            authority: spec.authority,
+            notes: Vec::new(),
+        }))
     }
-    async fn provision(&self, _tx: &Tx<'_>, grant: &GrantRow, _now: OffsetDateTime) -> Result<Value, ProvisionError> {
+    async fn provision(
+        &self,
+        _tx: &Tx<'_>,
+        grant: &GrantRow,
+        _now: OffsetDateTime,
+    ) -> Result<Value, ProvisionError> {
         self.record(format!("provision {}", grant.id));
         match &self.fail_provision {
             Some(msg) => Err(ProvisionError::failed(msg.clone())),
             None => Ok(serde_json::json!({"fake": true})),
         }
     }
-    async fn revoke(&self, _tx: &Tx<'_>, grant: &GrantRow, _now: OffsetDateTime) -> Result<(), ProvisionError> {
+    async fn revoke(
+        &self,
+        _tx: &Tx<'_>,
+        grant: &GrantRow,
+        _now: OffsetDateTime,
+    ) -> Result<(), ProvisionError> {
         self.record(format!("revoke {}", grant.id));
         Ok(())
     }
-    async fn credential(&self, _tx: &Tx<'_>, grant: &IssuableGrant<'_>, _now: OffsetDateTime) -> Result<Credential, ProvisionError> {
-        Ok(Credential { kind: "fake".to_owned(), note: Some(grant.grant().resource.clone()), ..Credential::default() })
+    async fn credential(
+        &self,
+        _tx: &Tx<'_>,
+        grant: &IssuableGrant<'_>,
+        _now: OffsetDateTime,
+    ) -> Result<Credential, ProvisionError> {
+        Ok(Credential {
+            kind: "fake".to_owned(),
+            note: Some(grant.grant().resource.clone()),
+            ..Credential::default()
+        })
     }
     fn catalog(&self, _agent: &AgentRow) -> Option<Value> {
         None

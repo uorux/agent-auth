@@ -15,3 +15,9 @@ serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
 uuid.workspace = true
+# Plaintext secrets (API keys, tokens, TOTP codes) pass through wire types on
+# their way to crypto::Secret; they are wiped when a wire value is dropped.
+zeroize.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

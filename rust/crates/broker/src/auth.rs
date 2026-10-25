@@ -33,9 +33,20 @@ pub struct AgentCaller {
 }
 
 impl AgentCaller {
-    #[expect(dead_code, reason = "called by the extractors (auth::extract), not yet written")]
-    pub(crate) fn new(agent: AgentRow, session: Option<SessionRow>, via: AgentCredentialKind) -> AgentCaller {
-        AgentCaller { agent, session, via }
+    #[expect(
+        dead_code,
+        reason = "called by the extractors (auth::extract), not yet written"
+    )]
+    pub(crate) fn new(
+        agent: AgentRow,
+        session: Option<SessionRow>,
+        via: AgentCredentialKind,
+    ) -> AgentCaller {
+        AgentCaller {
+            agent,
+            session,
+            via,
+        }
     }
     #[must_use]
     pub fn agent(&self) -> &AgentRow {
@@ -73,7 +84,10 @@ pub struct AdminCaller {
 }
 
 impl AdminCaller {
-    #[expect(dead_code, reason = "called by the extractors (auth::extract), not yet written")]
+    #[expect(
+        dead_code,
+        reason = "called by the extractors (auth::extract), not yet written"
+    )]
     pub(crate) fn new(who: AdminIdentity) -> AdminCaller {
         AdminCaller { who }
     }
@@ -101,7 +115,10 @@ pub struct DiscordOwner {
 }
 
 impl DiscordOwner {
-    #[expect(dead_code, reason = "called by the extractors (auth::extract), not yet written")]
+    #[expect(
+        dead_code,
+        reason = "called by the extractors (auth::extract), not yet written"
+    )]
     pub(crate) fn new(user_id: u64, name: String) -> DiscordOwner {
         DiscordOwner { user_id, name }
     }
@@ -132,12 +149,16 @@ impl HumanDecider {
 
 impl From<&AdminCaller> for HumanDecider {
     fn from(admin: &AdminCaller) -> HumanDecider {
-        HumanDecider { label: admin.label() }
+        HumanDecider {
+            label: admin.label(),
+        }
     }
 }
 
 impl From<&DiscordOwner> for HumanDecider {
     fn from(owner: &DiscordOwner) -> HumanDecider {
-        HumanDecider { label: owner.label().to_owned() }
+        HumanDecider {
+            label: owner.label().to_owned(),
+        }
     }
 }

@@ -11,9 +11,18 @@ use uuid::Uuid;
 macro_rules! id_type {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
-        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
         #[serde(transparent)]
         pub struct $name(Uuid);
+
+        // Only the canonical spelling, as `FromStr` (uuid's own Deserialize
+        // also takes upper case, braces and URNs).
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let s = <std::borrow::Cow<'de, str>>::deserialize(d)?;
+                parse_canonical(&s).map(Self).map_err(serde::de::Error::custom)
+            }
+        }
 
         impl $name {
             /// A fresh random (v4) id.
@@ -148,5 +157,9 @@ mod tests {
         assert!(text.to_uppercase().parse::<AgentId>().is_err());
         assert!(text.replace('-', "").parse::<AgentId>().is_err());
         assert!(format!("{{{text}}}").parse::<AgentId>().is_err());
+        let json = format!("\"{}\"", text.to_uppercase());
+        assert!(serde_json::from_str::<AgentId>(&json).is_err());
+        let json = format!("\"{text}\"");
+        assert_eq!(serde_json::from_str::<AgentId>(&json).ok(), Some(id));
     }
 }

@@ -1,6 +1,6 @@
-# Fuzz targets (cargo-fuzz). Its own workspace, outside the main one: it
-# needs libfuzzer-sys and a nightly toolchain.
-#   nix develop ..#nightly -c cargo fuzz run policy_yaml -- -max_total_time=60
+# cargo-fuzz targets: every parser of untrusted input (ARCHITECTURE.md).
+# A workspace of its own, so the main build never links libFuzzer.
+#   nix develop ..#nightly -c cargo fuzz run <target> -- -max_total_time=60
 [package]
 name = "agent-auth-fuzz"
 version = "0.0.0"
@@ -16,11 +16,17 @@ members = ["."]
 [dependencies]
 libfuzzer-sys = "=0.4.13"
 agent-auth-core = { path = "../crates/core" }
-serde_json = { version = "1", default-features = false, features = ["std"] }
+agent-auth-wire = { path = "../crates/wire" }
+# float_roundtrip: so a re-parsed f64 (`wait`) compares equal in the round trips.
+serde_json = { version = "1.0.152", default-features = false, features = ["std", "float_roundtrip"] }
 time = { version = "=0.3.55", default-features = false }
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[profile.release]
+debug = 1
+overflow-checks = true
 
 [[bin]]
 name = "policy_yaml"
@@ -46,6 +52,34 @@ bench = false
 [[bin]]
 name = "duration_parse"
 path = "fuzz_targets/duration_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_request_bodies"
+path = "fuzz_targets/wire_request_bodies.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_channel"
+path = "fuzz_targets/wire_channel.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_oauth_register"
+path = "fuzz_targets/wire_oauth_register.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_scalars"
+path = "fuzz_targets/wire_scalars.rs"
 test = false
 doc = false
 bench = false
