@@ -64,7 +64,10 @@ async fn status(b: &Broker, id: agent_auth_core::RequestId) -> requests::Request
 async fn settled(b: &Broker, id: agent_auth_core::RequestId) -> requests::RequestRow {
     for _ in 0..750 {
         let r = status(b, id).await;
-        if r.status != RequestStatus::AwaitingHuman {
+        if !matches!(
+            r.status,
+            RequestStatus::AwaitingHuman | RequestStatus::Provisioning
+        ) {
             return r;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

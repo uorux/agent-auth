@@ -140,7 +140,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
- "tokio-tungstenite",
+ "tokio-tungstenite 0.30.0",
  "url",
  "uuid",
 ]
