@@ -820,6 +820,13 @@ and why. Keep entries short. Group by area.
   in the Python, although it breaks the sandbox daemon's copy. Refuse it
   (like rename and attributes), or keep it as the operator's escape hatch?
 
+- **Remote MCP redirect URIs.** The allowlist is now exact callback URIs
+  (`remote_mcp.redirect_uris`, replacing `redirect_hosts`; a policy with the
+  old key does not load). Defaults: `https://claude.ai/api/mcp/auth_callback`
+  (from the Python tests), `https://claude.com/api/mcp/auth_callback` and
+  `https://chatgpt.com/connector_platform_oauth_redirect` (not verified
+  against the live services). Confirm or correct them.
+
 ## To do (engineering, tracked here until done)
 
 - Local unix-socket protocols (hostctl, hostd-user, sandboxd local API) are
