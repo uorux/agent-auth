@@ -127,6 +127,9 @@ pub struct Hostd<E: Executor> {
     channel: OnceLock<Channel>,
     started_at: f64,
     user_uid: OnceLock<Option<u32>>,
+    /// Locked down in memory too: holds even if the flag file could not
+    /// be written (cleared by an unlock).
+    locked: std::sync::atomic::AtomicBool,
     /// Tests move the TOTP clock forward to use more than two codes.
     #[cfg(test)]
     totp_skew: std::sync::atomic::AtomicU64,
@@ -170,6 +173,7 @@ impl<E: Executor> Hostd<E> {
             channel: OnceLock::new(),
             started_at: now_f64(),
             user_uid: OnceLock::new(),
+            locked: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             totp_skew: std::sync::atomic::AtomicU64::new(0),
             me: me.clone(),
@@ -217,7 +221,9 @@ impl<E: Executor> Hostd<E> {
     /// The lockdown file exists (or cannot be checked: fail closed).
     #[must_use]
     pub fn lock_state(&self) -> LockState {
-        if fsutil::exists_or_unknown(&self.lockdown_path()) {
+        if self.locked.load(std::sync::atomic::Ordering::SeqCst)
+            || fsutil::exists_or_unknown(&self.lockdown_path())
+        {
             LockState::Locked
         } else {
             LockState::Unlocked
@@ -857,7 +863,10 @@ impl<E: Executor> Hostd<E> {
     /// drop every approval and desk prompt, end every shell, kill every job
     /// (also those left from an earlier hostd), and freeze or stop the VM.
     pub async fn lockdown(&self, via: &str, kill_vm: bool) -> HandlerResult {
-        fsutil::private_dir(&self.config.state_dir, 0o700)
+        // The flag first; whatever happens to it, everything below still
+        // runs (stopping things never waits on the disk).
+        self.locked.store(true, std::sync::atomic::Ordering::SeqCst);
+        let flag = fsutil::private_dir(&self.config.state_dir, 0o700)
             .and_then(|()| {
                 fsutil::write_atomic(
                     &self.lockdown_path(),
@@ -865,7 +874,7 @@ impl<E: Executor> Hostd<E> {
                     0o600,
                 )
             })
-            .map_err(|e| format!("hostd error: could not write the lockdown flag: {e}"))?;
+            .map_err(|e| format!("hostd error: could not write the lockdown flag: {e}"));
         let (shells, jobs, orphans) = {
             let mut st = self.state();
             st.arm.disarm(None);
@@ -896,7 +905,11 @@ impl<E: Executor> Hostd<E> {
             };
             vm = Some(self.unit_report(action, unit).await);
         }
-        self.audit("lockdown", json!({"via": via, "vm": vm}));
+        self.audit(
+            "lockdown",
+            json!({"via": via, "vm": vm, "flag_written": flag.is_ok()}),
+        );
+        flag?;
         Ok(data(json!({"locked": true, "vm": vm})))
     }
 
@@ -914,6 +927,8 @@ impl<E: Executor> Hostd<E> {
     pub async fn unlock(&self, via: &str) -> HandlerResult {
         fsutil::remove_durably(&self.lockdown_path())
             .map_err(|e| format!("hostd error: could not remove the lockdown flag: {e}"))?;
+        self.locked
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let mut vm = None;
         if let Some(unit) = &self.config.vm_unit {
             vm = Some(self.unit_report(UnitAction::Thaw, unit).await);

@@ -219,16 +219,22 @@ async fn allow_at_its_own_desk_approves_exactly_that_command(pool: sqlx::PgPool)
             .await
             .unwrap();
         drop(tx);
-        if j.as_ref().is_some_and(|j| j.status != agent_auth_store::hostexec::JobStatus::Starting
-            && j.status != agent_auth_store::hostexec::JobStatus::Running)
-        {
+        if j.as_ref().is_some_and(|j| {
+            j.status != agent_auth_store::hostexec::JobStatus::Starting
+                && j.status != agent_auth_store::hostexec::JobStatus::Running
+        }) {
             job = j;
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let job = job.expect("the job ended");
-    assert_eq!(job.status, agent_auth_store::hostexec::JobStatus::Done, "{:?}", job.error);
+    assert_eq!(
+        job.status,
+        agent_auth_store::hostexec::JobStatus::Done,
+        "{:?}",
+        job.error
+    );
     assert_eq!(job.via.as_deref(), Some("desk"));
     assert_eq!(job.output.as_deref(), Some("from the desk\n"));
 }

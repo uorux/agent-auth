@@ -15,6 +15,9 @@ use base64::Engine as _;
 use serde_json::{Map, Value, json};
 
 use super::{HostExec, MAX_BUFFER_BYTES};
+
+/// Results being reassembled per host at once.
+pub const MAX_BUFFERS_PER_HOST: usize = 16;
 use crate::daemons::DaemonPeer;
 use crate::notify::Notify as _;
 
@@ -33,6 +36,17 @@ impl HostExec {
         };
         let mut buffers = self.buffers.lock().unwrap_or_else(PoisonError::into_inner);
         let key = (peer.name().to_owned(), job_id);
+        // A host has at most a few results in flight; bound what one host
+        // can make the broker hold.
+        if !buffers.contains_key(&key)
+            && buffers.keys().filter(|(h, _)| h == peer.name()).count() >= MAX_BUFFERS_PER_HOST
+        {
+            tracing::warn!(
+                host = peer.name(),
+                "too many results in flight; dropping a chunk"
+            );
+            return;
+        }
         if chunk == Some(0) {
             buffers.insert(key.clone(), Vec::new());
         }
