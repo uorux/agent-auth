@@ -824,8 +824,11 @@ and why. Keep entries short. Group by area.
 - **Startup**: a missing `POLICY_FILE` stops the broker (core B-12);
   `DATABASE_URL` must be a postgres URL; one broker per database (a session
   advisory lock; a second one exits — B-19, ARCHITECTURE.md "Deployment").
-  `./.env` is read without changing the process environment (no `set_var`):
-  parts that read the environment themselves see only the real one.
+  `./.env` is read without changing the process environment (no `set_var`);
+  every part reads its settings through that lookup (`config::Env`). The
+  Discord bot and the a2a settings read only the process environment at
+  first, so `DISCORD_TOKEN` in `./.env`, as the README's quick start puts
+  it, left the bot off (found by the e2e suite).
 - **Shutdown drains for at most 10 s** (found by the e2e suite). On SIGTERM
   the Python's uvicorn waited for every open request, so one agent's
   long-poll (`wait`, a2a `poll`/`events`: up to 300 s) held the shutdown

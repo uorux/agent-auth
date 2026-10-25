@@ -203,15 +203,18 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
     let policy = Arc::new(policy);
     let (registry, platform_services) = register_provisioners(&env, &config, &policy)?;
     let spine = spine(&config, &policy)?;
+    // `env` (the process environment over `./.env`), not the process
+    // environment alone: the quick start puts DISCORD_TOKEN in `.env`.
+    let lookup = |k: &str| env.get(k).map(str::to_owned);
     let a2a = crate::a2a::A2a::new(
-        crate::a2a::A2aConfig::from_env().map_err(|e| anyhow::anyhow!("a2a: {e}"))?,
+        crate::a2a::A2aConfig::from_lookup(lookup).map_err(|e| anyhow::anyhow!("a2a: {e}"))?,
     );
     let web = crate::webui::Web::from_policy(
         &policy,
         config.encryption_key.as_ref().map(|k| k.expose().as_str()),
     )
     .map_err(|e| anyhow::anyhow!("web UI: {e}"))?;
-    let discord = match crate::discord::DiscordConfig::from_env()
+    let discord = match crate::discord::DiscordConfig::from_vars(lookup)
         .map_err(|e| anyhow::anyhow!("discord: {e}"))?
     {
         Some(cfg) => Some(
