@@ -260,20 +260,44 @@ impl Sandboxes {
         if !self.hub.is_online(Role::Sandbox, name) {
             return;
         }
+        // The held list goes first, read in the same snapshot as the keys
+        // (review 2026-10): a key is committed with its agent row, so an
+        // agent minted, re-enabled or re-keyed while some entry holds it
+        // (its own, its orchestrator's, a lockdown's) is named in the list
+        // the VM applies before it reads the key. Under `tell_lock`, so no
+        // older list can follow it; a later list is newer.
+        let told = self.tell_lock.lock().await;
         let pending = async {
             let tx = self.store.begin().await?;
             let rows = store::pending_for(&tx, id).await?;
+            let held = if rows.is_empty() {
+                Vec::new()
+            } else {
+                lockdown::held_in(&tx, id).await?
+            };
             tx.commit().await?;
-            Ok::<_, StoreError>(rows)
+            Ok::<_, StoreError>((rows, held))
         }
         .await;
         let pending = match pending {
-            Ok(p) => p,
+            Ok((p, _)) if p.is_empty() => return,
+            Ok((p, held)) => {
+                if !self
+                    .hub
+                    .send_default(Role::Sandbox, name, &payload(self.held_message(&held)))
+                    .await
+                {
+                    // No key without the held list before it.
+                    return;
+                }
+                p
+            }
             Err(e) => {
                 tracing::error!(sandbox = %name, error = %e, "listing pending keys failed");
                 return;
             }
         };
+        drop(told);
         for row in pending {
             let delivery = row.id.to_string();
             let Ok(key) = boxed.open_str(&row.key_encrypted, &binding(&delivery)) else {
@@ -585,12 +609,16 @@ impl Sandboxes {
         let mut reports = Map::new();
         match lists {
             Ok(lists) => {
-                for (name, held) in lists {
-                    let n = held.len();
-                    let sent = self
-                        .hub
-                        .send_default(Role::Sandbox, &name, &payload(self.held_message(&held)))
-                        .await;
+                // Every VM at once (each send is bounded): one that stopped
+                // reading delays no other. Numbered here, under the lock.
+                let sends = lists.into_iter().map(|(name, held)| {
+                    let msg = payload(self.held_message(&held));
+                    async move {
+                        let sent = self.hub.send_default(Role::Sandbox, &name, &msg).await;
+                        (name, held.len(), sent)
+                    }
+                });
+                for (name, n, sent) in futures::future::join_all(sends).await {
                     reports.insert(
                         format!("sandbox:{name}"),
                         json!(if sent {

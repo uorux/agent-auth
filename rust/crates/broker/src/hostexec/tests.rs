@@ -463,6 +463,48 @@ async fn lockdown_stops_the_host_and_only_its_code_unlocks_it(pool: sqlx::PgPool
     drop(host);
 }
 
+/// Review 2026-10: an agent VM that stops reading its connection doesn't
+/// hold a lockdown back from the hosts. Hosts and VMs are told at once,
+/// each within its own timeout; the VM is reported not reached and its
+/// connection dropped (it is locked when it reconnects).
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_stalled_vm_does_not_hold_a_lockdown_back_from_the_hosts(pool: sqlx::PgPool) {
+    let b = Broker::start(pool).await;
+    let host = Host::start(&b).await;
+    let vm = crate::daemons::testkit::StallingDaemon::start(&b, "stuck").await;
+    let flood = vm.stall(&b).await;
+    let hx = b.hostexec();
+    let st = b.st.clone();
+    let started = tokio::time::Instant::now();
+    let run = tokio::spawn(async move {
+        lockdown::lockdown(&st, &hx, LockdownScope::All, None, false, "jrt").await
+    });
+    // The host is locked at once, not after the VM's timeouts.
+    wait_until(|| host.hostd.lock_state().is_locked()).await;
+    assert!(
+        started.elapsed() < super::SANDBOX_LOCKDOWN_TIMEOUT,
+        "{:?}",
+        started.elapsed()
+    );
+    let out = tokio::time::timeout(Duration::from_secs(30), run)
+        .await
+        .expect("lockdown did not finish")
+        .unwrap()
+        .unwrap();
+    assert_eq!(out.daemons["host:excelsior"], "locked");
+    let report = &out.daemons["sandbox:stuck"];
+    assert!(
+        report.starts_with("NOT reached") && report.contains("not reading"),
+        "{report}"
+    );
+    assert!(!b.part.hub.is_online(Role::Sandbox, "stuck"));
+    tokio::time::timeout(Duration::from_secs(2), flood)
+        .await
+        .expect("the stalled send was not ended")
+        .unwrap();
+    drop(host);
+}
+
 #[sqlx::test(migrations = "../store/migrations")]
 async fn a_locked_broker_tells_a_host_that_connects(pool: sqlx::PgPool) {
     let b = Broker::start(pool).await;

@@ -624,6 +624,65 @@ async fn inv23_the_orchestrator_sets_up_a_project_and_its_agent(pool: sqlx::PgPo
     vm.stop().await;
 }
 
+/// Held means held from the first moment (review 2026-10): an agent minted
+/// while an entry holds it (here one naming its project) is held by the
+/// real daemon by the time its key is stored, and is not run.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_held_agent_is_held_in_the_vm_when_its_key_arrives(pool: sqlx::PgPool) {
+    let vm = Vm::start(pool).await;
+    let (_, token) = vm.orch_conv().await;
+    agent_call(
+        &vm,
+        "project_create",
+        json!({"name": "larder"}),
+        &token,
+        me(),
+    )
+    .await
+    .unwrap();
+    crate::containment::contain(
+        &vm.b.st,
+        json!({"project": "larder"}),
+        "test",
+        "",
+        "jrt",
+        agent_auth_store::lockdown::ContainmentSource::Operator,
+    )
+    .await
+    .unwrap();
+    let minted = agent_call(
+        &vm,
+        "agent_mint",
+        json!({"runtime": "claude", "project": "larder"}),
+        &token,
+        me(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(minted["status"], "granted", "{minted}");
+    assert_eq!(minted["key_received"], true);
+    let child = "claude-larder-excelsior-sandbox";
+    assert!(vm.sbx.store.agent(child).is_some());
+    assert!(vm.sbx.held(child), "held when its key arrived");
+    assert!(!vm.sbx.held(ORCH));
+    // A spawn is parked, never run, while it is held.
+    let spawned = agent_call(
+        &vm,
+        "agent_spawn",
+        json!({"agent": child, "prompt": "hello"}),
+        &token,
+        me(),
+    )
+    .await;
+    if let Ok(conv) = &spawned {
+        assert_eq!(conv["turns"], json!(0), "{conv}");
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!vm.turns().iter().any(|t| t == "hello"), "{:?}", vm.turns());
+    assert!(vm.starts().is_empty(), "{:?}", vm.starts());
+    vm.stop().await;
+}
+
 /// INV-14, INV-16: the token alone is never enough (the caller's uid must
 /// be the conversation's); a forged token is refused; orchestrator calls
 /// are refused to a project's agent; no key or session leaves the API.

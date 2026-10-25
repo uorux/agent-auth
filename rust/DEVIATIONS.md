@@ -1282,6 +1282,29 @@ Final hostexec review (2026-10), fixed:
   (the store's lock order); the old order could deadlock with a
   containment writer that then read the flag.
 
+Security review 2026-10 (daemon hub, lockdown), fixed:
+- **A daemon that stops reading holds up nobody.** Every message to a
+  daemon must be written within 10 s (`daemons::SEND_TIMEOUT`, waiting for
+  the connection included; a call's own timeout when shorter). One that
+  isn't drops the connection: it leaves the live map (sends find the
+  daemon offline), is closed (code 4408 `not reading`), and every send in
+  flight on it ends at once, giving back the write lock. A call whose send
+  stalled fails as a timeout (`<role>:<name> did not take the message
+  within Ns (not reading); its connection was dropped`); a call's timeout
+  now bounds the send too, not only the wait for the reply. Close frames
+  the broker writes give up after 2 s. Python and port before: the send
+  had no timeout and held the connection's write lock, so root in one VM
+  could stop reading and block every later send to it.
+- **Lockdown tells hosts and agent VMs at once**, each within its own call
+  timeout (hosts 20 s, VMs 5 s); a VM's held list then its `lockdown` run
+  alongside the hosts' calls, and the held lists of all VMs go out
+  concurrently. Before (Python and port): VMs first (their held lists one
+  after another, then their calls), and only then the hosts, so a stalled
+  VM kept every host armed and every VM running. The report names each
+  daemon not reached (`NOT reached (…)`), also logged as an error. A host
+  may now freeze its VM before the VM answered; the report then says so,
+  as it did when that happened before.
+
 ## Mail (`crates/mail`, broker `mail`, `discord/mail.rs`; upstream snapshot 2026-10-25)
 
 Ported from the snapshot with every fix its review log lists (judge reads
@@ -1667,6 +1690,19 @@ inherited from the Python; "port" what the port introduced.
   `refuse_vm_logins_when_unreachable` (default true) a broker that cannot
   be reached starts no process; a reachable broker without a gateway still
   means the VM's logins.
+- **Keys reach a VM only after a held list read with them** (security
+  review 2026-10; Python and port): every push of pending keys first
+  sends the VM's complete held list, read in the same transaction as the
+  keys and numbered under the same lock as every other list. A key is
+  committed with its agent row, so an agent minted, re-enabled after its
+  lease, re-enabled by the operator, re-keyed at the VM's request or
+  bootstrapped as the orchestrator while an entry holds it (its own, its
+  orchestrator's, a lockdown's) is held in the VM before its key is read:
+  sandboxd applies a hold before reading the next message. Before, the
+  list was sent only when containment changed, so an agent minted under
+  an entry that matched it (e.g. `{"project": "larder"}`) but not its
+  orchestrator ran unheld in its VM. If that list can't be sent, no key is
+  sent either.
 - **A thread's cursor moves past a message only once it is recorded**
   (Python moved it first: at most once): sent, or queued even if its
   process then failed to start. A message whose text could not be recorded

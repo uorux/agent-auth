@@ -875,6 +875,148 @@ async fn containment_tells_the_vm_its_held_agents(pool: sqlx::PgPool) {
     assert!(held(json!([])).await);
 }
 
+/// The messages up to (not including) the first `key` for `agent`: the
+/// held list last applied before that key must hold it.
+fn held_before_key(sb: &FakeSandbox, agent: &str) -> Option<Value> {
+    let seen = sb.seen.lock().unwrap();
+    let at = seen
+        .messages
+        .iter()
+        .position(|m| m["type"] == json!("key") && m["name"] == json!(agent))?;
+    seen.messages[..at]
+        .iter()
+        .rev()
+        .find(|m| m["type"] == json!("agents.contained"))
+        .map(|m| m["agents"].clone())
+}
+
+/// Held means held from the first moment (review 2026-10): an agent
+/// minted while an entry already holds it (one naming its project; not
+/// its orchestrator, which could not mint otherwise) reaches its VM held:
+/// the held list naming it comes before its key.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_minted_agent_that_is_held_reaches_its_vm_held(pool: sqlx::PgPool) {
+    let b = Broker::start(pool).await;
+    let (sb, orch, _) = vm(&b).await;
+    crate::containment::contain(
+        &b.st,
+        json!({"project": "larder"}),
+        "test",
+        "",
+        "jrt",
+        ContainmentSource::Operator,
+    )
+    .await
+    .unwrap();
+    let r = ask(&b, &orch, mint_body(CHILD)).await;
+    assert_eq!(r.status, RequestStatus::Granted, "{:?}", r.decision_reason);
+    sb.wait_key(CHILD).await;
+    let held = held_before_key(&sb, CHILD);
+    assert_eq!(held, Some(json!([CHILD])), "{:?}", sb.types());
+    // Its key works (it exists), but it is held at the broker too.
+    let child = b.agent(CHILD).await;
+    let tx = b.st.store.begin().await.unwrap();
+    let checked = agent_auth_store::lockdown::check(&tx, child.id, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    assert!(checked.is_err());
+}
+
+/// The same for every other way a key reaches a VM: a lapsed agent
+/// re-enabled by a mint, the operator's re-enable, a key the VM asked for.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn every_rekey_of_a_held_agent_reaches_its_vm_held(pool: sqlx::PgPool) {
+    let b = Broker::start(pool).await;
+    let (sb, orch, child, _) = vm_with_child(&b).await;
+    // Lapse the child, then hold it by name (as an operator would).
+    {
+        let tx = b.st.store.begin().await.unwrap();
+        agents::set_lease(
+            &tx,
+            child.id,
+            Some(OffsetDateTime::now_utc() - time::Duration::seconds(1)),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+    assert_eq!(crate::scheduler::sweep_leases(&b.st).await, 1);
+    assert!(b.agent(CHILD).await.disabled);
+    crate::containment::contain(
+        &b.st,
+        json!({"name": CHILD}),
+        "test",
+        "",
+        "jrt",
+        ContainmentSource::Operator,
+    )
+    .await
+    .unwrap();
+    let keys_of = |sb: &FakeSandbox| {
+        sb.seen
+            .lock()
+            .unwrap()
+            .messages
+            .iter()
+            .filter(|m| m["type"] == json!("key") && m["name"] == json!(CHILD))
+            .count()
+    };
+    // Each new key must come right after a held list naming the child.
+    let check_last_key = |sb: &FakeSandbox| {
+        let seen = sb.seen.lock().unwrap();
+        let at = seen
+            .messages
+            .iter()
+            .rposition(|m| m["type"] == json!("key") && m["name"] == json!(CHILD))
+            .unwrap();
+        let held = seen.messages[..at]
+            .iter()
+            .rev()
+            .find(|m| m["type"] == json!("agents.contained"))
+            .map(|m| m["agents"].clone());
+        assert_eq!(held, Some(json!([CHILD])), "{:?}", seen.messages);
+    };
+    // A mint re-enables the lapsed child with a new key.
+    let n = keys_of(&sb);
+    let r = ask(&b, &orch, mint_body(CHILD)).await;
+    assert_eq!(r.status, RequestStatus::Granted, "{:?}", r.decision_reason);
+    wait_until_more(&sb, n, keys_of).await;
+    check_last_key(&sb);
+    // The VM asks for a new key.
+    let n = keys_of(&sb);
+    assert!(sb.send(json!({"type": "key.rotate", "name": CHILD})).await);
+    wait_until_more(&sb, n, keys_of).await;
+    check_last_key(&sb);
+    // The operator disables and re-enables it.
+    let n = keys_of(&sb);
+    let (status, body) = b
+        .post_as(
+            ADMIN_TOKEN,
+            &format!("/admin/agents/{}/disable", child.id),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = b
+        .post_as(
+            ADMIN_TOKEN,
+            &format!("/admin/agents/{}/enable", child.id),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    wait_until_more(&sb, n, keys_of).await;
+    check_last_key(&sb);
+}
+
+async fn wait_until_more(sb: &FakeSandbox, n: usize, count: impl Fn(&FakeSandbox) -> usize) {
+    assert!(
+        eventually(|| async { count(sb) > n }).await,
+        "no new key: {:?}",
+        sb.types()
+    );
+}
+
 // ----------------------------------------------- cross-project access
 
 /// INV-22 (broker half): a project.read grant is applied by the daemon
