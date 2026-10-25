@@ -73,6 +73,16 @@ spec:
               value: /etc/agent-auth/github/app.pem
             # Traefik sets X-Real-IP: the security log and the per-address
             # limits see the client, not the proxy.
+            # In-cluster services without TLS that outbound URL settings may
+            # reach over plain http:// (or ldap://); everything else must be
+            # https/wss/ldaps. LLDAP's API: LLDAP_URL in agent-auth-env is
+            # http://lldap-http.lldap.svc.cluster.local:17170. Its LDAPS
+            # certificate is the *.rooty.dev wildcard, which no in-cluster
+            # name matches: for LLDAP_LDAP_URL either a name the certificate
+            # covers (ldaps://), or the LDAP service's in-cluster name over
+            # ldap:// listed here too, with LLDAP_LDAP_ALLOW_PLAINTEXT=1.
+            - name: PLAINTEXT_HTTP_HOSTS
+              value: lldap-http.lldap.svc.cluster.local
             - name: TRUST_PROXY_HEADERS
               value: "1"
             - name: LOG_LEVEL

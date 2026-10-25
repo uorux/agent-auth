@@ -140,7 +140,7 @@ value that does not parse stops the broker with the variable's name.
 | `LLDAP_ADMIN_USER`, `LLDAP_ADMIN_PASSWORD` | (none) | |
 | `LLDAP_LDAP_URL` | (none) | **new**: LDAP interface for setting managed accounts' passwords (`ldaps://host:6360`, or `ldap://host:3890`). Replaces `lldap_set_password`, whose command line exposed the admin token |
 | `LLDAP_BASE_DN` | (none) | **new**: `dc=example,dc=com` |
-| `LLDAP_LDAP_ALLOW_PLAINTEXT` | `false` | **new**: allow `ldap://` to a non-loopback host (the admin password crosses in the clear) |
+| `LLDAP_LDAP_ALLOW_PLAINTEXT` | `false` | **new**: allow `ldap://` to a non-loopback host (the admin password crosses in the clear); the host must also be in `PLAINTEXT_HTTP_HOSTS` |
 | `LLDAP_SET_PASSWORD_BIN` | | **ignored** (a warning) |
 
 Managed accounts need `ENCRYPTION_KEY`, `LLDAP_LDAP_URL` and `LLDAP_BASE_DN`.
