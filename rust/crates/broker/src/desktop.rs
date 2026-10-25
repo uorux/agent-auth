@@ -854,3 +854,7 @@ impl Notify for Fanout {
             null => tracing::warn!(?event, "contained (no notifier)"));
     }
 }
+
+#[cfg(test)]
+#[path = "desktop_tests.rs"]
+mod tests;
