@@ -363,6 +363,7 @@ async fn open_thread(
         },
     )
     .await
+    .unwrap()
     .unwrap();
     a2a::accept(&tx, &clear, thread, None, now())
         .await

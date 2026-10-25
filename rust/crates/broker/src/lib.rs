@@ -4,6 +4,7 @@
 //! hub, and the scheduler. Binary: `agent-auth-server`.
 //!
 //! Layout (one module per area; see rust/ARCHITECTURE.md):
+//! - `a2a`: threads, sessions, webhook pings, the operator's chat.
 //! - `auth`: principals (`AgentCaller`, `AdminCaller`, `DiscordOwner`,
 //!   `HumanDecider`) and their extractors.
 //! - `discord`: the Discord bot and its notifier.
@@ -14,6 +15,7 @@
 //! - `webui`: the admin panel (`/ui`) and its OpenID sign-in; `oauth`: the
 //!   OAuth server for web-UI connectors; `remote_mcp`: `/mcp` for them.
 
+pub mod a2a;
 pub mod auth;
 pub mod discord;
 pub mod error;

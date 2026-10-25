@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::lockdown::PairClear;
 use crate::values::{self, text_enum};
-use crate::{StoreError, Tx};
+use crate::{Outcome, StoreError, Tx};
 
 const T: &str = "a2a_threads";
 
@@ -202,14 +202,47 @@ pub struct NewThread<'a> {
     pub now: OffsetDateTime,
 }
 
+/// The backing grant is not (or no longer) an active, unexpired a2a grant
+/// of the initiator to talk to the responder: nothing was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrantNotLive;
+
 /// Open a thread (`pending_open`, `last_seq = 1`) with its first message.
+///
+/// A backing grant is share-locked (so a revoke waits for this
+/// transaction) and must be the initiator's own a2a grant for the
+/// responder's name, active and unexpired at `now` (a2a INV-5); otherwise
+/// [`GrantNotLive`] and nothing is written. Lock order: agents (the
+/// [`PairClear`]), then the grant, then the new thread.
 pub async fn open(
     tx: &Tx<'_>,
     clear: &PairClear<'_>,
     n: &NewThread<'_>,
-) -> Result<(ThreadRow, MessageRow), StoreError> {
+) -> Outcome<(ThreadRow, MessageRow), GrantNotLive> {
     clear.verify(tx, n.initiator, n.responder)?;
+    let (a, b) = clear.agents();
+    let responder_name = if a.id == n.responder {
+        &a.name
+    } else {
+        &b.name
+    };
     let mut c = tx.conn().await;
+    if let Some(grant) = n.grant_id {
+        let live = sqlx::query_scalar!(
+            r#"SELECT (status = 'active' AND expires_at > $3 AND platform = 'a2a'
+                       AND agent_id = $2 AND resource = $4) AS "live!"
+               FROM grants WHERE id = $1 FOR SHARE"#,
+            Uuid::from(grant),
+            Uuid::from(n.initiator),
+            n.now,
+            responder_name.as_str()
+        )
+        .fetch_optional(&mut **c)
+        .await?;
+        if live != Some(true) {
+            return Ok(Err(GrantNotLive));
+        }
+    }
     let t = sqlx::query_as!(
         RawThread,
         "INSERT INTO a2a_threads (id, initiator_agent_id, initiator_session_id, responder_agent_id,
@@ -244,7 +277,7 @@ pub async fn open(
     )
     .fetch_one(&mut **c)
     .await?;
-    Ok((t.try_into()?, m.try_into()?))
+    Ok(Ok((t.try_into()?, m.try_into()?)))
 }
 
 /// `pending_open` → `open` (an accept, or the responder's first reply),
@@ -300,24 +333,57 @@ pub struct NewMessage<'a> {
     pub now: OffsetDateTime,
 }
 
+/// Why [`append`] stored nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppendRefused {
+    /// The thread is missing or not `open`, or the sender is not one of
+    /// its participants.
+    NotOpen,
+    /// The thread's backing grant is no longer active and unexpired
+    /// (a2a INV-6).
+    GrantNotLive,
+}
+
+/// Share-lock a thread's backing grant and say whether it is active and
+/// unexpired at `now` (`false` if it is gone). A revoke then waits for this
+/// transaction, or this sees the revoke (a2a INV-6). Lock order: call it
+/// before locking the thread.
+pub async fn lock_backing_grant(
+    tx: &Tx<'_>,
+    grant: GrantId,
+    now: OffsetDateTime,
+) -> Result<bool, StoreError> {
+    let mut c = tx.conn().await;
+    let live = sqlx::query_scalar!(
+        r#"SELECT (status = 'active' AND expires_at > $2) AS "live!"
+           FROM grants WHERE id = $1 FOR SHARE"#,
+        Uuid::from(grant),
+        now
+    )
+    .fetch_optional(&mut **c)
+    .await?;
+    Ok(live == Some(true))
+}
+
 /// Store a message on an `open` thread: the thread's `last_seq` is bumped
-/// and the message takes it, in one transaction. `None` if the thread is
-/// missing or not open, or the sender is not a participant (nothing is
-/// stored).
+/// and the message takes it, in one transaction. The backing grant (if
+/// any) must be active and unexpired at `now`: its id is read without a
+/// lock, the grant is share-locked ([`lock_backing_grant`]), then the
+/// thread row is updated (the store's lock order: grants before threads).
 pub async fn append(
     tx: &Tx<'_>,
     clear: &PairClear<'_>,
     n: &NewMessage<'_>,
-) -> Result<Option<MessageRow>, StoreError> {
+) -> Outcome<MessageRow, AppendRefused> {
     let mut c = tx.conn().await;
     let parties = sqlx::query!(
-        "SELECT initiator_agent_id, responder_agent_id FROM a2a_threads WHERE id = $1",
+        "SELECT initiator_agent_id, responder_agent_id, grant_id FROM a2a_threads WHERE id = $1",
         Uuid::from(n.thread_id)
     )
     .fetch_optional(&mut **c)
     .await?;
     let Some(p) = parties else {
-        return Ok(None);
+        return Ok(Err(AppendRefused::NotOpen));
     };
     let sender = Uuid::from(n.sender);
     let recipient = if p.initiator_agent_id == sender {
@@ -325,9 +391,18 @@ pub async fn append(
     } else if p.responder_agent_id == sender {
         p.initiator_agent_id
     } else {
-        return Ok(None);
+        return Ok(Err(AppendRefused::NotOpen));
     };
     clear.verify(tx, n.sender, AgentId::from_uuid(recipient))?;
+    // The backing grant never changes on a thread: read its id unlocked,
+    // lock the grant, then the thread.
+    if let Some(grant) = p.grant_id {
+        drop(c);
+        if !lock_backing_grant(tx, GrantId::from_uuid(grant), n.now).await? {
+            return Ok(Err(AppendRefused::GrantNotLive));
+        }
+        c = tx.conn().await;
+    }
     let bumped = sqlx::query!(
         "UPDATE a2a_threads SET last_seq = last_seq + 1, last_activity_at = $2
          WHERE id = $1 AND state = 'open'
@@ -338,7 +413,7 @@ pub async fn append(
     .fetch_optional(&mut **c)
     .await?;
     let Some(b) = bumped else {
-        return Ok(None);
+        return Ok(Err(AppendRefused::NotOpen));
     };
     let m = sqlx::query_as!(
         RawMessage,
@@ -359,7 +434,7 @@ pub async fn append(
     )
     .fetch_one(&mut **c)
     .await?;
-    Ok(Some(m.try_into()?))
+    Ok(Ok(m.try_into()?))
 }
 
 /// Close a thread that is not closed yet (`None` otherwise). Sets
@@ -504,6 +579,28 @@ pub async fn close_all_for(
     threads(raw)
 }
 
+/// Every non-closed thread of the agent, either side → `peer_gone`,
+/// `closed_by` NULL (the agent was disabled: a2a B7).
+pub async fn close_for_agent(
+    tx: &Tx<'_>,
+    agent: AgentId,
+    now: OffsetDateTime,
+) -> Result<Vec<ThreadRow>, StoreError> {
+    let mut c = tx.conn().await;
+    let raw = sqlx::query_as!(
+        RawThread,
+        "UPDATE a2a_threads SET state = 'closed', closed_at = $2, close_reason = 'peer_gone',
+             closed_by = NULL, close_note = NULL, last_activity_at = $2
+         WHERE state <> 'closed' AND (initiator_agent_id = $1 OR responder_agent_id = $1)
+         RETURNING *",
+        Uuid::from(agent),
+        now
+    )
+    .fetch_all(&mut **c)
+    .await?;
+    threads(raw)
+}
+
 /// Every non-closed thread where the agent is the responder → `peer_gone`
 /// (demotion to ephemeral, lockdown, disable).
 pub async fn orphan_inbound(
@@ -613,6 +710,39 @@ pub async fn activity(
         Uuid::from(viewer.agent),
         viewer.session.map(Uuid::from),
         after,
+        limit
+    )
+    .fetch_all(&mut **c)
+    .await?;
+    threads(raw)
+}
+
+/// Events feed with an upper bound: the viewer's threads whose activity is
+/// after `after` (strict; without a cursor: its non-closed threads) and
+/// strictly before `before` (activity at or after it may still be
+/// uncommitted: a2a B3). Oldest activity first, ties by id.
+pub async fn activity_before(
+    tx: &Tx<'_>,
+    viewer: Viewer,
+    after: Option<OffsetDateTime>,
+    before: OffsetDateTime,
+    limit: i64,
+) -> Result<Vec<ThreadRow>, StoreError> {
+    let mut c = tx.conn().await;
+    let raw = sqlx::query_as!(
+        RawThread,
+        "SELECT * FROM a2a_threads
+         WHERE ((initiator_agent_id = $1 AND ($2::uuid IS NULL OR initiator_session_id = $2))
+             OR (responder_agent_id = $1 AND ($2::uuid IS NULL OR responder_session_id = $2)))
+           AND (CASE WHEN $3::timestamptz IS NULL THEN state <> 'closed'
+                     ELSE last_activity_at > $3 END)
+           AND last_activity_at < $4
+         ORDER BY last_activity_at, id
+         LIMIT $5",
+        Uuid::from(viewer.agent),
+        viewer.session.map(Uuid::from),
+        after,
+        before,
         limit
     )
     .fetch_all(&mut **c)

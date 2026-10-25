@@ -322,6 +322,7 @@ async fn disabling_a_delegator_waits_for_a_provisioning_instead_of_deadlocking(p
         },
     )
     .await
+    .unwrap()
     .unwrap();
     a2a::accept(&tx, &clear, thread, None, now())
         .await

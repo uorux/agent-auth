@@ -12,6 +12,7 @@ use agent_auth_core::policy::Policy;
 use agent_auth_store::Store;
 use time::OffsetDateTime;
 
+use crate::a2a::A2a;
 use crate::auth::AuthConfig;
 use crate::events::KeyedEvents;
 use crate::notify::Notifier;
@@ -31,6 +32,9 @@ pub struct AppState {
     pub security_log: Arc<SecurityLog>,
     /// The admin panel, the OAuth server and `/mcp` (`webui::install`).
     pub web: Arc<Web>,
+    /// a2a threads and sessions: config, wake-ups, the activity clock,
+    /// webhook delivery.
+    pub a2a: Arc<A2a>,
 }
 
 impl AppState {
@@ -56,6 +60,7 @@ impl AppState {
             auth: Arc::new(auth),
             security_log: Arc::default(),
             web: Arc::default(),
+            a2a: Arc::default(),
         }
     }
 }

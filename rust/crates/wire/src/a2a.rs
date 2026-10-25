@@ -35,7 +35,8 @@ pub struct SessionClosed {
 }
 
 /// `POST /v1/a2a/threads`. The payload's size is checked with Python's
-/// measure before the service takes it ([`Payload::sized`]).
+/// measure as it deserializes; parse with [`crate::payload::parse_body`]
+/// so out-of-range integers are refused too.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ThreadOpenBody {

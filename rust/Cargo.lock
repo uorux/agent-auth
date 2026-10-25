@@ -16,6 +16,7 @@ dependencies = [
  "base64 0.23.1",
  "clap",
  "futures",
+ "hex",
  "http-body-util",
  "proptest",
  "reqwest",
