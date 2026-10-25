@@ -818,3 +818,77 @@ async fn admin_rules_projects_and_logs(pool: sqlx::PgPool) {
     let r = call(&app, "GET", "/admin/models/usage", Some(ADMIN), None).await;
     assert_eq!(r.body, json!({"enabled": false, "agents": []}));
 }
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn per_agent_limits(pool: sqlx::PgPool) {
+    let mut st = state(pool, POLICY);
+    let mut spine = agent_auth_broker::service::Spine::default();
+    spine.limits = agent_auth_broker::limits::Limits::new(1, 2);
+    st.spine = Arc::new(spine);
+    let app = router(st);
+    let key = agent(&app, "worker", json!({})).await;
+    let other = agent(&app, "other", json!({})).await;
+    let body = request("a2a", "talk", "p", json!(60));
+    let first = call(&app, "POST", "/v1/requests", Some(&key), Some(&body)).await;
+    assert_eq!(first.status, StatusCode::OK);
+    assert_eq!(
+        call(&app, "POST", "/v1/requests", Some(&key), Some(&body))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    let r = call(&app, "POST", "/v1/requests", Some(&key), Some(&body)).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        r.body["detail"],
+        "at most 2 access requests an hour; wait before asking again"
+    );
+    assert_eq!(
+        call(&app, "POST", "/v1/requests", Some(&other), Some(&body))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    // One long-poll at a time for this agent.
+    let id = first.body["id"].as_str().unwrap().to_owned();
+    let parked = {
+        let (app, key, id) = (app.clone(), key.clone(), id.clone());
+        tokio::spawn(async move {
+            call(
+                &app,
+                "GET",
+                &format!("/v1/requests/{id}/wait?timeout=3"),
+                Some(&key),
+                None,
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let r = call(
+        &app,
+        "GET",
+        &format!("/v1/requests/{id}/wait?timeout=1"),
+        Some(&key),
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        r.body["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("at most 1 decision waits")
+    );
+    assert_eq!(parked.await.unwrap().status, StatusCode::OK);
+    // The slot is free again.
+    let r = call(
+        &app,
+        "GET",
+        &format!("/v1/requests/{id}/wait?timeout=1"),
+        Some(&key),
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+}

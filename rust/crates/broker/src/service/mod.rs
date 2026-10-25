@@ -51,7 +51,8 @@ pub use decide::{apply_rule_to_pending, decide, decide_attested, deny_pending};
 pub use llm_task::{escalate, resume, retry};
 pub use ops::SpineOps;
 pub use provision::{
-    expire_due_grants, reap_stale_provisioning, revoke_delegated_for_closed_threads, revoke_grant,
+    expire_due_grants, reap_provisioning_of, reap_stale_provisioning,
+    revoke_delegated_for_closed_threads, revoke_grant,
 };
 pub use routing::disposition;
 
@@ -200,6 +201,8 @@ pub struct Spine {
     /// Advisory risk lines on hostexec requests shown to a human.
     pub risk: Option<RiskSummarizer>,
     pub hooks: Hooks,
+    /// Per-agent limits on long-polls and new requests.
+    pub limits: crate::limits::Limits,
     /// Background LLM evaluations in flight (awaited by [`Spine::settle`]).
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -229,6 +232,21 @@ impl Spine {
             }
         }
     }
+}
+
+/// Run `fut` as a tracked task and wait for its result. If the caller is
+/// dropped (a client disconnects mid-request), the task still runs to its
+/// end, and shutdown waits for it (`Spine::settle`). `None`: it panicked.
+pub(crate) async fn detached<T: Send + 'static>(
+    st: &AppState,
+    fut: impl Future<Output = T> + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let _ = tx.send(fut.await);
+    });
+    st.spine.track(handle);
+    rx.await.ok()
 }
 
 /// Convert the store's agent enums to policy's (two crates' copies of the

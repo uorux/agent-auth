@@ -28,8 +28,10 @@ use crate::provisioners::{ProvisionError, Provisioner, not_enabled};
 use crate::service;
 use crate::state::AppState;
 
-/// The longest a decision long-poll sleeps before re-reading the row.
-const RECHECK: Duration = Duration::from_secs(2);
+/// The longest a decision long-poll sleeps before re-reading the row. Every
+/// change to a request notifies `request_events`, so this is only the
+/// fallback against a lost wake-up.
+const RECHECK: Duration = Duration::from_secs(10);
 
 fn unknown_request() -> ApiError {
     ApiError::not_found("unknown request")
@@ -69,6 +71,19 @@ async fn create(
     caller: AgentCaller,
     JsonBody(body): JsonBody<RequestCreate>,
 ) -> ApiResult<Json<RequestOut>> {
+    if !st
+        .spine
+        .limits
+        .take_request(caller.id(), std::time::Instant::now())
+    {
+        return Err(ApiError::new(
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "at most {} access requests an hour; wait before asking again",
+                st.spine.limits.requests_per_hour
+            ),
+        ));
+    }
     let row = service::create(&st, &caller, body).await?;
     Ok(Json(out(&st, &row).await?))
 }
@@ -100,6 +115,15 @@ async fn wait(
     uri: Uri,
 ) -> ApiResult<Json<RequestOut>> {
     let id = parse_request_id(&id)?;
+    let Some(_slot) = crate::limits::wait_slot(&st.spine, caller.id()) else {
+        return Err(ApiError::new(
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "at most {} decision waits at once per agent; let one finish first",
+                st.spine.limits.max_waits
+            ),
+        ));
+    };
     let params = query_params(&uri);
     let secs = match params.get("timeout") {
         None => 60.0,

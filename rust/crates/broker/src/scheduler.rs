@@ -3,7 +3,8 @@
 //! Each tick, in order, every step's failures logged and the tick going on:
 //! 1. reap PROVISIONING grants (any age on the first tick after boot, then
 //!    older than 15 minutes);
-//! 2. expire grants past their end;
+//! 2. expire grants past their end, then revoke any active grant of an
+//!    agent a containment holds;
 //! 3. LLM evaluations lost by a restart or stalled (core B-3): at boot
 //!    every LLM_EVALUATING request, later those untouched for 15 minutes;
 //! 4. the a2a sweep (when a2a is on), then revoke delegated grants of closed threads;
@@ -11,7 +12,8 @@
 //!    (their grants then expire on the next tick);
 //! 6. the hostexec and agent-VM hooks.
 //!
-//! The first tick runs at once (catch-up for what lapsed while down).
+//! The first tick ([`boot`]) runs to completion before the HTTP listener
+//! and the Discord bot start (catch-up for what lapsed while down).
 
 use std::time::Duration as StdDuration;
 
@@ -34,6 +36,8 @@ pub const LLM_STALL: Duration = Duration::minutes(15);
 pub struct TickReport {
     pub reaped: usize,
     pub expired: usize,
+    /// Active grants of held agents revoked (containment's backstop).
+    pub held_revoked: usize,
     pub llm_resumed: usize,
     pub delegated_revoked: usize,
     pub leases_ended: usize,
@@ -45,6 +49,7 @@ pub async fn tick(st: &AppState, boot: bool) -> TickReport {
         reaped: service::reap_stale_provisioning(st, if boot { Duration::ZERO } else { REAP_AGE })
             .await,
         expired: service::expire_due_grants(st).await,
+        held_revoked: crate::containment::sweep_held(st).await,
         ..TickReport::default()
     };
     report.llm_resumed = resume_llm(st, boot).await;
@@ -146,21 +151,26 @@ pub async fn after_disable(st: &AppState, names: &[String]) {
     }
 }
 
-/// Tick every [`INTERVAL`] until `stop` turns true.
+/// The first tick, run to completion before anything else starts (the
+/// HTTP listener, the Discord bot): catch-up for what lapsed while down.
+pub async fn boot(st: &AppState) {
+    let report = tick(st, true).await;
+    tracing::info!(?report, "scheduler boot tick");
+}
+
+/// After [`boot`]: tick every [`INTERVAL`] until `stop` turns true.
 pub async fn run(st: AppState, mut stop: watch::Receiver<bool>) {
-    let mut boot = true;
     loop {
-        if *stop.borrow() {
-            return;
-        }
-        let report = tick(&st, boot).await;
-        if report != TickReport::default() {
-            tracing::info!(?report, "scheduler tick");
-        }
-        boot = false;
         tokio::select! {
             _ = tokio::time::sleep(INTERVAL) => {}
             _ = stop.changed() => return,
+        }
+        if *stop.borrow() {
+            return;
+        }
+        let report = tick(&st, false).await;
+        if report != TickReport::default() {
+            tracing::info!(?report, "scheduler tick");
         }
     }
 }

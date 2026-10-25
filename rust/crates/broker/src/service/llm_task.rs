@@ -13,7 +13,7 @@ use agent_auth_store::{StoreError, lockdown};
 use serde_json::json;
 
 use super::create::announce_auto_approval;
-use super::provision::{begin_provision, finish_provision, step};
+use super::provision::{begin_provision, finish_detached, step};
 use super::routing::{Subject, clamp_duration, delegator_of, reroute};
 use super::{ServiceError, ServiceResult};
 use crate::auth::AgentCaller;
@@ -121,6 +121,11 @@ async fn evaluate(st: &AppState, id: RequestId) -> ServiceResult<()> {
     let Some(AnyRequest::LlmEvaluating(current)) = requests::get_for_update(&tx, id).await? else {
         return Ok(());
     };
+    // A retry started a newer round meanwhile: that round's evaluation
+    // decides, not this one.
+    if current.row().attempt != request.attempt {
+        return Ok(());
+    }
     let attempt = current.row().attempt;
     if let Some((v, reasoning, suggested)) = match &verdict {
         LlmVerdict::Approve {
@@ -177,9 +182,14 @@ async fn evaluate(st: &AppState, id: RequestId) -> ServiceResult<()> {
                 now,
             )
             .await?;
+            // The cap of the policy as it is now (INV-19).
+            let max_now = st.policy.cap_duration(
+                clamp_duration(current.row().requested_duration_secs),
+                Some(rerouted.decision.max_duration),
+            );
             match (rerouted.routed.map(|r| r.route), agent_now) {
                 (Some(Route::Llm(clearance)), None) => {
-                    let mut duration = max_duration.get();
+                    let mut duration = max_now.get().min(max_duration.get());
                     if let Some(s) = suggested_duration_secs.filter(|s| *s > 0) {
                         duration = duration.min(s);
                     }
@@ -253,7 +263,7 @@ async fn evaluate(st: &AppState, id: RequestId) -> ServiceResult<()> {
     tx.commit().await?;
 
     if let Some(grant) = grant {
-        finish_provision(st, grant).await;
+        finish_detached(st, grant).await;
         if let Some(row) = load(st, id).await? {
             announce_auto_approval(st, &row).await;
         }
@@ -314,8 +324,10 @@ pub async fn retry(
 ) -> ServiceResult<RequestRow> {
     let now = st.now();
     let tx = st.store.begin().await?;
-    let request = requests::get_owned(&tx, caller.id(), id)
+    // Lock order: the request row, then containment.
+    let request = requests::get_for_update(&tx, id)
         .await?
+        .filter(|r| r.row().agent_id == caller.id())
         .ok_or_else(|| ServiceError::transition("unknown request"))?;
     let AnyRequest::LlmDenied(denied) = request else {
         return Err(ServiceError::Transition(format!(
@@ -378,8 +390,10 @@ pub async fn escalate(
 ) -> ServiceResult<RequestRow> {
     let now = st.now();
     let tx = st.store.begin().await?;
-    let request = requests::get_owned(&tx, caller.id(), id)
+    // Lock order: the request row, then containment.
+    let request = requests::get_for_update(&tx, id)
         .await?
+        .filter(|r| r.row().agent_id == caller.id())
         .ok_or_else(|| ServiceError::transition("unknown request"))?;
     let AnyRequest::LlmDenied(denied) = request else {
         return Err(ServiceError::Transition(format!(

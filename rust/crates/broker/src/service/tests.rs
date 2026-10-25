@@ -835,7 +835,11 @@ async fn llm_deny_retry_then_escalate(pool: sqlx::PgPool) {
         .as_str()
         .unwrap()
         .to_owned();
-    assert!(second.contains("\n- Attempt 1: verdict=deny; reasoning: too vague"));
+    assert!(
+        second.contains(
+            "\n- Attempt 1: verdict=deny; reasoning (quoted model output): \"too vague\""
+        )
+    );
     // Ownership: another agent's retry is "unknown request" (INV-22).
     let b = agent(&st, "other").await;
     let err = escalate(&st, &caller(&b), r.id).await.unwrap_err();
@@ -1898,4 +1902,140 @@ async fn a_request_delegated_by_a_web_connector_is_a_humans(pool: sqlx::PgPool) 
         r.risk_notes
             .contains(&"for a web UI connector: always decided by a human".to_owned())
     );
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_containment_whose_handler_died_still_ends_the_grants(pool: sqlx::PgPool) {
+    // Review #2: only the recording transaction ran (the handler was
+    // dropped before acting); one scheduler tick finishes the job.
+    let st = state(pool);
+    let a = make_agent(&st, "auto-held", |n| n.project = Some("soc")).await;
+    let r1 = create(
+        &st,
+        &caller(&a),
+        body("a2a", "talk", "p1", json!({}), json!("1h")),
+    )
+    .await
+    .unwrap();
+    let r2 = create(
+        &st,
+        &caller(&a),
+        body("a2a", "talk", "p2", json!({}), json!("1h")),
+    )
+    .await
+    .unwrap();
+    let (entry, held) = crate::containment::record(
+        &st,
+        &json!({"project": ["soc"]}),
+        "odd",
+        "",
+        "jrt",
+        ContainmentSource::Operator,
+    )
+    .await
+    .unwrap();
+    assert_eq!(held.len(), 1);
+    assert!(!entry.id.is_empty());
+    // Already due: not issuable.
+    let tx = st.store.begin().await.unwrap();
+    let g1 = grant_of(&st, r1.id).await.unwrap();
+    assert!(g1.expires_at <= OffsetDateTime::now_utc());
+    drop(tx);
+    crate::scheduler::tick(&st, false).await;
+    for r in [r1.id, r2.id] {
+        assert_ne!(grant_of(&st, r).await.unwrap().status, GrantStatus::Active);
+    }
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn the_held_sweep_revokes_what_slipped_through(pool: sqlx::PgPool) {
+    let st = state(pool);
+    let a = agent(&st, "auto-x").await;
+    let r = create(
+        &st,
+        &caller(&a),
+        body("a2a", "talk", "p", json!({}), json!("1h")),
+    )
+    .await
+    .unwrap();
+    // An entry recorded without the freeze (as by another broker version).
+    let tx = st.store.begin().await.unwrap();
+    lockdown::record(
+        &tx,
+        &NewEntry {
+            id: "0000beef",
+            r#match: &json!({"name": "auto-x"}),
+            reason: "held",
+            evidence: "",
+            by: "jrt",
+            source: ContainmentSource::Operator,
+            at: OffsetDateTime::now_utc(),
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(crate::containment::sweep_held(&st).await, 1);
+    let g = grant_of(&st, r.id).await.unwrap();
+    assert_eq!(g.status, GrantStatus::Revoked);
+    assert_eq!(
+        g.revoke_reason.as_deref(),
+        Some("contained (0000beef): held (containment)")
+    );
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn host_approvals_fail_closed(pool: sqlx::PgPool) {
+    let st = state(pool);
+    let a = agent(&st, "worker").await;
+    let run = create(
+        &st,
+        &caller(&a),
+        body(
+            "hostexec",
+            "run",
+            "galaxy",
+            json!({"tier": "user", "argv": ["ls"]}),
+            json!("10m"),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(run.status, RequestStatus::AwaitingHuman);
+    // No hostexec gate registered: no approval.
+    let err = decide(&st, run.id, &jrt(), approve(None))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("no hostexec gate"), "{err}");
+    assert_eq!(
+        request(&st, run.id).await.status,
+        RequestStatus::AwaitingHuman
+    );
+    // A shell needs a TOTP code, gate or not.
+    let shell = create(
+        &st,
+        &caller(&a),
+        body(
+            "hostexec",
+            "shell",
+            "galaxy",
+            json!({"tier": "user"}),
+            json!("10m"),
+        ),
+    )
+    .await
+    .unwrap();
+    let err = decide(&st, shell.id, &jrt(), approve(None))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "a shell is approved with a TOTP code only (Approve with TOTP)"
+    );
+    // Denying needs neither.
+    let d = decide(&st, shell.id, &jrt(), HumanDecision::deny("no"))
+        .await
+        .unwrap();
+    assert_eq!(d.status, RequestStatus::Denied);
 }

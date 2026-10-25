@@ -70,6 +70,7 @@ pub fn register_provisioners(
 /// The spine's own state: the LLM reviewer and the risk summarizer.
 pub fn spine(config: &Config, policy: &Policy) -> anyhow::Result<Spine> {
     let mut spine = Spine::default();
+    spine.limits = crate::limits::Limits::new(config.max_waits_per_agent, config.requests_per_hour);
     if let Some(key) = &config.openrouter_api_key {
         spine.llm = Some(LlmReviewer::new(
             agent_auth_crypto::Secret::new(key.expose().clone()),
@@ -203,6 +204,7 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
         state.notifier = Arc::new(Notifier::Discord(d.notifier()));
     }
     let state = crate::webui::install(state, web);
+    crate::scheduler::boot(&state).await;
 
     let mut tasks = Vec::new();
     if let Some(d) = discord {

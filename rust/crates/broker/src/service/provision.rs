@@ -185,8 +185,8 @@ async fn finish_inner(st: &AppState, grant_id: GrantId) -> ServiceResult<()> {
     };
     match provisioner.provision(&tx, &grant, now).await {
         Err(e) => {
-            let why = e.to_string();
-            tracing::error!(request = %row.request_id, error = %why, "provisioning failed");
+            tracing::error!(request = %row.request_id, error = %e, "provisioning failed");
+            let why = agent_visible(&e);
             let recorded = async {
                 let _ = grants::fail_provisioning(&tx, grant, &why, None).await?;
                 fail_request(&tx, row.request_id, &why, now).await
@@ -229,6 +229,31 @@ async fn finish_inner(st: &AppState, grant_id: GrantId) -> ServiceResult<()> {
     Ok(())
 }
 
+/// A provisioner's failure as the agent may read it (it lands in the
+/// request's decision reason). Transport errors (an HTTP client's text,
+/// which can name hosts and internals) become generic text; the detail is
+/// in the broker's log. The provisioners' own refusals pass, cut to 300
+/// characters.
+fn agent_visible(e: &crate::provisioners::ProvisionError) -> String {
+    let text = e.to_string();
+    let lower = text.to_lowercase();
+    const TRANSPORT: [&str; 9] = [
+        "error sending request",
+        "error decoding",
+        "error trying to connect",
+        "connection",
+        "timed out",
+        "dns error",
+        "tcp connect",
+        "certificate",
+        "request or response body error",
+    ];
+    if TRANSPORT.iter().any(|t| lower.contains(t)) {
+        return "the platform could not be reached; try again later".to_owned();
+    }
+    text.chars().take(300).collect()
+}
+
 fn notify_request(st: &AppState, id: RequestId) {
     st.request_events.notify(&id);
 }
@@ -253,7 +278,7 @@ pub async fn reap_stale_provisioning(st: &AppState, max_age: Duration) -> usize 
     };
     let mut reaped = 0usize;
     for id in stale {
-        match reap_one(st, id, now).await {
+        match reap_one(st, id, now, &ReapWhy::interrupted()).await {
             Ok(Some(request)) => {
                 reaped = reaped.saturating_add(1);
                 tracing::warn!(grant = %id, "reaped interrupted provisioning");
@@ -268,10 +293,26 @@ pub async fn reap_stale_provisioning(st: &AppState, max_age: Duration) -> usize 
     reaped
 }
 
+/// Why a reaped grant failed: the grant's revoke reason and the request's.
+struct ReapWhy {
+    grant: &'static str,
+    request: String,
+}
+
+impl ReapWhy {
+    fn interrupted() -> ReapWhy {
+        ReapWhy {
+            grant: "provisioning interrupted; external state reverted",
+            request: "interrupted (broker restarted mid-provision)".to_owned(),
+        }
+    }
+}
+
 async fn reap_one(
     st: &AppState,
     id: GrantId,
     now: OffsetDateTime,
+    why: &ReapWhy,
 ) -> ServiceResult<Option<RequestId>> {
     let tx = st.store.begin().await?;
     let Some(grant) = grants::load_provisioning(&tx, id).await? else {
@@ -284,26 +325,69 @@ async fn reap_one(
         .get(platform)
         .ok_or(ServiceError::NotEnabled(platform))?;
     provisioner.revoke(&tx, grant.grant(), now).await?;
-    if grants::fail_provisioning(
-        &tx,
-        grant,
-        "provisioning interrupted; external state reverted",
-        Some(now),
-    )
-    .await?
-    .is_err()
+    if grants::fail_provisioning(&tx, grant, why.grant, Some(now))
+        .await?
+        .is_err()
     {
         return Ok(None);
     }
-    fail_request(
-        &tx,
-        request_id,
-        "interrupted (broker restarted mid-provision)",
-        now,
-    )
-    .await?;
+    fail_request(&tx, request_id, &why.request, now).await?;
     tx.commit().await?;
     Ok(Some(request_id))
+}
+
+/// Containment: PROVISIONING grants of these agents are reverted and failed
+/// now (a finish phase that has not run yet would refuse them anyway; one
+/// that died left external state behind).
+pub async fn reap_provisioning_of(st: &AppState, agents: &[agent_auth_core::AgentId]) {
+    let now = st.now();
+    let ids = async {
+        let tx = st.store.begin().await?;
+        let mut out = Vec::new();
+        for id in grants::stale_provisioning(&tx, now).await? {
+            if let Some(g) = grants::get(&tx, id).await?
+                && agents.contains(&g.agent_id)
+            {
+                out.push(id);
+            }
+        }
+        Ok::<_, StoreError>(out)
+    }
+    .await;
+    let ids = match ids {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::error!(error = %e, "listing a held agent's provisioning grants failed");
+            return;
+        }
+    };
+    let why = ReapWhy {
+        grant: "contained while provisioning; external state reverted",
+        request: "contained while provisioning".to_owned(),
+    };
+    for id in ids {
+        match reap_one(st, id, now, &why).await {
+            Ok(Some(request)) => notify_request(st, request),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(grant = %id, error = %e, "reaping a held agent's grant failed; the reaper retries")
+            }
+        }
+    }
+}
+
+/// Phase two in its own tracked task, awaited: a caller that goes away (a
+/// dropped connection) does not leave the provision half done.
+pub(crate) async fn finish_detached(st: &AppState, grant_id: GrantId) {
+    let task_state = st.clone();
+    let done = super::detached(
+        st,
+        async move { finish_provision(&task_state, grant_id).await },
+    )
+    .await;
+    if done.is_none() {
+        tracing::error!(grant = %grant_id, "the provisioning task failed; the reaper reverts it");
+    }
 }
 
 async fn request_row(st: &AppState, id: RequestId) -> Result<Option<RequestRow>, StoreError> {
