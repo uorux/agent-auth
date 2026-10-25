@@ -9,7 +9,7 @@
 //! the rule allows too. (The string and set handling around it is checked
 //! exhaustively by the unit tests, `covers_is_monotone_exhaustively`.)
 
-use crate::mail::{Covering, MailAction, covers_by};
+use crate::mail::{Covering, MailAction, covers_by, unconstrained_by};
 
 fn any_action() -> MailAction {
     match kani::any::<u8>() % 4 {
@@ -116,4 +116,29 @@ fn mail_create_is_its_own_privilege() {
         }
     }
     assert!(covers(&rule, &rule));
+}
+
+/// The "unconstrained sending" gate (`MailAuthority::sends_unconstrained`,
+/// which makes an authority sensitive): an authority that sends with no
+/// topic is let through only when it names correspondents and every one
+/// of them pins a domain; reading, or a topic, is never stopped by it.
+#[kani::proof]
+#[kani::unwind(6)]
+fn mail_unconstrained_gate() {
+    let (sends, topic): (bool, bool) = (kani::any(), kani::any());
+    let pins: [bool; 4] = kani::any();
+    let n: usize = kani::any();
+    kani::assume(n <= pins.len());
+    let named = pins.get(..n).unwrap_or_default();
+    let gated = unconstrained_by(sends, topic, named.iter().copied());
+    if sends && !topic && !gated {
+        assert!(n > 0);
+        assert!(named.iter().all(|p| *p));
+    }
+    if !sends || topic {
+        assert!(!gated);
+    }
+    if n == 0 || named.iter().any(|p| !*p) {
+        assert!(gated == (sends && !topic));
+    }
 }

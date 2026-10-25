@@ -430,11 +430,9 @@ fn declaration(html: &str, i: usize, emit: &mut impl FnMut(Token)) -> usize {
             return i.saturating_add(6);
         }
         let start = i.saturating_add(4);
-        let (text_end, end) = match (body.find("-->"), body.find("--!>")) {
-            (Some(a), Some(b)) if b < a => (b, b.saturating_add(4)),
-            (Some(a), _) => (a, a.saturating_add(3)),
-            (None, Some(b)) => (b, b.saturating_add(4)),
-            (None, None) => (body.len(), body.len()),
+        let (text_end, end) = match comment_close(body) {
+            Some((at, len)) => (at, at.saturating_add(len)),
+            None => (body.len(), body.len()),
         };
         if let Some(t) = body.get(..text_end) {
             emit(Token::Comment(t.to_owned()));
@@ -455,6 +453,31 @@ fn declaration(html: &str, i: usize, emit: &mut impl FnMut(Token)) -> usize {
         emit(Token::Comment(t.to_owned()));
     }
     close
+}
+
+/// Where a comment's body ends: the first `-->` or `--!>`, and the length
+/// of that close. One forward scan that stops at the close: searching the
+/// rest of the document for each close separately on every `<!--` (as
+/// this did) made a message of repeated comments quadratic, minutes of
+/// CPU for a few megabytes.
+fn comment_close(body: &str) -> Option<(usize, usize)> {
+    let bytes = body.as_bytes();
+    let mut from = 0usize;
+    while let Some(off) = bytes
+        .get(from..)
+        .and_then(|r| r.windows(2).position(|w| w == b"--"))
+    {
+        let at = from.saturating_add(off);
+        let after = bytes.get(at.saturating_add(2)..).unwrap_or_default();
+        if after.starts_with(b">") {
+            return Some((at, 3));
+        }
+        if after.starts_with(b"!>") {
+            return Some((at, 4));
+        }
+        from = at.saturating_add(1);
+    }
+    None
 }
 
 /// A start tag from its name's first letter: the token, and where the

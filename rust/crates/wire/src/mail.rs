@@ -127,8 +127,9 @@ pub struct MailMessage {
     pub truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hidden_text_removed: Option<bool>,
-    /// Mailbox grants only (DMARC/DKIM for the From's own domain; null:
-    /// the provider said nothing).
+    /// Is `from` verified: a SimpleLogin forward's original sender when
+    /// SimpleLogin signed it, else DMARC/DKIM for the From's own domain
+    /// (null: the provider said nothing). Alias and mailbox grants.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

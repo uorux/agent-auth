@@ -67,6 +67,8 @@ use crate::notify::{Notifier, Notify};
 pub const LIST_MAX: usize = 50;
 /// Messages fetched and judged at once.
 const CONCURRENCY: usize = 4;
+/// Messages parsed at once (on the blocking pool), for the whole gateway.
+const PARSERS: usize = 2;
 pub const MAX_SEND_BODY: usize = agent_auth_wire::mail::MAX_SEND_BODY;
 pub const MAX_RECIPIENTS: usize = 10;
 
@@ -189,6 +191,8 @@ pub struct Mail {
     judge: Option<MailJudge>,
     notifier: OnceLock<Arc<Notifier>>,
     locks: std::sync::Mutex<HashMap<GrantId, Weak<tokio::sync::Mutex<()>>>>,
+    /// Permits to parse (`off_runtime`).
+    parsing: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for Mail {
@@ -201,9 +205,11 @@ impl std::fmt::Debug for Mail {
     }
 }
 
-/// Whom a message is from. SimpleLogin's original-sender header counts
-/// only on an alias, where the From is SimpleLogin's reverse alias; in a
-/// mailbox anyone can write that header, so the From is what counts.
+/// Whom a message claims to be from, taking its claims at their word (for
+/// [`Mail::belongs`]; [`Mail::fit`] then checks them). SimpleLogin's
+/// original-sender header counts only on an alias, where the From is
+/// SimpleLogin's reverse alias; in a mailbox anyone can write that header,
+/// so the From is what counts. What is *shown* is [`Mail::shown_sender`].
 fn sender(target: &Target, m: &ParsedMessage) -> String {
     match target.mode {
         Mode::Alias => m.sender().to_owned(),
@@ -283,6 +289,30 @@ pub(crate) async fn created_for_another(
         .await?
         .filter(|creator| *creator != agent)
         .map(|_| format!("{resource} was created for another agent: always a human")))
+}
+
+/// Run `work` (parsing an outsider's message: MIME, HTML, the hint scan;
+/// CPU time proportional to its size, up to 25 MiB) on the blocking pool,
+/// at most `permits` at once, never on the async workers that serve
+/// approvals, Discord and a2a. The permit goes with the work, so a caller
+/// that gives up does not free a slot while the work still runs.
+async fn off_runtime<T: Send + 'static>(
+    permits: &Arc<tokio::sync::Semaphore>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, MailError> {
+    let permit = Arc::clone(permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| MailError::new(500, "internal error"))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "mail: parsing a message failed");
+        MailError::new(500, "internal error")
+    })
 }
 
 /// Backend pages a search reads at most to fill one page.
@@ -390,7 +420,16 @@ impl Mail {
             judge,
             notifier: OnceLock::new(),
             locks: std::sync::Mutex::new(HashMap::new()),
+            parsing: Arc::new(tokio::sync::Semaphore::new(PARSERS)),
         }
+    }
+
+    /// [`off_runtime`] with the gateway's permits.
+    async fn off_runtime<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, MailError> {
+        off_runtime(&self.parsing, work).await
     }
 
     /// Where held items are announced (set once, after the notifier exists).
@@ -641,10 +680,7 @@ impl Mail {
         if !Self::belongs(target, c, m) {
             return Fit::No;
         }
-        let mailbox = self.config().mailboxes.get(&target.mailbox);
-        let authserv = mailbox
-            .and_then(MailboxConfig::authserv)
-            .unwrap_or_default();
+        let authserv = self.authserv(target).unwrap_or_default();
         let from_ok =
             |addr: &str| domain_of(addr).is_some_and(|d| m.verified(&authserv, &d) == Some(true));
         let verified = match target.mode {
@@ -654,16 +690,7 @@ impl Mail {
                 let uses_sl = !m.sl_envelope_to.is_empty()
                     || (m.sl_original_from.is_some() && !c.layers.is_empty());
                 if uses_sl {
-                    let mut signers: Vec<String> = self
-                        .config()
-                        .simplelogin
-                        .as_ref()
-                        .map(|sl| sl.dkim_domains.clone())
-                        .unwrap_or_default();
-                    signers.extend(domain_of(&target.address));
-                    m.auth
-                        .as_ref()
-                        .is_some_and(|a| a.by(&authserv) && a.dkim_pass_by(&signers))
+                    self.sl_signed(target, m)
                 } else {
                     c.layers.is_empty() || from_ok(&m.from_addr)
                 }
@@ -672,11 +699,53 @@ impl Mail {
         if verified { Fit::Yes } else { Fit::Unverified }
     }
 
-    fn summary(m: &ParsedMessage, target: &Target) -> Map<String, Value> {
-        let from = sender(target, m);
+    /// The mailbox provider's authserv-id (None: nothing is verified).
+    fn authserv(&self, target: &Target) -> Option<String> {
+        self.config()
+            .mailboxes
+            .get(&target.mailbox)
+            .and_then(MailboxConfig::authserv)
+    }
+
+    /// Did the mailbox's provider see the message signed (DKIM) by
+    /// SimpleLogin (`simplelogin.dkim_domains`) or the alias's own domain?
+    /// Only then are SimpleLogin's headers SimpleLogin's (review #4).
+    fn sl_signed(&self, target: &Target, m: &ParsedMessage) -> bool {
+        let Some(authserv) = self.authserv(target) else {
+            return false;
+        };
+        let mut signers: Vec<String> = self
+            .config()
+            .simplelogin
+            .as_ref()
+            .map(|sl| sl.dkim_domains.clone())
+            .unwrap_or_default();
+        signers.extend(domain_of(&target.address));
+        m.auth
+            .as_ref()
+            .is_some_and(|a| a.by(&authserv) && a.dkim_pass_by(&signers))
+    }
+
+    /// Whom the agent and the judge are told a message is from: on an
+    /// alias, SimpleLogin's original sender only when SimpleLogin signed
+    /// the message; the From otherwise. (An alias grant without
+    /// correspondents delivers an unsigned message: anyone who mails the
+    /// mailbox directly can write `X-SimpleLogin-Original-From`, so it is
+    /// not shown as the sender.)
+    fn shown_sender(&self, target: &Target, m: &ParsedMessage) -> String {
+        match target.mode {
+            Mode::Alias if m.sl_original_from.is_some() && self.sl_signed(target, m) => {
+                m.sender().to_owned()
+            }
+            Mode::Alias | Mode::Mailbox => m.from_addr.clone(),
+        }
+    }
+
+    fn summary(&self, m: &ParsedMessage, target: &Target) -> Map<String, Value> {
+        let from = self.shown_sender(target, m);
         let from_name = match target.mode {
             Mode::Mailbox => m.from_name.clone(),
-            Mode::Alias => sl_name(&m.from_name, m.sender()),
+            Mode::Alias => sl_name(&m.from_name, &from),
         };
         // msg-id tokens only: the headers are an outsider's.
         let mut refs: Vec<String> = m.references.iter().chain(&m.in_reply_to).cloned().collect();
@@ -728,13 +797,13 @@ impl Mail {
             }
             Some(judge) => {
                 let message = json!({
-                    "from": sender(target, m),
+                    "from": self.shown_sender(target, m),
                     "from_name": m.from_name,
                     "to": m.to,
                     "cc": m.cc,
                     "date": m.date.map(timestamp),
                     "subject": m.subject,
-                    "sender_verified": if target.mode == Mode::Mailbox { json!(self.sender_verified(target, m)) } else { Value::Null },
+                    "sender_verified": self.sender_verified(target, m),
                     "attachments": m.attachments.iter().map(|a| a.filename.clone()).collect::<Vec<_>>(),
                     "hidden_text_removed": !m.hidden_text.is_empty(),
                     // Exactly what the agent can read: nothing past what was judged.
@@ -1008,12 +1077,16 @@ impl Mail {
                         return (f, None::<(ParsedMessage, Option<String>, Screen)>);
                     }
                 };
-                let m = msg::parse(&fetched.raw);
+                let sent = fetched.sent;
+                let m = match self.off_runtime(move || msg::parse(&fetched.raw)).await {
+                    Ok(m) => m,
+                    Err(_) => return (f, None),
+                };
                 let thread = f
                     .thread
                     .clone()
                     .or_else(|| m.thread_root().map(|t| chars(t, 512)));
-                let outcome = match self.fit(target, c, &m, fetched.sent) {
+                let outcome = match self.fit(target, c, &m, sent) {
                     Fit::No => (
                         "ignored".to_owned(),
                         None,
@@ -1056,7 +1129,7 @@ impl Mail {
                     s.insert("date".into(), json!(m.date.map(timestamp)));
                     s
                 }
-                _ => Self::summary(m, target),
+                _ => self.summary(m, target),
             };
             summary.insert("fp".into(), json!(fp));
             // What the operator must see in full before releasing it: what
@@ -1169,8 +1242,9 @@ impl Mail {
         now: OffsetDateTime,
     ) -> Result<MailMessage, MailError> {
         let (ctx, row, fetched) = self.fetch_own(grant, item, now).await?;
-        let m = msg::parse(&fetched.raw);
-        if self.fit(&ctx.target, &ctx.constraints, &m, fetched.sent) == Fit::No {
+        let sent = fetched.sent;
+        let m = self.off_runtime(move || msg::parse(&fetched.raw)).await?;
+        if self.fit(&ctx.target, &ctx.constraints, &m, sent) == Fit::No {
             // The grant's constraints changed (policy).
             return Err(MailError::new(404, "unknown message"));
         }
@@ -1202,8 +1276,7 @@ impl Mail {
             text: chars(&m.text, limit),
             truncated: m.text.chars().count() > limit,
             hidden_text_removed: (!m.hidden_text.is_empty()).then_some(true),
-            sender_verified: (ctx.target.mode == Mode::Mailbox)
-                .then(|| self.sender_verified(&ctx.target, &m)),
+            sender_verified: Some(self.sender_verified(&ctx.target, &m)),
         })
     }
 
@@ -1216,18 +1289,14 @@ impl Mail {
         now: OffsetDateTime,
     ) -> Result<MailAttachment, MailError> {
         let (ctx, _, fetched) = self.fetch_own(grant, item, now).await?;
-        let raw = fetched.raw;
-        if self.fit(
-            &ctx.target,
-            &ctx.constraints,
-            &msg::parse(&raw),
-            fetched.sent,
-        ) == Fit::No
-        {
+        let (raw, sent) = (fetched.raw, fetched.sent);
+        let (m, found) = self
+            .off_runtime(move || (msg::parse(&raw), msg::attachment_bytes(&raw, index)))
+            .await?;
+        if self.fit(&ctx.target, &ctx.constraints, &m, sent) == Fit::No {
             return Err(MailError::new(404, "unknown message"));
         }
-        let (meta, payload) = msg::attachment_bytes(&raw, index)
-            .ok_or_else(|| MailError::new(404, "no such attachment"))?;
+        let (meta, payload) = found.ok_or_else(|| MailError::new(404, "no such attachment"))?;
         let max = self.config().max_attachment_bytes;
         if u64::try_from(payload.len()).unwrap_or(u64::MAX) > u64::from(max) {
             return Err(MailError::new(
@@ -1689,13 +1758,16 @@ impl Mail {
         Ok(())
     }
 
-    /// Did the mailbox's provider verify the From's domain?
+    /// Is the shown sender ([`Mail::shown_sender`]) verified? On an
+    /// alias, SimpleLogin's original sender is, when SimpleLogin signed the
+    /// message; otherwise (and in a mailbox) the From is, when the
+    /// mailbox's provider saw DMARC or DKIM pass for its domain. None: the
+    /// provider said nothing (or no authserv-id is configured).
     fn sender_verified(&self, target: &Target, m: &ParsedMessage) -> Option<bool> {
-        let authserv = self
-            .config()
-            .mailboxes
-            .get(&target.mailbox)
-            .and_then(MailboxConfig::authserv)?;
+        if target.mode == Mode::Alias && m.sl_original_from.is_some() && self.sl_signed(target, m) {
+            return Some(true);
+        }
+        let authserv = self.authserv(target)?;
         m.verified(&authserv, &domain_of(&m.from_addr)?)
     }
 
@@ -1853,6 +1925,30 @@ impl MailOps for Mail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Slow parsing does not stall the runtime: on a single worker thread,
+    /// a timer still fires on time while two parses (more than the
+    /// permits) take half a second each; the second waits for a permit.
+    #[tokio::test(flavor = "current_thread")]
+    async fn parsing_runs_off_the_runtime() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let slow = || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            7
+        };
+        let started = std::time::Instant::now();
+        let (a, b, ticked) = tokio::join!(
+            off_runtime(&permits, slow),
+            off_runtime(&permits, slow),
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                started.elapsed()
+            }
+        );
+        assert_eq!((a, b), (Ok(7), Ok(7)));
+        assert!(ticked < std::time::Duration::from_millis(400), "{ticked:?}");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(1000));
+    }
 
     #[test]
     fn names_and_fingerprints() {
