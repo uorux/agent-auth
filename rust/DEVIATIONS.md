@@ -906,3 +906,5 @@ and why. Keep entries short. Group by area.
   out for a suspect minted agent is disable, then re-mint.
 - Store lock-order doc vs. the finish phase (grant before request row):
   verify in the next review that no path locks request then grant.
+- At shutdown, end long-polls early with their current state instead of
+  cutting them off after the 10 s drain ("could not reach the broker").
