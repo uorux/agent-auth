@@ -340,6 +340,7 @@ async fn run(common: Common) -> ExitCode {
             pkcheck: config.pkcheck.clone(),
             job_path: config.job_path.clone(),
             user: config.user.clone(),
+            env_dir: config.runtime_dir.join("env"),
         });
         agent_auth_hostd::run(config, exec).await
     };

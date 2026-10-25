@@ -65,6 +65,8 @@ use crate::provisioners::{Refused, Validated};
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 /// A kill or a shell close.
 pub const SHORT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// `job.kill` again this often until the host answers.
+pub const KILL_RETRY: Duration = Duration::from_secs(2);
 /// A sandbox gets this long to lock itself before its host freezes the VM.
 pub const SANDBOX_LOCKDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Output arrives in chunks; a job's buffer is dropped past this.
@@ -537,19 +539,19 @@ impl HostExec {
     }
 
     /// Kill a job that may still run (best effort).
-    pub async fn kill(&self, job: &JobRow) {
+    pub async fn kill(&self, job: &JobRow) -> Result<(), crate::daemons::CallError> {
         use agent_auth_store::hostexec::JobStatus as S;
-        if matches!(job.status, S::Starting | S::Running)
-            && let Err(e) = self
-                .call(
-                    &job.host,
-                    json!({"type": "job.kill", "job_id": job.id.to_string()}),
-                    SHORT_CALL_TIMEOUT,
-                )
-                .await
-        {
-            tracing::info!(job = %job.id, host = %job.host, "could not kill: {e}");
+        if !matches!(job.status, S::Starting | S::Running) {
+            return Ok(());
         }
+        self.call(
+            &job.host,
+            json!({"type": "job.kill", "job_id": job.id.to_string()}),
+            SHORT_CALL_TIMEOUT,
+        )
+        .await
+        .map(|_| ())
+        .inspect_err(|e| tracing::info!(job = %job.id, host = %job.host, "could not kill: {e}"))
     }
 
     // ----------------------------------------------------------- arming

@@ -146,6 +146,18 @@ impl Broker {
         self.part.hostexec.clone().unwrap()
     }
 
+    /// The recording notifier.
+    pub fn recorder(&self) -> &Recorder {
+        match self.st.notifier.as_ref() {
+            Notifier::Recording(r) => r,
+            Notifier::Fanout(f) => match &f.primary {
+                crate::desktop::Primary::Recording(r) => r,
+                _ => panic!("not recording"),
+            },
+            _ => panic!("not recording"),
+        }
+    }
+
     pub fn recorded(&self) -> Vec<String> {
         match self.st.notifier.as_ref() {
             Notifier::Recording(r) => r.lines(),

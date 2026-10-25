@@ -23,7 +23,7 @@ use agent_auth_store::{StoreError, Tx};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
-use super::{CALL_TIMEOUT, HostExec, SHORT_CALL_TIMEOUT, job_out, tail};
+use super::{CALL_TIMEOUT, HostExec, KILL_RETRY, SHORT_CALL_TIMEOUT, job_out, tail};
 use crate::provisioners::{
     Credential, ProvisionError, Provisioner, Refused, RequestSpec, Validated,
 };
@@ -118,21 +118,10 @@ impl HostExec {
                 // stored if it comes; else it becomes `lost`), the host is
                 // told to stop it, and provisioning fails.
                 tracing::warn!(job = %job_id, host = %host, "no answer to job.start; killing it to be safe");
-                let me_host = host.clone();
-                let hub = self.hub.clone();
-                tokio::spawn(async move {
-                    let mut kill = serde_json::Map::new();
-                    kill.insert("type".into(), json!("job.kill"));
-                    kill.insert("job_id".into(), json!(job_id.to_string()));
-                    let _ = hub
-                        .call(
-                            agent_auth_crypto::daemon::Role::Host,
-                            &me_host,
-                            kill,
-                            SHORT_CALL_TIMEOUT,
-                        )
-                        .await;
-                });
+                if let Some(me) = self.self_arc() {
+                    let me_host = host.clone();
+                    tokio::spawn(async move { me.kill_until_acked(&me_host, job_id).await });
+                }
                 Err(failed(
                     &host,
                     format!("{e}; the host was told to stop the job in case it started"),
@@ -155,25 +144,65 @@ impl HostExec {
         }
     }
 
+    /// `job.kill` until hostd answers (it then has stopped the job, or
+    /// never had it), or the job's row says it ended; every
+    /// [`KILL_RETRY`] for up to a day.
+    pub(crate) async fn kill_until_acked(&self, host: &str, job: JobId) {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(86_400))
+            .unwrap_or_else(tokio::time::Instant::now);
+        while tokio::time::Instant::now() < deadline {
+            let acked = self
+                .call(
+                    host,
+                    json!({"type": "job.kill", "job_id": job.to_string()}),
+                    SHORT_CALL_TIMEOUT,
+                )
+                .await
+                .is_ok();
+            if acked {
+                return;
+            }
+            let ended = async {
+                let tx = self.store.begin().await?;
+                let j = store::get(&tx, job).await?;
+                tx.commit().await?;
+                Ok::<_, StoreError>(j)
+            }
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|j| !matches!(j.status, JobStatus::Starting | JobStatus::Running));
+            if ended {
+                return;
+            }
+            tokio::time::sleep(KILL_RETRY).await;
+        }
+    }
+
     /// Ending the grant ends what it started: a running job is killed, a
-    /// shell is closed. Never blocks long on an unreachable host: it ends
-    /// the shell at its own expiry, and is told again when it reconnects.
+    /// shell is closed. Unless the host says it did, this fails, so the
+    /// grant stays ACTIVE (and is expired now) and the revoke is retried on
+    /// every expiry pass until the host answers (security review 2026-10).
     pub async fn stop(&self, grant: &GrantRow) -> Result<(), ProvisionError> {
         if matches!(
             grant.authority,
             Authority::Hostexec(HostexecAuthority::Shell { .. })
         ) {
-            if let Err(e) = self
+            return self
                 .call(
                     &grant.resource,
                     json!({"type": "shell.close", "shell_id": grant.request_id.to_string()}),
                     SHORT_CALL_TIMEOUT,
                 )
                 .await
-            {
-                tracing::info!(shell = %grant.request_id, host = %grant.resource, "shell not closed yet: {e}");
-            }
-            return Ok(());
+                .map(|_| ())
+                .map_err(|e| {
+                    ProvisionError::failed(format!(
+                        "{}: the shell was not closed: {e}",
+                        grant.resource
+                    ))
+                });
         }
         let job = async {
             let tx = self.store.begin().await?;
@@ -183,10 +212,12 @@ impl HostExec {
         }
         .await
         .map_err(|e| ProvisionError::failed(e.to_string()))?;
-        if let Some(job) = job {
-            self.kill(&job).await;
+        match job {
+            Some(job) => self.kill(&job).await.map_err(|e| {
+                ProvisionError::failed(format!("{}: the job was not killed: {e}", job.host))
+            }),
+            None => Ok(()),
         }
-        Ok(())
     }
 }
 

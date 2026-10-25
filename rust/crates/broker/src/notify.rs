@@ -144,6 +144,8 @@ pub struct Recorder {
     pub calls: std::sync::Mutex<Vec<String>>,
     /// What `shell_command` answers.
     pub refuse_shell: bool,
+    /// How long `shell_command` takes (a slow Discord post), in ms.
+    pub shell_delay_ms: std::sync::atomic::AtomicU64,
 }
 
 impl Recorder {
@@ -186,6 +188,12 @@ impl Notify for Recorder {
     }
     async fn shell_command(&self, _request: &RequestRow, job: &JobRow) -> bool {
         self.record(format!("shell_command {}", job.id));
+        let delay = self
+            .shell_delay_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
         !self.refuse_shell
     }
     async fn watch_alert(&self, _request: &RequestRow, job: &JobRow, _text: &str) {

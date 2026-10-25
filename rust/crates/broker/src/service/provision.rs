@@ -478,7 +478,10 @@ async fn revoke_external(
 }
 
 /// End an ACTIVE grant through its provisioner (spec §4.9). The
-/// provisioner's error leaves the grant active and is returned.
+/// provisioner's error leaves the grant active, but expired now: nothing
+/// more is issued for it, and the expiry pass retries the revoke until the
+/// provisioner manages (a host that was unreachable stops the job or shell
+/// when it is back; security review 2026-10). The error is returned.
 pub async fn revoke_grant(
     st: &AppState,
     grant_id: GrantId,
@@ -491,7 +494,22 @@ pub async fn revoke_grant(
         Some(g) if g.status == GrantStatus::Active => g,
         _ => return Err(ServiceError::transition("grant is not active")),
     };
-    let external = revoke_external(st, &tx, &grant, now).await?;
+    let external = match revoke_external(st, &tx, &grant, now).await {
+        Ok(x) => x,
+        Err(e) => {
+            drop(tx);
+            let expired = async {
+                let tx = st.store.begin().await?;
+                grants::expire_now(&tx, grant_id, now).await?;
+                tx.commit().await
+            }
+            .await;
+            if let Err(store) = expired {
+                tracing::error!(grant = %grant_id, error = %store, "a grant whose revoke failed was not expired");
+            }
+            return Err(e);
+        }
+    };
     let reason = if !external {
         RETIRED.to_owned()
     } else if revoked_by.is_empty() {

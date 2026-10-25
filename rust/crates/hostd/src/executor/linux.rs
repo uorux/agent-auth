@@ -6,7 +6,14 @@
 //! systemd-run [-p User=<user>] --unit=aa-job-<id> --collect --quiet --pipe --wait
 //!   -p RuntimeMaxSec=<timeout> -p KillMode=control-group
 //!   -p "Description=agent-auth job <id>" --working-directory=<dir>
-//!   --setenv=PATH=<path> --setenv=K=V ... -- argv...
+//!   -p EnvironmentFile=<runtime_dir>/env/aa-job-<id>.env -- argv...
+//! ```
+//!
+//! The job's environment (PATH included) is in a root-only file written
+//! before and removed after, never on the `systemd-run` command line, where
+//! `/proc/<pid>/cmdline` shows it to every user (security review 2026-10).
+//!
+//! ```text
 //! ```
 //!
 //! The job units are named after the job, so after a crash hostd finds
@@ -47,6 +54,8 @@ pub struct LinuxConfig {
     pub job_path: String,
     /// The account the user tier runs as.
     pub user: Option<String>,
+    /// Where the jobs' environment files go (`{runtime_dir}/env`, 0700).
+    pub env_dir: std::path::PathBuf,
 }
 
 /// The parts of a job the command line is built from.
@@ -81,6 +90,9 @@ pub struct SystemdCommand {
     pub program: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// The job's environment file and what goes in it.
+    pub env_file: std::path::PathBuf,
+    pub env_text: String,
 }
 
 impl LinuxConfig {
@@ -142,11 +154,16 @@ impl LinuxConfig {
             "-p".into(),
             format!("Description=agent-auth job {}", job.id),
             format!("--working-directory={cwd}"),
-            format!("--setenv=PATH={path}"),
         ]);
+        env.insert("PATH".into(), path.clone());
+        let mut env_text = String::new();
         for (k, v) in &env {
-            args.push(format!("--setenv={k}={v}"));
+            env_text.push_str(&env_line(k, v)?);
+            env_text.push('\n');
         }
+        let env_file = self.env_dir.join(format!("{unit}.env"));
+        args.push("-p".into());
+        args.push(format!("EnvironmentFile={}", env_file.display()));
         args.push("--".into());
         // The service manager expands `$VAR`/`${VAR}` in a transient unit's
         // command as in ExecStart=, so what ran would differ from the argv
@@ -157,7 +174,57 @@ impl LinuxConfig {
             program: self.systemd_run.clone(),
             args,
             env: vec![("PATH".into(), path), ("LANG".into(), "C.UTF-8".into())],
+            env_file,
+            env_text,
         })
+    }
+}
+
+/// An environment file's line: `KEY="value"` with systemd's double-quote
+/// escapes for `\`, `"`, `` ` `` and `$`. A line break or NUL is refused.
+pub fn env_line(key: &str, value: &str) -> Result<String, String> {
+    let key_ok = !key.is_empty()
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !key.starts_with(|c: char| c.is_ascii_digit());
+    if !key_ok {
+        return Err(format!("invalid environment variable name {key:?}"));
+    }
+    if value.contains(['\n', '\r', '\0']) {
+        return Err(format!("environment value for {key} contains a line break"));
+    }
+    let mut out = String::with_capacity(value.len().saturating_add(key.len()).saturating_add(4));
+    out.push_str(key);
+    out.push_str("=\"");
+    for c in value.chars() {
+        if matches!(c, '\\' | '"' | '`' | '$') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    Ok(out)
+}
+
+/// Write a job's environment file (its directory 0700, the file 0600).
+fn write_env_file(c: &SystemdCommand) -> Result<(), String> {
+    let dir = c
+        .env_file
+        .parent()
+        .ok_or_else(|| "no directory for the environment file".to_owned())?;
+    crate::fsutil::private_dir(dir, 0o700)
+        .and_then(|()| {
+            std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        })
+        .and_then(|()| crate::fsutil::write_atomic(&c.env_file, c.env_text.as_bytes(), 0o600))
+        .map_err(|e| format!("the job's environment file: {e}"))
+}
+
+/// Removes a file when dropped.
+struct RemoveOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -262,6 +329,9 @@ impl Executor for SystemdExecutor {
         };
         let parts = JobParts::of(job);
         let c = self.cfg.command(&parts, user.as_ref())?;
+        write_env_file(&c)?;
+        // Gone again however the run ends.
+        let _remove = RemoveOnDrop(c.env_file.clone());
         let mut cmd = std::process::Command::new(&c.program);
         cmd.args(&c.args)
             .env_clear()
@@ -388,6 +458,7 @@ mod tests {
             pkcheck: "pkcheck".into(),
             job_path: "/run/wrappers/bin:/run/current-system/sw/bin".into(),
             user: Some("jrt".into()),
+            env_dir: "/run/agent-auth-hostd/env".into(),
         }
     }
 
@@ -429,12 +500,18 @@ mod tests {
         assert!(a.contains(&"--working-directory=/home/jrt"));
         assert!(a.contains(&"RuntimeMaxSec=60"));
         assert!(a.contains(&"KillMode=control-group"));
+        // The environment is in the file, not on the command line.
+        assert!(!a.iter().any(|x| x.starts_with("--setenv")));
         assert!(a.contains(
-            &"--setenv=PATH=/run/wrappers/bin:/run/current-system/sw/bin:/etc/profiles/per-user/jrt/bin"
+            &"EnvironmentFile=/run/agent-auth-hostd/env/aa-job-01234567-89ab-cdef-0123-456789abcdef.env"
         ));
-        assert!(a.contains(&"--setenv=XDG_RUNTIME_DIR=/run/user/1000"));
-        assert!(a.contains(&"--setenv=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus"));
-        assert!(a.contains(&"--setenv=LANG=C"));
+        let lines: Vec<&str> = c.env_text.lines().collect();
+        assert!(lines.contains(
+            &"PATH=\"/run/wrappers/bin:/run/current-system/sw/bin:/etc/profiles/per-user/jrt/bin\""
+        ));
+        assert!(lines.contains(&"XDG_RUNTIME_DIR=\"/run/user/1000\""));
+        assert!(lines.contains(&"DBUS_SESSION_BUS_ADDRESS=\"unix:path=/run/user/1000/bus\""));
+        assert!(lines.contains(&"LANG=\"C\""));
         let dash = a.iter().position(|x| *x == "--").unwrap();
         assert_eq!(&a[dash + 1..], ["systemctl", "--user", "status", "a b"]);
         assert_eq!(
@@ -462,10 +539,32 @@ mod tests {
         let a: Vec<&str> = c.args.iter().map(String::as_str).collect();
         assert!(!a.iter().any(|x| x.starts_with("User=")));
         assert!(a.contains(&"--working-directory=/srv"));
-        assert!(a.contains(&"--setenv=HOME=/root"));
-        assert!(a.contains(&"--setenv=PATH=/run/wrappers/bin:/run/current-system/sw/bin"));
+        assert!(c.env_text.lines().any(|l| l == "HOME=\"/root\""));
+        assert!(
+            c.env_text
+                .lines()
+                .any(|l| l == "PATH=\"/run/wrappers/bin:/run/current-system/sw/bin\"")
+        );
         let c = cfg().command(&parts(Tier::Root, None), None).unwrap();
         assert!(c.args.contains(&"--working-directory=/".to_owned()));
+    }
+
+    #[test]
+    fn env_lines_are_systemd_quoted() {
+        assert_eq!(env_line("A", "plain").unwrap(), "A=\"plain\"");
+        assert_eq!(
+            env_line("A", r#"it's "q" $HOME `x` \n"#).unwrap(),
+            r#"A="it's \"q\" \$HOME \`x\` \\n""#
+        );
+        assert!(env_line("A", "two\nlines").is_err());
+        assert!(env_line("A", "cr\r").is_err());
+        assert!(env_line("1A", "x").is_err());
+        // A secret value never reaches the command line.
+        let mut p = parts(Tier::Root, None);
+        p.env.insert("TOKEN".into(), "s3cr3t".into());
+        let c = cfg().command(&p, None).unwrap();
+        assert!(!c.args.iter().any(|a| a.contains("s3cr3t")));
+        assert!(c.env_text.contains("TOKEN=\"s3cr3t\""));
     }
 
     #[test]
@@ -552,13 +651,17 @@ mod tests {
         let script = d.path().join("systemd-run");
         std::fs::write(
             &script,
-            "#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do case \"$1\" in --setenv=*) export \"${1#--setenv=}\";; esac; shift; done\nshift\nexec \"$@\"\n",
+            format!(
+                "#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do case \"$1\" in EnvironmentFile=*) f=\"${{1#EnvironmentFile=}}\";; esac; shift; done\nshift\nstat -c %a \"$f\" > {}/mode\nset -a; . \"$f\"; set +a\nexec \"$@\"\n",
+                d.path().display()
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut c = cfg();
         c.systemd_run = script.to_string_lossy().into_owned();
         c.job_path = std::env::var("PATH").unwrap();
+        c.env_dir = d.path().join("env");
         let exec = SystemdExecutor::new(c);
         let admitted = admitted_root("0123abcd-0000", &["sh", "-c", "cat; printenv HOME; exit 7"]);
         let mut out = OutputTail::new(1024);
@@ -567,6 +670,14 @@ mod tests {
         assert_eq!(code, 7);
         // The root tier gets HOME=/root (daemons bug 21), stdin reached the job.
         assert_eq!(out.finish().bytes, b"in\n/root\n");
+        // Read from a 0600 file, gone after the run.
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("mode"))
+                .unwrap()
+                .trim(),
+            "600"
+        );
+        assert_eq!(std::fs::read_dir(d.path().join("env")).unwrap().count(), 0);
     }
 
     /// Security review 2026-10, finding 2: a kill that lands before
@@ -602,6 +713,7 @@ mod tests {
         c.systemd_run = run.to_string_lossy().into_owned();
         c.systemctl = ctl.to_string_lossy().into_owned();
         c.job_path = std::env::var("PATH").unwrap();
+        c.env_dir = d.path().join("env");
         let exec = SystemdExecutor::new(c);
         let admitted = admitted_root("0123abcd-0001", &["sh", "-c", "sleep 2; echo ran"]);
         let mut out = OutputTail::new(1024);
@@ -637,6 +749,7 @@ mod tests {
         let mut c = cfg();
         c.systemd_run = run.to_string_lossy().into_owned();
         c.job_path = std::env::var("PATH").unwrap();
+        c.env_dir = d.path().join("env");
         let exec = SystemdExecutor::new(c);
         let admitted = admitted_root("0123abcd-0002", &["echo", "done"]);
         let mut out = OutputTail::new(1024);

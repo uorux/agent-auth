@@ -320,6 +320,10 @@ pub async fn unlock(
     let internal = |e: StoreError| HostExecError(format!("unlock: {e}"));
     let (sandboxes, still) = async {
         let tx = st.store.begin().await?;
+        // The entries lockdown recorded first: the containment lock comes
+        // before any row (the store's lock order); a containment made for
+        // agents (not a lockdown) is lifted on its own.
+        containment::lift_lockdown(&tx, host).await?;
         let flag = flags::get_for_update(&tx, flags::LOCKDOWN, &json!({}), now).await?;
         let mut hosts: Vec<String> = flag
             .get("hosts")
@@ -341,9 +345,6 @@ pub async fn unlock(
             updated.insert("hosts".into(), json!(hosts));
             flags::set(&tx, flags::LOCKDOWN, &Value::Object(updated), now).await?;
         }
-        // The entries lockdown recorded; a containment made for agents (not
-        // a lockdown) is lifted on its own.
-        containment::lift_lockdown(&tx, host).await?;
         let sandboxes = daemons::list_role(&tx, DaemonRole::Sandbox).await?;
         tx.commit().await?;
         Ok::<_, StoreError>((sandboxes, hosts))

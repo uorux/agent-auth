@@ -503,3 +503,178 @@ fn tails_and_sanitized_status() {
         0
     );
 }
+
+/// Security review 2026-10: a shell command is checked again after the
+/// operator was shown it, in the transaction that writes it: an agent
+/// disabled while the Discord post was in flight gets nothing run.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_shell_command_is_checked_again_after_it_was_shown(pool: sqlx::PgPool) {
+    let b = Broker::start(pool).await;
+    let host = Host::start(&b).await;
+    let a = b.agent("claude-1").await;
+    let r = crate::service::create(&b.st, &caller(&a), body("shell", json!({"tier": "user"})))
+        .await
+        .unwrap();
+    let d = HumanDecision {
+        duration_secs: Some(600),
+        ..totp(host.code("user-shell", 0))
+    };
+    crate::service::decide(&b.st, r.id, &jrt(), d)
+        .await
+        .unwrap();
+    let tx = b.st.store.begin().await.unwrap();
+    let grant = agent_auth_store::grants::by_request(&tx, r.id)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(tx);
+    // A slow post; the agent is contained meanwhile.
+    b.recorder()
+        .shell_delay_ms
+        .store(800, std::sync::atomic::Ordering::Relaxed);
+    let hx = b.hostexec();
+    let exec: ShellExecBody =
+        serde_json::from_value(json!({"argv": ["echo", "after the check"], "wait": 5})).unwrap();
+    let agent = a.id;
+    let gid = grant.id;
+    let running = tokio::spawn(async move { hx.shell_exec(agent, gid, &exec).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // (Disabled directly: nothing closes the shell on the host, so only
+    // the broker's check can stop the command.)
+    let tx = b.st.store.begin().await.unwrap();
+    agent_auth_store::agents::set_disabled(&tx, a.id, true)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let err = running.await.unwrap().unwrap_err();
+    assert!(matches!(err, ShellExecError::Refused(_)), "{err:?}");
+    let runs = host.hostd.executor().recorded.lock().unwrap().runs.clone();
+    assert!(
+        !runs
+            .iter()
+            .any(|(_, _, argv)| argv.iter().any(|x| x == "after the check")),
+        "{runs:?}"
+    );
+}
+
+/// Security review 2026-10: a revoke the host didn't confirm fails, and
+/// the grant stays ACTIVE but expired, so the expiry pass retries it until
+/// the host is back and closes the shell.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_revoke_the_host_missed_is_retried_until_it_lands(pool: sqlx::PgPool) {
+    use agent_auth_core::GrantStatus;
+    let b = Broker::start(pool).await;
+    let host = Host::start(&b).await;
+    let a = b.agent("claude-1").await;
+    let r = crate::service::create(&b.st, &caller(&a), body("shell", json!({"tier": "user"})))
+        .await
+        .unwrap();
+    let d = HumanDecision {
+        duration_secs: Some(600),
+        ..totp(host.code("user-shell", 0))
+    };
+    crate::service::decide(&b.st, r.id, &jrt(), d)
+        .await
+        .unwrap();
+    let grant_of = || async {
+        let tx = b.st.store.begin().await.unwrap();
+        agent_auth_store::grants::by_request(&tx, r.id)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    let grant = grant_of().await;
+    assert_eq!(host.hostd.status()["shells"], json!(1));
+    // The host drops off just as the shell is revoked.
+    b.part
+        .hub
+        .kick(agent_auth_crypto::daemon::Role::Host, HOST, "test");
+    assert!(
+        crate::service::revoke_grant(&b.st, grant.id, "done", "jrt")
+            .await
+            .is_err()
+    );
+    let g = grant_of().await;
+    assert_eq!(g.status, GrantStatus::Active);
+    assert!(g.expires_at <= time::OffsetDateTime::now_utc());
+    assert_eq!(host.hostd.status()["shells"], json!(1));
+    // Back: the next expiry pass closes it.
+    wait_until(|| {
+        b.part
+            .hub
+            .is_online(agent_auth_crypto::daemon::Role::Host, HOST)
+    })
+    .await;
+    assert_eq!(crate::service::expire_due_grants(&b.st).await, 1);
+    assert_eq!(grant_of().await.status, GrantStatus::Expired);
+    assert_eq!(host.hostd.status()["shells"], json!(0));
+}
+
+/// `job.kill` is sent again until the host answers.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_kill_is_retried_until_the_host_answers(pool: sqlx::PgPool) {
+    let b = Broker::start(pool).await;
+    let hx = b.hostexec();
+    let job = JobId::new();
+    let killing = tokio::spawn(async move { hx.kill_until_acked(HOST, job).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!killing.is_finished(), "no host yet: still trying");
+    let _host = Host::start(&b).await;
+    tokio::time::timeout(Duration::from_secs(10), killing)
+        .await
+        .expect("acknowledged once the host is there")
+        .unwrap();
+}
+
+/// Security review 2026-10: unlock takes the containment lock before the
+/// lockdown flag's row (the store's lock order), so it can't deadlock with
+/// a transaction that holds the containment lock and then reads the flag.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn unlock_takes_the_containment_lock_first(pool: sqlx::PgPool) {
+    let b = Broker::start(pool).await;
+    let hx = b.hostexec();
+    let now = time::OffsetDateTime::now_utc();
+    let tx = b.st.store.begin().await.unwrap();
+    agent_auth_store::flags::set(
+        &tx,
+        agent_auth_store::flags::LOCKDOWN,
+        &json!({"hosts": [HOST]}),
+        now,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    // Containment first (as every writer of entries does)...
+    let t1 = b.st.store.begin().await.unwrap();
+    agent_auth_store::lockdown::record(
+        &t1,
+        &agent_auth_store::lockdown::NewEntry {
+            id: "0000abcd",
+            r#match: &json!({"name": "nobody"}),
+            reason: "test",
+            evidence: "",
+            by: "jrt",
+            source: agent_auth_store::lockdown::ContainmentSource::Operator,
+            at: now,
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let st = b.st.clone();
+    let unlocking =
+        tokio::spawn(async move { lockdown::unlock(&st, &hx, None, None, "jrt").await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // ...then the flag: no deadlock with the unlock waiting meanwhile.
+    agent_auth_store::flags::get_for_update(
+        &t1,
+        agent_auth_store::flags::LOCKDOWN,
+        &json!({}),
+        now,
+    )
+    .await
+    .unwrap();
+    t1.commit().await.unwrap();
+    let un = unlocking.await.unwrap().unwrap();
+    assert!(un.broker_locked.is_empty());
+}

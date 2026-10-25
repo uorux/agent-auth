@@ -5,6 +5,11 @@ use std::sync::Arc;
 use agent_auth_core::authority::HostexecAuthority;
 use agent_auth_core::hostexec::{SpecFields, make_spec};
 use agent_auth_core::{AgentId, Authority, GrantId, JobId, Platform};
+
+fn now_utc() -> OffsetDateTime {
+    OffsetDateTime::now_utc()
+}
+use agent_auth_store::grants::{self, IssuableGrant, NotIssuable};
 use agent_auth_store::hostexec::{self as store, JobRow, JobStatus, NewJob};
 use agent_auth_store::{StoreError, flags};
 use agent_auth_wire::hostexec::ShellExecBody;
@@ -39,8 +44,54 @@ impl From<StoreError> for ShellExecError {
 }
 
 impl HostExec {
+    /// The shell grant, if a command may go out on it now, checked in
+    /// `tx`: the caller's own, issuable (ACTIVE, unexpired, its agent not
+    /// held, a delegated one's thread open), a shell, its host not locked.
+    /// Its share locks (and the containment lock) last until `tx` ends.
+    async fn shell_grant<'t>(
+        &self,
+        tx: &'t agent_auth_store::Tx<'_>,
+        agent: AgentId,
+        grant_id: GrantId,
+        now: OffsetDateTime,
+    ) -> Result<(IssuableGrant<'t>, agent_auth_core::Tier), ShellExecError> {
+        let grant = match grants::issuable(tx, agent, grant_id, now).await? {
+            Ok(g) => g,
+            Err(NotIssuable::UnknownGrant) => return Err(ShellExecError::NotFound),
+            Err(NotIssuable::Held(held)) => return Err(ShellExecError::Refused(held.text())),
+            Err(NotIssuable::DelegationClosed) => {
+                return Err(ShellExecError::Refused(
+                    "that shell's delegation thread is closed".into(),
+                ));
+            }
+            Err(NotIssuable::NotActive { .. }) => {
+                // Another platform's grant is not a shell at all.
+                let g = grants::get_owned(tx, agent, grant_id).await?;
+                if g.is_some_and(|g| g.platform == Platform::Hostexec) {
+                    return Err(ShellExecError::Refused("that shell has ended".into()));
+                }
+                return Err(ShellExecError::NotFound);
+            }
+        };
+        let g = grant.grant();
+        if g.platform != Platform::Hostexec {
+            return Err(ShellExecError::NotFound);
+        }
+        let Authority::Hostexec(HostexecAuthority::Shell { tier }) = g.authority else {
+            return Err(ShellExecError::NotFound);
+        };
+        if flags::locked(tx, &g.resource).await? {
+            return Err(ShellExecError::Refused("locked down".into()));
+        }
+        Ok((grant, tier))
+    }
+
     /// One command in an open shell: shown to the operator before it is
-    /// sent, and not sent if that fails (INV-31).
+    /// sent, and not sent if that fails (INV-31). The grant is checked
+    /// again after the operator was shown it, in the transaction that
+    /// writes the job and holds its locks while the host is asked, so a
+    /// revoke, a containment, a closed delegation thread or a lockdown that
+    /// landed meanwhile stops it (security review 2026-10).
     pub async fn shell_exec(
         &self,
         agent: AgentId,
@@ -48,29 +99,17 @@ impl HostExec {
         body: &ShellExecBody,
     ) -> Result<JobRow, ShellExecError> {
         let now = OffsetDateTime::now_utc();
-        let tx = self.store.begin().await?;
-        let grant = agent_auth_store::grants::get_owned(&tx, agent, grant_id)
-            .await?
-            .filter(|g| g.platform == Platform::Hostexec)
-            .ok_or(ShellExecError::NotFound)?;
-        let Authority::Hostexec(HostexecAuthority::Shell { tier }) = grant.authority else {
-            return Err(ShellExecError::NotFound);
+        let (grant, tier, request) = {
+            let tx = self.store.begin().await?;
+            let (issuable, tier) = self.shell_grant(&tx, agent, grant_id, now).await?;
+            let grant = issuable.grant().clone();
+            let request = agent_auth_store::requests::get(&tx, grant.request_id)
+                .await?
+                .ok_or(ShellExecError::NotFound)?
+                .into_row();
+            tx.commit().await?;
+            (grant, tier, request)
         };
-        if !grant.is_live(now) {
-            return Err(ShellExecError::Refused("that shell has ended".into()));
-        }
-        if flags::locked(&tx, &grant.resource).await? {
-            return Err(ShellExecError::Refused("locked down".into()));
-        }
-        // Held means held on every path.
-        if let Err(held) = agent_auth_store::lockdown::check(&tx, agent, now).await? {
-            return Err(ShellExecError::Refused(held.text()));
-        }
-        let request = agent_auth_store::requests::get(&tx, grant.request_id)
-            .await?
-            .ok_or(ShellExecError::NotFound)?
-            .into_row();
-        tx.commit().await?;
         let host = grant.resource.clone();
         let argv = json!(body.argv.iter().map(|a| a.as_str()).collect::<Vec<_>>());
         let env: Map<String, Value> = body
@@ -97,38 +136,47 @@ impl HostExec {
         .map_err(|e| ShellExecError::Spec(e.0))?;
         let spec_json = spec.to_json();
         let job_id = JobId::new();
-        let tx = self.store.begin().await?;
-        let job = store::insert(
-            &tx,
-            &NewJob {
-                id: job_id,
-                grant_id: Some(grant.id),
-                request_id: request.id,
-                agent_id: agent,
-                host: &host,
-                tier,
-                shell_id: Some(request.id),
-                spec: &spec_json,
-                now,
-            },
-        )
-        .await?;
-        tx.commit().await?;
+        let new_job = NewJob {
+            id: job_id,
+            grant_id: Some(grant.id),
+            request_id: request.id,
+            agent_id: agent,
+            host: &host,
+            tier,
+            shell_id: Some(request.id),
+            spec: &spec_json,
+            now,
+        };
         // Before dispatch, and failing closed: a command nobody was shown
         // does not run.
-        if !self.notifier().shell_command(&request, &job).await {
-            self.set_status(
+        let shown = self
+            .notifier()
+            .shell_command(&request, &new_job.to_row())
+            .await;
+        let tx = self.store.begin().await?;
+        if !shown {
+            store::insert(&tx, &new_job).await?;
+            store::set_status(
+                &tx,
                 job_id,
                 &host,
                 JobStatus::Refused,
                 Some("could not show the command on Discord"),
                 None,
             )
-            .await;
+            .await?;
+            tx.commit().await?;
+            self.job_events.notify(&job_id);
             return Err(ShellExecError::Refused(
                 "could not show the command on Discord; not run".into(),
             ));
         }
+        // Again, now: the operator was shown it a moment ago.
+        if let Err(e) = self.shell_grant(&tx, agent, grant_id, now_utc()).await {
+            drop(tx);
+            return Err(e);
+        }
+        let job = store::insert(&tx, &new_job).await?;
         let sent = self
             .call(
                 &host,
@@ -139,20 +187,30 @@ impl HostExec {
             .await;
         match sent {
             Ok(_) => {
-                self.set_status(job_id, &host, JobStatus::Running, None, None)
-                    .await;
+                store::set_status(&tx, job_id, &host, JobStatus::Running, None, None).await?;
+                tx.commit().await?;
                 self.watch(job_id);
                 Ok(self.reload(job_id).await?.unwrap_or(job))
             }
             Err(e) if e.timed_out => {
                 // As for job.start (bug 2): it may run; its result, if any,
                 // is stored, otherwise it becomes lost.
+                tx.commit().await?;
                 self.watch(job_id);
                 Err(ShellExecError::Refused(e.message))
             }
             Err(e) => {
-                self.set_status(job_id, &host, JobStatus::Refused, Some(&e.message), None)
-                    .await;
+                store::set_status(
+                    &tx,
+                    job_id,
+                    &host,
+                    JobStatus::Refused,
+                    Some(&e.message),
+                    None,
+                )
+                .await?;
+                tx.commit().await?;
+                self.job_events.notify(&job_id);
                 if let Some(refused) = self.reload(job_id).await? {
                     self.job_finished(&refused).await;
                 }
