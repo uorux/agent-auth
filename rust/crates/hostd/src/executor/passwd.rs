@@ -100,7 +100,15 @@ pub async fn lookup(name: &str) -> Result<Passwd, String> {
         let path = format!("/Users/{name}");
         let text = output(
             "/usr/bin/dscl",
-            &[".", "-read", &path, "UniqueID", "PrimaryGroupID", "NFSHomeDirectory", "UserShell"],
+            &[
+                ".",
+                "-read",
+                &path,
+                "UniqueID",
+                "PrimaryGroupID",
+                "NFSHomeDirectory",
+                "UserShell",
+            ],
         )
         .await
         .ok_or_else(|| format!("no user {name}"))?;
@@ -125,8 +133,11 @@ mod tests {
 
     #[test]
     fn passwd_lines() {
-        let p = parse_passwd_line("jrt:x:1000:100:Jacob:/home/jrt:/run/current-system/sw/bin/zsh", "jrt")
-            .unwrap();
+        let p = parse_passwd_line(
+            "jrt:x:1000:100:Jacob:/home/jrt:/run/current-system/sw/bin/zsh",
+            "jrt",
+        )
+        .unwrap();
         assert_eq!((p.uid, p.gid, p.home.as_str()), (1000, 100, "/home/jrt"));
         assert!(parse_passwd_line("jrt:x:1000:100::/home/jrt:/bin/sh", "jr").is_none());
         assert!(parse_passwd_line("jrt:x:abc:100::/home/jrt:/bin/sh", "jrt").is_none());
@@ -137,7 +148,10 @@ mod tests {
     fn dscl_output() {
         let text = "NFSHomeDirectory: /Users/jrt\nPrimaryGroupID: 20\nUniqueID: 501\nUserShell: /bin/zsh\n";
         let p = parse_dscl(text, "jrt").unwrap();
-        assert_eq!((p.uid, p.gid, p.home.as_str(), p.shell.as_str()), (501, 20, "/Users/jrt", "/bin/zsh"));
+        assert_eq!(
+            (p.uid, p.gid, p.home.as_str(), p.shell.as_str()),
+            (501, 20, "/Users/jrt", "/bin/zsh")
+        );
         let spaced = "NFSHomeDirectory:\n /Users/Jacob Root\nPrimaryGroupID: 20\nUniqueID: 502\n";
         let p = parse_dscl(spaced, "jacob").unwrap();
         assert_eq!(p.home, "/Users/Jacob Root");

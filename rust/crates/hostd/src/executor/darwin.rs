@@ -27,11 +27,12 @@ use agent_auth_core::Tier;
 use agent_auth_core::hostd::output::OutputTail;
 use agent_auth_core::hostd::{AdmittedJob, LocalId, PolkitConfirmed};
 use serde::{Deserialize, Serialize};
-use tokio::time::Instant;
 
 use super::linux::JobParts;
 use super::passwd::{self, Passwd};
-use super::{Collect, Executor, UnitAction, collect, exit_code, kill_group, signal_group, spawn_piped};
+use super::{
+    Collect, Executor, UnitAction, collect, exit_code, kill_group, signal_group, spawn_piped,
+};
 
 /// Homebrew, for the user tier only (its directories are the user's).
 pub const USER_EXTRA_PATH: &str = "/opt/homebrew/bin:/usr/local/bin";
@@ -104,7 +105,10 @@ impl DarwinExecutor {
     fn path(&self, tier: Tier) -> String {
         match (tier, &self.user) {
             (Tier::User, Some(u)) => {
-                format!("{}:/etc/profiles/per-user/{u}/bin:{USER_EXTRA_PATH}", self.job_path)
+                format!(
+                    "{}:/etc/profiles/per-user/{u}/bin:{USER_EXTRA_PATH}",
+                    self.job_path
+                )
             }
             _ => self.job_path.clone(),
         }
@@ -148,7 +152,10 @@ impl DarwinExecutor {
         };
         let json = serde_json::to_string(&spec).map_err(|e| e.to_string())?;
         let launch_env: BTreeMap<String, String> = [
-            ("PATH".to_owned(), "/usr/bin:/bin:/usr/sbin:/sbin".to_owned()),
+            (
+                "PATH".to_owned(),
+                "/usr/bin:/bin:/usr/sbin:/sbin".to_owned(),
+            ),
             ("LANG".to_owned(), "C.UTF-8".to_owned()),
         ]
         .into();
@@ -195,7 +202,9 @@ pub(crate) async fn run_in_group(
         .current_dir(&c.cwd)
         .process_group(0);
     let (mut child, rx) = spawn_piped(cmd, stdin.is_some()).map_err(|e| e.to_string())?;
-    let pgid = child.id().ok_or_else(|| "the job exited at once".to_owned())?;
+    let pgid = child
+        .id()
+        .ok_or_else(|| "the job exited at once".to_owned())?;
     groups
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -206,7 +215,7 @@ pub(crate) async fn run_in_group(
         stdin,
         out,
         Collect {
-            deadline: Some(Instant::now() + timeout),
+            deadline: Some(super::after(timeout)),
             stop_at_exit: true,
         },
         async || kill_group(kill, pgid).await,
@@ -335,7 +344,15 @@ mod tests {
         };
         let c = exec().command(&parts(Tier::User), Some(&pw)).unwrap();
         assert_eq!(c.program, "/bin/launchctl");
-        assert_eq!(&c.args[..4], ["asuser", "501", "/opt/agent-auth/bin/agent-auth-hostd", "asuser"]);
+        assert_eq!(
+            &c.args[..4],
+            [
+                "asuser",
+                "501",
+                "/opt/agent-auth/bin/agent-auth-hostd",
+                "asuser"
+            ]
+        );
         assert_eq!(c.cwd, "/");
         // launchctl gets none of the job's environment.
         assert_eq!(c.env.get("LANG").map(String::as_str), Some("C.UTF-8"));
@@ -370,7 +387,10 @@ mod tests {
         // Owned by the test user (not root): refused.
         let path = format!("/nonexistent-dir:{}", dir.display());
         let problem = root_path_problem(&path).unwrap();
-        assert!(problem.contains("writable by others than root"), "{problem}");
+        assert!(
+            problem.contains("writable by others than root"),
+            "{problem}"
+        );
         // Missing directories are skipped.
         assert_eq!(root_path_problem("/nonexistent-a:/nonexistent-b"), None);
     }

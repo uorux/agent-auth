@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use crate::pyfmt::shlex_quote;
+use crate::pyfmt::{is_display_safe, shlex_quote};
 
 /// One argument, quoted for display: `shlex.quote` for printable text,
 /// bash's `$'...'` when it holds control characters (newlines, tabs, ESC,
@@ -44,12 +44,10 @@ pub fn display_arg(s: &str) -> String {
     out
 }
 
+/// Control, bidi, zero-width and other characters that do not show as
+/// themselves (`pyfmt::is_display_safe`).
 fn needs_escape(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            u32::from(c),
-            0x2028 | 0x2029 | 0x200b..=0x200f | 0x202a..=0x202e | 0x2066..=0x2069 | 0xfeff
-        )
+    !is_display_safe(c)
 }
 
 /// An argv as one unambiguous line.

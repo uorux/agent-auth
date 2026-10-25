@@ -1151,7 +1151,7 @@ round_trips! {
         reply().prop_map(HostToBroker::Reply),
         (job_id(), option::of(any::<u32>()), "[A-Za-z0-9+/=]{0,40}").prop_map(|(job_id, chunk, data)| HostToBroker::JobOutput(JobOutput { job_id, chunk, data: Text::new(data).unwrap() })),
         (job_id(), option::of(any::<i32>()), option::of(text::<0, 16384>()), option::of(float()), any::<u64>(), hex64(), any::<bool>())
-            .prop_map(|(job_id, exit_code, error, duration_secs, bytes, sha256, truncated)| HostToBroker::JobDone(JobDone { job_id, exit_code, error, duration_secs, bytes, sha256, truncated })),
+            .prop_map(|(job_id, exit_code, error, duration_secs, bytes, sha256, truncated)| HostToBroker::JobDone(JobDone { job_id, exit_code, error, duration_secs, bytes, sha256, truncated, lost: false })),
         (any::<bool>(), any::<bool>(), option::of(text::<0, 256>()), option::of(float()))
             .prop_map(|(enabled, present, away_reason, dnd_until)| HostToBroker::Presence(Presence { enabled, present, away_reason, dnd_until })),
         (uuid(), pick![Answer::Allow, Answer::Deny, Answer::Mute, Answer::Discord, Answer::Timeout], any::<bool>())

@@ -83,7 +83,8 @@ pub(crate) mod testdir {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let dir = std::env::temp_dir().join(format!("aa-hostd-{tag}-{}-{n}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("aa-hostd-{tag}-{}-{n}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             TestDir(dir)
         }
@@ -113,7 +114,10 @@ mod tests {
         write_atomic(&p, b"one", 0o600).unwrap();
         write_atomic(&p, b"two", 0o600).unwrap();
         assert_eq!(fs::read(&p).unwrap(), b"two");
-        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert!(exists_or_unknown(&p));
         assert!(remove_durably(&p).unwrap());
         assert!(!remove_durably(&p).unwrap());

@@ -13,7 +13,9 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 use std::sync::{Mutex, PoisonError};
 
-use agent_auth_core::hostd::totp::{self as guard, AcceptedCode, SecretName, TotpRefusal, TotpState};
+use agent_auth_core::hostd::totp::{
+    self as guard, AcceptedCode, SecretName, TotpRefusal, TotpState,
+};
 use agent_auth_crypto::Secret;
 use agent_auth_crypto::totp::{TotpError as CodeError, TotpSecret, verify as check_code};
 
@@ -40,10 +42,7 @@ pub struct TotpStore {
 }
 
 fn index(name: SecretName) -> usize {
-    SecretName::ALL
-        .iter()
-        .position(|n| *n == name)
-        .unwrap_or(0)
+    SecretName::ALL.iter().position(|n| *n == name).unwrap_or(0)
 }
 
 fn io_err(e: &io::Error) -> TotpError {
@@ -111,7 +110,10 @@ impl TotpStore {
         let path = self.secret_path(name);
         let meta = fs::symlink_metadata(&path).map_err(|_| TotpError::NotEnrolled(name))?;
         if !meta.file_type().is_file() {
-            return Err(TotpError::Io(format!("{} is not a regular file", path.display())));
+            return Err(TotpError::Io(format!(
+                "{} is not a regular file",
+                path.display()
+            )));
         }
         let mut f = fs::File::open(&path).map_err(|_| TotpError::NotEnrolled(name))?;
         let mut buf = String::new();
@@ -119,7 +121,7 @@ impl TotpStore {
         let text = Secret::new(buf);
         read.map_err(|e| io_err(&e))?;
         TotpSecret::from_base32(text.expose())
-            .ok_or_else(|| TotpError::Io(format!("{} is not a base32 secret", path.display())))
+            .map_err(|e| TotpError::Io(format!("{}: {e}", path.display())))
     }
 
     /// The state; `None` when present but unreadable.
@@ -173,7 +175,7 @@ impl TotpStore {
     pub fn clear_lock(&self, name: SecretName, now_secs: u64) -> Result<(), TotpError> {
         let _guard = self.lock(name);
         let mut state = self.read_state(name).unwrap_or_else(|| TotpState {
-            last_step: Some(now_secs / guard::STEP_SECS + guard::WINDOW_STEPS),
+            last_step: Some((now_secs / guard::STEP_SECS).saturating_add(guard::WINDOW_STEPS)),
             ..TotpState::default()
         });
         state.clear_lock();
@@ -206,7 +208,10 @@ mod tests {
         let d = TestDir::new("totp");
         let store = TotpStore::new(d.path().join("totp"));
         let secret = store.enroll(UD, false).unwrap();
-        let mode = fs::metadata(d.path().join("totp/user-direct")).unwrap().permissions().mode();
+        let mode = fs::metadata(d.path().join("totp/user-direct"))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o400);
         let now = 1_700_000_000u64;
         let step = now / 30;
@@ -214,21 +219,40 @@ mod tests {
         assert_eq!(store.verify(UD, &code(step), now).unwrap().step(), step);
         let again = store.verify(UD, &code(step), now).unwrap_err();
         assert!(again.to_string().contains("already used"));
-        assert!(store.verify(UD, &code(step - 1), now).unwrap_err().to_string().contains("already used"));
+        assert!(
+            store
+                .verify(UD, &code(step - 1), now)
+                .unwrap_err()
+                .to_string()
+                .contains("already used")
+        );
         assert!(store.verify(UD, &code(step + 1), now).is_ok());
         assert_eq!(
             store.verify(RA, "000000", now).unwrap_err().to_string(),
             "no root-arm secret on this host (run totp-enroll)"
         );
-        assert!(store.enroll(UD, false).unwrap_err().to_string().contains("already enrolled"));
+        assert!(
+            store
+                .enroll(UD, false)
+                .unwrap_err()
+                .to_string()
+                .contains("already enrolled")
+        );
         let later = now + 600;
         for _ in 0..5 {
-            assert_eq!(store.verify(UD, "000000", later).unwrap_err().to_string(), "wrong code");
+            assert_eq!(
+                store.verify(UD, "000000", later).unwrap_err().to_string(),
+                "wrong code"
+            );
         }
         let locked = store.verify(UD, &code(later / 30), later).unwrap_err();
         assert!(locked.to_string().contains("locked"), "{locked}");
         assert!(store.locked(UD, later));
-        assert!(store.verify(UD, &code((later + 400) / 30), later + 400).is_ok());
+        assert!(
+            store
+                .verify(UD, &code((later + 400) / 30), later + 400)
+                .is_ok()
+        );
         // Non-digits are ignored (what was typed with a space).
         let c = code((later + 460) / 30);
         let spaced = format!("{} {}", &c[..3], &c[3..]);
@@ -251,6 +275,10 @@ mod tests {
         // The current window stays spent after clearing an unknown state.
         assert!(store.verify(UD, &code, now).is_err());
         let later = now + 90;
-        assert!(store.verify(UD, secret.code_at(later / 30).expose(), later).is_ok());
+        assert!(
+            store
+                .verify(UD, secret.code_at(later / 30).expose(), later)
+                .is_ok()
+        );
     }
 }

@@ -150,13 +150,19 @@ dependencies = [
  "agent-auth-core",
  "agent-auth-crypto",
  "agent-auth-daemon",
+ "agent-auth-tls",
  "agent-auth-wire",
  "anyhow",
+ "base64 0.23.1",
  "clap",
+ "futures",
  "serde",
  "serde_json",
+ "thiserror",
+ "time",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

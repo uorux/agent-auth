@@ -146,7 +146,10 @@ fn bool_at(map: &Map<String, Value>, key: &str, what: &str) -> Result<bool, Conf
     }
 }
 
-fn object<'a>(v: Option<&'a Value>, what: &str) -> Result<Option<&'a Map<String, Value>>, ConfigError> {
+fn object<'a>(
+    v: Option<&'a Value>,
+    what: &str,
+) -> Result<Option<&'a Map<String, Value>>, ConfigError> {
     match v {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Object(m)) => Ok(Some(m)),
@@ -183,14 +186,22 @@ fn strings(v: Option<&Value>, what: &str) -> Result<Vec<String>, ConfigError> {
 }
 
 fn patterns(v: Option<&Value>, what: &str) -> Result<Vec<Vec<String>>, ConfigError> {
-    let bad = || ConfigError(format!("{what}: a command pattern must be a non-empty list of strings"));
+    let bad = || {
+        ConfigError(format!(
+            "{what}: a command pattern must be a non-empty list of strings"
+        ))
+    };
     match v {
         None | Some(Value::Null) => Ok(Vec::new()),
         Some(Value::Array(items)) => items
             .iter()
             .map(|p| {
                 let list = strings(Some(p), what).map_err(|_| bad())?;
-                if list.is_empty() { Err(bad()) } else { Ok(list) }
+                if list.is_empty() {
+                    Err(bad())
+                } else {
+                    Ok(list)
+                }
             })
             .collect(),
         Some(_) => Err(bad()),
@@ -205,7 +216,13 @@ fn tier(v: Option<&Value>, name: &str) -> Result<TierPolicy, ConfigError> {
     };
     only(
         map,
-        &["enable", "max_arm", "accept_approve_all", "accept_machine_approvals", "shell"],
+        &[
+            "enable",
+            "max_arm",
+            "accept_approve_all",
+            "accept_machine_approvals",
+            "shell",
+        ],
         &what,
     )?;
     t.enable = bool_at(map, "enable", &what)?;
@@ -390,8 +407,7 @@ impl HostConfig {
         let user = opt_string(map, "user")?;
         let vm_unit = opt_string(map, "vm_unit")?;
         let config = HostConfig {
-            state_dir: opt_string(map, "state_dir")?
-                .map_or_else(default_state_dir, PathBuf::from),
+            state_dir: opt_string(map, "state_dir")?.map_or_else(default_state_dir, PathBuf::from),
             runtime_dir: opt_string(map, "runtime_dir")?
                 .map_or_else(default_runtime_dir, PathBuf::from),
             job_path: opt_string(map, "job_path")?.unwrap_or_else(default_job_path),
@@ -526,7 +542,10 @@ mod tests {
         assert!(c.policy.templates.contains_key("rebuild"));
         assert!(c.policy.desk_approve_user && !c.policy.desk_approve_root);
         assert!(c.privileged());
-        assert_eq!(c.ctl_socket(), PathBuf::from("/run/agent-auth-hostd/ctl.sock"));
+        assert_eq!(
+            c.ctl_socket(),
+            PathBuf::from("/run/agent-auth-hostd/ctl.sock")
+        );
     }
 
     #[test]
@@ -543,7 +562,12 @@ mod tests {
         );
         let mut typo = module_json();
         typo["deny_comands"] = json!([["rm"]]);
-        assert!(HostConfig::from_json(&typo, false).unwrap_err().0.contains("unknown keys"));
+        assert!(
+            HostConfig::from_json(&typo, false)
+                .unwrap_err()
+                .0
+                .contains("unknown keys")
+        );
         let mut empty_pattern = module_json();
         empty_pattern["deny_commands"] = json!([[]]);
         assert!(HostConfig::from_json(&empty_pattern, false).is_err());
@@ -560,17 +584,30 @@ mod tests {
         let mut vm = module_json();
         vm["vm_unit"] = json!("microvm@agents.service");
         assert!(HostConfig::from_json(&vm, false).is_ok());
-        assert!(HostConfig::from_json(&vm, true).unwrap_err().0.contains("vm_unit"));
+        assert!(
+            HostConfig::from_json(&vm, true)
+                .unwrap_err()
+                .0
+                .contains("vm_unit")
+        );
         let mut root = module_json();
         root["desktop"]["approve"]["root"] = json!(true);
-        assert!(HostConfig::from_json(&root, true).unwrap_err().0.contains("polkit"));
+        assert!(
+            HostConfig::from_json(&root, true)
+                .unwrap_err()
+                .0
+                .contains("polkit")
+        );
         let mut logind = module_json();
         logind["desktop"]["idle_source"] = json!("logind");
         assert!(HostConfig::from_json(&logind, true).is_err());
         let mut macos = module_json();
         macos["desktop"]["idle_source"] = json!("macos");
         assert_eq!(
-            HostConfig::from_json(&macos, true).unwrap().desktop.idle_source,
+            HostConfig::from_json(&macos, true)
+                .unwrap()
+                .desktop
+                .idle_source,
             IdleSource::Macos
         );
     }
@@ -588,10 +625,19 @@ mod tests {
     #[test]
     fn defaults_by_platform() {
         if darwin() {
-            assert_eq!(default_state_dir(), PathBuf::from("/var/db/agent-auth-hostd"));
+            assert_eq!(
+                default_state_dir(),
+                PathBuf::from("/var/db/agent-auth-hostd")
+            );
         } else {
-            assert_eq!(default_state_dir(), PathBuf::from("/var/lib/agent-auth-hostd"));
-            assert_eq!(default_runtime_dir(), PathBuf::from("/run/agent-auth-hostd"));
+            assert_eq!(
+                default_state_dir(),
+                PathBuf::from("/var/lib/agent-auth-hostd")
+            );
+            assert_eq!(
+                default_runtime_dir(),
+                PathBuf::from("/run/agent-auth-hostd")
+            );
             assert_eq!(
                 default_job_path(),
                 "/run/wrappers/bin:/run/current-system/sw/bin"

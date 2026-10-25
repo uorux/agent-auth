@@ -400,6 +400,11 @@ pub struct JobDone {
     pub bytes: u64,
     pub sha256: LowerHex<64>,
     pub truncated: bool,
+    /// The job was running when hostd stopped (crash, reboot): its outcome
+    /// is unknown, and the broker records it as `lost` (daemons bug 3).
+    /// Absent (false) from a Python hostd.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lost: bool,
 }
 
 /// `presence`: the desktop part of hostd's status.

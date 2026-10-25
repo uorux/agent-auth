@@ -35,6 +35,13 @@ use tokio::time::Instant;
 
 /// Read output in pieces of at most this.
 pub const READ_CHUNK: usize = 64 * 1024;
+/// `now + d`, saturating at now (never overflows in practice).
+#[must_use]
+pub fn after(d: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(d).unwrap_or(now)
+}
+
 /// A job unit's name prefix (`aa-job-<id>`).
 pub const UNIT_PREFIX: &str = "aa-job-";
 /// After a job's main process ends: how long its output may still drain.
@@ -179,11 +186,9 @@ where
         if eof && status.is_some() {
             break;
         }
-        let deadline = how
-            .deadline
-            .filter(|_| on_deadline.is_some())
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(86400 * 365));
-        let drain = drain_until.unwrap_or_else(|| Instant::now() + Duration::from_secs(86400 * 365));
+        // A disabled branch's timer is built but never polled.
+        let deadline = how.deadline.unwrap_or_else(Instant::now);
+        let drain = drain_until.unwrap_or_else(Instant::now);
         tokio::select! {
             n = rx.read(&mut buf), if !eof => {
                 match n {
@@ -197,7 +202,7 @@ where
                     f().await;
                 }
                 if how.stop_at_exit && !eof {
-                    drain_until = Some(Instant::now() + DRAIN);
+                    drain_until = Some(after(DRAIN));
                 }
             }
             () = tokio::time::sleep_until(deadline), if on_deadline.is_some() && how.deadline.is_some() => {
@@ -231,7 +236,7 @@ pub(crate) async fn kill_group(kill: &str, pgid: u32) {
     if !signal_group(kill, pgid, "TERM").await {
         return;
     }
-    let until = Instant::now() + KILL_GRACE;
+    let until = after(KILL_GRACE);
     while Instant::now() < until {
         tokio::time::sleep(Duration::from_millis(100)).await;
         if !signal_group(kill, pgid, "0").await {

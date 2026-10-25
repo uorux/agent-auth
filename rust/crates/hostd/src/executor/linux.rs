@@ -23,10 +23,11 @@ use std::time::Duration;
 use agent_auth_core::Tier;
 use agent_auth_core::hostd::output::OutputTail;
 use agent_auth_core::hostd::{AdmittedJob, LocalId, PolkitConfirmed};
-use tokio::time::Instant;
 
 use super::passwd::{self, Passwd};
-use super::{Collect, Executor, UNIT_PREFIX, UnitAction, collect, exit_code, spawn_piped, unit_name};
+use super::{
+    Collect, Executor, UNIT_PREFIX, UnitAction, collect, exit_code, spawn_piped, unit_name,
+};
 
 /// Installed by the NixOS module (auth_admin for the active local session).
 pub const POLKIT_ACTION: &str = "dev.agent-auth.hostd.run-as-root";
@@ -81,7 +82,9 @@ pub struct SystemdCommand {
 impl LinuxConfig {
     fn path(&self, tier: Tier) -> String {
         match (tier, &self.user) {
-            (Tier::User, Some(user)) => format!("{}:/etc/profiles/per-user/{user}/bin", self.job_path),
+            (Tier::User, Some(user)) => {
+                format!("{}:/etc/profiles/per-user/{user}/bin", self.job_path)
+            }
             _ => self.job_path.clone(),
         }
     }
@@ -103,7 +106,10 @@ impl LinuxConfig {
                 env.insert("USER".into(), pw.name.clone());
                 env.insert("LOGNAME".into(), pw.name.clone());
                 env.insert("SHELL".into(), pw.shell.clone());
-                env.insert("DBUS_SESSION_BUS_ADDRESS".into(), format!("unix:path={runtime}/bus"));
+                env.insert(
+                    "DBUS_SESSION_BUS_ADDRESS".into(),
+                    format!("unix:path={runtime}/bus"),
+                );
                 env.insert("XDG_RUNTIME_DIR".into(), runtime);
                 job.cwd.clone().unwrap_or_else(|| pw.home.clone())
             }
@@ -165,7 +171,10 @@ pub fn parse_job_units(text: &str) -> Vec<LocalId> {
             let unit = cols.next()?;
             let _load = cols.next()?;
             let active = cols.next()?;
-            if !matches!(active, "active" | "activating" | "deactivating" | "reloading") {
+            if !matches!(
+                active,
+                "active" | "activating" | "deactivating" | "reloading"
+            ) {
                 return None;
             }
             let id = unit.strip_prefix(UNIT_PREFIX)?.strip_suffix(".service")?;
@@ -210,11 +219,13 @@ impl Executor for SystemdExecutor {
         let parts = JobParts::of(job);
         let c = self.cfg.command(&parts, user.as_ref())?;
         let mut cmd = std::process::Command::new(&c.program);
-        cmd.args(&c.args).env_clear().envs(c.env.iter().map(|(k, v)| (k, v)));
+        cmd.args(&c.args)
+            .env_clear()
+            .envs(c.env.iter().map(|(k, v)| (k, v)));
         let (mut child, rx) = spawn_piped(cmd, job.stdin().is_some()).map_err(|e| e.to_string())?;
-        let deadline = Instant::now()
-            + Duration::from_secs(u64::from(parts.timeout_secs))
-            + DEADLINE_SLACK;
+        let deadline = super::after(
+            Duration::from_secs(u64::from(parts.timeout_secs)).saturating_add(DEADLINE_SLACK),
+        );
         let unit = format!("{}.service", unit_name(&parts.id));
         let status = collect(
             &mut child,
@@ -249,7 +260,9 @@ impl Executor for SystemdExecutor {
         message: &str,
         timeout: Duration,
     ) -> Option<PolkitConfirmed> {
-        let stat = tokio::fs::read_to_string(format!("/proc/{pid}/stat")).await.ok()?;
+        let stat = tokio::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .await
+            .ok()?;
         let start = proc_start_time(&stat)?;
         let mut child = tokio::process::Command::new(&self.cfg.pkcheck)
             .args([
@@ -286,7 +299,14 @@ impl Executor for SystemdExecutor {
     async fn running_jobs(&self) -> Vec<LocalId> {
         let pattern = format!("{UNIT_PREFIX}*");
         match self
-            .systemctl(&["list-units", "--plain", "--no-legend", "--all", "--type=service", &pattern])
+            .systemctl(&[
+                "list-units",
+                "--plain",
+                "--no-legend",
+                "--all",
+                "--type=service",
+                &pattern,
+            ])
             .await
         {
             Ok((0, text)) => parse_job_units(&text),
@@ -320,7 +340,12 @@ mod tests {
         JobParts {
             id: LocalId::parse("01234567-89ab-cdef-0123-456789abcdef").unwrap(),
             tier,
-            argv: vec!["systemctl".into(), "--user".into(), "status".into(), "a b".into()],
+            argv: vec![
+                "systemctl".into(),
+                "--user".into(),
+                "status".into(),
+                "a b".into(),
+            ],
             cwd: cwd.map(str::to_owned),
             env: [("LANG".to_owned(), "C".to_owned())].into(),
             timeout_secs: 60,
@@ -339,7 +364,9 @@ mod tests {
 
     #[test]
     fn linux_executor_user_tier_command() {
-        let c = cfg().command(&parts(Tier::User, None), Some(&jrt())).unwrap();
+        let c = cfg()
+            .command(&parts(Tier::User, None), Some(&jrt()))
+            .unwrap();
         assert_eq!(c.program, "/nix/store/s/bin/systemd-run");
         let a: Vec<&str> = c.args.iter().map(String::as_str).collect();
         assert_eq!(&a[..2], ["-p", "User=jrt"]);
@@ -358,7 +385,11 @@ mod tests {
         assert_eq!(
             c.env,
             vec![
-                ("PATH".to_owned(), "/run/wrappers/bin:/run/current-system/sw/bin:/etc/profiles/per-user/jrt/bin".to_owned()),
+                (
+                    "PATH".to_owned(),
+                    "/run/wrappers/bin:/run/current-system/sw/bin:/etc/profiles/per-user/jrt/bin"
+                        .to_owned()
+                ),
                 ("LANG".to_owned(), "C.UTF-8".to_owned())
             ]
         );
@@ -370,7 +401,9 @@ mod tests {
 
     #[test]
     fn linux_executor_root_tier_command() {
-        let c = cfg().command(&parts(Tier::Root, Some("/srv")), None).unwrap();
+        let c = cfg()
+            .command(&parts(Tier::Root, Some("/srv")), None)
+            .unwrap();
         let a: Vec<&str> = c.args.iter().map(String::as_str).collect();
         assert!(!a.iter().any(|x| x.starts_with("User=")));
         assert!(a.contains(&"--working-directory=/srv"));
@@ -387,6 +420,9 @@ mod tests {
         let units = "aa-job-0123abcd-0000.service loaded active running agent-auth job x\n\
                      aa-job-ffffffff-1111.service loaded inactive dead agent-auth job y\n\
                      aa-job-..%2f.service loaded active running z\n";
-        assert_eq!(parse_job_units(units), vec![LocalId::parse("0123abcd-0000").unwrap()]);
+        assert_eq!(
+            parse_job_units(units),
+            vec![LocalId::parse("0123abcd-0000").unwrap()]
+        );
     }
 }
