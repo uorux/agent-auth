@@ -7,8 +7,9 @@
 //!   referrer, no caching).
 //! - No CORS, no OpenAPI or docs routes; unknown routes answer 404
 //!   `{"detail": "Not Found"}`, wrong methods 405.
-//! - Unauthenticated routes are listed in [`public`]; every other handler
-//!   takes an authenticated principal.
+//! - Every handler takes an authenticated principal, except the routes
+//!   listed (with the reason) in `tests/route_auth.rs`, which fails for any
+//!   other route that answers without credentials.
 
 pub mod admin;
 pub mod admin_log;

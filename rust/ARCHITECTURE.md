@@ -56,8 +56,12 @@ can build (private fields, no `Default`, no `Deserialize`):
 OAuth access token), `AdminCaller` (admin token or a signed-in panel session
 with CSRF checked), `DaemonPeer` (a paired daemon whose hello verified),
 `DiscordOwner` (an interaction from the configured owner id). They are axum
-extractors. A handler that changes or reveals anything takes one; the few
-unauthenticated routes are listed in one place (`broker::http::public`). A
+extractors. A handler that changes or reveals anything takes one. The routes that
+take no principal (OAuth, sign-in, pairing, the daemon WebSocket, public
+metadata; each checks its own protocol's credential) are listed with the
+reason in `crates/broker/tests/route_auth.rs`, which reads every route from
+the sources and fails for any other route that answers without valid
+credentials, or that answers an agent's key under `/admin`. A
 service function acting for an agent takes `&AgentCaller`, never an id.
 
 **Containment.** "Is this agent held?" is answered inside the transaction
