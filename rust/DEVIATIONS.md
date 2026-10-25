@@ -1601,6 +1601,17 @@ characters stripped; `mail_attachment` never served remotely). Beyond it:
   `mail::tests::pinned_globs_match_only_their_domain` (exhaustive over
   short globs and addresses; a Kani harness over the real `fnmatch` on
   four-character strings did not finish in 25 minutes, so it is a test).
+- **Known and accepted: reading mail costs CPU in proportion to its text**
+  (decided 2026-10-25). Every step is linear (timed in release: 16
+  adversarial HTML shapes at 1, 2 and 8 MB, all linear; HTML itself
+  ~15 ms per 2 MB), but the injection-hint scan (11 regexes) costs about
+  0.3 s per MB of any text, so a message near the 25 MiB cap takes ~8 s
+  of one of the two shared parse permits (`off_runtime`, blocking pool).
+  A flood of large messages slows mail reading for every agent; it
+  cannot stall the API, approvals or Discord. The 27× faster fix
+  (regex's `perf-dfa` features plus ASCII `\b` in the hint patterns) was
+  measured and declined: it would expose the lazy DFA's unchecked-index
+  `unsafe` to outsiders' text. Scanning only a prefix was declined too.
 
 ## Agent VMs (`crates/sandboxd`, broker `sandboxes`)
 
