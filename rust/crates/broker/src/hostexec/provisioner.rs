@@ -40,21 +40,20 @@ fn failed(host: &str, e: impl std::fmt::Display) -> ProvisionError {
 
 impl HostExec {
     /// Provision a hostexec grant: start its one job, or open its shell.
-    pub async fn start(&self, grant: &GrantRow) -> Result<Value, ProvisionError> {
+    /// Every write goes through the provisioning transaction (`tx`), which
+    /// holds the grant: a separate one would wait for it (the job row's
+    /// foreign key) while it waits for this. A result that arrives before
+    /// that transaction commits is retried briefly (`results`).
+    pub async fn start(&self, tx: &Tx<'_>, grant: &GrantRow) -> Result<Value, ProvisionError> {
         let host = grant.resource.clone();
         let Authority::Hostexec(h) = &grant.authority else {
             return Err(failed(&host, "not a host command"));
         };
-        let request = async {
-            let tx = self.store.begin().await?;
-            let r = agent_auth_store::requests::get(&tx, grant.request_id).await?;
-            tx.commit().await?;
-            Ok::<_, StoreError>(r)
-        }
-        .await
-        .map_err(|e| failed(&host, e))?
-        .ok_or_else(|| failed(&host, "no such request"))?
-        .into_row();
+        let request = agent_auth_store::requests::get(tx, grant.request_id)
+            .await
+            .map_err(|e| failed(&host, e))?
+            .ok_or_else(|| failed(&host, "no such request"))?
+            .into_row();
         if let HostexecAuthority::Shell { tier } = h {
             let duration = request
                 .approved_duration_secs
@@ -74,27 +73,20 @@ impl HostExec {
         let spec = CommandSpec::from_authority(&host, h).map_err(|e| failed(&host, e))?;
         let spec_json = spec.to_json();
         let job_id = JobId::for_request(request.id);
-        // Committed before the host is asked: a fast job's result must find
-        // its row.
-        async {
-            let tx = self.store.begin().await?;
-            store::insert(
-                &tx,
-                &NewJob {
-                    id: job_id,
-                    grant_id: Some(grant.id),
-                    request_id: request.id,
-                    agent_id: grant.agent_id,
-                    host: &host,
-                    tier: spec.tier(),
-                    shell_id: None,
-                    spec: &spec_json,
-                    now: OffsetDateTime::now_utc(),
-                },
-            )
-            .await?;
-            tx.commit().await
-        }
+        store::insert(
+            tx,
+            &NewJob {
+                id: job_id,
+                grant_id: Some(grant.id),
+                request_id: request.id,
+                agent_id: grant.agent_id,
+                host: &host,
+                tier: spec.tier(),
+                shell_id: None,
+                spec: &spec_json,
+                now: OffsetDateTime::now_utc(),
+            },
+        )
         .await
         .map_err(|e| failed(&host, e))?;
         let evidence = HostExec::evidence(&request);
@@ -109,8 +101,9 @@ impl HostExec {
         match started {
             Ok(data) => {
                 let via = data.get("via").and_then(Value::as_str);
-                self.set_status(job_id, &host, JobStatus::Running, None, via)
-                    .await;
+                store::set_status(tx, job_id, &host, JobStatus::Running, None, via)
+                    .await
+                    .map_err(|e| failed(&host, e))?;
                 let window = evidence.get("window").and_then(Value::as_bool) == Some(true);
                 if request.decision_source != Some(DecisionSource::Human) || window {
                     // Nobody looked at this one command: a rule, a window or
@@ -146,8 +139,17 @@ impl HostExec {
                 ))
             }
             Err(e) => {
-                self.set_status(job_id, &host, JobStatus::Refused, Some(&e.message), None)
-                    .await;
+                store::set_status(
+                    tx,
+                    job_id,
+                    &host,
+                    JobStatus::Refused,
+                    Some(&e.message),
+                    None,
+                )
+                .await
+                .map_err(|e| failed(&host, e))?;
+                self.job_events.notify(&job_id);
                 Err(failed(&host, e))
             }
         }
@@ -206,11 +208,11 @@ impl Provisioner for HostexecProvisioner {
 
     async fn provision<'t>(
         &self,
-        _tx: &'t Tx<'_>,
+        tx: &'t Tx<'_>,
         grant: &ProvisioningGrant<'t>,
         _now: OffsetDateTime,
     ) -> Result<Value, ProvisionError> {
-        self.hostexec.start(grant.grant()).await
+        self.hostexec.start(tx, grant.grant()).await
     }
 
     async fn revoke(

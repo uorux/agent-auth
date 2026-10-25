@@ -32,7 +32,9 @@ use serde_json::{Value, json};
 use time::OffsetDateTime;
 
 use super::{DaemonsConfig, HostdPart};
-use crate::auth::{AdminCaller, AdminIdentity, AgentCaller, AgentCredentialKind, AuthConfig, HumanDecider};
+use crate::auth::{
+    AdminCaller, AdminIdentity, AgentCaller, AgentCredentialKind, AuthConfig, HumanDecider,
+};
 use crate::notify::{Notifier, Recorder};
 use crate::provisioners::{AnyProvisioner, FakeProvisioner, Registry};
 use crate::service::Spine;
@@ -90,7 +92,9 @@ impl Broker {
         )
         .unwrap();
         let mut registry = Registry::default();
-        registry.register(AnyProvisioner::Fake(FakeProvisioner::new(Platform::Homelab)));
+        registry.register(AnyProvisioner::Fake(FakeProvisioner::new(
+            Platform::Homelab,
+        )));
         if let Some(p) = part.provisioner() {
             registry.register(p);
         }
@@ -220,7 +224,6 @@ fn find(program: &str) -> String {
 /// A real hostd for the broker's tests.
 pub struct Host {
     pub hostd: Arc<Hostd<DirectExecutor>>,
-    pub channel: Channel,
     pub secrets: BTreeMap<String, TotpSecret>,
     pub dir: PathBuf,
     task: tokio::task::JoinHandle<()>,
@@ -292,7 +295,6 @@ impl Host {
         };
         let host = Host {
             hostd,
-            channel,
             secrets,
             dir,
             task,
@@ -305,7 +307,10 @@ impl Host {
     /// single use, so a test takes at most two per secret).
     pub fn code(&self, name: &str, offset: u64) -> String {
         let now = OffsetDateTime::now_utc().unix_timestamp().unsigned_abs();
-        self.secrets[name].code_at(now / 30 + offset).expose().clone()
+        self.secrets[name]
+            .code_at(now / 30 + offset)
+            .expose()
+            .clone()
     }
 }
 

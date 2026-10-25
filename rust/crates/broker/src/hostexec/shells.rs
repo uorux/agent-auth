@@ -188,10 +188,22 @@ impl HostExec {
         let Some(watcher) = &self.watcher else {
             return Ok(());
         };
-        let tx = self.store.begin().await?;
-        let Some(job) = store::get(&tx, job_id).await? else {
+        // Started in a provisioning transaction that may not have
+        // committed yet.
+        let mut found = None;
+        for _ in 0..10 {
+            let tx = self.store.begin().await?;
+            found = store::get(&tx, job_id).await?;
+            tx.commit().await?;
+            if found.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        let Some(job) = found else {
             return Ok(());
         };
+        let tx = self.store.begin().await?;
         let agent = agent_auth_store::agents::get(&tx, job.agent_id).await?;
         let request = agent_auth_store::requests::get(&tx, job.request_id)
             .await?

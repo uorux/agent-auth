@@ -65,7 +65,18 @@ impl HostExec {
             tracing::warn!(job = %done.job_id, host = peer.name(), "result incomplete; waiting for a resend");
             return;
         }
-        match self.store_result(peer.name(), &done, &output).await {
+        // The job's row may not be committed yet (it is written in its
+        // grant's provisioning transaction): retry briefly before treating
+        // it as someone else's.
+        let mut stored = self.store_result(peer.name(), &done, &output).await;
+        for _ in 0..10 {
+            if !matches!(stored, Ok(None)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            stored = self.store_result(peer.name(), &done, &output).await;
+        }
+        match stored {
             Ok(Some((fresh, job))) => {
                 let mut ack = Map::new();
                 ack.insert("type".into(), json!("job.ack"));

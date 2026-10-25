@@ -49,10 +49,16 @@ fn pair_body(code: &str, name: &str, key: &SigningKey) -> Value {
 
 async fn attempts(b: &Broker, name: &str) -> u32 {
     let tx = b.st.store.begin().await.unwrap();
-    daemons::live_code(&tx, DaemonRole::Host, name, time::OffsetDateTime::now_utc(), 100)
-        .await
-        .unwrap()
-        .map_or(u32::MAX, |c| c.failed_attempts)
+    daemons::live_code(
+        &tx,
+        DaemonRole::Host,
+        name,
+        time::OffsetDateTime::now_utc(),
+        100,
+    )
+    .await
+    .unwrap()
+    .map_or(u32::MAX, |c| c.failed_attempts)
 }
 
 const REFUSED: &str =
@@ -62,30 +68,77 @@ const REFUSED: &str =
 async fn pairing_binds_the_key_and_the_broker_proves_itself(pool: sqlx::PgPool) {
     let b = Broker::start(pool).await;
     // Through the admin route: the code is shown with the broker's key.
-    let (status, issued) = post(&b, "/admin/daemons/pairing-codes", json!({"role": "host", "name": HOST}), true).await;
+    let (status, issued) = post(
+        &b,
+        "/admin/daemons/pairing-codes",
+        json!({"role": "host", "name": HOST}),
+        true,
+    )
+    .await;
     assert_eq!(status, 200, "{issued}");
-    assert_eq!(issued["broker_public_key"], json!(b.key.public_key().to_text()));
+    assert_eq!(
+        issued["broker_public_key"],
+        json!(b.key.public_key().to_text())
+    );
     let code = issued["code"].as_str().unwrap().to_owned();
     assert_eq!(code.len(), 14);
     let daemon = SigningKey::generate().unwrap();
-    let (status, out) = post(&b, "/v1/daemons/pair", pair_body(&code, HOST, &daemon), false).await;
+    let (status, out) = post(
+        &b,
+        "/v1/daemons/pair",
+        pair_body(&code, HOST, &daemon),
+        false,
+    )
+    .await;
     assert_eq!(status, 200, "{out}");
     let k = PairingKey::from_code(&code);
     let id = ChannelId::new(Role::Host, DaemonName::parse(HOST).unwrap());
-    assert!(k.verify_broker_proof(&id, &daemon.public_key(), &b.key.public_key(), out["proof"].as_str().unwrap()));
+    assert!(k.verify_broker_proof(
+        &id,
+        &daemon.public_key(),
+        &b.key.public_key(),
+        out["proof"].as_str().unwrap()
+    ));
     assert_eq!(out["fingerprint"], json!(daemon.public_key().fingerprint()));
     // Single use.
-    let (status, out) = post(&b, "/v1/daemons/pair", pair_body(&code, HOST, &daemon), false).await;
+    let (status, out) = post(
+        &b,
+        "/v1/daemons/pair",
+        pair_body(&code, HOST, &daemon),
+        false,
+    )
+    .await;
     assert_eq!((status, out["detail"].as_str().unwrap()), (403, REFUSED));
     // Bound to its daemon's name.
     let other = b.code("other").await;
-    let (status, _) = post(&b, "/v1/daemons/pair", pair_body(&other, HOST, &daemon), false).await;
+    let (status, _) = post(
+        &b,
+        "/v1/daemons/pair",
+        pair_body(&other, HOST, &daemon),
+        false,
+    )
+    .await;
     assert_eq!(status, 403);
     // Admin endpoints need the admin token.
-    let (status, _) = post(&b, "/admin/daemons/pairing-codes", json!({"role": "host", "name": "x"}), false).await;
+    let (status, _) = post(
+        &b,
+        "/admin/daemons/pairing-codes",
+        json!({"role": "host", "name": "x"}),
+        false,
+    )
+    .await;
     assert_eq!(status, 401);
-    let (status, out) = post(&b, "/admin/daemons/pairing-codes", json!({"role": "admin", "name": "x"}), true).await;
-    assert_eq!((status, out["detail"].as_str().unwrap()), (400, "role must be one of host, sandbox"));
+    let (status, out) = post(
+        &b,
+        "/admin/daemons/pairing-codes",
+        json!({"role": "admin", "name": "x"}),
+        true,
+    )
+    .await;
+    assert_eq!(
+        (status, out["detail"].as_str().unwrap()),
+        (400, "role must be one of host, sandbox")
+    );
 }
 
 #[sqlx::test(migrations = "../store/migrations")]
@@ -111,7 +164,13 @@ async fn wrong_proofs_burn_the_code_and_each_spent_attempt_is_committed(pool: sq
     }
     post(&b, "/v1/daemons/pair", wrong.clone(), false).await;
     // Burnt: even the right proof is refused now, with the same text.
-    let (status, out) = post(&b, "/v1/daemons/pair", pair_body(&code, HOST, &daemon), false).await;
+    let (status, out) = post(
+        &b,
+        "/v1/daemons/pair",
+        pair_body(&code, HOST, &daemon),
+        false,
+    )
+    .await;
     assert_eq!((status, out["detail"].as_str().unwrap()), (403, REFUSED));
     // A malformed proof is a validation error.
     let mut bad = wrong.clone();
@@ -149,13 +208,43 @@ async fn new_codes_supersede_old_and_unpair_burns_them(pool: sqlx::PgPool) {
     let daemon = SigningKey::generate().unwrap();
     let old = b.code(HOST).await;
     let new = b.code(HOST).await;
-    assert_eq!(post(&b, "/v1/daemons/pair", pair_body(&old, HOST, &daemon), false).await.0, 403);
-    assert_eq!(post(&b, "/v1/daemons/pair", pair_body(&new, HOST, &daemon), false).await.0, 200);
+    assert_eq!(
+        post(
+            &b,
+            "/v1/daemons/pair",
+            pair_body(&old, HOST, &daemon),
+            false
+        )
+        .await
+        .0,
+        403
+    );
+    assert_eq!(
+        post(
+            &b,
+            "/v1/daemons/pair",
+            pair_body(&new, HOST, &daemon),
+            false
+        )
+        .await
+        .0,
+        200
+    );
     let pending = b.code(HOST).await;
     let rows = b.part.hub.list().await.unwrap();
     assert!(b.part.hub.unpair(rows[0].id).await.unwrap());
     assert!(!b.part.hub.unpair(rows[0].id).await.unwrap());
-    assert_eq!(post(&b, "/v1/daemons/pair", pair_body(&pending, HOST, &daemon), false).await.0, 403);
+    assert_eq!(
+        post(
+            &b,
+            "/v1/daemons/pair",
+            pair_body(&pending, HOST, &daemon),
+            false
+        )
+        .await
+        .0,
+        403
+    );
 }
 
 #[sqlx::test(migrations = "../store/migrations")]
@@ -179,7 +268,11 @@ async fn channel_end_to_end(pool: sqlx::PgPool) {
     // A call goes to the daemon and its reply comes back.
     let data = b
         .hostexec()
-        .call(HOST, json!({"type": "hostexec.precheck", "kind": "shell", "tier": "user", "duration": 60}), Duration::from_secs(5))
+        .call(
+            HOST,
+            json!({"type": "hostexec.precheck", "kind": "shell", "tier": "user", "duration": 60}),
+            Duration::from_secs(5),
+        )
         .await
         .unwrap();
     assert_eq!(data["needs"], json!("totp"));
@@ -194,18 +287,28 @@ async fn channel_end_to_end(pool: sqlx::PgPool) {
 
 /// A raw daemon connection, for the hello and envelope cases.
 struct Raw {
-    ws: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    ws: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
 }
 
 impl Raw {
     async fn connect(b: &Broker) -> (Raw, Nonce) {
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/v1/daemons/connect", b.addr.port()))
-            .await
-            .unwrap();
-        let Some(Ok(Message::Text(t))) = ws.next().await else { panic!() };
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+            "ws://127.0.0.1:{}/v1/daemons/connect",
+            b.addr.port()
+        ))
+        .await
+        .unwrap();
+        let Some(Ok(Message::Text(t))) = ws.next().await else {
+            panic!()
+        };
         let v: Value = serde_json::from_str(t.as_str()).unwrap();
         assert_eq!(v["type"], json!("challenge"));
-        (Raw { ws }, Nonce::parse(v["nonce"].as_str().unwrap()).unwrap())
+        (
+            Raw { ws },
+            Nonce::parse(v["nonce"].as_str().unwrap()).unwrap(),
+        )
     }
 
     async fn send(&mut self, v: Value) {
@@ -214,7 +317,10 @@ impl Raw {
 
     /// The close code the broker ends with, skipping other frames.
     async fn close_code(&mut self) -> Option<u16> {
-        while let Some(m) = tokio::time::timeout(Duration::from_secs(5), self.ws.next()).await.ok()? {
+        while let Some(m) = tokio::time::timeout(Duration::from_secs(5), self.ws.next())
+            .await
+            .ok()?
+        {
             if let Ok(Message::Close(Some(f))) = m {
                 return Some(u16::from(f.code));
             }
@@ -227,7 +333,10 @@ impl Raw {
 
     async fn next_text(&mut self) -> Option<String> {
         loop {
-            match tokio::time::timeout(Duration::from_secs(5), self.ws.next()).await.ok()?? {
+            match tokio::time::timeout(Duration::from_secs(5), self.ws.next())
+                .await
+                .ok()??
+            {
                 Ok(Message::Text(t)) => return Some(t.as_str().to_owned()),
                 Ok(Message::Close(_)) | Err(_) => return None,
                 _ => {}
@@ -239,7 +348,12 @@ impl Raw {
 async fn paired_key(b: &Broker, name: &str) -> SigningKey {
     let key = SigningKey::generate().unwrap();
     let code = b.code(name).await;
-    assert_eq!(post(b, "/v1/daemons/pair", pair_body(&code, name, &key), false).await.0, 200);
+    assert_eq!(
+        post(b, "/v1/daemons/pair", pair_body(&code, name, &key), false)
+            .await
+            .0,
+        200
+    );
     key
 }
 
@@ -264,16 +378,24 @@ async fn hello_rejections(pool: sqlx::PgPool) {
     // Unknown daemon: 4401.
     let (mut raw, bn) = Raw::connect(&b).await;
     let ghost = ChannelId::new(Role::Host, DaemonName::parse("ghost").unwrap());
-    raw.send(hello(&ghost, &key, &bn, &Nonce::generate().unwrap())).await;
+    raw.send(hello(&ghost, &key, &bn, &Nonce::generate().unwrap()))
+        .await;
     assert_eq!(raw.close_code().await, Some(4401));
     // Wrong key: 4401.
     let (mut raw, bn) = Raw::connect(&b).await;
-    raw.send(hello(&id, &SigningKey::generate().unwrap(), &bn, &Nonce::generate().unwrap())).await;
+    raw.send(hello(
+        &id,
+        &SigningKey::generate().unwrap(),
+        &bn,
+        &Nonce::generate().unwrap(),
+    ))
+    .await;
     assert_eq!(raw.close_code().await, Some(4401));
     // A hello signed over another connection's nonce (a replay): 4401.
     let (mut raw, _) = Raw::connect(&b).await;
     let stale = Nonce::generate().unwrap();
-    raw.send(hello(&id, &key, &stale, &Nonce::generate().unwrap())).await;
+    raw.send(hello(&id, &key, &stale, &Nonce::generate().unwrap()))
+        .await;
     assert_eq!(raw.close_code().await, Some(4401));
     // Right: a welcome signed by the broker's key.
     let (mut raw, bn) = Raw::connect(&b).await;
@@ -306,11 +428,24 @@ async fn bad_envelopes_close_the_connection(pool: sqlx::PgPool) {
         m.insert("status".into(), json!({"n": n}));
         m
     };
-    async fn welcome(raw: &mut Raw, b: &Broker, hs: Handshake, key: &SigningKey) -> (agent_auth_crypto::daemon::EnvelopeSealer, agent_auth_crypto::daemon::EnvelopeVerifier) {
+    async fn welcome(
+        raw: &mut Raw,
+        b: &Broker,
+        hs: Handshake,
+        key: &SigningKey,
+    ) -> (
+        agent_auth_crypto::daemon::EnvelopeSealer,
+        agent_auth_crypto::daemon::EnvelopeVerifier,
+    ) {
         let w: Value = serde_json::from_str(&raw.next_text().await.unwrap()).unwrap();
-        hs.verify(&b.key.public_key(), Speaker::Broker, w["params"].as_str().unwrap(), w["sig"].as_str().unwrap())
-            .unwrap()
-            .into_channel(key)
+        hs.verify(
+            &b.key.public_key(),
+            Speaker::Broker,
+            w["params"].as_str().unwrap(),
+            w["sig"].as_str().unwrap(),
+        )
+        .unwrap()
+        .into_channel(key)
     }
 
     // Replayed envelope.
@@ -388,7 +523,12 @@ async fn a_daemon_refuses_a_broker_without_the_pinned_key(pool: sqlx::PgPool) {
     let identity = agent_auth_hostd::identity(&config).unwrap();
     let tls = Arc::new(agent_auth_tls::default_client_config().unwrap());
     let code = b.code(HOST).await;
-    let err = agent_auth_daemon::pair::pair(&identity, &code, tls).await.unwrap_err();
-    assert!(err.to_string().contains("does not match the pinned"), "{err}");
+    let err = agent_auth_daemon::pair::pair(&identity, &code, tls)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("does not match the pinned"),
+        "{err}"
+    );
     std::fs::remove_dir_all(dir).ok();
 }

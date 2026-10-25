@@ -23,9 +23,9 @@ mod channel;
 mod pairing;
 mod routes;
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 pub(crate) mod testkit;
+#[cfg(test)]
+mod tests;
 
 use std::collections::HashMap;
 use std::fmt;
