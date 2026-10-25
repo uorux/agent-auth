@@ -7,7 +7,7 @@ use std::sync::{Mutex, PoisonError};
 use serde_json::{Map, Value};
 use time::OffsetDateTime;
 
-const KEEP: usize = 2000;
+const KEEP: usize = 5000;
 const MAX_FIELD_CHARS: usize = 300;
 
 #[derive(Debug, Clone, PartialEq)]

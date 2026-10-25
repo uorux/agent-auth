@@ -88,6 +88,10 @@ pub fn default_client_config() -> Result<rustls::ClientConfig, TlsError> {
 /// A reqwest builder with this TLS config, no proxy from the environment,
 /// no redirects, and the given timeout. Callers add what else they need.
 #[cfg(feature = "reqwest")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the one sanctioned construction site"
+)]
 pub fn reqwest_builder(
     config: rustls::ClientConfig,
     timeout: std::time::Duration,

@@ -31,6 +31,9 @@ pub struct AuthConfig {
     pub admin_token: Option<Secret<String>>,
     /// Accept `aat_` tokens as agent credentials.
     pub oauth_enabled: bool,
+    /// Take the client address from `X-Real-IP` (set only when a reverse
+    /// proxy that overwrites the header is in front: `TRUST_PROXY_HEADERS`).
+    pub trust_x_real_ip: bool,
 }
 
 /// The bearer token, if the request carries `Authorization: Bearer <t>`
@@ -46,8 +49,10 @@ pub fn bearer_token(parts: &Parts) -> Option<&str> {
 
 /// Who called, as the reverse proxy saw them (`X-Real-IP`), else the peer.
 #[must_use]
-pub fn client_address(parts: &Parts) -> Option<String> {
-    if let Some(ip) = parts.headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+pub fn client_address(parts: &Parts, trust_x_real_ip: bool) -> Option<String> {
+    if trust_x_real_ip
+        && let Some(ip) = parts.headers.get("x-real-ip").and_then(|v| v.to_str().ok())
+    {
         return Some(ip.chars().take(64).collect());
     }
     parts
@@ -63,7 +68,7 @@ fn record(
     now: OffsetDateTime,
     fields: &[(&str, Option<&str>)],
 ) {
-    let client = client_address(parts);
+    let client = client_address(parts, state.auth.trust_x_real_ip);
     let mut all: Vec<(&str, Option<&str>)> = vec![
         ("client", client.as_deref()),
         ("path", Some(parts.uri.path())),
@@ -93,7 +98,9 @@ impl FromRequestParts<AppState> for AgentCaller {
                 None => None,
             };
             match agent {
-                Some(a) if !a.disabled => (a, AgentCredentialKind::OAuthConnector),
+                Some(a) if !a.disabled && a.kind != AgentKind::Operator => {
+                    (a, AgentCredentialKind::OAuthConnector)
+                }
                 other => {
                     let name = other.as_ref().map(|a| a.name.clone());
                     record(
@@ -162,7 +169,12 @@ async fn with_session(
     agent: &agents::AgentRow,
     now: OffsetDateTime,
 ) -> Result<Option<sessions::SessionRow>, ApiError> {
-    let Some(header) = parts.headers.get("x-agent-session") else {
+    // An empty header is no header (spec http-api §3.1).
+    let Some(header) = parts
+        .headers
+        .get("x-agent-session")
+        .filter(|h| !h.is_empty())
+    else {
         return Ok(None);
     };
     // 401 (not 404): the auth context is stale — mint a new session.

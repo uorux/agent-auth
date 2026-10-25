@@ -2,3 +2,12 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
+# Every HTTP client goes through agent_auth_tls::reqwest_builder (our root
+# store, no proxy from the environment, no redirects, timeouts). A bare
+# reqwest client would trust the OS store via rustls-platform-verifier.
+disallowed-methods = [
+    { path = "reqwest::Client::new", reason = "use agent_auth_tls::reqwest_builder" },
+    { path = "reqwest::Client::builder", reason = "use agent_auth_tls::reqwest_builder" },
+    { path = "reqwest::ClientBuilder::new", reason = "use agent_auth_tls::reqwest_builder" },
+    { path = "reqwest::get", reason = "use agent_auth_tls::reqwest_builder" },
+]

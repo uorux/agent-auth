@@ -1,5 +1,11 @@
 //! The extractors against a real database (rust/spec/http-api.md §3).
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::indexing_slicing, clippy::panic, clippy::arithmetic_side_effects)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::arithmetic_side_effects
+)]
 
 use agent_auth_broker::auth::{AdminCaller, AgentCaller, AuthConfig};
 use agent_auth_broker::state::AppState;
@@ -111,6 +117,7 @@ fn state(pool: sqlx::PgPool, admin_token: Option<&str>) -> AppState {
         AuthConfig {
             admin_token: admin_token.map(|t| Secret::new(t.to_owned())),
             oauth_enabled: false,
+            trust_x_real_ip: false,
         },
     )
 }
@@ -204,6 +211,11 @@ async fn sessions_must_be_own_and_open(pool: sqlx::PgPool) {
     tx.commit().await.expect("commit");
     let app = app(st);
     let auth = format!("Bearer {key}");
+    // An empty header is no header.
+    assert_eq!(
+        call(&app, "/me", Some(&auth), Some("")).await,
+        (StatusCode::OK, "alice:".to_owned())
+    );
 
     let (s, body) = call(&app, "/me", Some(&auth), Some(&mine.id.to_string())).await;
     assert_eq!((s, body), (StatusCode::OK, format!("alice:{}", mine.id)));
