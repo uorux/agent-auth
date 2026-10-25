@@ -248,7 +248,7 @@ impl PoolProvisioner {
     /// The items to try, best first, after re-checking eligibility (policy
     /// may have changed since the request: a rule, the LLM or a window may
     /// approve long after).
-    fn candidates(
+    pub(super) fn candidates(
         pool_name: &str,
         pool: &PoolConfig,
         agent: &AgentRow,

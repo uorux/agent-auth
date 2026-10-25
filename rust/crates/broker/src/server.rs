@@ -365,6 +365,7 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
     state.hostd = Some(Arc::clone(&hostd));
     let state = crate::webui::install(state, web);
     hostd.bind(&state);
+    crate::provisioners::google::end_stub_era_grants(&state).await;
     crate::scheduler::boot(&state).await;
 
     let mut tasks = Vec::new();

@@ -713,6 +713,26 @@ pub async fn active_of_agents(tx: &Tx<'_>, agents: &[AgentId]) -> Result<Vec<Gra
     .await?))
 }
 
+/// Active grants of a platform whose provisioner state lacks `key` equal
+/// to their resource: for google, grants approved while it was a stub
+/// (`{"stub": true}`), which the real provisioner never minted for.
+pub async fn active_without_state(
+    tx: &Tx<'_>,
+    platform: Platform,
+    key: &str,
+) -> Result<Vec<GrantId>, StoreError> {
+    let mut c = tx.conn().await;
+    Ok(ids(sqlx::query_scalar!(
+        "SELECT id FROM grants WHERE status = 'active' AND platform = $1
+           AND (provisioner_state ->> $2) IS DISTINCT FROM resource
+         ORDER BY granted_at",
+        platform.as_str(),
+        key
+    )
+    .fetch_all(&mut **c)
+    .await?))
+}
+
 /// PROVISIONING grants created at or before `cutoff` (the reaper).
 pub async fn stale_provisioning(
     tx: &Tx<'_>,

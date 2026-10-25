@@ -551,3 +551,38 @@ async fn the_catalog_lists_the_pools_an_agent_may_lease_from(pool: sqlx::PgPool)
         "{out}"
     );
 }
+
+/// Review #4: an item made sensitive after a lease was approved without
+/// naming it ("any", "previous") is not taken at provision: provisioning
+/// re-reads the configuration, and only a named item can be a sensitive
+/// one.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn an_item_made_sensitive_since_approval_is_not_taken(pool: sqlx::PgPool) {
+    let st = pool_state(pool, true);
+    let a = bot(&st, "bot-a").await;
+    let dir = secrets_dir();
+    let alt2 = format!("secret_file: {}", dir.join("alt-2").display());
+    let text =
+        pool_policy(&dir, true).replace(&alt2, &format!("{alt2}\n          sensitive: true"));
+    let now_policy = Policy::from_yaml(&text).unwrap();
+    let mc = &now_policy.platforms().pools["minecraft"];
+    assert!(mc.items["alt-2"].sensitive);
+    let last = "alt-2".to_owned();
+    let previous = PoolProvisioner::candidates(
+        "minecraft",
+        mc,
+        &a,
+        &agent_auth_core::pool::PoolChoice::Previous,
+        Some(&last),
+    );
+    assert!(previous.is_err());
+    let any = PoolProvisioner::candidates(
+        "minecraft",
+        mc,
+        &a,
+        &agent_auth_core::pool::PoolChoice::Any(agent_auth_core::pool::PropMatch::new()),
+        Some(&last),
+    )
+    .unwrap();
+    assert_eq!(any, vec!["alt-1".to_owned()]);
+}

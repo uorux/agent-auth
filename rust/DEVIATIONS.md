@@ -754,13 +754,42 @@ and why. Keep entries short. Group by area.
   A transport failure is `google token endpoint unreachable (see broker
   logs)`; an unreadable login file names what is wrong (`no such file`,
   `not JSON`, `no client_id`), not the Python exception's repr.
-- **A login file's `token_uri` must be https** (plain http only to a
-  loopback address), in the broker and in `admin google-consent`: `google
-  account <a>: its token_uri is not an https URL`. The Python posted the
-  refresh token or assertion to whatever the file named.
-- **`admin google-consent` never writes through a link**: an existing
-  `--out` that is not a regular file is refused like a non-empty one; a
-  client JSON that does not parse is a clean error (the Python raised).
+- **A login file's `token_uri` must be Google's token endpoint**
+  (`https://oauth2.googleapis.com/token` or the legacy
+  `https://accounts.google.com/o/oauth2/token`), in the broker and in
+  `admin google-consent` (security review #4): `google account <a>: its
+  token_uri is not Google's token endpoint`. The Python posted the refresh
+  token or the signed assertion to whatever the file named. Tests' fake
+  endpoints are allowed only by the test constructor
+  (`GoogleTokens::with_http`) and the CLI's own unit tests.
+- **`admin google-consent --out` is a new file** (security review #4):
+  created `O_CREAT|O_EXCL`, mode 0600 from creation; anything already at the
+  name (an empty file, a link, a dangling link) is refused (`<path> already
+  exists; remove it first`; the Python replaced an empty file). A client
+  JSON that does not parse is a clean error (the Python raised).
+- **Stub-era Google grants never become tokens** (security review #4). A
+  grant approved while google was a stub recorded a decision only
+  (`{"stub": true}`); once accounts are configured its credential is
+  refused (`this grant was approved while google had no account configured
+  (nothing was issued then); request it again`: the credential needs the
+  real provisioner's state, `account` equal to the resource), and at
+  startup every such active grant is revoked with that reason, besides the
+  warning about saved google rules. The Python would have minted real,
+  account-wide tokens for them.
+- **A token answer without `scope` is not handed out** (security review
+  #4): the Python counted it as exactly the scopes asked for. An agent's
+  token needs Google to say what it carries (`Google's answer did not say
+  which scopes the token carries; not handed out`); the broker's own use
+  (the mail gateway's Gmail backend) still takes it.
+- **Delegated accounts name whom they act as** (security review #4): the
+  request note and the credential note read `<address> (acting as
+  <subject>, by domain-wide delegation)`, since the subject may be someone
+  else than the account's address.
+- **Pool items made sensitive after approval** (security review #4, not a
+  change): provisioning re-reads the pool's configuration, and "any" and
+  "previous" choose only among items that are not sensitive then (tested),
+  so an item marked sensitive between approval and provisioning is never
+  taken by them.
 - **Google texts**: a scope on a google request is refused with core's
   `no scope for google grants: the capability is the scope (unknown scope
   keys: ...)`; the stub's 501 reads `no google account is configured on this
