@@ -1,0 +1,32 @@
+# Releases allowed inside the 14-day cooldown (scripts/cooldown.py). Each is
+# a security fix whose advisory outweighs the risk of a fresh release.
+
+[[exception]]
+name = "rustls"
+version = "0.23.46"
+reason = "RUSTSEC-2026-0346/0347/0348/0349 (secrets in Debug, ECH, cert decompression, ServerHello downgrade)"
+
+[[exception]]
+name = "rustls-webpki"
+version = "0.103.16"
+reason = "RUSTSEC-2026-0382: distrusted intermediates accepted"
+
+[[exception]]
+name = "webpki-roots"
+version = "1.0.11"
+reason = "RUSTSEC-2026-0381: drops roots chaining to the compromised eMudhra/emSign intermediates"
+
+[[exception]]
+name = "webpki-root-certs"
+version = "1.0.11"
+reason = "RUSTSEC-2026-0383: same roots as webpki-roots"
+
+[[exception]]
+name = "tokio"
+version = "1.54.1"
+reason = "RUSTSEC-2026-0386: AsyncFd I/O-safety unsoundness"
+
+[[exception]]
+name = "ctutils"
+version = "0.4.5"
+reason = "RUSTSEC-2026-0385: non-constant-time mask generation"
