@@ -89,7 +89,12 @@ fn config() -> KubernetesConfig {
 
 async fn setup_with(pool: PgPool, cfg: KubernetesConfig, policy: Policy) -> K {
     let state = Arc::new(Mutex::new(K8s {
-        namespaces: vec!["apps-a".into(), "apps-b".into(), "soc-x".into()],
+        namespaces: vec![
+            "agent-auth-grants".into(),
+            "apps-a".into(),
+            "apps-b".into(),
+            "soc-x".into(),
+        ],
         ..K8s::default()
     }));
     let s2 = state.clone();
@@ -232,6 +237,35 @@ async fn validation(pool: PgPool) {
     let mut star = config();
     star.namespace_allowlist = vec![Glob::new("*")];
     let star = setup_with(t.store.pool().clone(), star, Policy::default()).await;
+    // The grants' own namespace is never a target, whatever the allowlist.
+    assert_eq!(
+        validate(
+            &star.store,
+            &star.p,
+            &a,
+            Platform::Kubernetes,
+            "view",
+            json!({}),
+            "agent-auth-grants"
+        )
+        .await
+        .unwrap_err(),
+        "namespace 'agent-auth-grants' holds the grants' ServiceAccounts and is never brokered"
+    );
+    let g = provisioning(
+        &star.store,
+        a.id,
+        &role("view", false),
+        "agent-auth-grants",
+        3600,
+    )
+    .await;
+    assert!(
+        provision(&star.store, &star.p, &g)
+            .await
+            .unwrap_err()
+            .ends_with("is never brokered")
+    );
     assert!(
         validate(
             &star.store,
@@ -267,9 +301,10 @@ async fn full_cycle(pool: PgPool) {
     let g = granted(&t.store, &t.p, a.id, &role("view", false), "apps-a").await;
     let name = sa_name("k8s-agent", &g.id.to_string());
     assert_eq!(name, format!("aa-k8s-agent-{}", g.id));
-    let sa = t
-        .fake
-        .find("POST", "/api/v1/namespaces/apps-a/serviceaccounts");
+    let sa = t.fake.find(
+        "POST",
+        "/api/v1/namespaces/agent-auth-grants/serviceaccounts",
+    );
     assert_eq!(
         sa[0].body["metadata"]["annotations"]["agent-auth/grant-id"],
         json!(g.id.to_string())
@@ -288,11 +323,11 @@ async fn full_cycle(pool: PgPool) {
     );
     assert_eq!(
         rb[0].body["subjects"],
-        json!([{"kind": "ServiceAccount", "name": name, "namespace": "apps-a"}])
+        json!([{"kind": "ServiceAccount", "name": name, "namespace": "agent-auth-grants"}])
     );
     assert_eq!(
         g.provisioner_state,
-        json!({"namespace": "apps-a", "service_account": name, "role": "view", "cluster": false})
+        json!({"namespace": "agent-auth-grants", "service_account": name, "role": "view", "cluster": false, "binding_namespace": "apps-a"})
     );
 
     // The token file is re-read on every call.
@@ -304,14 +339,14 @@ async fn full_cycle(pool: PgPool) {
     );
     let tr = t.fake.find(
         "POST",
-        &format!("/api/v1/namespaces/apps-a/serviceaccounts/{name}/token"),
+        &format!("/api/v1/namespaces/agent-auth-grants/serviceaccounts/{name}/token"),
     );
     assert_eq!(tr[0].header("authorization"), "Bearer sa-token-2");
     let secs = tr[0].body["spec"]["expirationSeconds"].as_i64().unwrap();
     assert!((3500..=3600).contains(&secs), "{secs}");
     assert_eq!(tr[0].body["kind"], "TokenRequest");
     assert!(c.note.unwrap().starts_with(&format!(
-        "bearer token for ServiceAccount apps-a/{name} (view) against {}",
+        "bearer token for ServiceAccount agent-auth-grants/{name} (view in namespace apps-a) against {}",
         t.fake.url
     )));
 
@@ -327,7 +362,7 @@ async fn full_cycle(pool: PgPool) {
         deletes,
         [
             format!("/apis/rbac.authorization.k8s.io/v1/namespaces/apps-a/rolebindings/{name}"),
-            format!("/api/v1/namespaces/apps-a/serviceaccounts/{name}"),
+            format!("/api/v1/namespaces/agent-auth-grants/serviceaccounts/{name}"),
         ]
     );
     assert!(t.objects().is_empty());
@@ -361,7 +396,7 @@ async fn existing_objects_are_adopted_only_when_they_are_this_grants(pool: PgPoo
     let g = provisioning(&t.store, a.id, &role("view", false), "apps-a", 3600).await;
     let name = sa_name("k8s-agent", &g.id.to_string());
     t.state.lock().unwrap().objects.insert(
-        format!("/api/v1/namespaces/apps-a/serviceaccounts/{name}"),
+        format!("/api/v1/namespaces/agent-auth-grants/serviceaccounts/{name}"),
         json!({"metadata": {"name": name, "annotations": {"agent-auth/grant-id": g.id.to_string()}}}),
     );
     provision(&t.store, &t.p, &g).await.unwrap();
@@ -370,7 +405,7 @@ async fn existing_objects_are_adopted_only_when_they_are_this_grants(pool: PgPoo
     let g = provisioning(&t.store, a.id, &role("view", false), "apps-b", 3600).await;
     let name = sa_name("k8s-agent", &g.id.to_string());
     t.state.lock().unwrap().objects.insert(
-        format!("/api/v1/namespaces/apps-b/serviceaccounts/{name}"),
+        format!("/api/v1/namespaces/agent-auth-grants/serviceaccounts/{name}"),
         json!({"metadata": {"name": name, "annotations": {"agent-auth/grant-id": "someone-else"}}}),
     );
     let err = provision(&t.store, &t.p, &g).await.unwrap_err();
@@ -394,8 +429,10 @@ async fn a_cluster_wide_grant_binds_a_cluster_role_binding(pool: PgPool) {
     let g = granted(&t.store, &t.p, a.id, &role("view", true), "*").await;
     let name = sa_name("k8s-agent", &g.id.to_string());
     assert_eq!(
-        t.fake
-            .count("POST", "/api/v1/namespaces/default/serviceaccounts"),
+        t.fake.count(
+            "POST",
+            "/api/v1/namespaces/agent-auth-grants/serviceaccounts"
+        ),
         1
     );
     let crb = t.fake.find(
@@ -404,7 +441,7 @@ async fn a_cluster_wide_grant_binds_a_cluster_role_binding(pool: PgPool) {
     );
     assert_eq!(
         crb[0].body["subjects"],
-        json!([{"kind": "ServiceAccount", "name": name, "namespace": "default"}])
+        json!([{"kind": "ServiceAccount", "name": name, "namespace": "agent-auth-grants"}])
     );
     assert!(crb[0].body["metadata"].get("namespace").is_none());
     assert_eq!(g.provisioner_state["cluster"], json!(true));
@@ -510,7 +547,7 @@ async fn endpoints_fail_over_and_the_answering_one_is_preferred(pool: PgPool) {
     );
     let g = provisioning(&t.store, a.id, &role("view", false), "apps-b", 3600).await;
     let err = provision(&t.store, &down, &g).await.unwrap_err();
-    assert!(err.starts_with("kubernetes API unreachable: "), "{err}");
+    assert_eq!(err, "kubernetes API unreachable (see broker logs)");
 }
 
 #[sqlx::test(migrations = "../store/migrations")]

@@ -68,8 +68,14 @@ impl std::fmt::Debug for LdapTarget {
 
 impl LdapTarget {
     /// `ldap://host[:3890]` or `ldaps://host[:6360]`, and the base DN
-    /// (`dc=example,dc=com`).
-    pub fn parse(url: &str, base_dn: &str) -> Result<LdapTarget, ConfigError> {
+    /// (`dc=example,dc=com`). Plain `ldap://` sends the admin password in
+    /// the clear: it is refused unless the host is loopback or
+    /// `allow_plaintext` (`LLDAP_LDAP_ALLOW_PLAINTEXT=1`) says so.
+    pub fn parse(
+        url: &str,
+        base_dn: &str,
+        allow_plaintext: bool,
+    ) -> Result<LdapTarget, ConfigError> {
         let bad = || {
             ConfigError(format!(
                 "LLDAP_LDAP_URL {url:?}: expected ldap://host[:port] or ldaps://host[:port]"
@@ -89,6 +95,23 @@ impl LdapTarget {
         };
         if host.is_empty() || host.contains(['/', '@', '?', '#']) {
             return Err(bad());
+        }
+        let loopback = host == "localhost"
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        if !tls && !loopback {
+            if !allow_plaintext {
+                return Err(ConfigError(format!(
+                    "LLDAP_LDAP_URL {url:?} would send the LLDAP admin password in the clear: use ldaps://, or set LLDAP_LDAP_ALLOW_PLAINTEXT=1"
+                )));
+            }
+            tracing::warn!(
+                url,
+                "LLDAP_LDAP_ALLOW_PLAINTEXT: the LLDAP admin password goes over plain LDAP"
+            );
         }
         if base_dn.trim().is_empty() {
             return Err(ConfigError(
@@ -537,15 +560,18 @@ mod tests {
 
     #[test]
     fn urls() {
-        let t = LdapTarget::parse("ldap://lldap.auth:3890", "dc=x").unwrap();
+        assert!(LdapTarget::parse("ldap://lldap.auth:3890", "dc=x", false).is_err());
+        assert!(LdapTarget::parse("ldap://127.0.0.1:3890", "dc=x", false).is_ok());
+        assert!(LdapTarget::parse("ldap://localhost", "dc=x", false).is_ok());
+        let t = LdapTarget::parse("ldap://lldap.auth:3890", "dc=x", true).unwrap();
         assert_eq!(
             (t.host.as_str(), t.port, t.tls.is_some()),
             ("lldap.auth", 3890, false)
         );
-        let t = LdapTarget::parse("ldaps://lldap", "dc=x").unwrap();
+        let t = LdapTarget::parse("ldaps://lldap", "dc=x", false).unwrap();
         assert_eq!((t.port, t.tls.is_some()), (6360, true));
-        assert!(LdapTarget::parse("http://lldap", "dc=x").is_err());
-        assert!(LdapTarget::parse("ldap://lldap", "").is_err());
+        assert!(LdapTarget::parse("http://lldap", "dc=x", true).is_err());
+        assert!(LdapTarget::parse("ldap://lldap", "", true).is_err());
     }
 
     proptest! {

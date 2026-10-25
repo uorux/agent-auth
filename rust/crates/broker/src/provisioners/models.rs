@@ -140,9 +140,10 @@ impl ModelsProvisioner {
         if let Some(b) = body {
             rb = rb.json(b);
         }
-        http::send(rb, TIMEOUT, MAX_BODY)
-            .await
-            .map_err(|e| ProvisionError::failed(format!("model gateway: {e}")))
+        http::send(rb, TIMEOUT, MAX_BODY).await.map_err(|e| {
+            tracing::warn!(error = %e, path, "model gateway call failed");
+            ProvisionError::failed("model gateway unreachable (see broker logs)")
+        })
     }
 
     /// The gateway user `name`, if the broker made it for this agent.

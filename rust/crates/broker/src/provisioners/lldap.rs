@@ -118,7 +118,11 @@ impl LldapProvisioner {
         let ldap = if ldap_url.is_empty() {
             None
         } else {
-            Some(LdapTarget::parse(&ldap_url, &env.get("LLDAP_BASE_DN"))?)
+            Some(LdapTarget::parse(
+                &ldap_url,
+                &env.get("LLDAP_BASE_DN"),
+                env.flag("LLDAP_LDAP_ALLOW_PLAINTEXT")?,
+            )?)
         };
         if !env.get("LLDAP_SET_PASSWORD_BIN").is_empty() {
             tracing::warn!(
@@ -192,7 +196,7 @@ impl LldapProvisioner {
         }
         http::send(rb, TIMEOUT, MAX_BODY).await.map_err(|e| {
             tracing::warn!(error = %e, path, "LLDAP call failed");
-            ProvisionError::failed(format!("LLDAP unreachable ({e})"))
+            ProvisionError::failed("LLDAP unreachable (see broker logs)")
         })
     }
 
@@ -506,6 +510,10 @@ impl LldapProvisioner {
             Some(u) => u,
             None => self.ensure_account(tx, agent.id).await?,
         };
+        // The add is serialized with every revoke of this membership.
+        agent_auth_store::lldap::lock_membership(tx, grant.agent_id, &grant.resource)
+            .await
+            .map_err(|e| store_failed(&e))?;
         let group = self.group_id(&grant.resource).await?;
         self.mutate(ADD, &user, group, true).await?;
         Ok(json!({"lldap_user": user, "group": grant.resource, "group_id": group}))
@@ -608,6 +616,11 @@ impl Provisioner for LldapProvisioner {
         // One (user, group) fact shared by every grant on the group: only
         // the last live grant removes it (INV-L4). Expiry counts as well as
         // status, so of several grants lapsing in one tick one removes it.
+        // Serialized per (agent, group) until commit, so a concurrent revoke
+        // of the other grant sees this one's outcome.
+        agent_auth_store::lldap::lock_membership(tx, grant.agent_id, &grant.resource)
+            .await
+            .map_err(|e| store_failed(&e))?;
         let siblings = grants::siblings(tx, grant)
             .await
             .map_err(|e| store_failed(&e))?;

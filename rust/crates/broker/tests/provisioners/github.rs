@@ -717,3 +717,32 @@ fn github_needs_the_encryption_key() {
     let err = GithubProvisioner::new(Arc::new(app), &config(), None).unwrap_err();
     assert_eq!(err.0, "ENCRYPTION_KEY is required when GitHub is enabled");
 }
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn globs_with_capitals_still_match(pool: PgPool) {
+    let mut cfg = config();
+    cfg.repo_denylist = vec![Glob::new("JRT/NixOS-*")];
+    cfg.repo_allowlist = vec![Glob::new("JRT/*")];
+    let t = setup_with(pool, cfg, None).await;
+    let a = agent(&t.store, "gh-agent").await;
+    let v = |res: &'static str| {
+        let (store, p, a) = (t.store.clone(), &t.p, a.clone());
+        async move {
+            validate(
+                &store,
+                p,
+                &a,
+                Platform::Github,
+                "repo",
+                json!({"permissions": {"contents": "read"}}),
+                res,
+            )
+            .await
+        }
+    };
+    assert_eq!(
+        v("jrt/nixos-dots").await.unwrap_err(),
+        "repo 'jrt/nixos-dots' is never brokered (denylist)"
+    );
+    assert!(v("jrt/cactus").await.is_ok());
+}

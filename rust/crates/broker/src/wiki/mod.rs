@@ -8,7 +8,8 @@
 //! readers get its project and last author with it.
 //!
 //! Fixes (DEVIATIONS.md): the last-change cache is keyed by path and blob
-//! sha, and a failed lookup is not cached (B12); the credential check also
+//! sha, and a failed lookup is remembered only briefly (B12); writes refresh
+//! the copy only when `base_sha` disagrees with it (B14); the credential check also
 //! covers the commit summary (B13); a truncated tree listing is logged
 //! (B15).
 
@@ -43,6 +44,8 @@ pub const PROJECTS_DIR: &str = "projects";
 const MAX_PATH: usize = 200;
 const MAX_DEPTH: usize = 6;
 const MAX_SUMMARY: usize = 200;
+/// How long a failed last-change lookup is remembered.
+const CHANGE_RETRY: Duration = Duration::from_secs(30);
 
 /// The shapes of credentials an agent is likely to hold: refused in a page
 /// and in a commit summary. A guard against pasting one by mistake.
@@ -160,6 +163,9 @@ pub struct Wiki {
     cache: tokio::sync::Mutex<Cache>,
     /// Last commit per (path, blob sha); failures are not remembered.
     changes: Mutex<HashMap<(String, String), LastChange>>,
+    /// Lookups that failed, and when: not retried for `change_retry`.
+    change_failures: Mutex<HashMap<(String, String), Instant>>,
+    change_retry: Duration,
 }
 
 fn snapshot_to_pages(files: Snapshot) -> BTreeMap<String, Page> {
@@ -181,8 +187,17 @@ impl Wiki {
             backend: GithubWikiBackend::new(app, &cfg.repo, &cfg.branch),
             cache: tokio::sync::Mutex::new(Cache::default()),
             changes: Mutex::new(HashMap::new()),
+            change_failures: Mutex::new(HashMap::new()),
+            change_retry: CHANGE_RETRY,
             policy,
         }
+    }
+
+    /// How long a failed last-change lookup is remembered (default 30 s).
+    #[must_use]
+    pub fn with_change_retry(mut self, after: Duration) -> Wiki {
+        self.change_retry = after;
+        self
     }
 
     fn refresh(&self) -> Duration {
@@ -270,6 +285,26 @@ impl Wiki {
         }
     }
 
+    /// The pages a write or delete checks `base_sha` against: the cached
+    /// copy when it agrees with `base_sha`, else a fresh one (GitHub's own
+    /// sha precondition backs up a stale agreement, B14).
+    async fn pages_for_write(
+        &self,
+        path: &str,
+        base_sha: Option<&str>,
+        now: OffsetDateTime,
+    ) -> Result<Arc<BTreeMap<String, Page>>, ApiError> {
+        let cached = self.load(false, now).await?;
+        let current = cached.get(path);
+        if current.is_some() && check_base(path, current, base_sha).is_ok() {
+            return Ok(cached);
+        }
+        if current.is_none() && base_sha.is_none_or(str::is_empty) {
+            return Ok(cached);
+        }
+        self.load(true, now).await
+    }
+
     pub async fn list(
         &self,
         agent: &AgentRow,
@@ -308,15 +343,32 @@ impl Wiki {
             .unwrap_or_else(PoisonError::into_inner)
             .get(&key)
             .cloned();
+        let failed_recently = self
+            .change_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .is_some_and(|at| at.elapsed() < self.change_retry);
         let change = match cached {
             Some(c) => Some(c),
+            None if failed_recently => None,
             None => {
                 let c = self.backend.last_change(path, now).await;
-                if let Some(c) = &c {
-                    self.changes
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .insert(key, c.clone());
+                match &c {
+                    Some(c) => {
+                        self.changes
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .insert(key, c.clone());
+                    }
+                    // Remembered briefly: a GitHub outage does not cost a
+                    // lookup per read, nor hide the author for long.
+                    None => {
+                        self.change_failures
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .insert(key, Instant::now());
+                    }
                 }
                 c
             }
@@ -398,7 +450,7 @@ impl Wiki {
         }
         refuse_secrets(content)?;
         refuse_secrets(summary)?;
-        let pages = self.load(true, now).await?;
+        let pages = self.pages_for_write(path, base_sha, now).await?;
         let current = pages.get(path);
         check_base(path, current, base_sha)?;
         if let Some(c) = current
@@ -463,7 +515,7 @@ impl Wiki {
         check_path(path)?;
         self.check_write(agent, path)?;
         refuse_secrets(summary)?;
-        let pages = self.load(true, now).await?;
+        let pages = self.pages_for_write(path, base_sha, now).await?;
         let Some(current) = pages.get(path) else {
             return Err(ApiError::not_found(format!("no page {}", repr(path))));
         };

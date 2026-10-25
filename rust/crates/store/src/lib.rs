@@ -51,6 +51,8 @@
 //!    transaction;
 //! 4. **grants**, ascending id when several are locked at once (multi-row
 //!    writers lock `ORDER BY id FOR NO KEY UPDATE` first);
+//!    Then the **LLDAP membership lock** (`lldap::lock_membership`, an
+//!    advisory lock per agent and group), after the grant it acts for;
 //! 5. **a2a threads** (a thread is locked after the grants it depends on;
 //!    look the backing grant id up without a lock, lock the grant, then the
 //!    thread);

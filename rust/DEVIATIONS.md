@@ -589,9 +589,22 @@ and why. Keep entries short. Group by area.
   INV-6). Models errors were `"{status} {text[:200]}"`; now only the status
   (`model gateway refused the key: 500`, `... refused the user for x: 500`,
   `... did not delete <alias>: 503`, usage `model gateway: 500`); bodies go
-  to the broker log. Transport failures say `GitHub API unreachable (...)`,
-  `LLDAP unreachable (...)`, `model gateway: ...` without URLs (the
-  Python's uncaught httpx text could include them).
+  to the broker log. Transport failures carry no client or upstream text
+  (host names, addresses): `GitHub API unreachable (see broker logs)`,
+  `LLDAP unreachable (see broker logs)`, `model gateway unreachable (see
+  broker logs)`, `kubernetes API unreachable (see broker logs)`, `cannot
+  read kubernetes token file (see broker logs)`; the detail is logged.
+- **Case-folded resources are matched by lowercased globs** (review): the
+  policy loader lowercases `platforms.github.repo_allowlist`/`repo_denylist`,
+  `platforms.kubernetes.namespace_allowlist`/`sensitive_namespaces`/
+  `cluster_grant_namespace`, and every restricted zone's `kubernetes` and
+  `github` globs (the GitHub provisioner lowercases its lists again). The
+  Python compared lowercased repos to the globs as written, so `JRT/x` in
+  a denylist never matched: it failed open.
+- **MCP servers need distinct audiences** (review): a policy where two
+  servers share an `audience` (or url) does not load (`platforms.mcp.servers:
+  a and b have the same audience '...'`); each would accept the other's
+  tokens.
 - **GitHub owner `.`/`..` refused** (B6): `invalid github repository`.
 - **GitHub ceiling values are checked at startup** (B7): a
   `permission_ceiling` value other than read/write/admin (any case) stops
@@ -622,6 +635,12 @@ and why. Keep entries short. Group by area.
   `0003` adds a unique index on `lower(agents.lldap_username)`: two agents
   can no longer share an LLDAP account (an admin setting one that another
   agent has now fails).
+- **LLDAP memberships are serialized per agent and group** (review: write
+  skew). Provision and revoke take a transaction-scoped advisory lock on
+  (agent, group) (`store::lldap::lock_membership`) before reading the
+  sibling grants, so of two concurrent revokes of an agent's last two
+  grants on a group, the second sees the first one's outcome and removes
+  the membership (the Python, and the first port, could keep it forever).
 - **LLDAP account creation holds the agent row** (B3): `ensure_account`
   locks the agent row `FOR UPDATE` in the provisioning transaction, so a
   concurrent provision for the same fresh agent waits for the commit (or,
@@ -634,7 +653,8 @@ and why. Keep entries short. Group by area.
   user. The broker now binds to LLDAP's LDAP interface as the admin and
   uses the Password Modify extended operation (RFC 3062), which LLDAP
   supports; new settings `LLDAP_LDAP_URL` (`ldap://host:3890` or
-  `ldaps://host:6360`) and `LLDAP_BASE_DN` (`dc=example,dc=com`).
+  `ldaps://host:6360`) and `LLDAP_BASE_DN` (`dc=example,dc=com`); plain
+  `ldap://` only to a loopback host or with `LLDAP_LDAP_ALLOW_PLAINTEXT=1`.
   `LLDAP_SET_PASSWORD_BIN` is ignored (a warning). Managed accounts need
   `ENCRYPTION_KEY` **and** `LLDAP_LDAP_URL`/`LLDAP_BASE_DN`; without them
   they are off as before (hand-registered accounts and existing managed
@@ -645,6 +665,23 @@ and why. Keep entries short. Group by area.
 - **LLDAP revoke treats a deleted user as not a member** (B17): a grant no
   longer stays ACTIVE forever when its account was deleted out of band.
 - **LLDAP `UserExists` also reads `displayName`** (for the B2 check).
+- **Kubernetes ServiceAccounts live in a namespace of their own**
+  (review). The Python put a namespaced grant's ServiceAccount in the
+  target namespace (and a cluster grant's in `cluster_grant_namespace`,
+  `default`), where anyone allowed to create pods there could run one as
+  that ServiceAccount and inherit its role. Every grant's ServiceAccount is
+  now created in `platforms.kubernetes.grant_namespace` (new setting,
+  default `agent-auth-grants`; the operator creates it and lets the broker
+  manage ServiceAccounts there); the RoleBinding stays in the target
+  namespace, its subject naming the ServiceAccount in the grant namespace.
+  A request for the grant namespace is refused whatever the allowlist says
+  (`namespace 'agent-auth-grants' holds the grants' ServiceAccounts and is
+  never brokered`), and a zone-avoiding cluster grant never binds there.
+  State gains `binding_namespace`; the credential note reads `bearer token
+  for ServiceAccount agent-auth-grants/<name> (<role> in namespace <ns>)`
+  (or `(<role> cluster-wide)`). A cluster-wide ClusterRoleBinding still
+  covers the grant namespace too (cluster-wide grants are always a human's
+  decision).
 - **Kubernetes half-made provisions clean up** (B10): when a binding (or
   the namespace listing of the zone branch) fails after the ServiceAccount
   was made, the SA (and any bindings made) is deleted before the error is
@@ -673,9 +710,14 @@ and why. Keep entries short. Group by area.
 ## Wiki (`broker/src/wiki`)
 
 - **`last_change` is cached per (path, blob sha), and a failed lookup is
-  not cached** (a2a B12): two pages with the same content no longer share
-  an author, and a transient GitHub error no longer hides it until the page
-  changes.
+  remembered for 30 s only** (a2a B12): two pages with the same content no
+  longer share an author, and a transient GitHub error no longer hides it
+  until the page changes.
+- **Writes re-read the repo only when `base_sha` disagrees with the
+  broker's copy** (a2a B14): the Python fetched the whole tree on every
+  write and delete. GitHub's own sha precondition still refuses a write
+  over a version the copy missed (409 `... changed while you were
+  writing`).
 - **The commit summary is checked for credentials too** (a2a B13), on
   write and delete, with the same 400 text as for the content.
 - **A truncated tree listing is logged** (a2a B15).
@@ -807,9 +849,14 @@ and why. Keep entries short. Group by area.
   the homelab catalog then lists no groups although all are grantable.
   The LLDAP administration groups are refused either way.
 - **LLDAP over LDAP needs two new settings** (B4 fix): `LLDAP_LDAP_URL` and
-  `LLDAP_BASE_DN` for managed accounts. Plain `ldap://` sends the admin
-  password like the existing HTTP login to `LLDAP_URL` does; prefer
-  `ldaps://` when LLDAP is not on a trusted network.
+  `LLDAP_BASE_DN` for managed accounts. Plain `ldap://` (the admin password
+  in the clear) is refused at startup unless the host is loopback or
+  `LLDAP_LDAP_ALLOW_PLAINTEXT=1` is set (then a warning is logged); use
+  `ldaps://`.
+- **Kubernetes `grant_namespace`** must exist before the first grant, with
+  the broker allowed to manage ServiceAccounts (and request their tokens)
+  there; existing grants made by the Python keep their ServiceAccounts
+  where they are until they end.
 - **Models user ids**: the port refuses a pre-existing gateway user it did
   not create (B12) instead of prefixing user ids; prefixing would change
   existing gateways' accounting.

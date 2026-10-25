@@ -393,6 +393,32 @@ pub async fn revoke_due<P: Provisioner>(
     }
 }
 
+/// An operator's revoke of an active, unexpired grant.
+pub async fn revoke_now<P: Provisioner>(
+    store: &Store,
+    p: &P,
+    grant: GrantId,
+) -> Result<(), String> {
+    let tx = store.begin().await.unwrap();
+    let row = grants::get_for_update(&tx, grant).await.unwrap().unwrap();
+    p.revoke(&tx, &row, now())
+        .await
+        .map_err(|e| e.to_string())?;
+    grants::end(
+        &tx,
+        grant,
+        GrantEnd::Revoked {
+            reason: "test (jrt)".into(),
+        },
+        now(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tx.commit().await.unwrap();
+    Ok(())
+}
+
 /// The reaper's revoke of a PROVISIONING grant.
 pub async fn reap<P: Provisioner>(store: &Store, p: &P, grant: &GrantRow) -> Result<(), String> {
     let tx = store.begin().await.unwrap();

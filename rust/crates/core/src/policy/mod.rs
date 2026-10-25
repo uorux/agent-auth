@@ -244,7 +244,8 @@ impl Policy {
         if let Some(v) = map.remove("restricted") {
             for (name, zone) in take_object("restricted", v)? {
                 let where_ = format!("restricted.{name}");
-                let zone: RestrictedZone = parse_section(&where_, zone)?;
+                let mut zone: RestrictedZone = parse_section(&where_, zone)?;
+                zone.normalize();
                 zone.validate()
                     .map_err(|e| PolicyError(format!("{where_}: {e}")))?;
                 policy.restricted.insert(name, zone);
@@ -465,6 +466,7 @@ fn parse_platforms(value: Value) -> Result<PlatformsConfig, PolicyError> {
     let mut out = PlatformsConfig::default();
     if let Some(v) = map.remove("github") {
         out.github = parse_section("platforms.github", v)?;
+        out.github.normalize();
     }
     if let Some(v) = map.remove("homelab") {
         out.homelab = parse_section("platforms.homelab", v)?;
@@ -474,6 +476,9 @@ fn parse_platforms(value: Value) -> Result<PlatformsConfig, PolicyError> {
     }
     if let Some(v) = map.remove("kubernetes") {
         out.kubernetes = parse_section("platforms.kubernetes", v)?;
+        out.kubernetes
+            .normalize()
+            .map_err(|e| PolicyError(format!("platforms.kubernetes.{e}")))?;
     }
     if let Some(v) = map.remove("agents") {
         out.agents = parse_section("platforms.agents", v)?;

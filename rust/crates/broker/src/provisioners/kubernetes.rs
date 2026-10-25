@@ -262,7 +262,8 @@ impl KubernetesProvisioner {
             Bearer::File(path) => std::fs::read_to_string(path)
                 .map(|t| Secret::new(t.trim().to_owned()))
                 .map_err(|e| {
-                    ProvisionError::failed(format!("cannot read kubernetes token file: {e}"))
+                    tracing::error!(error = %e, file = %path.display(), "kubernetes token file");
+                    ProvisionError::failed("cannot read kubernetes token file (see broker logs)")
                 }),
             Bearer::Fixed(t) => Ok(t.clone()),
             Bearer::None => Err(ProvisionError::failed(
@@ -281,7 +282,6 @@ impl KubernetesProvisioner {
     ) -> Result<Reply, ProvisionError> {
         let bearer = self.bearer()?;
         let endpoints = lock(&self.endpoints).clone();
-        let mut last = String::from("no endpoint");
         for (i, base) in endpoints.iter().enumerate() {
             let mut rb = self
                 .http
@@ -301,13 +301,12 @@ impl KubernetesProvisioner {
                 }
                 Err(e) => {
                     tracing::warn!(endpoint = %base, error = %e, "kubernetes API unreachable");
-                    last = e.to_string();
                 }
             }
         }
-        Err(ProvisionError::failed(format!(
-            "kubernetes API unreachable: {last}"
-        )))
+        Err(ProvisionError::failed(
+            "kubernetes API unreachable (see broker logs)",
+        ))
     }
 
     async fn create(&self, path: &str, body: &Value) -> Result<(), ProvisionError> {
@@ -430,11 +429,13 @@ impl KubernetesProvisioner {
         };
         let name = sa_name(&agent.name, &grant.id.to_string());
         let cluster = grant.resource == CLUSTER;
-        let sa_ns = if cluster {
-            self.config.cluster_grant_namespace.clone()
-        } else {
-            grant.resource.clone()
-        };
+        // Every grant's ServiceAccount lives in the grant namespace, which
+        // no grant may target: nobody with rights in the target namespace
+        // can run a pod as it.
+        let sa_ns = self.config.grant_namespace.clone();
+        if !cluster && grant.resource == sa_ns {
+            return Err(ProvisionError::failed(self.grant_namespace_refusal()));
+        }
         let labels = json!({"app.kubernetes.io/managed-by": "agent-auth"});
         let annotations = json!({
             "agent-auth/agent": agent.name,
@@ -470,9 +471,10 @@ impl KubernetesProvisioner {
                 .await
                 .map(|()| None)
         } else {
+            let target = &grant.resource;
             self.create(
-                &format!("{RBAC}/namespaces/{sa_ns}/rolebindings"),
-                &binding.namespaced(&sa_ns),
+                &format!("{RBAC}/namespaces/{target}/rolebindings"),
+                &binding.namespaced(target),
             )
             .await
             .map(|()| None)
@@ -487,9 +489,13 @@ impl KubernetesProvisioner {
         };
         let mut state =
             json!({"namespace": sa_ns, "service_account": name, "role": role, "cluster": cluster});
-        if let (Some(bound), Value::Object(map)) = (bound, &mut state) {
-            map.insert("bound_namespaces".into(), json!(bound));
-            map.insert("excluded".into(), json!(excluded));
+        if let Value::Object(map) = &mut state {
+            if let Some(bound) = bound {
+                map.insert("bound_namespaces".into(), json!(bound));
+                map.insert("excluded".into(), json!(excluded));
+            } else if !cluster {
+                map.insert("binding_namespace".into(), json!(grant.resource));
+            }
         }
         Ok(state)
     }
@@ -508,6 +514,8 @@ impl KubernetesProvisioner {
             .await?
             .into_iter()
             .filter(|ns| !globs.iter().any(|g| g.matches(ns)))
+            // Never a binding where the grants' ServiceAccounts live.
+            .filter(|ns| *ns != self.config.grant_namespace)
             .collect();
         let mut made: Vec<&str> = Vec::new();
         for ns in &bound {
@@ -556,7 +564,12 @@ impl KubernetesProvisioner {
                 self.delete(&format!("{RBAC}/clusterrolebindings/{name}"))
                     .await?;
             } else {
-                self.delete(&format!("{RBAC}/namespaces/{ns}/rolebindings/{name}"))
+                let target = state
+                    .get("binding_namespace")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(ns);
+                self.delete(&format!("{RBAC}/namespaces/{target}/rolebindings/{name}"))
                     .await?;
             }
             // Deleting the ServiceAccount invalidates every token minted for it.
@@ -574,11 +587,7 @@ impl KubernetesProvisioner {
         };
         let name = sa_name(&agent.name, &grant.id.to_string());
         let cluster = grant.resource == CLUSTER;
-        let sa_ns = if cluster {
-            self.config.cluster_grant_namespace.clone()
-        } else {
-            grant.resource.clone()
-        };
+        let sa_ns = self.config.grant_namespace.clone();
         if cluster {
             self.delete(&format!("{RBAC}/clusterrolebindings/{name}"))
                 .await?;
@@ -589,7 +598,8 @@ impl KubernetesProvisioner {
                 }
             }
         } else {
-            self.delete(&format!("{RBAC}/namespaces/{sa_ns}/rolebindings/{name}"))
+            let target = &grant.resource;
+            self.delete(&format!("{RBAC}/namespaces/{target}/rolebindings/{name}"))
                 .await?;
         }
         self.delete(&format!(
@@ -644,6 +654,15 @@ impl KubernetesProvisioner {
             Some(Value::String(s)) => s.clone(),
             _ => "None".to_owned(),
         };
+        let bound = if state.get("cluster").and_then(Value::as_bool) == Some(true) {
+            "cluster-wide".to_owned()
+        } else {
+            let target = state
+                .get("binding_namespace")
+                .and_then(Value::as_str)
+                .unwrap_or(ns);
+            format!("in namespace {target}")
+        };
         Ok(Credential {
             kind: "kubernetes_token".to_owned(),
             value: at(status, &["token"])
@@ -653,11 +672,18 @@ impl KubernetesProvisioner {
                 .as_str()
                 .and_then(parse_time),
             note: Some(format!(
-                "bearer token for ServiceAccount {ns}/{name} ({role}) against {}; re-fetch rather than caching — the account is deleted when the grant ends",
+                "bearer token for ServiceAccount {ns}/{name} ({role} {bound}) against {}; re-fetch rather than caching — the account is deleted when the grant ends",
                 self.api_url()
             )),
             ..Credential::default()
         })
+    }
+
+    fn grant_namespace_refusal(&self) -> String {
+        format!(
+            "namespace {} holds the grants' ServiceAccounts and is never brokered",
+            repr(&self.config.grant_namespace)
+        )
     }
 
     fn validate_spec(&self, spec: &RequestSpec<'_>) -> Result<Validated, Refused> {
@@ -703,6 +729,10 @@ impl KubernetesProvisioner {
                 "invalid namespace name {}",
                 repr(&namespace)
             )));
+        }
+        // Whatever the allowlist says (like LLDAP's admin groups).
+        if namespace == cfg.grant_namespace {
+            return Err(Refused(self.grant_namespace_refusal()));
         }
         if !cfg
             .namespace_allowlist

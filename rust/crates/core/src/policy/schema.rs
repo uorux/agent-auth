@@ -174,6 +174,10 @@ pub struct KubernetesConfig {
     pub role_descriptions: BTreeMap<String, String>,
     pub sensitive_roles: Vec<String>,
     pub sensitive_namespaces: Vec<Glob>,
+    /// Where every grant's ServiceAccount lives: a namespace no grant may
+    /// target, so nobody with rights in a target namespace can run a pod
+    /// as another grant's ServiceAccount.
+    pub grant_namespace: String,
 }
 
 impl Default for KubernetesConfig {
@@ -191,11 +195,40 @@ impl Default for KubernetesConfig {
                 "kube-node-lease",
                 "flux-system",
             ]),
+            grant_namespace: "agent-auth-grants".to_owned(),
         }
     }
 }
 
+/// A glob matched against case-folded (lowercased) resources: lowercased
+/// too, or a pattern with a capital would never match (and a denylist
+/// would fail open).
+fn lower_glob(g: &Glob) -> Glob {
+    Glob::new(&g.as_str().to_lowercase())
+}
+
+impl GithubConfig {
+    /// Repos are matched lowercased (`owner/repo`).
+    pub(crate) fn normalize(&mut self) {
+        self.repo_allowlist = self.repo_allowlist.iter().map(lower_glob).collect();
+        self.repo_denylist = self.repo_denylist.iter().map(lower_glob).collect();
+    }
+}
+
 impl KubernetesConfig {
+    /// Namespaces are matched lowercased; the grant namespace must be a
+    /// namespace name.
+    pub(crate) fn normalize(&mut self) -> Result<(), String> {
+        self.namespace_allowlist = self.namespace_allowlist.iter().map(lower_glob).collect();
+        self.sensitive_namespaces = self.sensitive_namespaces.iter().map(lower_glob).collect();
+        self.cluster_grant_namespace = self.cluster_grant_namespace.to_lowercase();
+        self.grant_namespace = self.grant_namespace.to_lowercase();
+        if !label63(&self.grant_namespace) {
+            return Err("grant_namespace: a namespace name".to_owned());
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn namespace_is_sensitive(&self, namespace: &str) -> bool {
         namespace == self.cluster_grant_namespace
@@ -587,6 +620,22 @@ impl McpConfig {
                     .to_owned(),
             );
         }
+        // A token is checked only against its audience: two servers with
+        // one audience would accept each other's tokens.
+        let mut seen = std::collections::BTreeMap::new();
+        for (name, server) in &self.servers {
+            let aud = server
+                .audience
+                .as_deref()
+                .filter(|a| !a.is_empty())
+                .unwrap_or(&server.url);
+            if let Some(other) = seen.insert(aud, name) {
+                return Err(format!(
+                    "platforms.mcp.servers: {other} and {name} have the same audience {}",
+                    repr(aud)
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -647,6 +696,12 @@ impl UiConfig {
 }
 
 impl RestrictedZone {
+    /// Namespaces and repos are matched lowercased.
+    pub(crate) fn normalize(&mut self) {
+        self.kubernetes = self.kubernetes.iter().map(lower_glob).collect();
+        self.github = self.github.iter().map(lower_glob).collect();
+    }
+
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.members.is_empty() {
             return Err("members: at least one agent pattern".to_owned());

@@ -200,7 +200,7 @@ pub async fn setup_with(pool: PgPool, cfg: HomelabConfig, managed: bool) -> L {
     let s2 = state.clone();
     let fake = Fake::start(move |c| lldap_handler(&s2, c)).await;
     let ldap = FakeLdap::start();
-    let target = LdapTarget::parse(&ldap.url, "dc=example,dc=com").unwrap();
+    let target = LdapTarget::parse(&ldap.url, "dc=example,dc=com", false).unwrap();
     let p = LldapProvisioner::new(
         &format!("{}/", fake.url),
         "admin",
@@ -618,4 +618,26 @@ async fn a_missing_group_fails_with_its_name(pool: PgPool) {
     );
     // Logged in once; the JWT is reused.
     assert_eq!(t.state.lock().unwrap().logins, 1);
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn concurrent_revokes_of_the_last_two_grants_remove_the_membership(pool: PgPool) {
+    let t = setup_with(pool, config(&[]), false).await;
+    let a = hand_registered(&t, "homelab-agent", "svc-homelab-agent").await;
+    for _ in 0..5 {
+        let g1 = granted(&t.store, &t.p, a.id, &Authority::Homelab, "svc-gitea").await;
+        let g2 = granted(&t.store, &t.p, a.id, &Authority::Homelab, "svc-gitea").await;
+        assert!(t.member("svc-homelab-agent", 4));
+        // Both unexpired: each revoke alone would see the other as live.
+        let (r1, r2) = tokio::join!(
+            revoke_now(&t.store, &t.p, g1.id),
+            revoke_now(&t.store, &t.p, g2.id)
+        );
+        r1.unwrap();
+        r2.unwrap();
+        assert!(
+            !t.member("svc-homelab-agent", 4),
+            "the membership outlived both grants"
+        );
+    }
 }

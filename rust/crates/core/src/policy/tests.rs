@@ -1673,3 +1673,49 @@ fn rule_value(rule: &PolicyRule) -> Value {
     }
     json!({"match": out, "action": rule.action.as_str()})
 }
+
+/// Case-folded resources are matched by lowercased globs (provisioners
+/// review: a denylist with a capital failed open).
+#[test]
+fn resource_globs_are_lowercased_at_load() {
+    let p = Policy::from_value(json!({
+        "platforms": {
+            "github": {"repo_denylist": ["JRT/Secrets"], "repo_allowlist": ["Acme/*"]},
+            "kubernetes": {"namespace_allowlist": ["Apps-*"], "sensitive_namespaces": ["Kube-*"], "grant_namespace": "AA-Grants"},
+        },
+        "restricted": {"soc": {"members": ["soc-*"], "kubernetes": ["SOC-*"], "github": ["Acme/SOC-*"]}},
+    }))
+    .unwrap();
+    let gh = &p.platforms().github;
+    assert!(gh.repo_denylist[0].matches("jrt/secrets"));
+    assert!(gh.repo_allowlist[0].matches("acme/x"));
+    let k = &p.platforms().kubernetes;
+    assert!(k.namespace_allowlist[0].matches("apps-x"));
+    assert!(k.namespace_is_sensitive("kube-system"));
+    assert_eq!(k.grant_namespace, "aa-grants");
+    let zone = &p.restricted()["soc"];
+    assert!(zone.kubernetes[0].matches("soc-x"));
+    assert!(zone.github[0].matches("acme/soc-1"));
+    assert_eq!(
+        KubernetesConfig::default().grant_namespace,
+        "agent-auth-grants"
+    );
+    let bad =
+        Policy::from_value(json!({"platforms": {"kubernetes": {"grant_namespace": "not a ns"}}}));
+    assert!(bad.unwrap_err().0.contains("grant_namespace"));
+}
+
+#[test]
+fn mcp_audiences_are_unique() {
+    let err = Policy::from_value(
+        json!({"platforms": {"mcp": {"issuer": "https://b", "servers": {
+            "a": {"url": "https://x/mcp"},
+            "b": {"url": "https://y/mcp", "audience": "https://x/mcp"},
+        }}}}),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.0,
+        "platforms.mcp.servers: a and b have the same audience 'https://x/mcp'"
+    );
+}

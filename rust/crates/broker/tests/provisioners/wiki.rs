@@ -689,7 +689,7 @@ async fn hidden_and_non_markdown_files_are_invisible(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../store/migrations")]
-async fn last_change_is_per_page_and_failures_are_not_remembered(pool: PgPool) {
+async fn last_change_is_per_page_and_failures_are_remembered_briefly(pool: PgPool) {
     let t = setup(pool).await;
     // Same content, so the same blob sha, on two pages by two authors (B12).
     t.seed("shared/a.md", "# Same", "alice");
@@ -725,8 +725,38 @@ async fn last_change_is_per_page_and_failures_are_not_remembered(pool: PgPool) {
             .is_none()
     );
     t.flags.commits_down.store(false, Ordering::SeqCst);
-    assert_eq!(
+    // A failure is remembered briefly: no second lookup right away.
+    let lookups = || {
+        t.fake
+            .calls()
+            .iter()
+            .filter(|c| c.path == "/repos/jrt/wiki/commits" && c.query.contains("c.md"))
+            .count()
+    };
+    assert!(
         t.wiki
+            .read("shared/c.md", now())
+            .await
+            .unwrap()
+            .last_change
+            .is_none()
+    );
+    assert_eq!(lookups(), 1);
+    // ...and only briefly: past the retry delay the author shows.
+    let quick = Wiki::new(t.app.clone(), Arc::new(t.policy.clone()))
+        .with_change_retry(std::time::Duration::ZERO);
+    t.flags.commits_down.store(true, Ordering::SeqCst);
+    assert!(
+        quick
+            .read("shared/c.md", now())
+            .await
+            .unwrap()
+            .last_change
+            .is_none()
+    );
+    t.flags.commits_down.store(false, Ordering::SeqCst);
+    assert_eq!(
+        quick
             .read("shared/c.md", now())
             .await
             .unwrap()
@@ -735,6 +765,34 @@ async fn last_change_is_per_page_and_failures_are_not_remembered(pool: PgPool) {
             .author,
         "carol"
     );
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_write_refreshes_the_copy_only_when_base_sha_disagrees(pool: PgPool) {
+    let t = setup_with(pool, 3600).await;
+    let a = project_agent(&t.store, "writer", Some("p")).await;
+    let trees = || t.fake.count("GET", "/repos/jrt/wiki/git/trees/main");
+    let (sha1, _) = written(
+        t.wiki
+            .write(&a, "projects/p/a.md", "one", "s", None, now())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(trees(), 1);
+    written(
+        t.wiki
+            .write(&a, "projects/p/a.md", "two", "s", Some(&sha1), now())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(trees(), 1, "no refresh when the copy agrees");
+    let e = t
+        .wiki
+        .write(&a, "projects/p/a.md", "three", "s", Some(&sha1), now())
+        .await
+        .unwrap_err();
+    assert_eq!(e.status, StatusCode::CONFLICT);
+    assert_eq!(trees(), 2, "a disagreeing base_sha re-reads the repo");
 }
 
 // ---------------------------------------------------------------- routes

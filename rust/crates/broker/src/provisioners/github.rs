@@ -73,6 +73,10 @@ fn path_part(s: &str) -> bool {
         })
 }
 
+fn lower_glob(g: &Glob) -> Glob {
+    Glob::new(&g.as_str().to_lowercase())
+}
+
 fn matches_any(globs: &[Glob], text: &str) -> bool {
     globs.iter().any(|g| g.matches(text))
 }
@@ -100,8 +104,10 @@ impl Policy {
             ceiling.insert(perm.clone(), parsed);
         }
         Ok(Policy {
-            allowlist: cfg.repo_allowlist.clone(),
-            denylist: cfg.repo_denylist.clone(),
+            // Repos are matched lowercased: so are the globs (a capital
+            // would never match, and a denylist would fail open).
+            allowlist: cfg.repo_allowlist.iter().map(lower_glob).collect(),
+            denylist: cfg.repo_denylist.iter().map(lower_glob).collect(),
             ceiling,
             ceiling_text: cfg.permission_ceiling.clone(),
             create_owners: cfg.create_owners.clone(),
@@ -339,7 +345,7 @@ impl GithubApp {
         }
         http::send(rb, timeout, MAX_BODY).await.map_err(|e| {
             tracing::warn!(error = %e, path, "GitHub API call failed");
-            ProvisionError::failed(format!("GitHub API unreachable ({e})"))
+            ProvisionError::failed("GitHub API unreachable (see broker logs)")
         })
     }
 
