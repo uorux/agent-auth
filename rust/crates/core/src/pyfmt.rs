@@ -2,6 +2,12 @@
 //! `repr(str)` (in error messages), `json.dumps(str)` with its default
 //! `ensure_ascii=True` (in risk notes and job descriptions), and
 //! `shlex.quote`/`shlex.join` (in job descriptions).
+//!
+//! Every rendering here is *display-safe*: no control character (newline,
+//! carriage return, escape...), bidirectional override or isolate, or
+//! zero-width/invisible character reaches the output; they are written as
+//! escapes. A command an approver reads is the command that runs, with no
+//! fake second line and no reordered text. [`is_display_safe`] is the test.
 
 use std::fmt::Write as _;
 
@@ -38,19 +44,60 @@ pub fn repr(s: &str) -> String {
             }
             c if c.is_ascii() => out.push(c),
             c if is_printable(c) => out.push(c),
-            c => {
-                let n = u32::from(c);
-                if n <= 0xff {
-                    let _ = write!(out, "\\x{n:02x}");
-                } else if n <= 0xffff {
-                    let _ = write!(out, "\\u{n:04x}");
-                } else {
-                    let _ = write!(out, "\\U{n:08x}");
-                }
-            }
+            c => push_python_escape(&mut out, c),
         }
     }
     out.push(quote);
+    out
+}
+
+/// `\xNN`, `\uNNNN` or `\UNNNNNNNN`, as Python's `repr` writes it.
+fn push_python_escape(out: &mut String, c: char) {
+    let n = u32::from(c);
+    if n <= 0xff {
+        let _ = write!(out, "\\x{n:02x}");
+    } else if n <= 0xffff {
+        let _ = write!(out, "\\u{n:04x}");
+    } else {
+        let _ = write!(out, "\\U{n:08x}");
+    }
+}
+
+/// May this character be shown to a person as itself? Printable ASCII and
+/// the space, and non-ASCII characters that are visible and don't reorder
+/// or hide text. Not: controls (including `\t`, `\n`, `\r`, ESC, DEL),
+/// line/paragraph separators and other non-space spaces, bidi controls
+/// (U+202A..E, U+2066..9, U+200E/F, U+061C), zero-width and invisible
+/// characters (U+200B..D, U+2060..4, U+FEFF, U+00AD, Hangul fillers), tag
+/// characters, private use.
+#[must_use]
+pub fn is_display_safe(c: char) -> bool {
+    if c.is_ascii() {
+        return (' '..='~').contains(&c);
+    }
+    is_printable(c)
+}
+
+/// The text with every character that is not [display-safe](is_display_safe)
+/// written as a Python escape (`\n`, `\t`, `\r`, `\x1b`, `\u202e`...);
+/// backslashes are doubled so the result reads back unambiguously. For
+/// free text shown inline (a host name, a pattern).
+#[must_use]
+pub fn escape_unprintable(s: &str) -> String {
+    if s.chars().all(|c| is_display_safe(c) && c != '\\') {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c if is_display_safe(c) => out.push(c),
+            c => push_python_escape(&mut out, c),
+        }
+    }
     out
 }
 
@@ -71,6 +118,13 @@ fn is_printable(c: char) -> bool {
             | 0xfff9..=0xfffb
             | 0xe0001
             | 0xe0020..=0xe007f
+            // Hangul fillers and the combining grapheme joiner: render as
+            // nothing.
+            | 0x34f
+            | 0x115f
+            | 0x1160
+            | 0x3164
+            | 0xffa0
     );
     let private_use = matches!(n, 0xe000..=0xf8ff | 0xf0000..=0x10ffff);
     !(c.is_control() || (c.is_whitespace() && c != ' ') || format_char || private_use)
@@ -129,10 +183,19 @@ pub fn json_str_map<'a>(entries: impl IntoIterator<Item = (&'a str, &'a str)>) -
 
 /// `shlex.quote`: unchanged when made only of `[A-Za-z0-9_@%+=:,./-]` (and
 /// non-empty), else single-quoted with each `'` as `'"'"'`.
+///
+/// Unlike Python, an argument holding a character that is not
+/// [display-safe](is_display_safe) is written in bash's ANSI-C quoting,
+/// `$'...'`, with that character escaped (`$'a\nb'`, `$'\u202e'`): still
+/// valid shell for the same argument, but it can't show a fake second line
+/// or reorder what the approver reads.
 #[must_use]
 pub fn shlex_quote(s: &str) -> String {
     if s.is_empty() {
         return "''".to_owned();
+    }
+    if !s.chars().all(is_display_safe) {
+        return ansi_c_quote(s);
     }
     let safe = s
         .chars()
@@ -144,7 +207,37 @@ pub fn shlex_quote(s: &str) -> String {
     }
 }
 
-/// `shlex.join`.
+/// `$'...'`: `\\`, `\'`, `\t`, `\n`, `\r`, other unsafe ASCII as `\xNN`,
+/// unsafe non-ASCII as `\uNNNN`/`\UNNNNNNNN` (fixed widths, so a
+/// following hex digit is never swallowed).
+fn ansi_c_quote(s: &str) -> String {
+    let mut out = String::from("$'");
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c if is_display_safe(c) => out.push(c),
+            c if c.is_ascii() => {
+                let _ = write!(out, "\\x{:02x}", u32::from(c));
+            }
+            c => {
+                let n = u32::from(c);
+                if n <= 0xffff {
+                    let _ = write!(out, "\\u{n:04x}");
+                } else {
+                    let _ = write!(out, "\\U{n:08x}");
+                }
+            }
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// `shlex.join` (display-safe, see [`shlex_quote`]).
 #[must_use]
 pub fn shlex_join<S: AsRef<str>>(args: &[S]) -> String {
     args.iter()
@@ -195,5 +288,81 @@ mod tests {
         );
         assert_eq!(shlex_quote("a=b,c:d@e%f+g"), "a=b,c:d@e%f+g");
         assert_eq!(shlex_quote("é"), "'é'");
+    }
+
+    #[test]
+    fn unsafe_characters_are_escaped_for_display() {
+        assert_eq!(shlex_quote("a\nb"), "$'a\\nb'");
+        assert_eq!(shlex_quote("echo ok\rrm -rf /"), "$'echo ok\\rrm -rf /'");
+        assert_eq!(shlex_quote("x\u{202e}gpj.exe"), "$'x\\u202egpj.exe'");
+        assert_eq!(shlex_quote("a\u{200b}b"), "$'a\\u200bb'");
+        assert_eq!(shlex_quote("it's\t\\"), "$'it\\'s\\t\\\\'");
+        assert_eq!(shlex_quote("\u{1b}[2J"), "$'\\x1b[2J'");
+        assert_eq!(shlex_quote("\u{e0041}"), "$'\\U000e0041'");
+        assert_eq!(escape_unprintable("host\nname"), "host\\nname");
+        assert_eq!(escape_unprintable("a\\n"), "a\\\\n");
+        assert_eq!(escape_unprintable("plain-é"), "plain-é");
+        assert_eq!(repr("\u{202e}\u{2066}\u{200d}"), "'\\u202e\\u2066\\u200d'");
+    }
+
+    /// Decode bash `$'...'` (the subset `ansi_c_quote` writes).
+    fn decode_ansi_c(q: &str) -> String {
+        let body = q
+            .strip_prefix("$'")
+            .and_then(|b| b.strip_suffix('\''))
+            .unwrap();
+        let mut out = String::new();
+        let mut it = body.chars();
+        while let Some(c) = it.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            let hex = |it: &mut std::str::Chars<'_>, n: usize| {
+                let h: String = it.take(n).collect();
+                char::from_u32(u32::from_str_radix(&h, 16).unwrap()).unwrap()
+            };
+            match it.next().unwrap() {
+                '\\' => out.push('\\'),
+                '\'' => out.push('\''),
+                't' => out.push('\t'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                'x' => out.push(hex(&mut it, 2)),
+                'u' => out.push(hex(&mut it, 4)),
+                'U' => out.push(hex(&mut it, 8)),
+                other => panic!("unexpected escape {other}"),
+            }
+        }
+        out
+    }
+
+    fn is_dangerous(c: char) -> bool {
+        c.is_control()
+            || matches!(u32::from(c), 0x200b..=0x200f | 0x202a..=0x202e | 0x2060..=0x206f | 0xfeff | 0x61c | 0x2028 | 0x2029 | 0xad)
+    }
+
+    proptest::proptest! {
+        /// Any argv renders with no control, bidi or zero-width character,
+        /// and each quoted argument still means the original.
+        #[test]
+        fn rendered_argv_is_display_safe(
+            argv in proptest::collection::vec(
+                "(.|[\\n\\r\\t\\x1b\\x7f\\u{200b}-\\u{200f}\\u{202a}-\\u{202e}\\u{2066}-\\u{2069}\\u{feff}'\\\\ a-z]){0,12}",
+                1..5,
+            )
+        ) {
+            let rendered = shlex_join(&argv);
+            proptest::prop_assert!(!rendered.chars().any(is_dangerous), "{:?}", rendered);
+            proptest::prop_assert!(rendered.chars().all(is_display_safe), "{:?}", rendered);
+            for arg in &argv {
+                let q = shlex_quote(arg);
+                if q.starts_with("$'") {
+                    proptest::prop_assert_eq!(&decode_ansi_c(&q), arg);
+                }
+                proptest::prop_assert!(escape_unprintable(arg).chars().all(is_display_safe));
+                proptest::prop_assert!(repr(arg).chars().all(is_display_safe));
+            }
+        }
     }
 }

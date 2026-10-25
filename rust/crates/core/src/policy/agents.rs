@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 
 use crate::glob::Glob;
 use crate::names::{AGENT_NAME_ALPHABET, AttrValue};
-use crate::pyfmt::repr;
+use crate::pyfmt::{escape_unprintable, repr};
 
 /// Where an agent runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -312,7 +312,7 @@ impl AgentMatch {
     pub fn text(&self) -> String {
         let mut parts = Vec::new();
         if self.name.as_str() != "*" {
-            parts.push(format!("name: {}", self.name.as_str()));
+            parts.push(format!("name: {}", escape_unprintable(self.name.as_str())));
         }
         for (key, values) in self.listed() {
             parts.push(format!("{key}: {}", values.join("|")));
@@ -441,7 +441,7 @@ impl AgentPattern {
     #[must_use]
     pub fn text(&self) -> String {
         match self {
-            AgentPattern::Name(g) => g.as_str().to_owned(),
+            AgentPattern::Name(g) => escape_unprintable(g.as_str()),
             AgentPattern::Fields(m) => m.text(),
         }
     }
@@ -623,17 +623,7 @@ pub fn check_resource(resource: &str) -> Result<(), PatternError> {
 /// `[[]`.
 #[must_use]
 pub fn glob_literal(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for c in value.chars() {
-        if matches!(c, '*' | '?' | '[') {
-            out.push('[');
-            out.push(c);
-            out.push(']');
-        } else {
-            out.push(c);
-        }
-    }
-    out
+    crate::glob::escape(value)
 }
 
 /// `resources_for`: the rule's resource globs with the agent's own fields
@@ -822,6 +812,14 @@ mod tests {
             }
             proptest::prop_assert_eq!(m.matches_everyone(), !missed);
         }
+    }
+
+    #[test]
+    fn pattern_text_is_display_safe() {
+        let p = AgentPattern::from_value(&json!({"name": "a\n\u{202e}*"})).unwrap();
+        assert_eq!(p.text(), "{name: a\\n\\u202e*}");
+        let p = AgentPattern::from_value(&json!("x\ry")).unwrap();
+        assert_eq!(p.text(), "x\\ry");
     }
 
     /// tests/test_agent_attributes.py::test_a_pattern_reads_back_the_way_it_was_written

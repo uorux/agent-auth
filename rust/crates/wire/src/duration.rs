@@ -1,161 +1,74 @@
 //! Durations as agents and the operator write them: a number of seconds, or
 //! `"30m"`, `"8h"`, `"2d"`, `"1w"` (Python `schemas.parse_duration`).
 //!
-//! Fixed here (http-api §8.4, see DEVIATIONS.md): JSON `true` and floats are
-//! refused (Python took `true` as 1 s and `1.0` as 1); a zero with a unit
-//! (`"0m"`) is refused like a plain zero; and there is an upper bound,
-//! [`MAX_DURATION_SECS`] (Python had none and failed the INSERT with a 500).
+//! One type for the whole system: [`DurationSecs`] is
+//! `agent_auth_core::durations::DurationSecs`, so the wire accepts exactly
+//! what the policy does (http-api §8.4, see DEVIATIONS.md): JSON `true` and
+//! floats are refused (Python took `true` as 1 s and `1.0` as 1); a zero
+//! with a unit (`"0m"`) is refused like a plain zero; and nothing over 365
+//! days is accepted (Python had no bound and failed the INSERT with a 500).
 
 use std::fmt;
 
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::error::ValidationError;
-use crate::pyrepr::repr;
+pub use agent_auth_core::durations::{
+    DurationError, DurationSecs, MAX_DURATION_SECS, MAX_HOST_DURATION_SECS, NOT_A_DURATION,
+    format_duration,
+};
+use agent_auth_core::durations::{host_duration_from_int, host_duration_secs};
+
 use crate::text::Text;
 
-/// The longest duration accepted anywhere: the int4 range the store keeps
-/// seconds in (about 68 years; policy caps grants far below this).
-pub const MAX_DURATION_SECS: u32 = 2_147_483_647;
-
-const NOT_A_DURATION: &str = "duration must be a string or a whole number of seconds";
-
-fn positive() -> ValidationError {
-    ValidationError::new("duration must be positive")
-}
-
-fn too_long() -> ValidationError {
-    ValidationError::new(format!(
-        "duration must be at most {MAX_DURATION_SECS} seconds"
-    ))
-}
-
-/// A positive number of seconds, at most [`MAX_DURATION_SECS`]. On the wire
-/// it is read from a number or a duration string and written as a number.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct DurationSecs(u32);
-
-impl DurationSecs {
-    pub fn from_secs(secs: u64) -> Result<Self, ValidationError> {
-        if secs == 0 {
-            return Err(positive());
-        }
-        match u32::try_from(secs) {
-            Ok(s) if s <= MAX_DURATION_SECS => Ok(DurationSecs(s)),
-            _ => Err(too_long()),
-        }
-    }
-
-    /// `"30m"`, `" 8H "`, `"600"`: stripped and lowercased, then all digits
-    /// (seconds) or digits and one unit of `s m h d w`.
-    pub fn parse(text: &str) -> Result<Self, ValidationError> {
-        let value = text.trim().to_lowercase();
-        let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-        if all_digits(&value) {
-            return value
-                .parse::<u64>()
-                .map_err(|_| too_long())
-                .and_then(Self::from_secs);
-        }
-        let unit = value.chars().last().and_then(|u| match u {
-            's' => Some(1u64),
-            'm' => Some(60),
-            'h' => Some(3600),
-            'd' => Some(86_400),
-            'w' => Some(604_800),
-            _ => None,
-        });
-        let number = value.get(..value.len().saturating_sub(1)).unwrap_or("");
-        match unit {
-            Some(unit) if all_digits(number) => {
-                let n = number.parse::<u64>().map_err(|_| too_long())?;
-                n.checked_mul(unit)
-                    .ok_or_else(too_long)
-                    .and_then(Self::from_secs)
-            }
-            _ => Err(ValidationError::new(format!(
-                "invalid duration {}: use e.g. '30m', '8h', '2d', or seconds",
-                repr(&value)
-            ))),
-        }
-    }
-
-    #[must_use]
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-}
-
-impl fmt::Display for DurationSecs {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&format_duration(self.0))
-    }
-}
-
-impl Serialize for DurationSecs {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_u32(self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for DurationSecs {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct V;
-        impl Visitor<'_> for V {
-            type Value = DurationSecs;
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a duration such as \"30m\" or a number of seconds")
-            }
-            fn visit_u64<E: de::Error>(self, v: u64) -> Result<DurationSecs, E> {
-                DurationSecs::from_secs(v).map_err(E::custom)
-            }
-            fn visit_i64<E: de::Error>(self, v: i64) -> Result<DurationSecs, E> {
-                match u64::try_from(v) {
-                    Ok(v) => self.visit_u64(v),
-                    Err(_) => Err(E::custom(positive())),
-                }
-            }
-            fn visit_str<E: de::Error>(self, v: &str) -> Result<DurationSecs, E> {
-                DurationSecs::parse(v).map_err(E::custom)
-            }
-            fn visit_bool<E: de::Error>(self, _: bool) -> Result<DurationSecs, E> {
-                Err(E::custom(NOT_A_DURATION))
-            }
-            fn visit_f64<E: de::Error>(self, _: f64) -> Result<DurationSecs, E> {
-                Err(E::custom(NOT_A_DURATION))
-            }
-        }
-        d.deserialize_any(V)
-    }
-}
-
-/// `600` → `"10m"`: the largest unit that divides evenly (Python
-/// `format_duration`).
-#[must_use]
-pub fn format_duration(secs: u32) -> String {
-    for (unit, div) in [("w", 604_800u32), ("d", 86_400), ("h", 3600), ("m", 60)] {
-        if secs >= div && secs.checked_rem(div) == Some(0) {
-            return format!("{}{unit}", secs.checked_div(div).unwrap_or(0));
-        }
-    }
-    format!("{secs}s")
-}
-
 /// A duration passed through to a host (`arm`, `dnd`), which parses it with
-/// its own rules (hostd's `duration_secs` also takes a bare `"30"`). Only
-/// its type and size are checked here.
+/// its own rules (hostd's `duration_secs` also takes a bare `"30"`). It is
+/// checked here with those same rules and bounded by
+/// [`MAX_HOST_DURATION_SECS`] (365 days), so nothing the broker relays can
+/// overflow the host's clock arithmetic; the text form is kept as written.
+///
+/// Only the constructors make one, so a value is always within the bound.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum HostDuration {
+pub struct HostDuration(HostRepr);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum HostRepr {
     Seconds(u64),
     Text(Text<1, 32>),
 }
 
+impl HostDuration {
+    /// One second.
+    pub const MIN: HostDuration = HostDuration(HostRepr::Seconds(1));
+
+    /// A number of seconds: positive, at most [`MAX_HOST_DURATION_SECS`].
+    pub fn from_secs(secs: u64) -> Result<HostDuration, DurationError> {
+        let secs = i64::try_from(secs).unwrap_or(i64::MAX);
+        host_duration_from_int(secs).map(|s| HostDuration(HostRepr::Seconds(s)))
+    }
+
+    /// Text by the host's rules (`"30"`, `"30m"`, `"8h"`), kept as written.
+    pub fn parse(text: &str) -> Result<HostDuration, DurationError> {
+        let kept = Text::new(text).map_err(|e| DurationError(e.to_string()))?;
+        host_duration_secs(text)?;
+        Ok(HostDuration(HostRepr::Text(kept)))
+    }
+
+    /// The number of seconds, by the host's rules.
+    #[must_use]
+    pub fn secs(&self) -> u64 {
+        match &self.0 {
+            HostRepr::Seconds(n) => *n,
+            HostRepr::Text(t) => host_duration_secs(t.as_str()).unwrap_or(0),
+        }
+    }
+}
+
 impl Serialize for HostDuration {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        match self {
-            HostDuration::Seconds(n) => s.serialize_u64(*n),
-            HostDuration::Text(t) => t.serialize(s),
+        match &self.0 {
+            HostRepr::Seconds(n) => s.serialize_u64(*n),
+            HostRepr::Text(t) => t.serialize(s),
         }
     }
 }
@@ -169,15 +82,15 @@ impl<'de> Deserialize<'de> for HostDuration {
                 f.write_str("a duration such as \"30m\" or a number of seconds")
             }
             fn visit_u64<E: de::Error>(self, v: u64) -> Result<HostDuration, E> {
-                Ok(HostDuration::Seconds(v))
+                HostDuration::from_secs(v).map_err(E::custom)
             }
             fn visit_i64<E: de::Error>(self, v: i64) -> Result<HostDuration, E> {
-                u64::try_from(v)
-                    .map(HostDuration::Seconds)
-                    .map_err(|_| E::custom(positive()))
+                host_duration_from_int(v)
+                    .map(|s| HostDuration(HostRepr::Seconds(s)))
+                    .map_err(E::custom)
             }
             fn visit_str<E: de::Error>(self, v: &str) -> Result<HostDuration, E> {
-                Text::new(v).map(HostDuration::Text).map_err(E::custom)
+                HostDuration::parse(v).map_err(E::custom)
             }
             fn visit_bool<E: de::Error>(self, _: bool) -> Result<HostDuration, E> {
                 Err(E::custom(NOT_A_DURATION))
@@ -236,12 +149,15 @@ mod tests {
         assert_eq!(de(json!(true)).unwrap_err(), not);
         assert_eq!(de(json!(1.0)).unwrap_err(), not);
         assert_eq!(de(json!("0m")).unwrap_err(), "duration must be positive");
-        let max = "duration must be at most 2147483647 seconds";
-        assert_eq!(de(json!("3551w")).unwrap_err(), max);
+        let max = "duration must be at most 365 days";
+        assert_eq!(de(json!("100w")).unwrap_err(), max);
+        assert_eq!(de(json!("366d")).unwrap_err(), max);
+        assert_eq!(de(json!(31_536_001u64)).unwrap_err(), max);
         assert_eq!(de(json!(2_147_483_648u64)).unwrap_err(), max);
         assert_eq!(de(json!("99999999999999999999999")).unwrap_err(), max);
         assert_eq!(de(json!("99999999999999999w")).unwrap_err(), max);
-        assert_eq!(de(json!(2_147_483_647u64)), Ok(2_147_483_647));
+        assert_eq!(de(json!(31_536_000u64)), Ok(31_536_000));
+        assert_eq!(de(json!("52w")), Ok(52 * 604_800));
         assert!(de(json!(null)).unwrap_err().contains("expected a duration"));
     }
 
@@ -260,13 +176,37 @@ mod tests {
     }
 
     #[test]
-    fn host_durations_pass_through() {
+    fn host_durations_pass_through_bounded() {
         let d: HostDuration = serde_json::from_value(json!("30m")).unwrap();
         assert_eq!(serde_json::to_value(&d).unwrap(), json!("30m"));
+        assert_eq!(d.secs(), 1800);
+        let d: HostDuration = serde_json::from_value(json!("30")).unwrap();
+        assert_eq!(d.secs(), 30);
         let d: HostDuration = serde_json::from_value(json!(90)).unwrap();
-        assert_eq!(d, HostDuration::Seconds(90));
-        assert!(serde_json::from_value::<HostDuration>(json!(true)).is_err());
-        assert!(serde_json::from_value::<HostDuration>(json!(1.5)).is_err());
-        assert!(serde_json::from_value::<HostDuration>(json!("x".repeat(33))).is_err());
+        assert_eq!(d, HostDuration::from_secs(90).unwrap());
+        assert_eq!(d.secs(), 90);
+        assert!(HostDuration::from_secs(MAX_HOST_DURATION_SECS + 1).is_err());
+        assert!(HostDuration::from_secs(0).is_err());
+        assert!(HostDuration::parse("1y").is_err());
+        for bad in [
+            json!(true),
+            json!(1.5),
+            json!("x".repeat(33)),
+            json!("soon"),
+            json!(0),
+            json!(-1),
+            json!("0m"),
+            json!("366d"),
+            json!(31_536_001u64),
+            json!(u64::MAX),
+            json!("99999999999999999999w"),
+        ] {
+            assert!(
+                serde_json::from_value::<HostDuration>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+        let max: HostDuration = serde_json::from_value(json!("365d")).unwrap();
+        assert_eq!(max.secs(), MAX_HOST_DURATION_SECS);
     }
 }

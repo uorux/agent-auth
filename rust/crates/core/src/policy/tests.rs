@@ -908,6 +908,39 @@ fn catch_all_rules_do_not_clear_explicit_only_privileges() {
     assert!(matches!(r.route, Route::Approve(_)));
 }
 
+/// A glob that happens to match the capability doesn't name it: `tpl.*`
+/// is not explicit for `tpl.x`, nor `tpl.?` for... `tpl.?`.
+#[test]
+fn only_a_literal_capability_is_explicit() {
+    let tpl = auth(
+        Platform::Hostexec,
+        "tpl.x",
+        json!({"tier": "user", "params": {}}),
+    );
+    for (pattern, explicit) in [
+        ("tpl.*", false),
+        ("tpl.?", false),
+        ("tpl.[x]", false),
+        ("tpl.x", true),
+    ] {
+        let p = rules_policy(
+            json!([{"match": {"platform": "hostexec", "capability": pattern}, "action": "approve"}]),
+            json!({}),
+        );
+        let (d, r) = routed(
+            &p,
+            AgentRef::named("a"),
+            Delegation::None,
+            &tpl,
+            "excelsior",
+            &[],
+        );
+        assert_eq!(d.action, PolicyAction::Approve, "{pattern}");
+        assert_eq!(d.explicit, explicit, "{pattern}");
+        assert_eq!(matches!(r.route, Route::Approve(_)), explicit, "{pattern}");
+    }
+}
+
 #[test]
 fn shells_and_web_connectors_always_reach_a_human() {
     let p = rules_policy(
@@ -1478,6 +1511,7 @@ proptest! {
                 let by_saved = matched_saved.is_some_and(|r| r.authority.is_some());
                 let by_yaml = matched_yaml.is_some_and(|r| {
                     r.matches.platform == Some(authority.platform())
+                        && r.matches.capability.is_literal()
                         && r.matches.capability.as_str() == authority.capability()
                 });
                 prop_assert!(by_saved || by_yaml);
