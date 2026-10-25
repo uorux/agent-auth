@@ -497,12 +497,34 @@ pub const MCP_TOOL_NAMES: [&str; 30] = [
     "host_shell_close",
 ];
 
+/// The web UIs' OAuth callbacks a connector may register by default:
+/// Claude (claude.ai and claude.com) and ChatGPT.
+pub const REMOTE_MCP_REDIRECT_URIS: [&str; 3] = [
+    "https://claude.ai/api/mcp/auth_callback",
+    "https://claude.com/api/mcp/auth_callback",
+    "https://chatgpt.com/connector_platform_oauth_redirect",
+];
+
+/// Whether `uri` may be a registrable callback: `https://`, a host, no
+/// fragment, no whitespace or control characters, at most 512 characters.
+#[must_use]
+pub fn redirect_uri_ok(uri: &str) -> bool {
+    uri.len() <= 512
+        && uri
+            .strip_prefix("https://")
+            .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))
+        && !uri.contains('#')
+        && !uri.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct RemoteMcpConfig {
     pub enabled: bool,
     pub base_url: String,
-    pub redirect_hosts: Vec<String>,
+    /// The callback URIs a connector may register, compared exactly
+    /// (the Python allowed any https URI on a listed host).
+    pub redirect_uris: Vec<String>,
     pub tools: Vec<String>,
     pub access_ttl: DurationSecs,
     pub refresh_ttl: DurationSecs,
@@ -514,7 +536,7 @@ impl Default for RemoteMcpConfig {
         RemoteMcpConfig {
             enabled: false,
             base_url: String::new(),
-            redirect_hosts: strings(&["claude.ai", "claude.com", "chatgpt.com", "chat.openai.com"]),
+            redirect_uris: strings(&REMOTE_MCP_REDIRECT_URIS),
             tools: strings(&REMOTE_MCP_TOOLS),
             access_ttl: secs("1h"),
             refresh_ttl: secs("30d"),

@@ -545,7 +545,7 @@ fn typos_are_errors_everywhere() {
 
 #[test]
 fn field_validators() {
-    let cases: [(Value, &str); 12] = [
+    let cases: [(Value, &str); 14] = [
         (
             json!({"wiki": {"repo": "nope"}}),
             "wiki.repo 'nope': owner/name",
@@ -577,6 +577,14 @@ fn field_validators() {
         (
             json!({"remote_mcp": {"enabled": true, "base_url": "https://b", "tools": ["whoami", "zz", "aa"]}, "ui": {"issuer": "https://id"}}),
             "remote_mcp.tools: no such tools: aa, zz",
+        ),
+        (
+            json!({"remote_mcp": {"enabled": true, "base_url": "https://b", "redirect_uris": ["http://claude.ai/cb"]}, "ui": {"issuer": "https://id"}}),
+            "remote_mcp.redirect_uris: 'http://claude.ai/cb' is not an https URL without a fragment",
+        ),
+        (
+            json!({"remote_mcp": {"enabled": true, "base_url": "https://b", "redirect_uris": ["https://claude.ai/cb#x"]}, "ui": {"issuer": "https://id"}}),
+            "remote_mcp.redirect_uris: 'https://claude.ai/cb#x' is not an https URL without a fragment",
         ),
         (
             json!({"restricted": {"z": {"members": []}}}),

@@ -3,10 +3,11 @@
 //! §C). The HTTP side is [`routes`].
 //!
 //! - Registration is dynamic (RFC 7591) and open; a client may only send
-//!   the browser back to `remote_mcp.redirect_hosts` (https, no fragment,
-//!   at most 512 characters). A client nobody authorized within
-//!   [`UNBOUND_CLIENT_TTL`] expires (it stops counting toward
-//!   `max_clients` and is deleted at the next registration).
+//!   the browser back to one of `remote_mcp.redirect_uris`, exactly.
+//!   Registrations nobody authorized have their own cap
+//!   ([`MAX_UNBOUND_CLIENTS`], the oldest evicted) and expire after
+//!   [`UNBOUND_CLIENT_TTL`]; `max_clients` caps authorized clients; each
+//!   address may register [`REGISTRATIONS_PER_HOUR`] an hour.
 //! - Authorization is the code flow with PKCE (S256 only). The person
 //!   authorizing signs in at the admin panel's provider and must be in its
 //!   admin group; the consent form names the agent the client acts as.
@@ -52,6 +53,13 @@ pub const CODE_TTL: Duration = Duration::minutes(5);
 pub const WEB_RUNTIME: &str = "web";
 /// A registered client nobody authorized expires after this (Bug-C6).
 pub const UNBOUND_CLIENT_TTL: Duration = Duration::hours(1);
+/// Registrations nobody authorized kept at once; a new one evicts the
+/// oldest (a flood of registrations evicts only itself).
+pub const MAX_UNBOUND_CLIENTS: i64 = 20;
+/// Registrations one client address may make in an hour.
+pub const REGISTRATIONS_PER_HOUR: usize = 20;
+/// Addresses whose registrations are remembered at once.
+const MAX_TRACKED_ADDRESSES: usize = 4096;
 /// The longest redirect URI registration accepts (Bug-C7).
 pub const MAX_REDIRECT_URI_CHARS: usize = 512;
 /// The longest `state` an authorization carries (it is sealed into a
@@ -179,7 +187,9 @@ pub struct TokenForm {
 /// The OAuth server.
 pub struct OAuthServer {
     base: String,
-    redirect_hosts: Vec<String>,
+    redirect_uris: Vec<String>,
+    /// Recent registrations per client address (the rate limit).
+    registrations: std::sync::Mutex<std::collections::HashMap<String, Vec<OffsetDateTime>>>,
     access_ttl: Duration,
     refresh_ttl: Duration,
     max_clients: i64,
@@ -209,7 +219,8 @@ impl OAuthServer {
         }
         Ok(OAuthServer {
             base,
-            redirect_hosts: config.redirect_hosts.clone(),
+            redirect_uris: config.redirect_uris.clone(),
+            registrations: std::sync::Mutex::default(),
             access_ttl: config.access_ttl.as_duration(),
             refresh_ttl: config.refresh_ttl.as_duration(),
             max_clients: i64::from(config.max_clients),
@@ -225,26 +236,42 @@ impl OAuthServer {
     }
 
     fn redirect_ok(&self, uri: &str) -> bool {
-        let Ok(parsed) = url::Url::parse(uri) else {
+        self.redirect_uris.iter().any(|allowed| allowed == uri)
+    }
+
+    /// Counts a registration from `address` at `now`; `false` when the
+    /// address has used up its hour.
+    fn admit_registration(&self, address: &str, now: OffsetDateTime) -> bool {
+        let hour_ago = now.saturating_sub(Duration::hours(1));
+        let mut seen = self
+            .registrations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if seen.len() >= MAX_TRACKED_ADDRESSES {
+            seen.retain(|_, times| times.iter().any(|t| *t > hour_ago));
+            if seen.len() >= MAX_TRACKED_ADDRESSES {
+                seen.clear();
+            }
+        }
+        let times = seen.entry(address.to_owned()).or_default();
+        times.retain(|t| *t > hour_ago);
+        if times.len() >= REGISTRATIONS_PER_HOUR {
             return false;
-        };
-        let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
-        parsed.scheme() == "https"
-            && parsed.fragment().is_none()
-            && !uri.contains('#')
-            && self
-                .redirect_hosts
-                .iter()
-                .any(|h| h.eq_ignore_ascii_case(&host))
+        }
+        times.push(now);
+        true
     }
 
     // ---------------------------------------------------------- registration
 
     /// `POST /oauth/register` (RFC 7591).
+    /// `address`: the caller's address (`None`: unknown, one shared
+    /// allowance).
     pub async fn register(
         &self,
         store: &Store,
         body: &[u8],
+        address: Option<&str>,
         now: OffsetDateTime,
     ) -> Result<ClientRegistered, OAuthFailure> {
         let reg =
@@ -253,8 +280,8 @@ impl OAuthServer {
             return Err(refuse(
                 OAuthErrorCode::InvalidRedirectUri,
                 format!(
-                    "this broker sends the browser back only to {} (https)",
-                    self.redirect_hosts.join(", ")
+                    "this broker sends the browser back only to {}",
+                    self.redirect_uris.join(", ")
                 ),
             )
             .into());
@@ -270,14 +297,29 @@ impl OAuthServer {
             )
             .into());
         }
+        if !self.admit_registration(address.unwrap_or("unknown"), now) {
+            return Err(Refusal {
+                status: 429,
+                body: OAuthError::new(
+                    OAuthErrorCode::InvalidClientMetadata,
+                    "too many registrations from this address; try again later",
+                ),
+            }
+            .into());
+        }
         let name = reg.client_name.clone().unwrap_or_default();
         let tx = store.begin().await?;
         let expired =
             db::delete_unbound_clients(&tx, now.saturating_sub(UNBOUND_CLIENT_TTL)).await?;
-        if expired > 0 {
-            tracing::info!(expired, "oauth: clients nobody authorized expired");
+        let evicted = db::evict_unbound_clients(&tx, MAX_UNBOUND_CLIENTS.saturating_sub(1)).await?;
+        if expired > 0 || evicted > 0 {
+            tracing::info!(
+                expired,
+                evicted,
+                "oauth: registrations nobody authorized removed"
+            );
         }
-        if db::count_live_clients(&tx).await? >= self.max_clients {
+        if db::count_live_bound_clients(&tx).await? >= self.max_clients {
             tx.commit().await?;
             return Err(refuse(
                 OAuthErrorCode::InvalidClientMetadata,

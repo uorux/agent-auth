@@ -181,6 +181,78 @@ pub fn wait_param(tool: &str) -> Option<&'static str> {
     }
 }
 
+/// A route of the agent API: `(method, path)`, `{}` standing for one path
+/// segment.
+pub type ApiRoute = (&'static str, &'static str);
+
+const SESSIONS: ApiRoute = ("POST", "/v1/sessions");
+
+/// The agent-API routes each tool calls (Bug-C1). A web UI connector's
+/// token reaches only the routes of the tools the remote endpoint serves,
+/// so this list is also that token's whole reach on `/v1`. The tools that
+/// bind to a session mint one on the remote endpoint when the caller names
+/// none, hence `POST /v1/sessions` in their lists. Unknown tools (and
+/// `get_credential`, never served remotely) have none.
+#[must_use]
+pub fn api_routes(tool: &str) -> &'static [ApiRoute] {
+    match tool {
+        "whoami" => &[("GET", "/v1/me")],
+        "list_capabilities" => &[("GET", "/v1/catalog")],
+        "request_access" => &[("POST", "/v1/requests"), SESSIONS],
+        "wait_for_decision" => &[("GET", "/v1/requests/{}/wait")],
+        "check_status" => &[("GET", "/v1/requests/{}")],
+        "retry_request" => &[("POST", "/v1/requests/{}/retry")],
+        "escalate_request" => &[("POST", "/v1/requests/{}/escalate")],
+        "list_grants" => &[("GET", "/v1/grants")],
+        "create_session" => &[SESSIONS],
+        "close_session" => &[("POST", "/v1/sessions/close")],
+        "check_a2a" => &[("GET", "/v1/a2a/check"), SESSIONS],
+        "a2a_open" => &[("POST", "/v1/a2a/threads"), SESSIONS],
+        "a2a_send" => &[("POST", "/v1/a2a/threads/{}/messages"), SESSIONS],
+        "a2a_poll" => &[("GET", "/v1/a2a/threads/{}/messages"), SESSIONS],
+        "a2a_threads" => &[("GET", "/v1/a2a/threads"), SESSIONS],
+        "a2a_accept" => &[("POST", "/v1/a2a/threads/{}/accept"), SESSIONS],
+        "a2a_reject" => &[("POST", "/v1/a2a/threads/{}/reject"), SESSIONS],
+        "a2a_close" => &[("POST", "/v1/a2a/threads/{}/close"), SESSIONS],
+        "a2a_events" => &[("GET", "/v1/a2a/events"), SESSIONS],
+        "wiki_search" => &[("GET", "/v1/wiki/search")],
+        "wiki_read" => &[("GET", "/v1/wiki/page")],
+        "wiki_list" => &[("GET", "/v1/wiki")],
+        "wiki_write" => &[("PUT", "/v1/wiki/page")],
+        "wiki_delete" => &[("POST", "/v1/wiki/delete")],
+        "notify_operator" => &[("POST", "/v1/attention")],
+        "host_run" => &[
+            ("POST", "/v1/requests"),
+            ("GET", "/v1/requests/{}/wait"),
+            ("GET", "/v1/hostexec/jobs/{}"),
+            SESSIONS,
+        ],
+        "host_job" => &[("GET", "/v1/hostexec/jobs/{}")],
+        "host_shell_exec" => &[
+            ("POST", "/v1/hostexec/shells/{}/exec"),
+            ("GET", "/v1/hostexec/jobs/{}"),
+        ],
+        "host_shell_close" => &[("POST", "/v1/hostexec/shells/{}/close")],
+        _ => &[],
+    }
+}
+
+/// Whether `path` matches `pattern` segment by segment, `{}` matching one
+/// non-empty segment; the whole path must match.
+#[must_use]
+pub fn route_matches(pattern: &str, path: &str) -> bool {
+    let mut want = pattern.split('/');
+    let mut have = path.split('/');
+    loop {
+        match (want.next(), have.next()) {
+            (None, None) => return true,
+            (Some("{}"), Some(seg)) if !seg.is_empty() => {}
+            (Some(w), Some(h)) if w == h => {}
+            _ => return false,
+        }
+    }
+}
+
 /// The remote endpoint's instructions, verbatim (they end with a newline).
 pub const REMOTE_INSTRUCTIONS: &str = "\
 agent-auth is this homelab's access broker, reached here as a web UI connector:
@@ -1178,6 +1250,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_served_tool_has_its_routes() {
+        for t in TOOLS {
+            let routes = api_routes(t.name);
+            if REMOTE_NEVER_SERVED.contains(&t.name) {
+                assert!(routes.is_empty(), "{}", t.name);
+                continue;
+            }
+            assert!(!routes.is_empty(), "{}", t.name);
+            for (m, p) in routes {
+                assert!(
+                    ["GET", "POST", "PUT"].contains(m) && p.starts_with("/v1/"),
+                    "{p}"
+                );
+                assert!(!p.contains("credential"), "{p}");
+            }
+        }
+        assert!(api_routes("get_credential").is_empty() && api_routes("nope").is_empty());
+        assert!(route_matches(
+            "/v1/requests/{}/wait",
+            "/v1/requests/abc/wait"
+        ));
+        assert!(!route_matches("/v1/requests/{}/wait", "/v1/requests//wait"));
+        assert!(!route_matches("/v1/requests/{}", "/v1/requests/a/b"));
+        assert!(!route_matches("/v1/wiki", "/v1/wiki/"));
+        assert!(!route_matches("/v1/grants", "/v1/grants/g/credential"));
     }
 
     #[test]

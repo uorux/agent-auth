@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS (SELECT 1 FROM oauth_clients WHERE agent_id = $1) AS \"bound!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "bound!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "280dcdf3a95aeb7537423524ed93a36f90f659ff7e157adb6cfaa66cc5e25b82"
+}
