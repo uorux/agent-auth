@@ -480,6 +480,57 @@ and why. Keep entries short. Group by area.
 - **Not changed**: a sessionless caller still lists, and gets activity for,
   its agent's session-bound threads (a2a B8, metadata only; every read is
   403).
+## Agent-side programs (client, `agent-auth` CLI, stdio MCP, bridge)
+
+- **One MCP tool table** (surfaces §D.5): names, descriptions, parameters
+  and schemas live in `wire::mcp_tools`, used by the stdio server and the
+  broker's remote endpoint (which keeps its differences there as data:
+  `REMOTE_NEVER_SERVED`, `REMOTE_MAX_WAIT_SECS`, `wait_param`, its
+  instructions). A number parameter's default is advertised as the Python
+  wrote it (`120`, not `120.0`), checked against a golden copy of the
+  Python server's `tools/list` (`crates/mcp/tests/golden/tools.json`).
+- **The broker URL must be `https://`** unless it is a loopback address
+  (§D.1). Otherwise every call fails with `[0] AGENT_AUTH_URL must be an
+  https:// URL ...` before sending the key. The Python sent keys over any
+  scheme.
+- **Request bodies are checked before sending** with the wire types the
+  broker parses them into: a body the broker would refuse fails here with
+  `[422] <the same message>` and no request. Durations go out as seconds.
+- **Ids are one path segment**: percent-encoded (`/` too); `""`, `.` and
+  `..` are refused (`[0] not an id: ...`). The Python interpolated them into
+  the path.
+- **`host_shell_exec` keeps waiting on the job** after the first slice (the
+  Python looked for `job["id"]`, which jobs never have, so it never did).
+- **Waits**: the first slice is exactly `min(wait, 60)`; a total that is NaN
+  or negative is no wait and at most a day is waited (the Python looped
+  forever on NaN and had no bound).
+- **Printed JSON** is Python's `json.dumps(..., indent=2)` (ASCII-escaped,
+  floats as `repr`), keys in the wire types' order (the Python models'); keys
+  inside free-form objects (scopes, payloads) come sorted rather than in the
+  broker's order. Answers are typed: a field a newer broker adds is not
+  printed until the wire type has it.
+- **`create_session`/`close_session` use the caller's credentials** (Bug-C3):
+  the tools run for a `Caller`; neither builds a client from the
+  environment.
+- **`get_credential(to_file=True)`** (Bug-D1): an existing symlink at the
+  file's name is refused; the value goes to a new `O_CREAT|O_EXCL` 0600 file
+  that is renamed into place; the directory must be a real directory (not a
+  link) owned by the user and is set to 0700 if it exists; `git_helper`
+  shell-quotes the path (unchanged for ordinary paths). The file name keeps
+  ASCII alphanumerics and `-` (Python: Unicode alphanumerics).
+- **MCP argument errors** read `Error executing tool <t>: 1 validation error
+  for <t>Arguments\n<param>: <problem>` (pydantic's text was longer).
+  Arguments are not coerced from strings.
+- **CLI**: bad JSON in `--scope`/`--payload` (Bug-D3) or a non-object is a
+  usage error (exit 2), not a traceback. `BadParameter` cases are clap usage
+  errors (`error: Invalid value: ...`, exit 2). An answer that does not parse
+  prints `could not read the broker's answer: ...`, exit 1. The default
+  session label keeps ASCII `[A-Za-z0-9._-]` only. `admin contain-lift`
+  without an id sends `{"all": true}` (wire change). `admin gen-key` prints a
+  `SecretBox` key (same shape as a Fernet key).
+- **Bridge** (Bug-D2): a credential without `expires_at` is not cached (a
+  new token per message) instead of crashing. Broker errors at startup are
+  reported as `cannot reach agent-auth: [status] detail`.
 
 ## Open questions
 
@@ -506,8 +557,6 @@ and why. Keep entries short. Group by area.
 
 - Local unix-socket protocols (hostctl, hostd-user, sandboxd local API) are
   typed in the daemon crate, not wire.
-- Python client bug to not port: `host_shell_exec` keeps waiting only if
-  `job.get("id")`, but jobs carry `job_id`.
 - A missing `POLICY_FILE` (B-12): the broker refuses to start.
 - ES256 MCP token key: derived from `BROKER_SIGNING_KEY` via ring's
   deprecated `test::rand::FixedSliceRandom` (ring has no scalar-to-key
