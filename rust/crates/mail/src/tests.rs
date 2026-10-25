@@ -32,7 +32,7 @@ async fn imap_login_search_fetch() {
     assert_eq!(sel.uidvalidity, 7);
     assert!(s.examine("Nope").await.unwrap().is_none());
     s.examine("INBOX").await.unwrap();
-    let criteria = or_all(&[vec!["FROM".into(), imap::quote("a@b.example")]]);
+    let criteria = or_all(&[vec!["FROM".into(), imap::quote("a@b.example").unwrap()]]);
     let uids = s.uid_search(&criteria).await.unwrap();
     assert_eq!(uids, vec![1, 2]);
     assert_eq!(

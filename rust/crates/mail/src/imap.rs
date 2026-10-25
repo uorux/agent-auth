@@ -23,6 +23,13 @@ pub const MAX_LITERAL: usize = 64 * 1024 * 1024;
 pub const MAX_UIDS: usize = 1_000_000;
 /// Most responses read for one command (untagged noise included).
 pub const MAX_RESPONSES: usize = 100_000;
+/// The most bytes one command's answer may make us hold (lines and kept
+/// literal bytes): a whole message and a SEARCH line fit.
+pub const COMMAND_BUDGET: usize = 48 * 1024 * 1024;
+/// Most literals in one response (a FETCH of BODY[] has one).
+pub const MAX_LITERALS_PER_RESPONSE: usize = 8;
+/// How long a whole command (or the greeting and login) may take.
+pub const COMMAND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// One server response: its lines, and the literal after each line that
 /// announced one.
@@ -229,7 +236,12 @@ pub fn quotable(s: &str) -> bool {
 
 /// `_quote`: a quoted string.
 #[must_use]
-pub fn quote(s: &str) -> String {
+/// `None` for a string holding CR, LF or NUL: never sent, quoted or not
+/// (defence in depth: callers check their values too).
+pub fn quote(s: &str) -> Option<String> {
+    if s.contains(['\r', '\n', '\0']) {
+        return None;
+    }
     let mut out = String::with_capacity(s.len().saturating_add(2));
     out.push('"');
     for c in s.chars() {
@@ -239,7 +251,7 @@ pub fn quote(s: &str) -> String {
         out.push(c);
     }
     out.push('"');
-    out
+    Some(out)
 }
 
 /// An argument of a command.
@@ -283,7 +295,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             lines: Lines::new(stream, MAX_LINE),
             next_tag: 0,
         };
-        let greeting = s.read_response().await?;
+        let mut budget = COMMAND_BUDGET;
+        let greeting = tokio::time::timeout(COMMAND_DEADLINE, s.read_response(&mut budget))
+            .await
+            .map_err(|_| ConnError::Timeout)??;
         match classify(greeting.head()) {
             Kind::Untagged(rest) if rest.to_ascii_uppercase().starts_with(b"OK") => {}
             _ => return Err(ImapError::Conn(ConnError::Refused("greeting".into()))),
@@ -300,13 +315,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         Ok(s)
     }
 
-    async fn read_response(&mut self) -> Result<Response, ConnError> {
+    /// One response, charging what it holds to `budget`.
+    async fn read_response(&mut self, budget: &mut usize) -> Result<Response, ConnError> {
         let mut r = Response::default();
+        let mut literals = 0usize;
         loop {
             let line = self.lines.line().await?;
+            *budget = budget.checked_sub(line.len()).ok_or(ConnError::TooLarge)?;
             match literal_len(&line) {
                 Some(n) if n <= MAX_LITERAL => {
-                    let lit = self.lines.bytes(n, MAX_RAW_BYTES).await?;
+                    literals = literals.saturating_add(1);
+                    if literals > MAX_LITERALS_PER_RESPONSE {
+                        return Err(ConnError::TooLarge);
+                    }
+                    let keep = MAX_RAW_BYTES.min(*budget);
+                    let lit = self.lines.bytes(n, keep).await?;
+                    if n > keep && keep < MAX_RAW_BYTES {
+                        return Err(ConnError::TooLarge);
+                    }
+                    *budget = budget.saturating_sub(lit.len());
                     r.parts.push((line, Some(lit)));
                 }
                 Some(_) => return Err(ConnError::TooLarge),
@@ -325,21 +352,41 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         name: &'static str,
         args: &[Arg],
     ) -> Result<(Status, Vec<Response>), ImapError> {
+        tokio::time::timeout(COMMAND_DEADLINE, self.command_inner(name, args))
+            .await
+            .map_err(|_| ImapError::Conn(ConnError::Timeout))?
+    }
+
+    async fn command_inner(
+        &mut self,
+        name: &'static str,
+        args: &[Arg],
+    ) -> Result<(Status, Vec<Response>), ImapError> {
+        let mut budget = COMMAND_BUDGET;
         self.next_tag = self.next_tag.saturating_add(1);
         let tag = format!("A{}", self.next_tag);
         let mut pending = format!("{tag} {name}").into_bytes();
         for arg in args {
             pending.push(b' ');
             match arg {
+                Arg::Raw(r) if r.contains(['\r', '\n', '\0']) => {
+                    return Err(ImapError::Command(name));
+                }
                 Arg::Raw(r) => pending.extend_from_slice(r.as_bytes()),
-                Arg::Str(s) if quotable(s) => pending.extend_from_slice(quote(s).as_bytes()),
+                Arg::Str(s) if s.contains(['\r', '\n', '\0']) => {
+                    return Err(ImapError::Command(name));
+                }
+                Arg::Str(s) if quotable(s) => {
+                    let q = quote(s).ok_or(ImapError::Command(name))?;
+                    pending.extend_from_slice(q.as_bytes());
+                }
                 Arg::Str(s) => {
                     // A synchronizing literal: wait for the go-ahead.
                     pending.extend_from_slice(format!("{{{}}}\r\n", s.len()).as_bytes());
                     self.lines.write(&pending).await?;
                     pending.clear();
                     loop {
-                        let r = self.read_response().await?;
+                        let r = self.read_response(&mut budget).await?;
                         match classify(r.head()) {
                             Kind::Continuation => break,
                             Kind::Tagged { .. } => return Err(ImapError::Command(name)),
@@ -354,7 +401,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         self.lines.write(&pending).await?;
         let mut untagged = Vec::new();
         for _ in 0..MAX_RESPONSES {
-            let r = self.read_response().await?;
+            let r = self.read_response(&mut budget).await?;
             match classify(r.head()) {
                 Kind::Tagged { tag: t, status } if t == tag.as_bytes() => {
                     return Ok((status, untagged));
@@ -500,7 +547,9 @@ mod tests {
         assert_eq!(fetch_body(&rs[0]).as_deref(), Some(&b"hello"[..]));
         let rs = responses(b"* 3 FETCH (UID 9 BODY[] \"hi \\\"x\\\"\")\r\n");
         assert_eq!(fetch_body(&rs[0]).as_deref(), Some(&b"hi \"x\""[..]));
-        assert_eq!(quote("a\"b\\c"), "\"a\\\"b\\\\c\"");
+        assert_eq!(quote("a\"b\\c").as_deref(), Some("\"a\\\"b\\\\c\""));
+        assert_eq!(quote("a\r\nb"), None);
+        assert_eq!(quote("a\0"), None);
         assert!(!quotable("p\u{e9}ss") && !quotable("a\r\nb") && quotable("p@ss w"));
         assert_eq!(
             or_all(&[vec!["A".into()], vec!["B".into()], vec!["C".into()]]),

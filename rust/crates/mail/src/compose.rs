@@ -57,9 +57,28 @@ pub fn rfc2822(t: OffsetDateTime) -> String {
     t.format(fmt).unwrap_or_default()
 }
 
-/// The message, CRLF line endings.
-#[must_use]
-pub fn compose(d: &Draft<'_>) -> Vec<u8> {
+/// A header value that would break the header block (CR, LF or NUL).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("a header value holds a line break or NUL")]
+pub struct ComposeError;
+
+fn header_safe(v: &str) -> Result<&str, ComposeError> {
+    if v.contains(['\r', '\n', '\0']) {
+        Err(ComposeError)
+    } else {
+        Ok(v)
+    }
+}
+
+/// The message, CRLF line endings. Header values holding CR, LF or NUL are
+/// refused (defence in depth: the gateway checks them first).
+pub fn compose(d: &Draft<'_>) -> Result<Vec<u8>, ComposeError> {
+    header_safe(d.from)?;
+    header_safe(d.subject)?;
+    header_safe(d.unique)?;
+    for t in d.to {
+        header_safe(t)?;
+    }
     let domain = d.from.rsplit('@').next().unwrap_or("localhost");
     let mut h = String::new();
     h.push_str(&format!("From: {}\r\n", d.from));
@@ -98,7 +117,7 @@ pub fn compose(d: &Draft<'_>) -> Vec<u8> {
             out.extend_from_slice(b"\r\n");
         }
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -125,7 +144,7 @@ mod tests {
             unique: "u1",
             date: OffsetDateTime::from_unix_timestamp(1_792_836_000).unwrap(),
         };
-        let raw = compose(&d);
+        let raw = compose(&d).unwrap();
         let text = String::from_utf8(raw.clone()).unwrap();
         assert!(text.contains("In-Reply-To: <orig@qantas.example>\r\n"));
         assert!(text.contains("Date: Sat, 24 Oct 2026 10:00:00 -0000\r\n"));
@@ -151,7 +170,12 @@ mod tests {
             unique: "u",
             date: OffsetDateTime::UNIX_EPOCH,
         };
-        let raw = String::from_utf8(compose(&d)).unwrap();
+        let raw = String::from_utf8(compose(&d).unwrap()).unwrap();
+        let bad = Draft {
+            subject: "x\r\nBcc: v@evil",
+            ..d.clone()
+        };
+        assert_eq!(compose(&bad), Err(ComposeError));
         assert!(!raw.contains("Bcc") && !raw.contains("evil"));
         assert!(raw.contains("In-Reply-To: <a@b>\r\n"));
     }

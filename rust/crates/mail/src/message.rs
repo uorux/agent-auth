@@ -50,9 +50,10 @@ pub struct ParsedMessage {
     pub sl_envelope_to: Vec<String>,
     /// SimpleLogin: the sender before the From was rewritten.
     pub sl_original_from: Option<String>,
-    /// Did the mailbox's own provider (its topmost Authentication-Results)
-    /// see DMARC/DKIM pass for the From domain?
-    pub authenticated: Option<bool>,
+    /// The topmost Authentication-Results (the one the mailbox's own
+    /// provider added; each hop prepends), parsed. Trusted only when its
+    /// authserv-id is the provider's ([`ParsedMessage::verified`]).
+    pub auth: Option<AuthResults>,
     pub hidden_text: String,
     pub hints: Vec<String>,
     pub raw_size: usize,
@@ -170,43 +171,230 @@ fn to_datetime(d: &mail_parser::DateTime) -> Option<OffsetDateTime> {
     )
 }
 
-/// `_authenticated`: the topmost Authentication-Results is the one the
-/// mailbox's own provider added (each hop prepends), so it is the only one
-/// read: `dmarc=pass` for the From's own domain (`header.from=`), or
-/// `dkim=pass` for it (or a parent domain).
+/// One result of an Authentication-Results header (RFC 8601): a method,
+/// its result, and its properties (`header.from`, `header.d`...), all
+/// lowercased, comments removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthResult {
+    pub method: String,
+    pub result: String,
+    pub props: Vec<(String, String)>,
+}
+
+impl AuthResult {
+    #[must_use]
+    pub fn prop(&self, name: &str) -> Option<&str> {
+        self.props
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// A parsed Authentication-Results header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthResults {
+    /// Who wrote it (`mx.google.com`), lowercased.
+    pub authserv_id: String,
+    pub results: Vec<AuthResult>,
+}
+
+/// The most results read from one header.
+const MAX_AUTH_RESULTS: usize = 64;
+
+/// Comments (nested, with quoted strings and escapes respected) removed.
+fn strip_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let (mut depth, mut quoted, mut escaped) = (0usize, false, false);
+    for c in text.chars() {
+        if escaped {
+            escaped = false;
+            if depth == 0 {
+                out.push(c);
+            }
+            continue;
+        }
+        match c {
+            '\\' => {
+                escaped = true;
+                if depth == 0 {
+                    out.push(c);
+                }
+            }
+            '"' if depth == 0 => {
+                quoted = !quoted;
+                out.push(c);
+            }
+            '(' if !quoted => depth = depth.saturating_add(1),
+            ')' if !quoted && depth > 0 => {
+                depth = depth.saturating_sub(1);
+                out.push(' ');
+            }
+            c if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Split on `sep` outside quoted strings.
+fn split_unquoted(text: &str, sep: fn(char) -> bool) -> Vec<String> {
+    let mut parts = vec![String::new()];
+    let (mut quoted, mut escaped) = (false, false);
+    for c in text.chars() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            quoted = !quoted;
+        } else if !quoted && sep(c) {
+            parts.push(String::new());
+            continue;
+        }
+        if let Some(last) = parts.last_mut() {
+            last.push(c);
+        }
+    }
+    parts
+}
+
+fn unquote(v: &str) -> String {
+    v.trim_matches('"').to_lowercase()
+}
+
+/// Parse an Authentication-Results value: `authserv-id [version];
+/// method=result [reason=...] [ptype.prop=value ...]; ...`.
+#[must_use]
+pub fn parse_auth_results(value: &str) -> Option<AuthResults> {
+    let text = strip_comments(value);
+    let mut parts = split_unquoted(&text, |c| c == ';').into_iter();
+    let authserv_id = parts.next()?.split_whitespace().next()?.to_lowercase();
+    let mut results = Vec::new();
+    for part in parts.take(MAX_AUTH_RESULTS) {
+        let mut tokens = split_unquoted(part.trim(), char::is_whitespace)
+            .into_iter()
+            .filter(|t| !t.is_empty());
+        let Some((method, result)) = tokens.next().and_then(|t| {
+            let (m, r) = t.split_once('=')?;
+            Some((m.trim().to_lowercase(), unquote(r.trim())))
+        }) else {
+            continue;
+        };
+        let method = method.split('/').next().unwrap_or("").to_owned();
+        let props = tokens
+            .take(32)
+            .filter_map(|t| {
+                let (k, v) = t.split_once('=')?;
+                Some((k.trim().to_lowercase(), unquote(v.trim())))
+            })
+            .collect();
+        results.push(AuthResult {
+            method,
+            result,
+            props,
+        });
+    }
+    Some(AuthResults {
+        authserv_id,
+        results,
+    })
+}
+
+/// The domain a DKIM result is for (`header.d`, else `header.i`'s).
+fn dkim_domain(r: &AuthResult) -> Option<&str> {
+    r.prop("header.d").or_else(|| {
+        r.prop("header.i")
+            .map(|i| i.rsplit('@').next().unwrap_or(i))
+    })
+}
+
+fn same_or_parent(domain: &str, signer: &str) -> bool {
+    !signer.is_empty() && (domain == signer || domain.ends_with(&format!(".{signer}")))
+}
+
+impl AuthResults {
+    /// Was it written by `authserv` (the mailbox provider's own id)?
+    #[must_use]
+    pub fn by(&self, authserv: &str) -> bool {
+        !authserv.is_empty() && self.authserv_id.eq_ignore_ascii_case(authserv)
+    }
+
+    /// `_authenticated`, as results rather than text: `dmarc=pass` with
+    /// `header.from` the domain, or `dkim=pass` signed by it (or a parent);
+    /// false on a DMARC, DKIM or SPF failure; None otherwise.
+    #[must_use]
+    pub fn verdict(&self, domain: &str) -> Option<bool> {
+        let domain = domain.to_lowercase();
+        if self.results.iter().any(|r| {
+            r.method == "dmarc"
+                && r.result == "pass"
+                && r.prop("header.from") == Some(domain.as_str())
+        }) {
+            return Some(true);
+        }
+        if self.results.iter().any(|r| {
+            r.method == "dkim"
+                && r.result == "pass"
+                && dkim_domain(r).is_some_and(|d| same_or_parent(&domain, d))
+        }) {
+            return Some(true);
+        }
+        let failed = self.results.iter().any(|r| {
+            matches!(
+                (r.method.as_str(), r.result.as_str()),
+                ("dmarc", "fail" | "none") | ("dkim", "fail") | ("spf", "fail")
+            )
+        });
+        failed.then_some(false)
+    }
+
+    /// A DKIM pass signed by one of `domains` (or a subdomain of one).
+    #[must_use]
+    pub fn dkim_pass_by(&self, domains: &[String]) -> bool {
+        self.results.iter().any(|r| {
+            r.method == "dkim"
+                && r.result == "pass"
+                && dkim_domain(r).is_some_and(|d| domains.iter().any(|x| same_or_parent(d, x)))
+        })
+    }
+}
+
+impl ParsedMessage {
+    /// Did the mailbox's own provider (authserv-id `authserv`) see DMARC or
+    /// DKIM pass for `domain`? None when it said nothing (or the header is
+    /// not the provider's: anyone can write one).
+    #[must_use]
+    pub fn verified(&self, authserv: &str, domain: &str) -> Option<bool> {
+        self.auth
+            .as_ref()
+            .filter(|a| a.by(authserv))
+            .and_then(|a| a.verdict(domain))
+    }
+}
+
+/// `authenticated` for a raw header and From (tests, fuzzing): the verdict
+/// whoever wrote the header.
 #[must_use]
 pub fn authenticated(top: Option<&str>, from_addr: &str) -> Option<bool> {
-    static DMARC: OnceLock<Regex> = OnceLock::new();
-    static DKIM: OnceLock<Regex> = OnceLock::new();
-    static FAIL: OnceLock<Regex> = OnceLock::new();
-    let top = top?.to_lowercase();
-    let domain = from_addr.rsplit('@').next().unwrap_or("");
-    let dmarc = DMARC.get_or_init(|| {
-        Regex::new(r"\bdmarc=pass\b[^;]*?header\.from=([a-z0-9.-]+)").unwrap_or_else(|_| never())
-    });
-    for c in dmarc.captures_iter(&top) {
-        if c.get(1).is_some_and(|m| m.as_str() == domain) {
-            return Some(true);
-        }
+    let auth = parse_auth_results(top?)?;
+    auth.verdict(from_addr.rsplit('@').next().unwrap_or(""))
+}
+
+/// A MIME type in `type/subtype` token syntax (RFC 2045), lowercased;
+/// anything else is `application/octet-stream`.
+#[must_use]
+pub fn safe_content_type(ct: &str) -> String {
+    let token = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 64
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$&-^_.+".contains(&b))
+    };
+    match ct.split_once('/') {
+        Some((t, sub)) if token(t) && token(sub) => ct.to_ascii_lowercase(),
+        _ => "application/octet-stream".to_owned(),
     }
-    let dkim = DKIM.get_or_init(|| {
-        Regex::new(r"\bdkim=(\w+)[^;]*?header\.(?:d|i)=@?([a-z0-9.-]+)").unwrap_or_else(|_| never())
-    });
-    for c in dkim.captures_iter(&top) {
-        let result = c.get(1).map_or("", |m| m.as_str());
-        let d = c.get(2).map_or("", |m| m.as_str());
-        if result == "pass" && (d == domain || domain.ends_with(&format!(".{d}"))) {
-            return Some(true);
-        }
-    }
-    let fail = FAIL.get_or_init(|| {
-        Regex::new(r"\bdmarc=(?:fail|none)\b|\bdkim=fail\b|\bspf=fail\b")
-            .unwrap_or_else(|_| never())
-    });
-    if fail.is_match(&top) {
-        return Some(false);
-    }
-    None
 }
 
 fn part_type(part: &mail_parser::MessagePart<'_>) -> String {
@@ -228,7 +416,7 @@ fn attachment_meta(i: usize, part: &mail_parser::MessagePart<'_>) -> Attachment 
     Attachment {
         index: i,
         filename: chars(&name, 200),
-        content_type: chars(&part_type(part), 200),
+        content_type: safe_content_type(&part_type(part)),
         size: part.len(),
     }
 }
@@ -263,7 +451,7 @@ pub fn parse(raw: &[u8]) -> ParsedMessage {
         attachments: Vec::new(),
         sl_envelope_to: Vec::new(),
         sl_original_from: None,
-        authenticated: None,
+        auth: None,
         hidden_text: String::new(),
         hints: Vec::new(),
         raw_size: raw.len(),
@@ -274,9 +462,20 @@ pub fn parse(raw: &[u8]) -> ParsedMessage {
     out.message_id = msg_ids(&first_raw(&msg, "Message-ID")).into_iter().next();
     out.in_reply_to = msg_ids(&first_raw(&msg, "In-Reply-To"));
     out.references = msg_ids(&first_raw(&msg, "References"));
-    out.date = msg.date().and_then(to_datetime);
-    out.subject = chars(&clean(msg.subject().unwrap_or("")), 500);
-    if let Some(first) = msg.from().and_then(|a| a.first()) {
+    // The FIRST From, Subject and Date (as Python's `msg.get`); mail-parser
+    // reads the last.
+    out.date = msg
+        .header_values("Date")
+        .next()
+        .and_then(HeaderValue::as_datetime)
+        .and_then(to_datetime);
+    out.subject = chars(&clean(&first_text(&msg, "Subject")), 500);
+    if let Some(first) = msg
+        .header_values("From")
+        .next()
+        .and_then(HeaderValue::as_address)
+        .and_then(|a| a.first())
+    {
         out.from_addr = first
             .address()
             .map(|a| clean(a).to_lowercase())
@@ -308,7 +507,7 @@ pub fn parse(raw: &[u8]) -> ParsedMessage {
             HeaderValue::Text(t) => Some(t.to_string()),
             _ => None,
         });
-    out.authenticated = authenticated(auth.as_deref(), &out.from_addr);
+    out.auth = auth.as_deref().and_then(parse_auth_results);
 
     let plain = msg
         .text_bodies()
@@ -393,6 +592,10 @@ pub fn injection_hints(m: &ParsedMessage) -> Vec<String> {
         && let Some(hit) = first_hit(&m.hidden_text)
     {
         hints.push(format!("hidden text says {hit}"));
+    }
+    // Attachment names reach the agent too.
+    if let Some(hit) = m.attachments.iter().find_map(|a| first_hit(&a.filename)) {
+        hints.push(format!("an attachment name says {hit}"));
     }
     hints
 }

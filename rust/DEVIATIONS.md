@@ -1216,6 +1216,67 @@ characters stripped; `mail_attachment` never served remotely). Beyond it:
 - **CLI `mail-send`** reads the body from `--body-file` or stdin, as the
   Python; `mail-list --limit` is an integer (clap usage error otherwise).
 
+### Mail: security review #4
+
+"(upstream)" marks what the Python does too: upstream should know.
+
+- **Verified senders only** (upstream). A mailbox grant counts a
+  correspondent only when the mailbox provider's own Authentication-Results
+  (its authserv-id: `mx.google.com` for Gmail, `authserv_id` for IMAP,
+  unset = nothing verified) shows DMARC pass for the From's domain or a
+  DKIM pass signed by it; a message "from" the mailbox counts as its own
+  only so verified or filed as sent (Gmail's `SENT` label, IMAP
+  `sent_folders`, default `Sent`, `Sent Items`, `Sent Messages`,
+  `[Gmail]/Sent Mail`). An alias trusts `X-SimpleLogin-Envelope-To` and
+  `-Original-From` only on a message the provider saw DKIM-signed by
+  `simplelogin.dkim_domains` (default `simplelogin.co`) or the alias's own
+  domain. A message that would belong if its claims were true but is not
+  verified is held ("the sender could not be verified..."), never
+  delivered or dropped; the judge does not see it. New policy keys:
+  `mailboxes.*.authserv_id`, `mailboxes.*.sent_folders`,
+  `simplelogin.dkim_domains`.
+- **Authentication-Results are parsed** (RFC 8601; upstream used regexes
+  over the text): comments removed, results split on `;`, `method=result`
+  anchored at each result's start, `header.from`/`header.d` read from that
+  same result, and the header counts only from the provider's authserv-id.
+- **Attachments**: a content type is kept only in `type/subtype` token
+  syntax, else `application/octet-stream` (upstream passed what the
+  sender wrote); attachment names are scanned for injection hints
+  (upstream did not).
+- **Held items are released only after their whole text was shown**
+  (upstream showed 1,500 characters, Discord 900, of up to 50,000). Held
+  items keep their whole text sealed (inbound too: what the agent would
+  read plus the hidden text; migration 0015); `GET /admin/mail/items/{id}`
+  and `/admin/mail/held` return it in `text`, the Discord card attaches it
+  as a file when it does not fit, and each records `shown_at`; a release
+  before that is 409.
+- **IMAP answers are bounded per command**: 48 MiB held, 8 literals per
+  response, 120 s for a whole command (and for the greeting); a
+  per-read timeout alone let one login hold 400 MiB.
+- **No paging oracle while searching** (upstream): a search's pages are
+  filled from messages the agent may read only (up to 5 backend pages per
+  call), behind a sealed cursor (`page is not a cursor of this search`,
+  400, for anything else). Held and unscreened messages are not listed
+  while searching. The time a search takes still grows with what it
+  skipped.
+- **Hidden text** (upstream): every Unicode Default_Ignorable code point
+  and U+FFF9..FFFB are stripped, U+2028/2029 are line breaks; CSS is read
+  after removing comments and decoding escapes, declaration by
+  declaration; also hiding: `opacity` ≤ 0.05 (`.0`, `0%`),
+  `visibility:collapse`, `mso-hide:all`, font sizes under 2 px in any
+  unit, zero width with overflow hidden, transparent `rgb`/`hsl` alpha,
+  `scale(0)`, empty clips, far off-screen positions and indents;
+  `<style>` rules that hide hide every element with a class or id they
+  name (over-approximated); closed `<details>`, `<iframe>`, `<noembed>`,
+  `<noframes>` content is hidden. Not detected: text coloured like its
+  background, SVG text, `<select>` options.
+- **The first From, Subject and Date** count when a header repeats (as the
+  Python's `msg.get`; mail-parser reads the last).
+- **The judge's hints sit inside the quoted `<email>` block**
+  (`heuristic_hints`), not after it (upstream).
+- **Defence in depth**: `imap::quote`, IMAP command arguments and
+  `compose` refuse CR, LF and NUL themselves.
+
 ## Agent VMs (`crates/sandboxd`, broker `sandboxes`)
 
 Broker side:

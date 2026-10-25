@@ -40,7 +40,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use agent_auth_core::mail::{MailAuthority, Ops, domain_of, is_address, matches_any};
 use agent_auth_core::policy::Policy;
 use agent_auth_core::policy::mail::{
-    InjectionMode, MailConfig, SendReview, UnclearMode, allowed_ops,
+    InjectionMode, MailConfig, MailboxConfig, SendReview, UnclearMode, allowed_ops,
 };
 use agent_auth_core::{Authority, GrantId, MailItemId};
 use agent_auth_crypto::secretbox::{Binding, SecretBox};
@@ -238,8 +238,35 @@ fn timestamp(t: OffsetDateTime) -> String {
     agent_auth_wire::timestamp::format(t).unwrap_or_default()
 }
 
+/// Backend pages a search reads at most to fill one page.
+const SEARCH_PAGES: usize = 5;
+
+/// Why a message whose claims are not verified is held.
+const UNVERIFIED: &str = "the sender could not be verified (the mailbox's provider saw no DMARC or DKIM pass for it): the operator decides";
+
+/// Whether a message is the grant's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fit {
+    /// Not the grant's.
+    No,
+    /// The grant's, by verified claims.
+    Yes,
+    /// The grant's if its unverified claims (its From, SimpleLogin's
+    /// headers) are true: held for the operator.
+    Unverified,
+}
+
+/// What a held inbound item's sealed text is bound to (its row's identity;
+/// the row id is not known before the upsert).
+fn inbound_binding(grant: GrantId, key: &str) -> String {
+    format!("in:{grant}:{key}")
+}
+
 /// `_why`: what an agent is told about a held message.
 fn why(row: &MailItemRow) -> String {
+    if row.verdict.as_deref() == Some("unverified") {
+        return "the sender could not be verified; the operator decides".to_owned();
+    }
     if row.injection.as_deref() == Some("likely")
         && row.reason.starts_with("possible prompt injection")
     {
@@ -513,8 +540,8 @@ impl Mail {
         })
     }
 
-    /// `_belongs`: is this message the grant's, by the deterministic
-    /// filters?
+    /// `_belongs`, taking the message's claims at their word: is it the
+    /// grant's, by the deterministic filters?
     fn belongs(target: &Target, c: &Constraints, m: &ParsedMessage) -> bool {
         let parties: Vec<String> = match target.mode {
             Mode::Alias => {
@@ -553,6 +580,49 @@ impl Mail {
             return false;
         }
         true
+    }
+
+    /// Is this message the grant's, and are the claims that make it so
+    /// verified (review #4)? A mailbox counts a correspondent only when its
+    /// provider saw DMARC or DKIM pass for the From's domain, and takes a
+    /// message "from" itself as its own only so verified or when filed as
+    /// sent; an alias trusts SimpleLogin's headers only on a message its
+    /// provider saw signed (DKIM) by SimpleLogin or the alias's domain. A
+    /// message that would belong if its claims were true, but whose claims
+    /// are not verified, is held for the operator.
+    fn fit(&self, target: &Target, c: &Constraints, m: &ParsedMessage, sent: bool) -> Fit {
+        if !Self::belongs(target, c, m) {
+            return Fit::No;
+        }
+        let mailbox = self.config().mailboxes.get(&target.mailbox);
+        let authserv = mailbox
+            .and_then(MailboxConfig::authserv)
+            .unwrap_or_default();
+        let from_ok =
+            |addr: &str| domain_of(addr).is_some_and(|d| m.verified(&authserv, &d) == Some(true));
+        let verified = match target.mode {
+            Mode::Mailbox if m.from_addr == target.address => sent || from_ok(&m.from_addr),
+            Mode::Mailbox => from_ok(&m.from_addr),
+            Mode::Alias => {
+                let uses_sl = !m.sl_envelope_to.is_empty()
+                    || (m.sl_original_from.is_some() && !c.layers.is_empty());
+                if uses_sl {
+                    let mut signers: Vec<String> = self
+                        .config()
+                        .simplelogin
+                        .as_ref()
+                        .map(|sl| sl.dkim_domains.clone())
+                        .unwrap_or_default();
+                    signers.extend(domain_of(&target.address));
+                    m.auth
+                        .as_ref()
+                        .is_some_and(|a| a.by(&authserv) && a.dkim_pass_by(&signers))
+                } else {
+                    c.layers.is_empty() || from_ok(&m.from_addr)
+                }
+            }
+        };
+        if verified { Fit::Yes } else { Fit::Unverified }
     }
 
     fn summary(m: &ParsedMessage, target: &Target) -> Map<String, Value> {
@@ -617,7 +687,7 @@ impl Mail {
                     "cc": m.cc,
                     "date": m.date.map(timestamp),
                     "subject": m.subject,
-                    "sender_verified": if target.mode == Mode::Mailbox { json!(m.authenticated) } else { Value::Null },
+                    "sender_verified": if target.mode == Mode::Mailbox { json!(self.sender_verified(target, m)) } else { Value::Null },
                     "attachments": m.attachments.iter().map(|a| a.filename.clone()).collect::<Vec<_>>(),
                     "hidden_text_removed": !m.hidden_text.is_empty(),
                     // Exactly what the agent can read: nothing past what was judged.
@@ -696,136 +766,29 @@ impl Mail {
         now: OffsetDateTime,
     ) -> Result<MailList, MailError> {
         let ctx = self.context(grant, now).await?;
-        let (target, c) = (&ctx.target, &ctx.constraints);
-        if !c.ops.read {
+        if !ctx.constraints.ops.read {
             return Err(MailError::new(403, "this grant does not include reading"));
         }
         let limit = usize::try_from(limit.clamp(1, 50)).unwrap_or(LIST_MAX);
-        let backend = self.backend(target)?;
+        let text = text.filter(|t| !t.is_empty());
         let query = Search {
-            to: (target.mode == Mode::Alias).then(|| target.address.clone()),
+            to: (ctx.target.mode == Mode::Alias).then(|| ctx.target.address.clone()),
             // Any one layer narrows correctly (a message must match them all).
-            correspondents: c.layers.first().cloned().unwrap_or_default(),
-            since: c.since,
+            correspondents: ctx.constraints.layers.first().cloned().unwrap_or_default(),
+            since: ctx.constraints.since,
             text: text.map(str::to_owned),
         };
-        let (found, next_page) = backend
+        if text.is_some() {
+            return self
+                .search_list(grant, &ctx, &query, limit, page, now)
+                .await;
+        }
+        let (found, next_page) = self
+            .backend(&ctx.target)?
             .search(&query, limit, page)
             .await
             .map_err(|e| MailError::new(502, e.0))?;
-        let keys: Vec<String> = found.iter().map(|f| f.key.clone()).collect();
-        let mut newly_held: Vec<MailItemId> = Vec::new();
-        let lock = self.lock(grant.id);
-        let guard = lock.lock().await;
-        let tx = self.store.begin().await?;
-        let rows: HashMap<String, MailItemRow> = store_mail::inbound_for_keys(&tx, grant.id, &keys)
-            .await?
-            .into_iter()
-            .filter_map(|r| r.message_key.clone().map(|k| (k, r)))
-            .collect();
-        let context_rows = store_mail::context(&tx, grant.id).await?;
-        tx.commit().await?;
-        // Judged again: a failed screen, and anything judged under other
-        // constraints (the policy's restrictions changed since).
-        let fp = c.fingerprint();
-        let todo: Vec<backends::Found> = found
-            .iter()
-            .filter(|f| match rows.get(&f.key) {
-                None => true,
-                Some(r) => {
-                    r.status == ItemStatus::Error
-                        || (!matches!(r.status, ItemStatus::Released | ItemStatus::Discarded)
-                            && r.summary.get("fp").and_then(Value::as_str) != Some(fp.as_str()))
-                }
-            })
-            .cloned()
-            .collect();
-        let (context_rows, purpose) = (&context_rows, ctx.purpose.as_str());
-        let results: Vec<_> = futures::stream::iter(todo)
-            .map(|f: backends::Found| async move {
-                let raw = match backend.fetch(&f.key).await {
-                    Ok(raw) => raw,
-                    Err(e) => {
-                        tracing::warn!(key = %f.key, error = %e, "mail: fetching failed");
-                        return (f, None::<(ParsedMessage, Option<String>, Screen)>);
-                    }
-                };
-                let m = msg::parse(&raw);
-                let thread = f
-                    .thread
-                    .clone()
-                    .or_else(|| m.thread_root().map(|t| chars(t, 512)));
-                if !Self::belongs(target, c, &m) {
-                    let outcome = (
-                        "ignored".to_owned(),
-                        None,
-                        ItemStatus::Ignored,
-                        String::new(),
-                    );
-                    return (f, Some((m, thread, outcome)));
-                }
-                let context: Vec<Value> = context_rows
-                    .iter()
-                    .filter(|r| r.thread_key.is_some() && r.thread_key == thread)
-                    .map(|r| {
-                        json!({"subject": r.summary.get("subject"), "from": r.summary.get("from"),
-                               "date": r.summary.get("date")})
-                    })
-                    .collect();
-                let outcome = self.screen(target, c, purpose, &m, &context).await;
-                (f, Some((m, thread, outcome)))
-            })
-            .buffered(CONCURRENCY)
-            .collect()
-            .await;
-        let tx = self.store.begin().await?;
-        for (f, result) in &results {
-            let Some((m, thread, (verdict, injection, status, reason))) = result else {
-                continue;
-            };
-            let mut summary = match status {
-                ItemStatus::Ignored => Map::new(),
-                ItemStatus::Withheld => {
-                    let mut s = Map::new();
-                    s.insert("date".into(), json!(m.date.map(timestamp)));
-                    s
-                }
-                _ => Self::summary(m, target),
-            };
-            summary.insert("fp".into(), json!(fp));
-            let screened = store_mail::Screened {
-                grant: grant.id,
-                agent: grant.agent_id,
-                address: &target.address,
-                message_key: &f.key,
-                thread_key: thread.as_deref(),
-                summary: &summary,
-                verdict: Some(verdict),
-                injection: injection.as_deref(),
-                status: *status,
-                reason: &chars(reason, 4000),
-            };
-            match store_mail::record_screened(&tx, &screened, now).await {
-                Ok(Some(id)) if *status == ItemStatus::Held => newly_held.push(id),
-                Ok(_) => {}
-                Err(e) if e.is_unique_violation() => {
-                    return Err(MailError::new(409, "listed concurrently; list again"));
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-        tx.commit().await?;
-        drop(guard);
-        for id in newly_held {
-            self.notify_held(id, None).await;
-        }
-        let tx = self.store.begin().await?;
-        let rows: HashMap<String, MailItemRow> = store_mail::inbound_for_keys(&tx, grant.id, &keys)
-            .await?
-            .into_iter()
-            .filter_map(|r| r.message_key.clone().map(|k| (k, r)))
-            .collect();
-        tx.commit().await?;
+        let rows = self.screen_found(grant, &ctx, &found, now).await?;
         let (mut withheld, mut held) = (0u64, 0u64);
         let mut messages = Vec::new();
         for f in &found {
@@ -855,17 +818,252 @@ impl Mail {
                 _ => {}
             }
         }
-        // With a search, how many hidden messages matched would say what
-        // they contain: not counted then.
-        let searching = text.is_some_and(|t| !t.is_empty());
         Ok(MailList {
-            address: target.address.clone(),
+            address: ctx.target.address.clone(),
             messages,
-            withheld_out_of_scope: (!searching).then_some(withheld),
-            held_for_operator: (!searching).then_some(held),
+            withheld_out_of_scope: Some(withheld),
+            held_for_operator: Some(held),
             next_page,
             notice: LIST_NOTICE.to_owned(),
         })
+    }
+
+    /// A search: pages filled from screened messages the agent may read
+    /// only, behind an opaque cursor over them, so neither a page's size
+    /// nor its cursor says how many hidden messages matched (review #4).
+    async fn search_list(
+        &self,
+        grant: &GrantRow,
+        ctx: &GrantContext,
+        query: &Search,
+        limit: usize,
+        page: Option<&str>,
+        now: OffsetDateTime,
+    ) -> Result<MailList, MailError> {
+        let binding = format!("{}", grant.id);
+        let bind = || Binding::new("mail_search", "cursor", &binding);
+        let (mut backend_page, mut skip): (Option<String>, usize) = match page {
+            None | Some("") => (None, 0),
+            Some(p) => {
+                let opened = self
+                    .secret_box
+                    .open_str(p, &bind())
+                    .map_err(|_| MailError::new(400, "page is not a cursor of this search"))?;
+                let v: Value = serde_json::from_str(opened.expose())
+                    .map_err(|_| MailError::new(400, "page is not a cursor of this search"))?;
+                (
+                    v.get("p").and_then(Value::as_str).map(str::to_owned),
+                    v.get("s")
+                        .and_then(Value::as_u64)
+                        .and_then(|n| usize::try_from(n).ok())
+                        .unwrap_or(0),
+                )
+            }
+        };
+        let backend = self.backend(&ctx.target)?;
+        let mut messages = Vec::new();
+        let mut next: Option<(Option<String>, usize)> = None;
+        for round in 0..SEARCH_PAGES {
+            let (found, after) = backend
+                .search(query, limit, backend_page.as_deref())
+                .await
+                .map_err(|e| MailError::new(502, e.0))?;
+            let rows = self.screen_found(grant, ctx, &found, now).await?;
+            for (i, f) in found.iter().enumerate().skip(skip) {
+                if messages.len() >= limit {
+                    next = Some((backend_page.clone(), i));
+                    break;
+                }
+                if let Some(row) = rows.get(&f.key)
+                    && matches!(row.status, ItemStatus::Delivered | ItemStatus::Released)
+                {
+                    messages.push(Listed::Shown(listing(row)));
+                }
+            }
+            if next.is_some() {
+                break;
+            }
+            skip = 0;
+            match after {
+                None => break,
+                Some(a) => {
+                    backend_page = Some(a);
+                    if messages.len() >= limit || round.saturating_add(1) == SEARCH_PAGES {
+                        next = Some((backend_page.clone(), 0));
+                        break;
+                    }
+                }
+            }
+        }
+        let next_page = match next {
+            None => None,
+            Some((p, s)) => Some(
+                self.secret_box
+                    .seal_str(&json!({"p": p, "s": s}).to_string(), &bind())
+                    .map_err(|_| MailError::new(500, "internal error"))?,
+            ),
+        };
+        Ok(MailList {
+            address: ctx.target.address.clone(),
+            messages,
+            // How many hidden messages matched would say what they contain.
+            withheld_out_of_scope: None,
+            held_for_operator: None,
+            next_page,
+            notice: LIST_NOTICE.to_owned(),
+        })
+    }
+
+    /// Fetch, filter and judge what was found and is not judged yet (or was
+    /// judged under other constraints); record it; tell the operator about
+    /// what is held. The rows for the found keys.
+    async fn screen_found(
+        &self,
+        grant: &GrantRow,
+        ctx: &GrantContext,
+        found: &[backends::Found],
+        now: OffsetDateTime,
+    ) -> Result<HashMap<String, MailItemRow>, MailError> {
+        let (target, c) = (&ctx.target, &ctx.constraints);
+        let backend = self.backend(target)?;
+        let keys: Vec<String> = found.iter().map(|f| f.key.clone()).collect();
+        let mut newly_held: Vec<MailItemId> = Vec::new();
+        let lock = self.lock(grant.id);
+        let guard = lock.lock().await;
+        let tx = self.store.begin().await?;
+        let rows: HashMap<String, MailItemRow> = store_mail::inbound_for_keys(&tx, grant.id, &keys)
+            .await?
+            .into_iter()
+            .filter_map(|r| r.message_key.clone().map(|k| (k, r)))
+            .collect();
+        let context_rows = store_mail::context(&tx, grant.id).await?;
+        tx.commit().await?;
+        let fp = c.fingerprint();
+        let todo: Vec<backends::Found> = found
+            .iter()
+            .filter(|f| match rows.get(&f.key) {
+                None => true,
+                Some(r) => {
+                    r.status == ItemStatus::Error
+                        || (!matches!(r.status, ItemStatus::Released | ItemStatus::Discarded)
+                            && r.summary.get("fp").and_then(Value::as_str) != Some(fp.as_str()))
+                }
+            })
+            .cloned()
+            .collect();
+        let (context_rows, purpose) = (&context_rows, ctx.purpose.as_str());
+        let results: Vec<_> = futures::stream::iter(todo)
+            .map(|f: backends::Found| async move {
+                let fetched = match backend.fetch(&f.key).await {
+                    Ok(x) => x,
+                    Err(e) => {
+                        tracing::warn!(key = %f.key, error = %e, "mail: fetching failed");
+                        return (f, None::<(ParsedMessage, Option<String>, Screen)>);
+                    }
+                };
+                let m = msg::parse(&fetched.raw);
+                let thread = f
+                    .thread
+                    .clone()
+                    .or_else(|| m.thread_root().map(|t| chars(t, 512)));
+                let outcome = match self.fit(target, c, &m, fetched.sent) {
+                    Fit::No => (
+                        "ignored".to_owned(),
+                        None,
+                        ItemStatus::Ignored,
+                        String::new(),
+                    ),
+                    Fit::Unverified => (
+                        "unverified".to_owned(),
+                        None,
+                        ItemStatus::Held,
+                        UNVERIFIED.to_owned(),
+                    ),
+                    Fit::Yes => {
+                        let context: Vec<Value> = context_rows
+                            .iter()
+                            .filter(|r| r.thread_key.is_some() && r.thread_key == thread)
+                            .map(|r| {
+                                json!({"subject": r.summary.get("subject"),
+                                       "from": r.summary.get("from"),
+                                       "date": r.summary.get("date")})
+                            })
+                            .collect();
+                        self.screen(target, c, purpose, &m, &context).await
+                    }
+                };
+                (f, Some((m, thread, outcome)))
+            })
+            .buffered(CONCURRENCY)
+            .collect()
+            .await;
+        let tx = self.store.begin().await?;
+        for (f, result) in &results {
+            let Some((m, thread, (verdict, injection, status, reason))) = result else {
+                continue;
+            };
+            let mut summary = match status {
+                ItemStatus::Ignored => Map::new(),
+                ItemStatus::Withheld => {
+                    let mut s = Map::new();
+                    s.insert("date".into(), json!(m.date.map(timestamp)));
+                    s
+                }
+                _ => Self::summary(m, target),
+            };
+            summary.insert("fp".into(), json!(fp));
+            // What the operator must see in full before releasing it: what
+            // the agent would read, and the text hidden from a person.
+            let payload = if *status == ItemStatus::Held {
+                let full = json!({"text": chars(&m.text, self.max_body()),
+                                  "hidden_text": m.hidden_text});
+                let b = inbound_binding(grant.id, &f.key);
+                Some(
+                    self.secret_box
+                        .seal_str(
+                            &full.to_string(),
+                            &Binding::new("mail_items", "payload_encrypted", &b),
+                        )
+                        .map_err(|_| MailError::new(500, "internal error"))?,
+                )
+            } else {
+                None
+            };
+            let screened = store_mail::Screened {
+                grant: grant.id,
+                agent: grant.agent_id,
+                address: &target.address,
+                message_key: &f.key,
+                thread_key: thread.as_deref(),
+                summary: &summary,
+                verdict: Some(verdict),
+                injection: injection.as_deref(),
+                status: *status,
+                reason: &chars(reason, 4000),
+                payload_encrypted: payload.as_deref(),
+            };
+            match store_mail::record_screened(&tx, &screened, now).await {
+                Ok(Some(id)) if *status == ItemStatus::Held => newly_held.push(id),
+                Ok(_) => {}
+                Err(e) if e.is_unique_violation() => {
+                    return Err(MailError::new(409, "listed concurrently; list again"));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        tx.commit().await?;
+        drop(guard);
+        for id in newly_held {
+            self.notify_held(id, None).await;
+        }
+        let tx = self.store.begin().await?;
+        let rows = store_mail::inbound_for_keys(&tx, grant.id, &keys)
+            .await?
+            .into_iter()
+            .filter_map(|r| r.message_key.clone().map(|k| (k, r)))
+            .collect();
+        tx.commit().await?;
+        Ok(rows)
     }
 
     async fn readable(&self, grant: &GrantRow, item: &str) -> Result<MailItemRow, MailError> {
@@ -898,7 +1096,7 @@ impl Mail {
         grant: &GrantRow,
         item: &str,
         now: OffsetDateTime,
-    ) -> Result<(GrantContext, MailItemRow, Vec<u8>), MailError> {
+    ) -> Result<(GrantContext, MailItemRow, backends::Fetched), MailError> {
         let ctx = self.context(grant, now).await?;
         if !ctx.constraints.ops.read {
             return Err(MailError::new(403, "this grant does not include reading"));
@@ -923,9 +1121,9 @@ impl Mail {
         item: &str,
         now: OffsetDateTime,
     ) -> Result<MailMessage, MailError> {
-        let (ctx, row, raw) = self.fetch_own(grant, item, now).await?;
-        let m = msg::parse(&raw);
-        if !Self::belongs(&ctx.target, &ctx.constraints, &m) {
+        let (ctx, row, fetched) = self.fetch_own(grant, item, now).await?;
+        let m = msg::parse(&fetched.raw);
+        if self.fit(&ctx.target, &ctx.constraints, &m, fetched.sent) == Fit::No {
             // The grant's constraints changed (policy).
             return Err(MailError::new(404, "unknown message"));
         }
@@ -957,7 +1155,8 @@ impl Mail {
             text: chars(&m.text, limit),
             truncated: m.text.chars().count() > limit,
             hidden_text_removed: (!m.hidden_text.is_empty()).then_some(true),
-            sender_verified: (ctx.target.mode == Mode::Mailbox).then_some(m.authenticated),
+            sender_verified: (ctx.target.mode == Mode::Mailbox)
+                .then(|| self.sender_verified(&ctx.target, &m)),
         })
     }
 
@@ -969,8 +1168,15 @@ impl Mail {
         index: usize,
         now: OffsetDateTime,
     ) -> Result<MailAttachment, MailError> {
-        let (ctx, _, raw) = self.fetch_own(grant, item, now).await?;
-        if !Self::belongs(&ctx.target, &ctx.constraints, &msg::parse(&raw)) {
+        let (ctx, _, fetched) = self.fetch_own(grant, item, now).await?;
+        let raw = fetched.raw;
+        if self.fit(
+            &ctx.target,
+            &ctx.constraints,
+            &msg::parse(&raw),
+            fetched.sent,
+        ) == Fit::No
+        {
             return Err(MailError::new(404, "unknown message"));
         }
         let (meta, payload) = msg::attachment_bytes(&raw, index)
@@ -1311,7 +1517,8 @@ impl Mail {
             references: &draft.references,
             unique: &unique,
             date: OffsetDateTime::now_utc(),
-        });
+        })
+        .map_err(|e| format!("could not send: {e}"))?;
         let backend = self
             .backends
             .get(&target.mailbox)
@@ -1332,6 +1539,7 @@ impl Mail {
             Ok(mut details) => {
                 if let Some(b) = body {
                     details.excerpt = Some(chars(b, 1500));
+                    details.text = Some(b.to_owned());
                 }
                 notifier.mail_held(&details).await;
             }
@@ -1350,21 +1558,10 @@ impl Mail {
         let agent = agents::get(&tx, row.agent_id).await?;
         tx.commit().await?;
         let sm = &row.summary;
+        let text = self.full_text(&row)?;
         let excerpt = match row.direction {
             Direction::In => s(sm.get("snippet")),
-            Direction::Out => match &row.payload_encrypted {
-                Some(sealed) => {
-                    let r = binding(row.id);
-                    let opened = self
-                        .secret_box
-                        .open_str(sealed, &Binding::new("mail_items", "payload_encrypted", &r))
-                        .map_err(|_| MailError::new(500, "a held draft does not open"))?;
-                    let draft: Draft = serde_json::from_str(opened.expose())
-                        .map_err(|_| MailError::new(500, "a held draft does not open"))?;
-                    Some(chars(&draft.body, 1500))
-                }
-                None => None,
-            },
+            Direction::Out => text.as_deref().map(|t| chars(t, 1500)),
         };
         Ok(MailItem {
             id: row.id.to_string(),
@@ -1382,7 +1579,65 @@ impl Mail {
             reason: row.reason.clone(),
             decided_by: row.decided_by.clone(),
             excerpt,
+            text,
         })
+    }
+
+    /// The whole text of a held item (what would be sent, or what the agent
+    /// would read and the text hidden from a person), from its sealed
+    /// payload.
+    fn full_text(&self, row: &MailItemRow) -> Result<Option<String>, MailError> {
+        let Some(sealed) = &row.payload_encrypted else {
+            return Ok(None);
+        };
+        match row.direction {
+            Direction::Out => Ok(Some(self.open_draft(row)?.body)),
+            Direction::In => {
+                let key = row.message_key.as_deref().unwrap_or("");
+                let b = inbound_binding(row.grant_id, key);
+                let opened = self
+                    .secret_box
+                    .open_str(sealed, &Binding::new("mail_items", "payload_encrypted", &b))
+                    .map_err(|_| MailError::new(500, "a held message does not open"))?;
+                let v: Value = serde_json::from_str(opened.expose())
+                    .map_err(|_| MailError::new(500, "a held message does not open"))?;
+                let text = v.get("text").and_then(Value::as_str).unwrap_or("");
+                let hidden = v.get("hidden_text").and_then(Value::as_str).unwrap_or("");
+                Ok(Some(if hidden.is_empty() {
+                    text.to_owned()
+                } else {
+                    format!(
+                        "{text}\n\n[text hidden from a reader, never shown to the agent]\n{hidden}"
+                    )
+                }))
+            }
+        }
+    }
+
+    /// An item for the operator, its whole text now made available: what
+    /// a release requires (review #4).
+    pub async fn show(&self, id: MailItemId) -> Result<MailItem, MailError> {
+        let item = self.describe(id).await?;
+        self.mark_shown(id).await?;
+        Ok(item)
+    }
+
+    /// The whole text of a held item was made available to the operator.
+    pub async fn mark_shown(&self, id: MailItemId) -> Result<(), MailError> {
+        let tx = self.store.begin().await?;
+        store_mail::mark_shown(&tx, id, OffsetDateTime::now_utc()).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Did the mailbox's provider verify the From's domain?
+    fn sender_verified(&self, target: &Target, m: &ParsedMessage) -> Option<bool> {
+        let authserv = self
+            .config()
+            .mailboxes
+            .get(&target.mailbox)
+            .and_then(MailboxConfig::authserv)?;
+        m.verified(&authserv, &domain_of(&m.from_addr)?)
     }
 
     /// Every held item, oldest first.
@@ -1392,7 +1647,7 @@ impl Mail {
         tx.commit().await?;
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
-            out.push(self.describe(id).await?);
+            out.push(self.show(id).await?);
         }
         Ok(out)
     }
@@ -1419,6 +1674,13 @@ impl Mail {
             return Err(MailError::new(
                 409,
                 format!("not held (it is {})", row.status.as_str()),
+            ));
+        }
+        // Released only once the operator could read all of it (review #4).
+        if row.shown_at.is_none() {
+            return Err(MailError::new(
+                409,
+                "its whole text has not been shown yet: open it first (the Discord card, agent-auth admin mail-held, or GET /admin/mail/items/<id>)",
             ));
         }
         // The grant as `grants::issuable` sees it: its agent not held, its

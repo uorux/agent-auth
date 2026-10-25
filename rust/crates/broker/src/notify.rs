@@ -202,7 +202,10 @@ impl Notify for Recorder {
             "mail_held {} {} {}",
             item.id,
             item.direction,
-            item.excerpt.as_deref().unwrap_or("")
+            item.text
+                .as_deref()
+                .or(item.excerpt.as_deref())
+                .unwrap_or("")
         ));
     }
 }

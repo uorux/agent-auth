@@ -29,7 +29,8 @@ platforms:
   mail:
     mailboxes:
       main: {{address: me@mail.example, backend: imap, imap_host: localhost, imap_port: {},
-              smtp_host: localhost, smtp_port: {}, password_file: "{}", direct: true}}
+              smtp_host: localhost, smtp_port: {}, password_file: "{}", direct: true,
+              authserv_id: mx.test}}
 "#,
         imap.port,
         smtp.port,
@@ -71,7 +72,7 @@ platforms:
 
     imap.add(
         "INBOX",
-        b"From: Desk <desk@qantas.example>\r\nTo: me@mail.example\r\nSubject: Your seat\r\nDate: Sat, 24 Oct 2026 10:00:00 +0000\r\n\r\nSeat 12A is yours.\r\n",
+        b"Authentication-Results: mx.test; dmarc=pass header.from=qantas.example\r\nFrom: Desk <desk@qantas.example>\r\nTo: me@mail.example\r\nSubject: Your seat\r\nDate: Sat, 24 Oct 2026 10:00:00 +0000\r\n\r\nSeat 12A is yours.\r\n",
     );
     imap.add(
         "INBOX",

@@ -182,6 +182,10 @@ pub struct MailItem {
     pub decided_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub excerpt: Option<String>,
+    /// The whole text of a held item: what would be sent, or what the
+    /// agent would read and the text hidden from a person.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 impl MailItem {

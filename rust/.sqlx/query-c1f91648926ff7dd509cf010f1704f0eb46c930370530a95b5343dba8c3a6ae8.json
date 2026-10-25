@@ -178,6 +178,17 @@
             "name": "created_at"
           }
         }
+      },
+      {
+        "ordinal": 16,
+        "name": "shown_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "mail_items",
+            "name": "shown_at"
+          }
+        }
       }
     ],
     "parameters": {
@@ -199,7 +210,8 @@
       true,
       true,
       true,
-      false
+      false,
+      true
     ]
   },
   "hash": "c1f91648926ff7dd509cf010f1704f0eb46c930370530a95b5343dba8c3a6ae8"

@@ -11,10 +11,13 @@
 
 pub mod compose;
 pub mod conn;
+pub mod css;
 mod entities;
 pub mod html;
 pub mod imap;
 pub mod message;
+#[cfg(test)]
+mod review_tests;
 pub mod smtp;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

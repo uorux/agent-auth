@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE mail_items SET shown_at = $2 WHERE id = $1 AND shown_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "00b66d1b3e34883fd65fcd84df94bcf8ab54b0ae17f54bd883ec87a5af8e3ae1"
+}

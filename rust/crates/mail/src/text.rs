@@ -1,19 +1,33 @@
 //! Text clean-up shared by the parsers (`message.py` `_clean`).
 
-/// Characters that hide or reorder text: zero-width, joiners, BOM, bidi
-/// overrides and isolates, the invisible separators, the soft hyphen, and
-/// the Unicode tag characters (U+E0000..U+E007F: "ASCII smuggling").
+/// Characters that hide or reorder text: every Unicode
+/// `Default_Ignorable_Code_Point` (zero-width characters and joiners, bidi
+/// controls, the soft hyphen, variation selectors, Hangul fillers, the
+/// Mongolian free variation selectors, U+061C, the musical-symbol
+/// formatting characters, the tag characters U+E0000..U+E0FFF: "ASCII
+/// smuggling" and variation-selector smuggling), and the interlinear
+/// annotation characters U+FFF9..U+FFFB.
 #[must_use]
 pub fn is_invisible(c: char) -> bool {
     matches!(
         c,
-        '\u{200b}'..='\u{200f}'
+        '\u{00ad}'
+            | '\u{034f}'
+            | '\u{061c}'
+            | '\u{115f}'..='\u{1160}'
+            | '\u{17b4}'..='\u{17b5}'
+            | '\u{180b}'..='\u{180f}'
+            | '\u{200b}'..='\u{200f}'
             | '\u{202a}'..='\u{202e}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{3164}'
+            | '\u{fe00}'..='\u{fe0f}'
             | '\u{feff}'
-            | '\u{00ad}'
-            | '\u{e0000}'..='\u{e007f}'
+            | '\u{ffa0}'
+            | '\u{fff0}'..='\u{fffb}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0000}'..='\u{e0fff}'
     )
 }
 
@@ -23,7 +37,10 @@ pub fn is_invisible(c: char) -> bool {
 #[must_use]
 pub fn clean(text: &str) -> String {
     let text: String = text.chars().filter(|c| !is_invisible(*c)).collect();
-    let text = text.replace("\r\n", "\n");
+    // Line and paragraph separators are line breaks.
+    let text = text
+        .replace("\r\n", "\n")
+        .replace(['\u{2028}', '\u{2029}'], "\n");
     let mut lines: Vec<String> = Vec::new();
     for line in text.split('\n') {
         let mut out = String::with_capacity(line.len());

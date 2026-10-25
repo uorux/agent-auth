@@ -144,7 +144,9 @@ fn authentication_results() {
     // Only the topmost header counts.
     let raw = b"From: a@q.example\r\nAuthentication-Results: mx; dmarc=fail\r\n\
 Authentication-Results: mx; dmarc=pass header.from=q.example\r\n\r\nx\r\n";
-    assert_eq!(parse(raw).authenticated, Some(false));
+    assert_eq!(parse(raw).verified("mx", "q.example"), Some(false));
+    // Not the provider's own header: not trusted at all.
+    assert_eq!(parse(raw).verified("mx.google.com", "q.example"), None);
 }
 
 #[test]

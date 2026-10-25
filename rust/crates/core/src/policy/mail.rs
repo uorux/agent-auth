@@ -77,6 +77,16 @@ pub struct MailboxConfig {
     /// correspondents its grant names? Always a human's call when on.
     #[serde(default)]
     pub direct: bool,
+    /// The authserv-id of the mailbox provider's own
+    /// Authentication-Results (`mx.google.com` for Gmail, the default
+    /// there). Only its results count; unset on IMAP: no sender is ever
+    /// verified, so mailbox grants hold every message for the operator.
+    #[serde(default)]
+    pub authserv_id: Option<String>,
+    /// IMAP folders holding the mailbox's own sent mail: a message there
+    /// "from" the mailbox is taken as the mailbox's own.
+    #[serde(default = "sent_folders")]
+    pub sent_folders: Vec<String>,
 }
 
 fn imap_port() -> u16 {
@@ -87,6 +97,11 @@ fn smtp_port() -> u16 {
 }
 fn inbox() -> Vec<String> {
     vec!["INBOX".to_owned()]
+}
+fn sent_folders() -> Vec<String> {
+    ["Sent", "Sent Items", "Sent Messages", "[Gmail]/Sent Mail"]
+        .map(String::from)
+        .to_vec()
 }
 
 impl MailboxConfig {
@@ -142,6 +157,16 @@ impl MailboxConfig {
         Ok(())
     }
 
+    /// The provider's authserv-id: the configured one, else Gmail's.
+    #[must_use]
+    pub fn authserv(&self) -> Option<String> {
+        match (&self.authserv_id, self.backend) {
+            (Some(a), _) if !a.trim().is_empty() => Some(a.trim().to_lowercase()),
+            (_, MailBackendKind::Gmail) => Some("mx.google.com".to_owned()),
+            _ => None,
+        }
+    }
+
     /// Who logs in: the username, or the address.
     #[must_use]
     pub fn login(&self) -> &str {
@@ -164,6 +189,10 @@ pub struct SimpleLoginConfig {
     pub aliases: Vec<String>,
     /// Domains where agents may create new aliases; empty: no creating.
     pub create_domains: Vec<String>,
+    /// Who signs SimpleLogin's forwards (DKIM `d=`), besides the alias's
+    /// own domain: its `X-SimpleLogin-*` headers count only on a message
+    /// the provider saw a DKIM pass for from one of these.
+    pub dkim_domains: Vec<String>,
 }
 
 impl Default for SimpleLoginConfig {
@@ -174,6 +203,7 @@ impl Default for SimpleLoginConfig {
             mailbox: String::new(),
             aliases: vec!["*".to_owned()],
             create_domains: Vec::new(),
+            dkim_domains: vec!["simplelogin.co".to_owned()],
         }
     }
 }
@@ -343,6 +373,7 @@ impl MailConfig {
             }
             sl.aliases = sl.aliases.iter().map(|g| g.to_lowercase()).collect();
             sl.create_domains = sl.create_domains.iter().map(|d| d.to_lowercase()).collect();
+            sl.dkim_domains = sl.dkim_domains.iter().map(|d| d.to_lowercase()).collect();
             if let Some(bad) = sl
                 .create_domains
                 .iter()

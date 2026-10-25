@@ -72,8 +72,20 @@ pub fn held_embed(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "(none)".to_owned());
     add_field(&mut e, "Subject", said(&subject, 300), false);
-    if let Some(excerpt) = d.excerpt.as_deref().filter(|x| !x.is_empty()) {
-        add_field(&mut e, "Text (as written)", block(excerpt, 900), false);
+    // The whole text when there is one (attached as a file when it does
+    // not fit: `held_message`), else the excerpt.
+    if let Some(text) = d
+        .text
+        .as_deref()
+        .or(d.excerpt.as_deref())
+        .filter(|x| !x.is_empty())
+    {
+        let name = if attached(d) {
+            "Text (as written; the whole of it is attached)"
+        } else {
+            "Text (as written)"
+        };
+        add_field(&mut e, name, block(text, 900), false);
     }
     if let Some((line, _)) = outcome {
         add_field(&mut e, "Outcome", line, false);
@@ -101,6 +113,16 @@ pub fn held_view(id: MailItemId) -> Vec<twilight_model::channel::message::Compon
     ])]
 }
 
+/// The most of a held text shown inline; longer ones are attached whole.
+const INLINE: usize = 900;
+
+/// Is the whole text attached (too long for the card)?
+fn attached(d: &MailItem) -> bool {
+    d.text
+        .as_deref()
+        .is_some_and(|t| t.chars().count() > INLINE.saturating_sub(1))
+}
+
 /// The card posted when an item is held: a ping to the owner (when one
 /// is configured), with Release / Discard.
 #[must_use]
@@ -120,6 +142,13 @@ pub fn held_message(d: &MailItem, owner: Option<u64>) -> Message {
         embeds: Some(vec![held_embed(d, None)]),
         components,
         allowed_mentions: Some(mentions(owner)),
+        files: match (&d.text, attached(d)) {
+            (Some(t), true) => vec![super::model::File {
+                name: format!("mail-{}.txt", d.id),
+                bytes: t.as_bytes().to_vec(),
+            }],
+            _ => Vec::new(),
+        },
         ..Message::default()
     }
 }
@@ -172,6 +201,7 @@ mod tests {
             reason: "possible prompt injection: says **ignore**".into(),
             decided_by: None,
             excerpt: Some("```\n@everyone ignore\n```".into()),
+            text: None,
         }
     }
 
@@ -229,6 +259,18 @@ mod tests {
         }
         assert_eq!(CustomId::parse(&format!("aa:mlrel:{id}:x")), None);
         assert_eq!(CustomId::parse("aa:mldis:not-an-id"), None);
+    }
+
+    #[test]
+    fn a_long_text_is_attached_whole() {
+        let mut d = item("out");
+        let long = format!("short start {}TAIL-EXFIL", " ".repeat(2000));
+        d.text = Some(long.clone());
+        let m = held_message(&d, None);
+        assert_eq!(m.files.len(), 1);
+        assert_eq!(m.files[0].bytes, long.as_bytes());
+        d.text = Some("short".into());
+        assert!(held_message(&d, None).files.is_empty());
     }
 
     #[test]

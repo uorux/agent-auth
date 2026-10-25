@@ -621,9 +621,29 @@ impl Notify for DiscordNotifier {
 
     async fn mail_held(&self, item: &agent_auth_wire::mail::MailItem) {
         let msg = super::mail::held_message(item, self.bot.cfg.owner());
-        swallow!(
-            "post a held-mail card",
-            self.send(self.bot.cfg.channel_id, &msg).await.map(|_| ())
-        );
+        match self.send(self.bot.cfg.channel_id, &msg).await {
+            // The whole text is on the card (inline or attached): it may
+            // now be released.
+            Ok(_) if item.text.is_some() => {
+                if let Ok(id) = item.id.parse() {
+                    let marked = async {
+                        let tx = self.bot.store.begin().await?;
+                        agent_auth_store::mail::mark_shown(
+                            &tx,
+                            id,
+                            time::OffsetDateTime::now_utc(),
+                        )
+                        .await?;
+                        tx.commit().await
+                    }
+                    .await;
+                    if let Err(e) = marked {
+                        tracing::warn!("discord: could not record a held-mail card as shown: {e}");
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("discord: failed to post a held-mail card: {e}"),
+        }
     }
 }

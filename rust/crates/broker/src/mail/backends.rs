@@ -35,6 +35,14 @@ pub struct Found {
     pub thread: Option<String>,
 }
 
+/// A fetched message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fetched {
+    pub raw: Vec<u8>,
+    /// Filed as the mailbox's own sent mail.
+    pub sent: bool,
+}
+
 /// What to look for. Only ever narrows: the gateway checks each message.
 #[derive(Debug, Clone, Default)]
 pub struct Search {
@@ -140,7 +148,9 @@ impl Backend {
         }
     }
 
-    pub async fn fetch(&self, key: &str) -> Result<Vec<u8>, BackendError> {
+    /// The raw message, and whether the mailbox filed it as its own sent
+    /// mail (Gmail's `SENT` label; an IMAP `sent_folders` folder).
+    pub async fn fetch(&self, key: &str) -> Result<Fetched, BackendError> {
         match self {
             Backend::Gmail(g) => g.fetch(key).await,
             Backend::Imap(i) => i.fetch(key).await,
@@ -296,7 +306,7 @@ impl GmailBackend {
         Ok((found, next))
     }
 
-    async fn fetch(&self, key: &str) -> Result<Vec<u8>, BackendError> {
+    async fn fetch(&self, key: &str) -> Result<Fetched, BackendError> {
         if !gmail_id_ok(key) {
             return Err(BackendError("malformed gmail message id".to_owned()));
         }
@@ -315,7 +325,11 @@ impl GmailBackend {
             .decode(raw)
             .map_err(|_| BackendError("gmail: a message that does not decode".to_owned()))?;
         bytes.truncate(MAX_RAW_BYTES);
-        Ok(bytes)
+        let sent = out
+            .get("labelIds")
+            .and_then(Value::as_array)
+            .is_some_and(|l| l.iter().any(|x| x.as_str() == Some("SENT")));
+        Ok(Fetched { raw: bytes, sent })
     }
 
     async fn send(&self, raw: &[u8], thread: Option<&str>) -> Result<String, BackendError> {
@@ -371,12 +385,12 @@ impl ImapBackend {
         BackendError(format!("imap {}: {e}", self.config.imap_host))
     }
 
-    /// `_criteria`.
+    /// `_criteria`. None when a value would not quote (CR, LF, NUL).
     #[must_use]
-    pub fn criteria(q: &Search) -> Vec<String> {
+    pub fn criteria(q: &Search) -> Option<Vec<String>> {
         let mut c = Vec::new();
         if let Some(to) = &q.to {
-            let to = imap::quote(to);
+            let to = imap::quote(to)?;
             c.extend([
                 "OR".to_owned(),
                 "HEADER".to_owned(),
@@ -390,8 +404,8 @@ impl ImapBackend {
             let alts: Vec<Vec<String>> = t
                 .iter()
                 .map(|t| {
-                    let t = imap::quote(t);
-                    vec![
+                    let t = imap::quote(t)?;
+                    Some(vec![
                         "OR".into(),
                         "FROM".into(),
                         t.clone(),
@@ -400,9 +414,9 @@ impl ImapBackend {
                         t.clone(),
                         "CC".into(),
                         t,
-                    ]
+                    ])
                 })
-                .collect();
+                .collect::<Option<_>>()?;
             c.extend(imap::or_all(&alts));
         }
         if let Some(d) = q.since {
@@ -424,12 +438,12 @@ impl ImapBackend {
             .collect();
         if !text.trim().is_empty() {
             // No CHARSET: ASCII only.
-            c.extend(["TEXT".to_owned(), imap::quote(&text)]);
+            c.extend(["TEXT".to_owned(), imap::quote(&text)?]);
         }
         if c.is_empty() {
             c.push("ALL".to_owned());
         }
-        c
+        Some(c)
     }
 
     async fn search(
@@ -452,7 +466,8 @@ impl ImapBackend {
         )
         .await
         .map_err(|e| self.err(&e))?;
-        let criteria = Self::criteria(q);
+        let criteria = Self::criteria(q)
+            .ok_or_else(|| BackendError("imap: a search term that does not quote".to_owned()))?;
         let mut keys: Vec<String> = Vec::new();
         let mut failure = None;
         for folder in &self.config.folders {
@@ -493,7 +508,7 @@ impl ImapBackend {
         Ok((window, more))
     }
 
-    async fn fetch(&self, key: &str) -> Result<Vec<u8>, BackendError> {
+    async fn fetch(&self, key: &str) -> Result<Fetched, BackendError> {
         let mut parts = key.split(SEP);
         let (Some(folder), Some(validity), Some(uid), None) =
             (parts.next(), parts.next(), parts.next(), parts.next())
@@ -519,7 +534,14 @@ impl ImapBackend {
         let gone = || BackendError("the message is no longer in the mailbox".to_owned());
         let out = match session.examine(folder).await {
             Ok(Some(sel)) if sel.uidvalidity == validity => match session.uid_fetch(uid).await {
-                Ok(raw) => Ok(raw),
+                Ok(raw) => Ok(Fetched {
+                    raw,
+                    sent: self
+                        .config
+                        .sent_folders
+                        .iter()
+                        .any(|f| f.eq_ignore_ascii_case(folder)),
+                }),
                 Err(imap::ImapError::Gone) => Err(gone()),
                 Err(e) => Err(self.err(&e)),
             },
@@ -576,7 +598,7 @@ mod tests {
             "to:airline@me.example {from:b@x.example to:b@x.example cc:b@x.example from:qantas.example to:qantas.example cc:qantas.example} after:2026/05/01 \"flight ABC OR -x\""
         );
         assert_eq!(
-            ImapBackend::criteria(&q).join(" "),
+            ImapBackend::criteria(&q).unwrap().join(" "),
             "OR HEADER X-SimpleLogin-Envelope-To \"airline@me.example\" TO \"airline@me.example\" OR (OR FROM \"b@x.example\" OR TO \"b@x.example\" CC \"b@x.example\") (OR FROM \"qantas.example\" OR TO \"qantas.example\" CC \"qantas.example\") SINCE 01-May-2026 TEXT \"flight ABC OR -x\""
         );
         let loose = Search {
@@ -584,7 +606,7 @@ mod tests {
             ..Search::default()
         };
         assert_eq!(GmailBackend::query(&loose), "");
-        assert_eq!(ImapBackend::criteria(&loose), vec!["ALL"]);
+        assert_eq!(ImapBackend::criteria(&loose).unwrap(), vec!["ALL"]);
         assert_eq!(safe_text("a\"b(c) d:e"), "a b c d e");
     }
 }

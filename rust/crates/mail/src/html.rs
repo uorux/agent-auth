@@ -14,7 +14,6 @@
 //! (never shown to an agent as if a person could see it).
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
 
 use regex::Regex;
 
@@ -45,24 +44,15 @@ const BLOCK: [&str; 14] = [
     "blockquote",
     "section",
 ];
-const SKIP: [&str; 5] = ["script", "style", "head", "title", "template"];
+/// Never shown as text: scripts, styles, the head, templates, and what a
+/// browser shows only without frames or plugins.
+const SKIP: [&str; 8] = [
+    "script", "style", "head", "title", "template", "iframe", "noembed", "noframes",
+];
 /// Parsed as raw text (HTML5 RAWTEXT): only their end tag ends them.
 const RAWTEXT: [&str; 6] = ["script", "style", "xmp", "iframe", "noembed", "noframes"];
 /// Raw text with character references (RCDATA).
 const RCDATA: [&str; 2] = ["textarea", "title"];
-
-fn hidden_style() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        // Only zero (or under a pixel) hides: 0.875rem is ordinary small
-        // print. Python's `$` (end, or before a final newline) is `\n?\z`.
-        let end = r"\s*(?:!important)?\s*(?:;|\n?\z)";
-        let pattern = format!(
-            r"(?i)display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0+(?:\.0+)?(?:px|pt|em|rem|%)?{end}|font-size\s*:\s*0?\.\d+px|font-size\s*:\s*1px|opacity\s*:\s*0(?:\.0*)?{end}|max-height\s*:\s*0(?:px)?{end}|height\s*:\s*0(?:px)?{end}|color\s*:\s*(?:transparent|rgba\([^)]*,\s*0(?:\.0*)?\s*\))"
-        );
-        Regex::new(&pattern).unwrap_or_else(|_| never())
-    })
-}
 
 /// A pattern that matches nothing (only reached if a literal pattern above
 /// failed to compile, which the tests rule out).
@@ -71,9 +61,10 @@ pub(crate) fn never() -> Regex {
 }
 
 /// Does an inline style hide its element's text from a reader?
+/// (`css::style_hides`: comments and escapes resolved first.)
 #[must_use]
 pub fn style_hides(style: &str) -> bool {
-    hidden_style().is_match(style)
+    crate::css::style_hides(style)
 }
 
 // --------------------------------------------------------- references
@@ -571,6 +562,8 @@ struct Reader {
     skip: usize,
     /// Nesting went past MAX_DEPTH: everything from here is hidden.
     too_deep: bool,
+    /// Classes and ids `<style>` rules hide.
+    rules: crate::css::HidingRules,
 }
 
 impl Reader {
@@ -600,7 +593,12 @@ impl Reader {
             return;
         }
         let style = attr("style").and_then(|v| v.as_deref()).unwrap_or("");
+        let value = |name: &str| attr(name).and_then(|v| v.as_deref());
         let hidden = style_hides(style)
+            || self.rules.matches(value("class"), value("id"))
+            // A closed <details> shows its summary only: all of it counts
+            // as hidden (on the hiding side).
+            || (tag == "details" && attr("open").is_none())
             || attr("hidden").is_some()
             || (attr("aria-hidden").is_some_and(|v| v.as_deref() == Some("true"))
                 && matches!(tag, "div" | "span" | "p" | "td"));
@@ -657,6 +655,21 @@ impl Reader {
 /// `(visible text, hidden text)`, each cleaned (`_clean`).
 #[must_use]
 pub fn html_to_text(html: &str) -> (String, String) {
+    // First pass: the stylesheets, for class and id rules (wherever they
+    // are in the document).
+    let mut sheets = String::new();
+    let mut in_style = false;
+    tokenize(html, |t| match t {
+        Token::Start {
+            name, self_closing, ..
+        } if name == "style" => in_style = !self_closing,
+        Token::End(name) if name == "style" => in_style = false,
+        Token::Text(t) if in_style && sheets.len() < crate::css::MAX_STYLESHEET => {
+            sheets.push_str(&t);
+            sheets.push('\n');
+        }
+        _ => {}
+    });
     let mut r = Reader {
         visible: String::new(),
         hidden: Vec::new(),
@@ -665,6 +678,7 @@ pub fn html_to_text(html: &str) -> (String, String) {
         hidden_open: 0,
         skip: 0,
         too_deep: false,
+        rules: crate::css::HidingRules::from_stylesheet(&sheets),
     };
     tokenize(html, |t| match t {
         Token::Start {

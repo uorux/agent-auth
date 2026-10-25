@@ -113,6 +113,8 @@ pub struct MailItemRow {
     pub decided_by: Option<String>,
     pub decided_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
+    /// When the whole text was made available to the operator.
+    pub shown_at: Option<OffsetDateTime>,
 }
 
 struct RawItem {
@@ -132,6 +134,7 @@ struct RawItem {
     decided_by: Option<String>,
     decided_at: Option<OffsetDateTime>,
     created_at: OffsetDateTime,
+    shown_at: Option<OffsetDateTime>,
 }
 
 impl TryFrom<RawItem> for MailItemRow {
@@ -158,6 +161,7 @@ impl TryFrom<RawItem> for MailItemRow {
             decided_by: r.decided_by,
             decided_at: r.decided_at,
             created_at: r.created_at,
+            shown_at: r.shown_at,
         })
     }
 }
@@ -234,6 +238,8 @@ pub struct Screened<'a> {
     pub injection: Option<&'a str>,
     pub status: ItemStatus,
     pub reason: &'a str,
+    /// A held message's whole text, sealed.
+    pub payload_encrypted: Option<&'a str>,
 }
 
 /// Record a screening: a new item, or the item judged again. An item the
@@ -246,12 +252,14 @@ pub async fn record_screened(
     let mut c = tx.conn().await;
     let id = sqlx::query_scalar!(
         "INSERT INTO mail_items (id, grant_id, agent_id, address, direction, message_key,
-                                 thread_key, summary, verdict, injection, reason, status, created_at)
-         VALUES ($1, $2, $3, $4, 'in', $5, $6, $7, $8, $9, $10, $11, $12)
+                                 thread_key, summary, verdict, injection, reason, status, created_at,
+                                 payload_encrypted)
+         VALUES ($1, $2, $3, $4, 'in', $5, $6, $7, $8, $9, $10, $11, $12, $13)
          ON CONFLICT (grant_id, direction, message_key) DO UPDATE
          SET thread_key = EXCLUDED.thread_key, summary = EXCLUDED.summary,
              verdict = EXCLUDED.verdict, injection = EXCLUDED.injection,
-             reason = EXCLUDED.reason, status = EXCLUDED.status
+             reason = EXCLUDED.reason, status = EXCLUDED.status,
+             payload_encrypted = EXCLUDED.payload_encrypted, shown_at = NULL
          WHERE mail_items.status NOT IN ('released', 'discarded')
          RETURNING id",
         Uuid::new_v4(),
@@ -265,7 +273,8 @@ pub async fn record_screened(
         s.injection,
         s.reason,
         s.status.as_str(),
-        now
+        now,
+        s.payload_encrypted
     )
     .fetch_optional(&mut **c)
     .await?;
@@ -404,6 +413,23 @@ pub async fn drop_payload(
          WHERE id = $1",
         Uuid::from(id),
         reason
+    )
+    .execute(&mut **c)
+    .await?;
+    Ok(())
+}
+
+/// The whole text of an item was made available to the operator.
+pub async fn mark_shown(
+    tx: &Tx<'_>,
+    id: MailItemId,
+    now: OffsetDateTime,
+) -> Result<(), StoreError> {
+    let mut c = tx.conn().await;
+    sqlx::query!(
+        "UPDATE mail_items SET shown_at = $2 WHERE id = $1 AND shown_at IS NULL",
+        Uuid::from(id),
+        now
     )
     .execute(&mut **c)
     .await?;

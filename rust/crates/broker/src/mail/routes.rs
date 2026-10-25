@@ -183,7 +183,7 @@ async fn item(
     Path(id): Path<String>,
 ) -> ApiResult<Json<MailItem>> {
     let gw = gateway(&st)?;
-    Ok(Json(gw.describe(item_id(&id)?).await?))
+    Ok(Json(gw.show(item_id(&id)?).await?))
 }
 
 /// An optional body: none (or `null`) is the default.
