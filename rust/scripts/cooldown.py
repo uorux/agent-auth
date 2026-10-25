@@ -183,7 +183,7 @@ def fix(cache: dict) -> int:
                     text=True,
                 )
                 if r.returncode == 0:
-                    print(f"{name}: {version} -> {cand} ({why})")
+                    print(f"{name}: {version} -> {cand} (was: {why})")
                     progressed = True
                     break
             else:
