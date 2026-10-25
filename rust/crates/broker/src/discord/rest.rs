@@ -313,6 +313,19 @@ impl Rest {
             .map(drop)
     }
 
+    /// Edit the interaction's original message.
+    pub async fn edit_original(
+        &self,
+        app: u64,
+        token: &str,
+        msg: &Message,
+    ) -> Result<(), RestError> {
+        let path = format!("/webhooks/{app}/{token}/messages/@original");
+        self.send(Method::PATCH, &path, message_body(msg)?)
+            .await
+            .map(drop)
+    }
+
     /// A followup message after a deferred answer.
     pub async fn followup(&self, app: u64, token: &str, msg: &Message) -> Result<(), RestError> {
         let path = format!("/webhooks/{app}/{token}");

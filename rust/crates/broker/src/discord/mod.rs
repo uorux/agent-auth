@@ -24,6 +24,7 @@ use tokio::sync::mpsc;
 pub mod commands;
 pub mod embeds;
 pub mod gateway;
+pub mod hostexec;
 pub mod interactions;
 pub mod model;
 pub mod notifier;
@@ -142,6 +143,10 @@ pub struct Services {
     pub requests: Option<Arc<dyn RequestOps>>,
     pub containment: Option<Arc<dyn ContainmentOps>>,
     pub hosts: Option<Arc<dyn HostsOps>>,
+    /// The broker's state, for the hostexec commands (`crate::hostexec`'s
+    /// arm, disarm, open_window, lockdown, unlock; the desktop's DND; the
+    /// daemon list).
+    pub app: Option<crate::state::AppState>,
 }
 
 impl std::fmt::Debug for Services {
@@ -150,6 +155,7 @@ impl std::fmt::Debug for Services {
             .field("requests", &self.requests.is_some())
             .field("containment", &self.containment.is_some())
             .field("hosts", &self.hosts.is_some())
+            .field("app", &self.app.is_some())
             .finish()
     }
 }
@@ -197,7 +203,8 @@ impl Discord {
 
     /// Handle one interaction (the gateway calls this; tests too).
     pub async fn handle(&self, interaction: twilight_model::application::interaction::Interaction) {
-        interactions::handle(&self.0, interaction).await;
+        // Boxed: the handlers' futures are large (lockdowns, windows).
+        Box::pin(interactions::handle(&self.0, interaction)).await;
     }
 
     /// Connect to the gateway and serve interactions until the gateway
@@ -237,5 +244,7 @@ impl Discord {
     }
 }
 
+#[cfg(test)]
+mod hostexec_tests;
 #[cfg(test)]
 mod tests;

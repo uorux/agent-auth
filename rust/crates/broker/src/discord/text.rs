@@ -124,6 +124,18 @@ pub fn code_block(text: &str, limit: usize) -> String {
     format!("```\n{shown}\n```")
 }
 
+/// Multi-line text (a command's stdin) for a code block: each line with
+/// its characters that are not display-safe escaped (`\r`, `\u202e`,
+/// zero-width...), so nothing is hidden, reordered or faked as another
+/// line; the line breaks themselves stay.
+#[must_use]
+pub fn display_lines(text: &str) -> String {
+    text.split('\n')
+        .map(agent_auth_core::pyfmt::escape_unprintable)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Python's `json.dumps(value, indent=…)` / `separators=(",", ":")`
 /// (`ensure_ascii`): `Some(n)` indents by `n` spaces with `", "`-less
 /// item separators, `None` is the compact form. Object keys come in the

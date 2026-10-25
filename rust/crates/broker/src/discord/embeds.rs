@@ -4,7 +4,7 @@
 //! could render "✅ Approved by policy" or a masked link in the card).
 
 use agent_auth_core::durations::format_duration;
-use agent_auth_core::pyfmt::{shlex_join, shlex_quote};
+use agent_auth_core::pyfmt::{escape_unprintable, shlex_join, shlex_quote};
 use agent_auth_core::{Authority, DecisionSource, GrantStatus, Platform, RequestStatus};
 use agent_auth_store::a2a::ThreadRow;
 use agent_auth_store::agents::AgentRow;
@@ -20,7 +20,9 @@ use super::model::{
     COLOR_APPROVED, COLOR_DENIED, COLOR_ENDED, COLOR_PENDING, File, add_field, discord_time, embed,
     set_footer, timestamp,
 };
-use super::text::{code, code_block, cut, escape, py_json, said, trim, trim_escaped};
+use super::text::{
+    code, code_block, cut, display_lines, escape, py_json, said, trim, trim_escaped,
+};
 
 /// hostexec's `MAX_CODE`.
 pub const MAX_CODE: usize = 900;
@@ -433,7 +435,12 @@ pub fn hostexec_embed(
         add_field(&mut e, "🤝 On behalf of", delegator_value(d, thread), true);
     }
     if let Some(cwd) = scope_str(&scope, "cwd") {
-        add_field(&mut e, "cwd", code_block(&cut(cwd, 200), 300), true);
+        add_field(
+            &mut e,
+            "cwd",
+            code_block(&escape_unprintable(&cut(cwd, 200)), 300),
+            true,
+        );
     }
     if let Some(env) = scope
         .get("env")
@@ -442,7 +449,13 @@ pub fn hostexec_embed(
     {
         let lines: Vec<String> = env
             .iter()
-            .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or("")))
+            .map(|(k, v)| {
+                format!(
+                    "{}={}",
+                    escape_unprintable(k),
+                    shlex_quote(v.as_str().unwrap_or(""))
+                )
+            })
             .collect();
         add_field(&mut e, "env", code_block(&lines.join("\n"), 500), false);
     }
@@ -450,7 +463,7 @@ pub fn hostexec_embed(
         add_field(
             &mut e,
             format!("stdin ({} chars)", stdin.chars().count()),
-            code_block(stdin, 700),
+            code_block(&display_lines(stdin), 700),
             false,
         );
     }

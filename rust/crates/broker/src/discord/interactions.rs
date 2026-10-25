@@ -36,7 +36,7 @@ pub const NO_CONTAINMENT: &str = "Containment is not set up on this broker.";
 pub const NOT_READY: &str = "The broker is still starting; try again in a moment.";
 
 /// Answers one interaction.
-struct Reply<'a> {
+pub(super) struct Reply<'a> {
     bot: &'a Bot,
     id: u64,
     token: String,
@@ -48,13 +48,13 @@ impl Reply<'_> {
         self.bot.rest.respond(self.id, &self.token, &body).await
     }
 
-    async fn ephemeral(&self, text: &str) -> Result<(), RestError> {
+    pub(super) async fn ephemeral(&self, text: &str) -> Result<(), RestError> {
         let msg = Message::ephemeral(text);
         self.callback(json!({"type": 4, "data": msg_value(&msg)}))
             .await
     }
 
-    async fn message(&self, msg: &Message) -> Result<(), RestError> {
+    pub(super) async fn message(&self, msg: &Message) -> Result<(), RestError> {
         self.callback(json!({"type": 4, "data": msg_value(msg)}))
             .await
     }
@@ -66,19 +66,19 @@ impl Reply<'_> {
     }
 
     /// "Thinking…", ephemeral; the answer follows.
-    async fn defer(&self) -> Result<(), RestError> {
+    pub(super) async fn defer(&self) -> Result<(), RestError> {
         self.callback(json!({"type": 5, "data": {"flags": EPHEMERAL}}))
             .await
     }
 
-    async fn followup(&self, text: &str) -> Result<(), RestError> {
+    pub(super) async fn followup(&self, text: &str) -> Result<(), RestError> {
         self.bot
             .rest
             .followup(self.app, &self.token, &Message::ephemeral(text))
             .await
     }
 
-    async fn modal(&self, modal: &Modal) -> Result<(), RestError> {
+    pub(super) async fn modal(&self, modal: &Modal) -> Result<(), RestError> {
         let components: Vec<_> = modal
             .inputs
             .iter()
@@ -89,6 +89,28 @@ impl Reply<'_> {
             "data": {"custom_id": modal.custom_id, "title": modal.title, "components": components},
         }))
         .await
+    }
+
+    /// "Thinking…" in the channel (the answer is public).
+    pub(super) async fn defer_public(&self) -> Result<(), RestError> {
+        self.callback(json!({"type": 5})).await
+    }
+
+    /// Acknowledge a click; the message is edited later.
+    pub(super) async fn defer_update(&self) -> Result<(), RestError> {
+        self.callback(json!({"type": 6})).await
+    }
+
+    pub(super) async fn followup_message(&self, msg: &Message) -> Result<(), RestError> {
+        self.bot.rest.followup(self.app, &self.token, msg).await
+    }
+
+    /// Edit the message the interaction came from (or answered with).
+    pub(super) async fn edit_original(&self, msg: &Message) -> Result<(), RestError> {
+        self.bot
+            .rest
+            .edit_original(self.app, &self.token, msg)
+            .await
     }
 
     async fn choices(&self, choices: Vec<(String, String)>) -> Result<(), RestError> {
@@ -116,7 +138,7 @@ pub fn user_label(u: &User) -> String {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum Failure {
+pub(super) enum Failure {
     #[error(transparent)]
     Rest(#[from] RestError),
     #[error(transparent)]
@@ -183,7 +205,7 @@ async fn dispatch(
     }
 }
 
-async fn load_request(
+pub(super) async fn load_request(
     bot: &Bot,
     id: RequestId,
 ) -> Result<Option<requests::RequestRow>, StoreError> {
@@ -217,6 +239,10 @@ async fn component(
             Some(r) => reply.modal(&views::totp_modal(&r)).await?,
         },
         CustomId::EndShell(rid) => end_shell(bot, reply, who, rid).await?,
+        CustomId::ApproveAll(rid) => super::hostexec::approve_all(bot, reply, rid).await?,
+        CustomId::KillVms { scope, host } => {
+            super::hostexec::kill_vms(bot, reply, who, scope, host).await?;
+        }
         CustomId::RulesSelect { page } => {
             let selected = values.first().and_then(|v| v.parse::<RuleId>().ok());
             reply
@@ -246,7 +272,10 @@ async fn component(
             reply.update(&rules_page(bot, page, None).await?).await?;
         }
         // Modal ids never arrive as components.
-        CustomId::DecisionModal { .. } | CustomId::EditModal(_) | CustomId::TotpModal(_) => {}
+        CustomId::DecisionModal { .. }
+        | CustomId::EditModal(_)
+        | CustomId::TotpModal(_)
+        | CustomId::WindowModal(_) => {}
     }
     Ok(())
 }
@@ -321,6 +350,9 @@ async fn modal_submit(
         }
         CustomId::EditModal(request) => (request, views::read_edit(form)),
         CustomId::TotpModal(request) => (request, views::read_totp(form)),
+        CustomId::WindowModal(request) => {
+            return super::hostexec::window_submit(bot, reply, who, request, form).await;
+        }
         _ => return Ok(()),
     };
     reply.defer().await?;
@@ -354,11 +386,11 @@ async fn modal_submit(
     Ok(())
 }
 
-fn option<'a>(c: &'a CommandData, name: &str) -> Option<&'a CommandOptionValue> {
+pub(super) fn option<'a>(c: &'a CommandData, name: &str) -> Option<&'a CommandOptionValue> {
     c.options.iter().find(|o| o.name == name).map(|o| &o.value)
 }
 
-fn string_option(c: &CommandData, name: &str) -> Option<String> {
+pub(super) fn string_option(c: &CommandData, name: &str) -> Option<String> {
     match option(c, name) {
         Some(CommandOptionValue::String(s) | CommandOptionValue::Focused(s, _)) => Some(s.clone()),
         _ => None,
@@ -394,7 +426,9 @@ async fn command(
                 .await?;
         }
         "release" => release(bot, reply, who, c).await?,
-        _ => {}
+        _ => {
+            Box::pin(super::hostexec::command(bot, reply, who, c)).await?;
+        }
     }
     Ok(())
 }
@@ -463,12 +497,35 @@ async fn release(
         return Ok(());
     };
     let entry = string_option(c, "entry").filter(|e| !e.is_empty());
+    let all = matches!(option(c, "all"), Some(CommandOptionValue::Boolean(true)));
+    if entry.is_none() && !all {
+        // Lifting everything is explicit, as on the admin API.
+        let entries = containment_entries(bot).await?;
+        reply.ephemeral(&release_help(&entries)).await?;
+        return Ok(());
+    }
     reply.defer().await?;
     match ops.lift(who, entry.as_deref()).await {
         Ok(lifted) => reply.followup(&released_text(&lifted)).await?,
         Err(OpError(e)) => reply.followup(&e).await?,
     }
     Ok(())
+}
+
+/// `/release` with neither an entry nor `all`: what stands, and how to
+/// lift one or every one.
+#[must_use]
+pub fn release_help(entries: &[lockdown::ContainmentEntry]) -> String {
+    let how =
+        "Say which: `/release entry:<id>` lifts one, `/release all:True` lifts every containment.";
+    if entries.is_empty() {
+        return format!("Nothing is contained. {how}");
+    }
+    let lines: Vec<String> = entries
+        .iter()
+        .map(|e| format!("• `{}` {}", e.id, escape(&describe(e))))
+        .collect();
+    cut(&format!("{how}\n{}", lines.join("\n")), 2000)
 }
 
 /// `/release`'s answer.
@@ -491,7 +548,19 @@ pub fn released_text(lifted: &[lockdown::ContainmentEntry]) -> String {
     format!("Lifted: {list}{tail}")
 }
 
+/// The option being typed in an autocomplete, and its text so far.
+fn focused(c: &CommandData) -> Option<(&str, &str)> {
+    c.options.iter().find_map(|o| match &o.value {
+        CommandOptionValue::Focused(text, _) => Some((o.name.as_str(), text.as_str())),
+        _ => None,
+    })
+}
+
 async fn autocomplete(bot: &Bot, reply: &Reply<'_>, c: &CommandData) -> Result<(), Failure> {
+    if let Some(("host", current)) = focused(c) {
+        let choices = super::hostexec::host_choices(bot, current).await;
+        return Ok(reply.choices(choices).await?);
+    }
     if c.name != "release" {
         return Ok(reply.choices(Vec::new()).await?);
     }

@@ -10,9 +10,11 @@
 
 use agent_auth_core::canonical_json::to_python_default_string;
 use agent_auth_core::durations::{DurationSecs, format_duration};
+use agent_auth_core::names::DaemonName;
 use agent_auth_core::{RequestId, RuleId};
 use agent_auth_store::requests::RequestRow;
 use agent_auth_store::rules::RuleAction;
+use agent_auth_wire::admin::LockdownScope;
 use serde_json::{Map, Value};
 use twilight_model::channel::message::Component;
 use twilight_model::channel::message::component::ButtonStyle;
@@ -32,6 +34,14 @@ pub enum CustomId {
     Totp(RequestId),
     /// hostexec: end an active shell.
     EndShell(RequestId),
+    /// hostexec: "Approve all…", a time-boxed window rule.
+    ApproveAll(RequestId),
+    /// hostexec: stop the frozen agent VMs after a lockdown. The host is
+    /// a daemon name (≤ 63 characters), so the id stays ≤ 100.
+    KillVms {
+        scope: LockdownScope,
+        host: Option<String>,
+    },
     /// Modal: the approve/deny decision (reason, duration).
     DecisionModal {
         approve: bool,
@@ -39,6 +49,7 @@ pub enum CustomId {
     },
     EditModal(RequestId),
     TotpModal(RequestId),
+    WindowModal(RequestId),
     /// Rules browser: the select (value = rule id), on `page`.
     RulesSelect {
         page: i64,
@@ -74,6 +85,16 @@ impl CustomId {
             ("edit", [r]) => CustomId::Edit(rid(r)?),
             ("hxtotp", [r]) => CustomId::Totp(rid(r)?),
             ("hxend", [r]) => CustomId::EndShell(rid(r)?),
+            ("hxall", [r]) => CustomId::ApproveAll(rid(r)?),
+            ("hxallm", [r]) => CustomId::WindowModal(rid(r)?),
+            ("hxkill", [scope, host]) => CustomId::KillVms {
+                scope: scope_of(scope)?,
+                host: if host.is_empty() {
+                    None
+                } else {
+                    Some(DaemonName::parse(host).ok()?.as_str().to_owned())
+                },
+            },
             ("decision", ["approve", r]) => CustomId::DecisionModal {
                 approve: true,
                 request: rid(r)?,
@@ -108,6 +129,13 @@ impl CustomId {
             CustomId::Edit(r) => format!("aa:edit:{r}"),
             CustomId::Totp(r) => format!("aa:hxtotp:{r}"),
             CustomId::EndShell(r) => format!("aa:hxend:{r}"),
+            CustomId::ApproveAll(r) => format!("aa:hxall:{r}"),
+            CustomId::WindowModal(r) => format!("aa:hxallm:{r}"),
+            CustomId::KillVms { scope, host } => format!(
+                "aa:hxkill:{}:{}",
+                scope_word(*scope),
+                host.as_deref().unwrap_or("")
+            ),
             CustomId::DecisionModal { approve, request } => format!(
                 "aa:decision:{}:{request}",
                 if *approve { "approve" } else { "deny" }
@@ -119,6 +147,26 @@ impl CustomId {
             CustomId::RulesToggle { page, rule } => format!("aa:rules:toggle:{page}:{rule}"),
             CustomId::RulesDelete { page, rule } => format!("aa:rules:del:{page}:{rule}"),
         }
+    }
+}
+
+/// The lockdown scope's word (`sandboxes`, `all`, `host`).
+#[must_use]
+pub fn scope_word(scope: LockdownScope) -> &'static str {
+    match scope {
+        LockdownScope::Sandboxes => "sandboxes",
+        LockdownScope::All => "all",
+        LockdownScope::Host => "host",
+    }
+}
+
+#[must_use]
+pub fn scope_of(word: &str) -> Option<LockdownScope> {
+    match word {
+        "sandboxes" => Some(LockdownScope::Sandboxes),
+        "all" => Some(LockdownScope::All),
+        "host" => Some(LockdownScope::Host),
+        _ => None,
     }
 }
 
@@ -153,10 +201,66 @@ pub fn hostexec_pending_view(request: &RequestRow) -> Vec<Component> {
     }
     vec![row(vec![
         live("Approve", ButtonStyle::Success, CustomId::Approve(rid)),
+        live(
+            "Approve all…",
+            ButtonStyle::Secondary,
+            CustomId::ApproveAll(rid),
+        ),
         totp,
         deny,
         live("Edit", ButtonStyle::Secondary, CustomId::Edit(rid)),
     ])]
+}
+
+/// The lockdown message's "Kill VMs" button (none when the VMs were
+/// stopped already).
+#[must_use]
+pub fn kill_vm_view(scope: LockdownScope, host: Option<&str>, disabled: bool) -> Vec<Component> {
+    let id = CustomId::KillVms {
+        scope,
+        host: host.map(str::to_owned),
+    };
+    vec![row(vec![button(
+        "Kill VMs",
+        ButtonStyle::Danger,
+        Some(id.render()),
+        disabled,
+    )])]
+}
+
+/// hostexec's `WindowModal`: how long to approve every command of this
+/// tier, from this agent, on this host.
+#[must_use]
+pub fn window_modal(request: &RequestRow, default: &str) -> Modal {
+    let tier = scope(request)
+        .get("tier")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    Modal {
+        custom_id: CustomId::WindowModal(request.id).render(),
+        title: "Approve all for a while".to_owned(),
+        inputs: vec![Input {
+            value: Some(default.to_owned()),
+            max_length: Some(16),
+            ..Input::new(
+                DURATION,
+                &cut(&format!("{tier} commands on {}, for", request.resource), 45),
+            )
+        }],
+    }
+}
+
+/// The window modal's answer: the duration, at most `max`.
+pub fn read_window(form: &Submitted, max: DurationSecs) -> Result<DurationSecs, Refusal> {
+    let d = duration(form.get(DURATION))?;
+    if d > max {
+        return Err(Refusal(format!(
+            "A window lasts at most {}.",
+            format_duration(u64::from(max.get()))
+        )));
+    }
+    Ok(d)
 }
 
 /// `disabled_view`: the three buttons, greyed out, with no custom ids.

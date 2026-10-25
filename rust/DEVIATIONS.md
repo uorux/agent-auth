@@ -443,11 +443,24 @@ and why. Keep entries short. Group by area.
   the REST API and the gateway are; default Discord's
   (`https://discord.com/api/v10`, `wss://gateway.discord.gg`). The e2e
   suite points them at a fake Discord.
-- **Not yet ported** (hostexec Discord UI, a follow-up): "Approve all…"
-  (window rules) is not offered on run/template cards; /arm, /disarm,
-  /lockdown, /unlock, /dnd and /hosts are not registered. "Approve with
-  TOTP" and "End shell" work through the generic decision/revoke
-  interfaces.
+- **`/release` lifts everything only with `all:True`** (decided; matches
+  the admin API's explicit `{"all": true}`). With neither an entry nor
+  `all`, it answers with the standing entries and how to release one or
+  all (Python: an empty `/release` lifted every containment).
+- **Host commands are shown display-safe** (daemons-hostd §10, review
+  2026-10): the card's command, `env` values (shell-quoted), `cwd` and
+  `stdin`, and the shell mirror's text, go through core's display-safe
+  quoting (`$'..'` for arguments, `\r`/`\u202e`-style escapes, line breaks
+  of stdin kept), so a carriage return, bidi override or zero-width
+  character cannot hide or fake part of what runs. Long commands keep head
+  and tail; the mirror attaches the whole text as a file when long.
+- **hostexec commands** (`/arm`, `/disarm`, `/lockdown`, `/unlock`,
+  `/dnd`, `/hosts`, "Approve all…", "Kill VMs") as the Python, with
+  daemon-supplied text (lockdown reports, versions) escaped. "Kill VMs"
+  carries its scope and host in its custom id (stateless; the Python view
+  lived an hour) and greys itself out after use. `/arm` parses the
+  duration first (`Invalid duration: …`) instead of letting the host
+  refuse it.
 
 ## a2a (broker::a2a)
 
@@ -1058,9 +1071,6 @@ Upstream fixes of review 2026-10, adopted:
   table or a per-user generation would allow "sign out everywhere".
 - **Consent can merge identities** (Bug-C5, unchanged): a new connector
   whose name normalizes to an existing `web-*` agent binds to it silently.
-- **`/release` with no entry lifts every containment** (Discord, as the
-  Python; its option says so). The admin API now needs an explicit
-  `{"all": true}`. Should Discord ask for confirmation, or require an entry?
 - **Does an empty `platforms.homelab.allowed_groups` mean "nothing"?**
   (provisioners B1). The Python (and the port, for now) reads it as "every
   group"; Kubernetes reads an empty `namespace_allowlist` as nothing, and
