@@ -197,3 +197,45 @@ async fn an_unfreezable_tui_is_stopped() {
     s.freeze_conversation(&conv, true).await;
     assert!(s.host.frozen().is_empty());
 }
+
+/// Final review: held lists are versioned; one older than a list already
+/// applied from the same broker (a contain and a lift racing) is ignored.
+#[tokio::test]
+async fn an_older_held_list_does_not_thaw() {
+    let d = TestDir::new("heldver");
+    let s = daemon(&d, |_| {});
+    let msg = |agents: serde_json::Value, epoch: &str, seq: u64| {
+        let serde_json::Value::Object(m) = serde_json::json!(
+            {"type": "agents.contained", "agents": agents, "epoch": epoch, "version": seq})
+        else {
+            panic!()
+        };
+        m
+    };
+    // Delivered out of order: the contain (seq 2) before the lift (seq 1).
+    s.on_broker_message(msg(serde_json::json!(["a"]), "e1", 2))
+        .await;
+    s.settle_holds().await;
+    s.on_broker_message(msg(serde_json::json!([]), "e1", 1))
+        .await;
+    s.settle_holds().await;
+    assert!(s.contained("a"), "the older list did not lift it");
+    // A newer one applies; a new broker process starts its own order.
+    s.on_broker_message(msg(serde_json::json!([]), "e1", 3))
+        .await;
+    s.settle_holds().await;
+    assert!(!s.contained("a"));
+    s.on_broker_message(msg(serde_json::json!(["b"]), "e2", 1))
+        .await;
+    s.settle_holds().await;
+    assert!(s.contained("b"));
+    // An unversioned list (an older broker) always applies.
+    let serde_json::Value::Object(m) =
+        serde_json::json!({"type": "agents.contained", "agents": []})
+    else {
+        panic!()
+    };
+    s.on_broker_message(m).await;
+    s.settle_holds().await;
+    assert!(!s.contained("b"));
+}

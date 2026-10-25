@@ -768,6 +768,11 @@ async fn b3_on_connect_a_sandbox_gets_unlock_then_held_then_keys(pool: sqlx::PgP
     assert!(pos("agents.contained") < pos("key"), "{types:?}");
     assert!(!types.contains(&"lockdown".to_owned()));
     assert_eq!(sb.of_type("agents.contained")[0]["agents"], json!([]));
+    // One list of live grants per connect (it was sent twice).
+    assert_eq!(sb.of_type("project.grants").len(), 1, "{types:?}");
+    // Held lists are versioned (this broker's epoch, increasing).
+    let first = &sb.of_type("agents.contained")[0];
+    assert!(first["epoch"].is_string() && first["version"].as_u64().unwrap() >= 1);
 }
 
 /// B-3: a sandbox that connects while the broker is locked for it gets
@@ -1173,4 +1178,57 @@ async fn a_vm_name_with_a_hyphen_is_refused_at_pairing(pool: sqlx::PgPool) {
     let host = ChannelId::new(Role::Host, DaemonName::parse("my-host").unwrap());
     assert!(b.part.hub.create_pairing_code(&host).await.is_ok());
     assert!(crate::daemons::pairing_identity("sandbox", "my-vm").is_err());
+}
+
+/// Final review: containing an orchestrator holds what it minted: the
+/// children's grants end, they are refused like it, and the VM is told to
+/// hold them too; lifting releases them.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn containing_an_orchestrator_holds_its_minted_agents(pool: sqlx::PgPool) {
+    let b = Broker::start(pool).await;
+    let (sb, _orch, child, _) = vm_with_child(&b).await;
+    // The child holds a grant of its own.
+    let r = ask(&b, &child, access_body("site", "project.read")).await;
+    assert_eq!(r.status, RequestStatus::Granted, "{:?}", r.decision_reason);
+    let grant = grant_of(&b, r.id).await;
+    crate::containment::contain(
+        &b.st,
+        json!({"name": ORCH}),
+        "test",
+        "",
+        "jrt",
+        ContainmentSource::Operator,
+    )
+    .await
+    .unwrap();
+    assert!(
+        eventually(|| async {
+            sb.of_type("agents.contained")
+                .last()
+                .map(|m| m["agents"].clone())
+                == Some(json!([CHILD, ORCH]))
+        })
+        .await
+    );
+    let tx = b.st.store.begin().await.unwrap();
+    let checked = agent_auth_store::lockdown::check(&tx, child.id, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    assert!(checked.is_err(), "the child is held with its orchestrator");
+    drop(tx);
+    let g = grant_of(&b, r.id).await;
+    assert!(g.status != GrantStatus::Active || g.expires_at <= OffsetDateTime::now_utc());
+    let _ = grant;
+    crate::containment::lift_entries(&b.st, None, "jrt")
+        .await
+        .unwrap();
+    assert!(
+        eventually(|| async {
+            sb.of_type("agents.contained")
+                .last()
+                .map(|m| m["agents"].clone())
+                == Some(json!([]))
+        })
+        .await
+    );
 }

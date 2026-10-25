@@ -236,6 +236,8 @@ pub struct Sandboxd<H: Host> {
     /// that got a 401 waits for).
     key_gen: watch::Sender<u64>,
     key_rotations: Mutex<HashMap<String, tokio::time::Instant>>,
+    /// The (broker epoch, seq) of the last held list applied.
+    held_version: Mutex<Option<(String, u64)>>,
     channel: Mutex<Option<Channel>>,
     tasks: Mutex<Vec<tokio::task::AbortHandle>>,
     pub(crate) slots: Slots,
@@ -291,6 +293,7 @@ impl<H: Host> Sandboxd<H> {
             grant_locks: Mutex::new(HashMap::new()),
             key_gen,
             key_rotations: Mutex::new(HashMap::new()),
+            held_version: Mutex::new(None),
             channel: Mutex::new(None),
             tasks: Mutex::new(Vec::new()),
             slots,
@@ -649,12 +652,35 @@ impl<H: Host> Sandboxd<H> {
                     }
                 });
             }
+            BrokerToSandbox::AgentsContained(c) if !self.held_list_is_newer(&c) => {
+                tracing::info!("ignored a held list older than one already applied");
+                if c.call_id.is_some() {
+                    self.reply(c.call_id.as_ref(), Ok(())).await;
+                }
+            }
             BrokerToSandbox::AgentsContained(c) => {
                 let set: BTreeSet<String> =
                     c.agents.iter().map(|a| a.as_str().to_owned()).collect();
                 self.hold(HoldEvent::Contained(set), c.call_id);
             }
         }
+    }
+
+    /// Whether a held list is newer than the last one applied from the same
+    /// broker process (and remember it). Unversioned lists always apply.
+    fn held_list_is_newer(&self, c: &agent_auth_wire::daemon::sandbox::AgentsContained) -> bool {
+        let (Some(epoch), Some(seq)) = (&c.epoch, c.version) else {
+            return true;
+        };
+        let mut last = locked(&self.held_version);
+        if let Some((e, s)) = last.as_ref()
+            && e == epoch.as_str()
+            && *s >= seq
+        {
+            return false;
+        }
+        *last = Some((epoch.as_str().to_owned(), seq));
+        true
     }
 
     /// A key, for this VM alone: stored, acknowledged (naming the key), and

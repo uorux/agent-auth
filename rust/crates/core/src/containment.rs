@@ -29,6 +29,10 @@ pub struct AgentFacts<'a> {
     pub project: Option<&'a str>,
     pub host: Option<&'a str>,
     pub placement: Placement,
+    /// The agents that minted it, nearest first (the parent chain): an
+    /// entry that holds any of them holds it too (sandboxd review: a
+    /// contained orchestrator's minted agents are held with it).
+    pub ancestors: &'a [AgentFacts<'a>],
 }
 
 /// Why an entry's `match` does not parse (the entry then holds everyone).
@@ -243,7 +247,13 @@ pub fn holds(entry_match: &Value, agent: &AgentFacts<'_>) -> bool {
         return true;
     }
     match AgentMatch::parse(entry_match) {
-        Ok(m) => m.matches(agent),
+        Ok(m) => {
+            m.matches(agent)
+                || agent
+                    .ancestors
+                    .iter()
+                    .any(|a| a.kind != AgentKind::Operator && m.matches(a))
+        }
         Err(_) => true,
     }
 }
@@ -271,6 +281,7 @@ mod tests {
             project: Some("agent-auth"),
             host: Some("excelsior"),
             placement: Placement::Sandbox,
+            ancestors: &[],
         }
     }
 
@@ -398,7 +409,52 @@ mod tests {
         })
     }
 
+    #[test]
+    fn a_held_ancestor_holds_its_minted_agents() {
+        let orch = AgentFacts {
+            name: "orchestrator-excelsior-sandbox",
+            runtime: Some("orchestrator"),
+            project: None,
+            ..agent(AgentKind::Service)
+        };
+        let parent = [orch];
+        let child = AgentFacts {
+            name: "claude-larder-excelsior-sandbox",
+            project: Some("larder"),
+            ancestors: &parent,
+            ..agent(AgentKind::Service)
+        };
+        let m = json!({"name": "orchestrator-*"});
+        assert!(holds(&m, &orch));
+        assert!(holds(&m, &child), "held with its orchestrator");
+        let grand = [child, orch];
+        let grandchild = AgentFacts {
+            name: "codex-x-excelsior-sandbox",
+            ancestors: &grand,
+            ..child
+        };
+        assert!(holds(&m, &grandchild));
+        assert!(!holds(&json!({"project": "larder"}), &orch), "not upwards");
+    }
+
     proptest! {
+        /// Held through the parent chain: an agent is held exactly when it
+        /// or one of its ancestors matches (a malformed or empty match
+        /// still holds every non-operator).
+        #[test]
+        fn ancestry_properties(m in any_json(), held_parent in any::<bool>()) {
+            let p = AgentFacts {
+                name: if held_parent { "held-parent" } else { "free-parent" },
+                ..agent(AgentKind::Service)
+            };
+            let parents = [p];
+            let c = AgentFacts { name: "child", ancestors: &parents, ..agent(AgentKind::Service) };
+            let alone = AgentFacts { ancestors: &[], ..c };
+            prop_assert_eq!(holds(&m, &c), holds(&m, &alone) || holds(&m, &p));
+            let by_name = json!({"name": "held-*"});
+            prop_assert_eq!(holds(&by_name, &c), held_parent);
+        }
+
         /// INV-C-1, INV-C-2, INV-C-3 over arbitrary JSON.
         #[test]
         fn containment_properties(m in any_json(), kind_ix in 0usize..3, placement_ix in 0usize..2) {
