@@ -140,6 +140,10 @@ id_type!(
     /// `llm_evaluations.id`
     EvaluationId
 );
+id_type!(
+    /// `shell_scopes.id`
+    ScopeId
+);
 
 impl JobId {
     /// A run/tpl grant's single job shares its request's id.

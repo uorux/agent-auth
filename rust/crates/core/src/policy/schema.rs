@@ -663,7 +663,7 @@ pub const REMOTE_MCP_TOOLS: [&str; 23] = [
 
 /// Every MCP tool's name (`mcp_names.TOOL_NAMES`). The MCP crate keeps its
 /// tools and this list the same.
-pub const MCP_TOOL_NAMES: [&str; 35] = [
+pub const MCP_TOOL_NAMES: [&str; 36] = [
     "whoami",
     "list_capabilities",
     "request_access",
@@ -699,6 +699,7 @@ pub const MCP_TOOL_NAMES: [&str; 35] = [
     "host_job",
     "host_shell_exec",
     "host_shell_close",
+    "host_shell_scope",
 ];
 
 /// The web UIs' OAuth callbacks a connector may register by default:

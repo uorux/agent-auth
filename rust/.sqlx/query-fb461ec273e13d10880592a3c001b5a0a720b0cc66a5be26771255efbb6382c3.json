@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT j.spec FROM shell_scope_jobs l JOIN host_jobs j ON j.id = l.job_id\n         WHERE l.scope_id = $1 AND j.status <> 'refused'\n         ORDER BY j.created_at DESC, j.id DESC LIMIT $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "spec",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "host_jobs",
+            "name": "spec"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "fb461ec273e13d10880592a3c001b5a0a720b0cc66a5be26771255efbb6382c3"
+}

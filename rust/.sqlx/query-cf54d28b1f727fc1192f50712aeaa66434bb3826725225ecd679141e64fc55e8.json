@@ -1,0 +1,101 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, grant_id, agent_id, purpose, verdict, opened_at, closed_at\n         FROM shell_scopes WHERE id = $1 AND grant_id = $2 AND closed_at IS NULL\n         FOR SHARE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "shell_scopes",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "grant_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "shell_scopes",
+            "name": "grant_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "agent_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "shell_scopes",
+            "name": "agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "purpose",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "shell_scopes",
+            "name": "purpose"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "verdict",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "shell_scopes",
+            "name": "verdict"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "opened_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "shell_scopes",
+            "name": "opened_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "closed_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "shell_scopes",
+            "name": "closed_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "cf54d28b1f727fc1192f50712aeaa66434bb3826725225ecd679141e64fc55e8"
+}

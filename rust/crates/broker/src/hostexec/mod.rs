@@ -26,6 +26,8 @@ pub mod lockdown;
 pub mod provisioner;
 mod results;
 mod routes;
+#[cfg(test)]
+mod shell_mode_tests;
 mod shells;
 #[cfg(test)]
 mod tests;
@@ -373,12 +375,27 @@ impl HostExec {
         };
         let mut notes = Vec::new();
         let (normalized, tier, shell) = match h {
-            HostexecAuthority::Shell { tier } => {
+            HostexecAuthority::Shell { tier, mode } => {
+                // A guard that cannot exist would refuse every command.
+                if mode.guarded() && self.watcher.is_none() {
+                    return refuse(format!(
+                        "a {mode} shell needs a model to check its commands, and this broker \
+                         has none (OPENROUTER_API_KEY): ask for a watched or general shell"
+                    ));
+                }
                 notes.push(format!(
                     "{} shell on {host}: any command, one at a time, each shown here before it runs",
                     if *tier == Tier::Root { "ROOT" } else { "user" }
                 ));
-                (HostexecAuthority::Shell { tier: *tier }, *tier, true)
+                notes.push(mode.describe().to_owned());
+                (
+                    HostexecAuthority::Shell {
+                        tier: *tier,
+                        mode: *mode,
+                    },
+                    *tier,
+                    true,
+                )
             }
             HostexecAuthority::Run { .. } | HostexecAuthority::Template { .. } => {
                 let spec = match CommandSpec::from_authority(&host, h) {

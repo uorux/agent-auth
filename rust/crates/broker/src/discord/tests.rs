@@ -1400,7 +1400,7 @@ async fn a_dead_discord_never_fails_the_caller() {
     let mut j = job(JobStatus::Running, None, "");
     j.shell_id = Some(RequestId::new());
     // A shell command that cannot be shown does not run.
-    assert!(!n.shell_command(&github(), &j).await);
+    assert!(!n.shell_command(&github(), &j, None).await);
 }
 
 // ------------------------------------------------- with a real database
@@ -1649,10 +1649,10 @@ async fn shell_commands_are_shown_before_they_run(pool: sqlx::PgPool) {
     let mut j = job(JobStatus::Starting, None, "");
     j.shell_id = Some(r.id);
     // No approval message: cannot be shown, so it must not run.
-    assert!(!bot.notifier().shell_command(&r, &j).await);
+    assert!(!bot.notifier().shell_command(&r, &j, None).await);
     bot.notifier().surface(&r, &a).await;
-    assert!(bot.notifier().shell_command(&r, &j).await);
-    assert!(bot.notifier().shell_command(&r, &j).await);
+    assert!(bot.notifier().shell_command(&r, &j, None).await);
+    assert!(bot.notifier().shell_command(&r, &j, None).await);
     let calls = f.calls();
     let paths: Vec<_> = calls
         .iter()

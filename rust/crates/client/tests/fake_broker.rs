@@ -279,7 +279,15 @@ async fn a_shell_command_is_posted_once_and_then_waited_on_by_its_job_id() {
     );
     let argv = vec!["uptime".to_owned()];
     let job = client
-        .host_shell_exec(shapes::GRANT_ID, &argv, Some("/tmp"), None, Some(30), 60.5)
+        .host_shell_exec(
+            shapes::GRANT_ID,
+            &argv,
+            Some("/tmp"),
+            None,
+            Some(30),
+            60.5,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(job.output.as_deref(), Some("ok\n"));
@@ -295,7 +303,7 @@ async fn a_shell_command_is_posted_once_and_then_waited_on_by_its_job_id() {
 
     // A short wait: the exec alone.
     client
-        .host_shell_exec(shapes::GRANT_ID, &argv, None, None, None, 10.0)
+        .host_shell_exec(shapes::GRANT_ID, &argv, None, None, None, 10.0, None)
         .await
         .unwrap();
     assert_eq!(

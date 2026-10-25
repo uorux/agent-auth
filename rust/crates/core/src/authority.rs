@@ -151,6 +151,84 @@ impl fmt::Display for Tier {
     }
 }
 
+/// How a shell's commands are checked by a model (the operator sees every
+/// one before it runs, in every mode; hostd opens every shell only on the
+/// operator's TOTP code, in every mode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum ShellMode {
+    /// After a command started, the watcher alerts the operator when it
+    /// looks dangerous or off the stated purpose. Never stops anything.
+    #[default]
+    Watched,
+    /// A catch-all shell: the watcher alerts on danger only, not on the
+    /// purpose (which is "general work").
+    General,
+    /// Before a command runs, a guard model checks it against the stated
+    /// purpose and refuses what does not serve it (or looks dangerous).
+    /// Fails closed: no guard, no command.
+    Guarded,
+    /// An overarching approval: the agent opens scoped shells inside it,
+    /// each with a purpose a model checks against this one's concept; their
+    /// commands are guarded against that purpose. No command runs outside
+    /// a scope.
+    Umbrella,
+}
+
+impl ShellMode {
+    pub const ALL: [ShellMode; 4] = [
+        ShellMode::Watched,
+        ShellMode::General,
+        ShellMode::Guarded,
+        ShellMode::Umbrella,
+    ];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ShellMode::Watched => "watched",
+            ShellMode::General => "general",
+            ShellMode::Guarded => "guarded",
+            ShellMode::Umbrella => "umbrella",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.as_str() == s)
+    }
+
+    /// A model must clear each command before it runs.
+    #[must_use]
+    pub const fn guarded(self) -> bool {
+        matches!(self, ShellMode::Guarded | ShellMode::Umbrella)
+    }
+
+    /// What the operator is told, on the approval card.
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
+        match self {
+            ShellMode::Watched => {
+                "watched: commands run after you see them; a model alerts you on danger or off-purpose work"
+            }
+            ShellMode::General => {
+                "general: a catch-all shell; a model alerts you on danger only, not on the purpose"
+            }
+            ShellMode::Guarded => {
+                "guarded: a model checks each command against the purpose first and refuses what doesn't fit"
+            }
+            ShellMode::Umbrella => {
+                "umbrella: the agent opens scoped shells inside it, each purpose checked against this one by a model, and each command checked against its scope's purpose"
+            }
+        }
+    }
+}
+
+impl fmt::Display for ShellMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// What a run/tpl command carries besides its argv or template.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CommandOptions {
@@ -176,7 +254,8 @@ pub enum HostexecAuthority {
         options: CommandOptions,
     },
     /// A time-boxed shell: every one is opened by a human with a TOTP code.
-    Shell { tier: Tier },
+    /// `mode` says how a model checks its commands.
+    Shell { tier: Tier, mode: ShellMode },
     /// Only ever a saved rule's authority: an "approve all" window covering
     /// any run/tpl command of its tier (never a shell).
     Window { tier: Tier },
@@ -188,7 +267,7 @@ impl HostexecAuthority {
         match self {
             HostexecAuthority::Run { options, .. }
             | HostexecAuthority::Template { options, .. } => options.tier,
-            HostexecAuthority::Shell { tier } | HostexecAuthority::Window { tier } => *tier,
+            HostexecAuthority::Shell { tier, .. } | HostexecAuthority::Window { tier } => *tier,
         }
     }
 }
@@ -457,9 +536,14 @@ impl Authority {
             Authority::Kubernetes(k) if k.cluster => json!({"cluster": true}),
             Authority::A2a { topic: Some(t) } => json!({"topic": t.as_str()}),
             Authority::Agents { runtime, .. } => json!({"runtime": runtime}),
-            Authority::Hostexec(
-                HostexecAuthority::Shell { tier } | HostexecAuthority::Window { tier },
-            ) => {
+            Authority::Hostexec(HostexecAuthority::Shell { tier, mode }) => {
+                if *mode == ShellMode::Watched {
+                    json!({"tier": tier.as_str()})
+                } else {
+                    json!({"tier": tier.as_str(), "mode": mode.as_str()})
+                }
+            }
+            Authority::Hostexec(HostexecAuthority::Window { tier }) => {
                 json!({"tier": tier.as_str()})
             }
             Authority::Hostexec(HostexecAuthority::Run { argv, options }) => {
@@ -539,7 +623,13 @@ impl Authority {
             Authority::Hostexec(HostexecAuthority::Run { options, .. }) => {
                 format!("run:{}", options.tier)
             }
-            Authority::Hostexec(HostexecAuthority::Shell { tier }) => format!("shell:{tier}"),
+            Authority::Hostexec(HostexecAuthority::Shell { tier, mode }) => {
+                if *mode == ShellMode::Watched {
+                    format!("shell:{tier}")
+                } else {
+                    format!("shell:{tier}:{mode}")
+                }
+            }
             Authority::Mail(m) => m.label(),
             Authority::Pool(PoolChoice::Item(item)) => format!("lease:{item}"),
             Authority::Pool(PoolChoice::Previous) => "lease:previous".to_owned(),
@@ -720,8 +810,14 @@ impl Authority {
             Authority::Google { action } => json!({"action": action}),
             Authority::Agents { action, runtime } => json!({"action": action, "runtime": runtime}),
             Authority::Sandbox { access } => json!({"access": access.capability()}),
-            Authority::Hostexec(HostexecAuthority::Shell { tier }) => {
-                json!({"action": "shell", "tier": tier.as_str()})
+            // A watched shell's row has no mode (rows written before modes
+            // existed are exactly these, and stay canonical).
+            Authority::Hostexec(HostexecAuthority::Shell { tier, mode }) => {
+                if *mode == ShellMode::Watched {
+                    json!({"action": "shell", "tier": tier.as_str()})
+                } else {
+                    json!({"action": "shell", "tier": tier.as_str(), "mode": mode.as_str()})
+                }
             }
             Authority::Hostexec(HostexecAuthority::Window { tier }) => {
                 json!({"action": "window", "tier": tier.as_str()})
@@ -823,7 +919,15 @@ impl Authority {
                     .and_then(Tier::parse)
                     .ok_or_else(|| AuthorityError("stored hostexec tier".into()))?;
                 match s("action") {
-                    Some("shell") => Authority::Hostexec(HostexecAuthority::Shell { tier }),
+                    // Grants stored before modes existed are watched.
+                    Some("shell") => Authority::Hostexec(HostexecAuthority::Shell {
+                        tier,
+                        mode: match s("mode") {
+                            None => ShellMode::Watched,
+                            Some(m) => ShellMode::parse(m)
+                                .ok_or_else(|| AuthorityError("stored shell mode".into()))?,
+                        },
+                    }),
                     Some("window") => Authority::Hostexec(HostexecAuthority::Window { tier }),
                     Some("run") => Authority::Hostexec(HostexecAuthority::Run {
                         argv: string_list(map.get("argv"))?,
@@ -1091,12 +1195,17 @@ fn hostexec_from_wire(
         None => return err("tier must be \"user\" or \"root\""),
     };
     if capability == "shell" {
-        only_keys(
-            scope,
-            &["tier"],
-            "a shell's scope is {\"tier\": \"user\"|\"root\"}",
-        )?;
-        return Ok(Authority::Hostexec(HostexecAuthority::Shell { tier }));
+        const SHAPE: &str = "a shell's scope is {\"tier\": \"user\"|\"root\", \"mode\"?: \"watched\"|\"general\"|\"guarded\"|\"umbrella\"}";
+        only_keys(scope, &["tier", "mode"], SHAPE)?;
+        let mode = match scope.get("mode") {
+            None | Some(Value::Null) => ShellMode::Watched,
+            Some(v) => v.as_str().and_then(ShellMode::parse).ok_or_else(|| {
+                AuthorityError(
+                    "mode must be \"watched\", \"general\", \"guarded\" or \"umbrella\"".into(),
+                )
+            })?,
+        };
+        return Ok(Authority::Hostexec(HostexecAuthority::Shell { tier, mode }));
     }
     let options = |scope: &Map<String, Value>| -> Result<CommandOptions, AuthorityError> {
         Ok(CommandOptions {
@@ -1299,7 +1408,14 @@ mod tests {
                 params: [("unit".to_owned(), "nginx".to_owned())].into(),
                 options: opts,
             }),
-            Authority::Hostexec(HostexecAuthority::Shell { tier: Tier::Root }),
+            Authority::Hostexec(HostexecAuthority::Shell {
+                tier: Tier::Root,
+                mode: ShellMode::Watched,
+            }),
+            Authority::Hostexec(HostexecAuthority::Shell {
+                tier: Tier::User,
+                mode: ShellMode::Umbrella,
+            }),
             Authority::Hostexec(HostexecAuthority::Window { tier: Tier::User }),
             Authority::Mcp {
                 tools: ToolSet::All,
@@ -1346,6 +1462,71 @@ mod tests {
             };
             assert_eq!(back, expected, "{a:?}");
         }
+    }
+
+    #[test]
+    fn shell_modes_on_the_wire_and_in_rows() {
+        // A row written before modes existed is a watched shell.
+        let old = json!({"action": "shell", "tier": "user"});
+        assert_eq!(
+            Authority::from_json(Platform::Hostexec, &old),
+            Ok(Authority::Hostexec(HostexecAuthority::Shell {
+                tier: Tier::User,
+                mode: ShellMode::Watched
+            }))
+        );
+        // "watched" is never written, so a row saying it is refused.
+        let explicit = json!({"action": "shell", "tier": "user", "mode": "watched"});
+        assert!(Authority::from_json(Platform::Hostexec, &explicit).is_err());
+        let bad = json!({"action": "shell", "tier": "user", "mode": "lax"});
+        assert!(Authority::from_json(Platform::Hostexec, &bad).is_err());
+        for mode in ShellMode::ALL {
+            let got = wire(
+                Platform::Hostexec,
+                "shell",
+                json!({"tier": "root", "mode": mode.as_str()}),
+            );
+            assert_eq!(
+                got,
+                Ok(Authority::Hostexec(HostexecAuthority::Shell {
+                    tier: Tier::Root,
+                    mode
+                }))
+            );
+        }
+        assert!(
+            wire(
+                Platform::Hostexec,
+                "shell",
+                json!({"tier": "user", "mode": "lax"})
+            )
+            .is_err()
+        );
+        assert!(
+            wire(
+                Platform::Hostexec,
+                "shell",
+                json!({"tier": "user", "mode": 1})
+            )
+            .is_err()
+        );
+        assert!(
+            wire(
+                Platform::Hostexec,
+                "shell",
+                json!({"tier": "user", "extra": 1})
+            )
+            .is_err()
+        );
+        assert_eq!(
+            wire(Platform::Hostexec, "shell", json!({"tier": "user"})),
+            Ok(Authority::Hostexec(HostexecAuthority::Shell {
+                tier: Tier::User,
+                mode: ShellMode::Watched
+            }))
+        );
+        assert!(ShellMode::Guarded.guarded() && ShellMode::Umbrella.guarded());
+        assert!(!ShellMode::Watched.guarded() && !ShellMode::General.guarded());
     }
 
     #[test]
@@ -1403,7 +1584,10 @@ mod tests {
         assert!(!rule_covers(Some(&window), &root_run));
         assert!(!rule_covers(
             Some(&window),
-            &Authority::Hostexec(HostexecAuthority::Shell { tier: Tier::User })
+            &Authority::Hostexec(HostexecAuthority::Shell {
+                tier: Tier::User,
+                mode: ShellMode::Watched
+            })
         ));
     }
 
@@ -1453,10 +1637,14 @@ mod tests {
             permissions: [("secrets".to_owned(), GithubAccess::Read)].into(),
         });
         assert!(gh.is_sensitive(&cfg, "o/r"));
-        assert!(
-            Authority::Hostexec(HostexecAuthority::Shell { tier: Tier::User })
-                .is_sensitive(&cfg, "h")
-        );
+        for mode in ShellMode::ALL {
+            let shell = Authority::Hostexec(HostexecAuthority::Shell {
+                tier: Tier::User,
+                mode,
+            });
+            assert!(shell.is_sensitive(&cfg, "h"));
+            assert!(shell.human_only());
+        }
         assert!(
             Authority::Sandbox {
                 access: ProjectAccess::Write

@@ -34,13 +34,16 @@ mod proofs_mail;
 mod proofs_policy;
 #[cfg(kani)]
 mod proofs_sandbox;
+#[cfg(kani)]
+mod proofs_shell;
 pub mod pyfmt;
 pub mod routing;
 pub mod sandbox;
+pub mod shell_mode;
 pub mod zones;
 
 pub use approval::HumanApproval;
-pub use authority::{Authority, AuthorityError, Tier, rule_covers};
+pub use authority::{Authority, AuthorityError, ShellMode, Tier, rule_covers};
 pub use durations::DurationSecs;
 pub use glob::{Glob, fnmatch};
 pub use ids::*;

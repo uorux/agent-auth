@@ -238,7 +238,11 @@ pub fn api_routes(tool: &str) -> &'static [ApiRoute] {
             ("POST", "/v1/hostexec/shells/{}/exec"),
             ("GET", "/v1/hostexec/jobs/{}"),
         ],
-        "host_shell_close" => &[("POST", "/v1/hostexec/shells/{}/close")],
+        "host_shell_close" => &[
+            ("POST", "/v1/hostexec/shells/{}/close"),
+            ("POST", "/v1/hostexec/shells/{}/scopes/{}/close"),
+        ],
+        "host_shell_scope" => &[("POST", "/v1/hostexec/shells/{}/scopes")],
         _ => &[],
     }
 }
@@ -328,6 +332,15 @@ grant a time-boxed shell instead: request_access(platform="hostexec",
 capability="shell", resource=<host>, scope={"tier": "user"|"root"}), then
 host_shell_exec(grant_id, argv) per command. Every command is shown to the
 operator before it runs, and there is no terminal: each is run on its own.
+A shell's scope may name a "mode": "watched" (the default: a model alerts
+the operator when a command looks dangerous or off your stated purpose),
+"general" (catch-all work: alerts on danger only), "guarded" (a model
+checks each command against your purpose first and refuses what doesn't
+serve it), or "umbrella" (one approval for a broad area of work; inside it
+you open a scoped shell per piece of work with host_shell_scope(grant_id,
+purpose), each purpose checked against the umbrella's, and run commands
+with host_shell_exec(..., scope_id=...), each checked against that scope's
+purpose). A refused command did not run; the reason says why.
 
 Mail (platform "mail"): the broker reads and sends mail for you on one
 address: a SimpleLogin alias (the person's per-service address, e.g.
@@ -1358,7 +1371,11 @@ command is shown to the operator before it is sent and runs on its own —
 no terminal, no state between commands except what they leave on disk
 (pass cwd each time). Returns the job; if it is still running after
 wait_secs, poll host_job(job_id). The operator can end the shell at any
-moment, and it ends by itself when its time is up."##,
+moment, and it ends by itself when its time is up. In a guarded shell a
+model first checks the command against the shell's purpose and may refuse
+it (409 with the reason; it did not run). In an umbrella shell, pass the
+scope_id of a scoped shell (host_shell_scope): commands run only in a
+scope, checked against its purpose."##,
         params: &[
             Param {
                 name: "grant_id",
@@ -1396,17 +1413,57 @@ moment, and it ends by itself when its time is up."##,
                 nullable: false,
                 default: DefaultValue::Int(120),
             },
+            Param {
+                name: "scope_id",
+                ty: Ty::Str,
+                nullable: true,
+                default: DefaultValue::Null,
+            },
         ],
     },
     ToolDef {
         name: "host_shell_close",
-        description: r##"End a shell as soon as you are done with it."##,
-        params: &[Param {
-            name: "grant_id",
-            ty: Ty::Str,
-            nullable: false,
-            default: DefaultValue::Required,
-        }],
+        description: r##"End a shell as soon as you are done with it. With scope_id, end only
+that scoped shell of an umbrella shell."##,
+        params: &[
+            Param {
+                name: "grant_id",
+                ty: Ty::Str,
+                nullable: false,
+                default: DefaultValue::Required,
+            },
+            Param {
+                name: "scope_id",
+                ty: Ty::Str,
+                nullable: true,
+                default: DefaultValue::Null,
+            },
+        ],
+    },
+    ToolDef {
+        name: "host_shell_scope",
+        description: r##"Open a scoped shell inside an umbrella shell you were granted
+(request_access platform "hostexec", capability "shell", scope {"tier":
+..., "mode": "umbrella"}). Give one specific piece of work as the purpose:
+a model checks it is within what the umbrella was approved for (vague or
+catch-all purposes are refused), and then checks each command you run in
+the scope (host_shell_exec with this scope_id) against it. Returns
+scope_id. At most 16 scopes are open at once; close one with
+host_shell_close(grant_id, scope_id) when that work is done."##,
+        params: &[
+            Param {
+                name: "grant_id",
+                ty: Ty::Str,
+                nullable: false,
+                default: DefaultValue::Required,
+            },
+            Param {
+                name: "purpose",
+                ty: Ty::Str,
+                nullable: false,
+                default: DefaultValue::Required,
+            },
+        ],
     },
 ];
 
@@ -1415,12 +1472,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn one_table_thirty_five_tools() {
-        assert_eq!(TOOLS.len(), 35);
+    fn one_table_thirty_six_tools() {
+        assert_eq!(TOOLS.len(), 36);
         let mut names: Vec<&str> = tool_names().collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 35);
+        assert_eq!(names.len(), 36);
         // The policy's list (core cannot depend on this crate) is this one.
         let mut policy = agent_auth_core::policy::MCP_TOOL_NAMES.to_vec();
         policy.sort_unstable();

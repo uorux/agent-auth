@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use agent_auth_core::authority::HostexecAuthority;
 use agent_auth_core::hostexec::{CommandSpec, ShellSpec};
-use agent_auth_core::{Authority, DecisionSource, JobId, Platform};
+use agent_auth_core::{Authority, DecisionSource, JobId, Platform, ShellMode};
 use agent_auth_store::agents::AgentRow;
 use agent_auth_store::grants::{GrantRow, IssuableGrant, ProvisioningGrant};
 use agent_auth_store::hostexec::{self as store, JobStatus, NewJob};
@@ -54,7 +54,7 @@ impl HostExec {
             .map_err(|e| failed(&host, e))?
             .ok_or_else(|| failed(&host, "no such request"))?
             .into_row();
-        if let HostexecAuthority::Shell { tier } = h {
+        if let HostexecAuthority::Shell { tier, .. } = h {
             let duration = request
                 .approved_duration_secs
                 .ok_or_else(|| failed(&host, "the shell has no approved duration"))?;
@@ -262,14 +262,31 @@ impl Provisioner for HostexecProvisioner {
         _now: OffsetDateTime,
     ) -> Result<Credential, ProvisionError> {
         let g = grant.grant();
-        if let Authority::Hostexec(HostexecAuthority::Shell { tier }) = &g.authority {
+        if let Authority::Hostexec(HostexecAuthority::Shell { tier, mode }) = &g.authority {
+            let how = match mode {
+                ShellMode::Watched | ShellMode::General => {
+                    "Run commands with host_shell_exec(grant_id, argv) — one at a time, each \
+                     shown to the operator before it runs"
+                }
+                ShellMode::Guarded => {
+                    "Run commands with host_shell_exec(grant_id, argv) — one at a time; a guard \
+                     model checks each against the purpose you gave and refuses what doesn't \
+                     serve it, and each is shown to the operator before it runs"
+                }
+                ShellMode::Umbrella => {
+                    "This is an umbrella shell: open a scoped shell for each piece of work with \
+                     host_shell_scope(grant_id, purpose) (a model checks the purpose is within \
+                     what this shell was approved for), then run commands in it with \
+                     host_shell_exec(grant_id, argv, scope_id=...) — each checked against that \
+                     scope's purpose and shown to the operator before it runs; close a scope \
+                     with host_shell_close(grant_id, scope_id)"
+                }
+            };
             return Ok(Credential {
                 value: Some(agent_auth_crypto::Secret::new(g.id.to_string())),
                 expires_at: Some(g.expires_at),
                 note: Some(format!(
-                    "A {tier} shell on {}. Run commands with host_shell_exec(grant_id, argv) — one \
-                     at a time, each shown to the operator before it runs — and end it with \
-                     host_shell_close(grant_id).",
+                    "A {tier} {mode} shell on {}. {how}. End it with host_shell_close(grant_id).",
                     g.resource
                 )),
                 ..Credential::of(CredentialKind::HostexecShell)

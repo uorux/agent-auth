@@ -51,7 +51,7 @@ impl HostExec {
             ));
         };
         match h {
-            HostexecAuthority::Shell { tier } => {
+            HostexecAuthority::Shell { tier, .. } => {
                 let duration = approved_duration_secs.min(HUMAN_MAX_DURATION_SECS);
                 ShellSpec::new(&host, *tier, duration)
                     .map(JobSpec::Shell)

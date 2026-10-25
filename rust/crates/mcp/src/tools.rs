@@ -160,11 +160,11 @@ mod tests {
 
     #[test]
     fn thirty_five_tools() {
-        assert_eq!(TOOLS.len(), 35);
+        assert_eq!(TOOLS.len(), 36);
         let mut names: Vec<_> = tool_names().collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 35);
+        assert_eq!(names.len(), 36);
     }
 
     #[test]

@@ -143,8 +143,11 @@ fn hostd_part(
 ) -> anyhow::Result<crate::daemons::HostdPart> {
     let daemons = crate::daemons::DaemonsConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
     let hx = &policy.platforms().hostexec;
+    // One model client for the shell models: the watcher (only with
+    // `platforms.hostexec.watch`), and the guard and scope check of guarded
+    // and umbrella shells (which cannot be granted without it).
     let watcher = match &config.openrouter_api_key {
-        Some(key) if hx.watch && daemons.signing_key.is_some() => {
+        Some(key) if daemons.signing_key.is_some() => {
             let model = hx
                 .risk_model
                 .clone()

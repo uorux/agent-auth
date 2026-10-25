@@ -93,6 +93,38 @@ pub struct ShellExecBody {
     /// Seconds to wait for the command to end (clamped to 0..300).
     #[serde(default = "sixty")]
     pub wait: f64,
+    /// The scoped shell it runs in: required in an umbrella shell, refused
+    /// in any other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_id: Option<Text<1, 64>>,
+}
+
+/// `POST /v1/hostexec/shells/{grant_id}/scopes`: open a scoped shell in an
+/// umbrella shell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellScopeBody {
+    /// What this scoped shell is for: one specific piece of work within
+    /// the umbrella's concept.
+    pub purpose: Text<1, 2000>,
+}
+
+/// A scoped shell (200 on opening it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellScopeOut {
+    pub scope_id: String,
+    pub grant_id: String,
+    pub purpose: String,
+    /// The model's one sentence on why the purpose fits the umbrella.
+    pub verdict: String,
+    #[serde(with = "crate::timestamp")]
+    pub opened_at: time::OffsetDateTime,
+}
+
+/// `POST /v1/hostexec/shells/{grant_id}/scopes/{scope_id}/close` → 200.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeClosed {
+    pub closed: bool,
 }
 
 fn sixty() -> f64 {

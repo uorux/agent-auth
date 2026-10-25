@@ -1010,8 +1010,13 @@ impl Api<'_> {
                 let path = format!("/v1/hostexec/shells/{}/exec", seg(&a.s("grant_id")));
                 let wait = a.f("wait_secs");
                 let first = wait.min(POLL_SLICE);
-                let body = json!({"argv": a.v("argv"), "cwd": a.v("cwd"), "stdin": a.v("stdin"),
+                let mut body = json!({"argv": a.v("argv"), "cwd": a.v("cwd"), "stdin": a.v("stdin"),
                                   "timeout": a.v("timeout_secs"), "wait": first});
+                if let (Value::String(scope), Value::Object(m)) = (a.v("scope_id"), &mut body)
+                    && !scope.is_empty()
+                {
+                    m.insert("scope_id".into(), json!(scope));
+                }
                 let job = self.post(&path, Some(body), None).await?;
                 let id = job
                     .get("job_id")
@@ -1030,8 +1035,19 @@ impl Api<'_> {
                 }
             }
             "host_shell_close" => {
-                let path = format!("/v1/hostexec/shells/{}/close", seg(&a.s("grant_id")));
+                let grant = seg(&a.s("grant_id"));
+                let path = match a.v("scope_id") {
+                    Value::String(scope) if !scope.is_empty() => {
+                        format!("/v1/hostexec/shells/{grant}/scopes/{}/close", seg(&scope))
+                    }
+                    _ => format!("/v1/hostexec/shells/{grant}/close"),
+                };
                 self.post(&path, None, None).await
+            }
+            "host_shell_scope" => {
+                let path = format!("/v1/hostexec/shells/{}/scopes", seg(&a.s("grant_id")));
+                self.post(&path, Some(json!({"purpose": a.s("purpose")})), None)
+                    .await
             }
             other => Err(BrokerError::new(0, format!("{other} is not served here"))),
         }

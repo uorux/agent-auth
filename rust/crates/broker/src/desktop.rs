@@ -826,8 +826,16 @@ impl Notify for Fanout {
     async fn job_finished(&self, request: &RequestRow, job: &JobRow) {
         primary!(self, n => n.job_finished(request, job).await, null => ());
     }
-    async fn shell_command(&self, request: &RequestRow, job: &JobRow) -> bool {
-        primary!(self, n => n.shell_command(request, job).await, null => true)
+    async fn shell_command(
+        &self,
+        request: &RequestRow,
+        job: &JobRow,
+        scope: Option<&agent_auth_store::shell_scopes::ScopeRow>,
+    ) -> bool {
+        primary!(self, n => n.shell_command(request, job, scope).await, null => true)
+    }
+    async fn shell_event(&self, request: &RequestRow, event: crate::notify::ShellEvent<'_>) {
+        primary!(self, n => n.shell_event(request, event).await, null => ());
     }
     async fn watch_alert(&self, request: &RequestRow, job: &JobRow, text: &str) {
         primary!(self, n => n.watch_alert(request, job, text).await,

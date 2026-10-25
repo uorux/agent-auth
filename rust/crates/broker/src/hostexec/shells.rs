@@ -4,21 +4,30 @@ use std::sync::Arc;
 
 use agent_auth_core::authority::HostexecAuthority;
 use agent_auth_core::hostexec::{SpecFields, make_spec};
-use agent_auth_core::{AgentId, Authority, GrantId, JobId, Platform};
+use agent_auth_core::shell_mode::{self, GuardOutcome, ShellRefusal};
+use agent_auth_core::{AgentId, Authority, GrantId, JobId, Platform, ScopeId, ShellMode, Tier};
 
 fn now_utc() -> OffsetDateTime {
     OffsetDateTime::now_utc()
 }
 use agent_auth_store::grants::{self, IssuableGrant, NotIssuable};
 use agent_auth_store::hostexec::{self as store, JobRow, JobStatus, NewJob};
+use agent_auth_store::shell_scopes::{self, ScopeRow};
 use agent_auth_store::{StoreError, flags};
 use agent_auth_wire::hostexec::ShellExecBody;
 use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 
-use super::watcher::{Level, Watched};
+use super::watcher::{GuardVerdict, Guarded, Level, Watched};
 use super::{CALL_TIMEOUT, HostExec};
-use crate::notify::Notify as _;
+use crate::notify::{Notify as _, ShellEvent};
+
+/// Earlier commands the guard is shown (the newest of the scope or shell).
+const GUARD_CONTEXT: i64 = 8;
+
+fn cut(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
 
 /// Why a shell command did not go out.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -54,7 +63,7 @@ impl HostExec {
         agent: AgentId,
         grant_id: GrantId,
         now: OffsetDateTime,
-    ) -> Result<(IssuableGrant<'t>, agent_auth_core::Tier), ShellExecError> {
+    ) -> Result<(IssuableGrant<'t>, Tier, ShellMode), ShellExecError> {
         let grant = match grants::issuable(tx, agent, grant_id, now).await? {
             Ok(g) => g,
             Err(NotIssuable::UnknownGrant) => return Err(ShellExecError::NotFound),
@@ -77,21 +86,59 @@ impl HostExec {
         if g.platform != Platform::Hostexec {
             return Err(ShellExecError::NotFound);
         }
-        let Authority::Hostexec(HostexecAuthority::Shell { tier }) = g.authority else {
+        let Authority::Hostexec(HostexecAuthority::Shell { tier, mode }) = g.authority else {
             return Err(ShellExecError::NotFound);
         };
         if flags::locked(tx, &g.resource).await? {
             return Err(ShellExecError::Refused("locked down".into()));
         }
-        Ok((grant, tier))
+        Ok((grant, tier, mode))
     }
 
-    /// One command in an open shell: shown to the operator before it is
-    /// sent, and not sent if that fails (INV-31). The grant is checked
-    /// again after the operator was shown it, in the transaction that
-    /// writes the job and holds its locks while the host is asked, so a
-    /// revoke, a containment, a closed delegation thread or a lockdown that
-    /// landed meanwhile stops it (security review 2026-10).
+    /// The scoped shell a command names, checked in `tx` (share-locked
+    /// until it ends, so it cannot close under the command): an umbrella's
+    /// command needs an open scope of that umbrella, any other shell's
+    /// command none.
+    async fn command_scope(
+        tx: &agent_auth_store::Tx<'_>,
+        grant: GrantId,
+        mode: ShellMode,
+        scope: Option<ScopeId>,
+    ) -> Result<Option<ScopeRow>, ShellExecError> {
+        match shell_mode::scope_rule(mode, scope.is_some()) {
+            Err(ShellRefusal::NeedsScope) => {
+                return Err(ShellExecError::Refused(
+                    "this is an umbrella shell: commands run only in a scoped shell; open one \
+                     with host_shell_scope(grant_id, purpose) and pass its scope_id"
+                        .into(),
+                ));
+            }
+            Err(_) => {
+                return Err(ShellExecError::Spec(
+                    "only an umbrella shell has scoped shells: leave out scope_id".into(),
+                ));
+            }
+            Ok(()) => {}
+        }
+        let Some(id) = scope else {
+            return Ok(None);
+        };
+        match shell_scopes::open_for_share(tx, grant, id).await? {
+            Some(s) => Ok(Some(s)),
+            None => Err(ShellExecError::Refused(
+                "that scoped shell is closed, or not one of this shell's".into(),
+            )),
+        }
+    }
+
+    /// One command in an open shell: in a guarded shell or an umbrella's
+    /// scope first cleared by the guard (fail closed), then shown to the
+    /// operator before it is sent, and not sent if that fails (INV-31). The
+    /// grant (and scope) are checked again after the operator was shown
+    /// it, in the transaction that writes the job and holds their locks
+    /// while the host is asked, so a revoke, a containment, a closed
+    /// delegation thread, a closed scope or a lockdown that landed
+    /// meanwhile stops it (security review 2026-10).
     pub async fn shell_exec(
         &self,
         agent: AgentId,
@@ -99,16 +146,38 @@ impl HostExec {
         body: &ShellExecBody,
     ) -> Result<JobRow, ShellExecError> {
         let now = OffsetDateTime::now_utc();
-        let (grant, tier, request) = {
+        let scope_id =
+            match &body.scope_id {
+                None => None,
+                Some(t) => Some(t.as_str().parse::<ScopeId>().map_err(|_| {
+                    ShellExecError::Spec("scope_id is not a scoped shell's id".into())
+                })?),
+            };
+        let (grant, tier, mode, request, scope, agent_name, earlier) = {
             let tx = self.store.begin().await?;
-            let (issuable, tier) = self.shell_grant(&tx, agent, grant_id, now).await?;
+            let (issuable, tier, mode) = self.shell_grant(&tx, agent, grant_id, now).await?;
             let grant = issuable.grant().clone();
+            let scope = Self::command_scope(&tx, grant.id, mode, scope_id).await?;
             let request = agent_auth_store::requests::get(&tx, grant.request_id)
                 .await?
                 .ok_or(ShellExecError::NotFound)?
                 .into_row();
+            let (agent_name, earlier) = if mode.guarded() {
+                let name = agent_auth_store::agents::get(&tx, agent)
+                    .await?
+                    .map_or_else(|| "?".to_owned(), |a| a.name);
+                let specs = match &scope {
+                    Some(s) => shell_scopes::earlier_specs(&tx, s.id, GUARD_CONTEXT).await?,
+                    None => {
+                        shell_scopes::earlier_in_shell_specs(&tx, request.id, GUARD_CONTEXT).await?
+                    }
+                };
+                (name, specs.iter().map(argv_of).collect())
+            } else {
+                (String::new(), Vec::new())
+            };
             tx.commit().await?;
-            (grant, tier, request)
+            (grant, tier, mode, request, scope, agent_name, earlier)
         };
         let host = grant.resource.clone();
         let argv = json!(body.argv.iter().map(|a| a.as_str()).collect::<Vec<_>>());
@@ -136,6 +205,7 @@ impl HostExec {
         .map_err(|e| ShellExecError::Spec(e.0))?;
         let spec_json = spec.to_json();
         let job_id = JobId::new();
+        let mut guard_why: Option<String> = None;
         let new_job = NewJob {
             id: job_id,
             grant_id: Some(grant.id),
@@ -147,11 +217,72 @@ impl HostExec {
             spec: &spec_json,
             now,
         };
+        // The guard first, before anyone is shown it: it can only refuse.
+        let outcome = if mode.guarded() {
+            let argv_list = argv_of(&spec_json);
+            let purpose = scope
+                .as_ref()
+                .map_or(request.justification.as_str(), |s| s.purpose.as_str());
+            let concept = scope.as_ref().map(|_| request.justification.as_str());
+            match &self.watcher {
+                None => GuardOutcome::Unavailable,
+                Some(w) => match w
+                    .guard(&Guarded {
+                        agent: &agent_name,
+                        host: &host,
+                        tier: tier.as_str(),
+                        purpose,
+                        concept,
+                        earlier: &earlier,
+                        argv: &argv_list,
+                        cwd: body.cwd.as_ref().map(|c| c.as_str()),
+                        stdin: body.stdin.as_ref().map(|s| s.as_str()),
+                    })
+                    .await
+                {
+                    GuardVerdict::Allow(_) => GuardOutcome::Allow,
+                    GuardVerdict::Refuse { alarming, why } => {
+                        guard_why = Some(why);
+                        GuardOutcome::Refuse { alarming }
+                    }
+                    GuardVerdict::Unavailable => GuardOutcome::Unavailable,
+                },
+            }
+        } else {
+            GuardOutcome::NotAsked
+        };
+        let watch_after = match shell_mode::after_guard(mode, outcome) {
+            Ok(watch) => watch,
+            Err(refusal) => {
+                let why = guard_why.unwrap_or_default();
+                let text = match refusal {
+                    ShellRefusal::Guard { .. } => format!("the shell's guard refused it: {why}"),
+                    _ => "the shell's guard could not be asked, so it did not run \
+                          (guarded shells fail closed); try again shortly"
+                        .to_owned(),
+                };
+                let job = self.record_refused(&new_job, scope.as_ref(), &text).await?;
+                let event = match refusal {
+                    ShellRefusal::Guard { alarming } => ShellEvent::GuardRefused {
+                        job: &job,
+                        scope: scope.as_ref(),
+                        why: &why,
+                        alarming,
+                    },
+                    _ => ShellEvent::GuardUnavailable {
+                        job: &job,
+                        scope: scope.as_ref(),
+                    },
+                };
+                self.notifier().shell_event(&request, event).await;
+                return Err(ShellExecError::Refused(text));
+            }
+        };
         // Before dispatch, and failing closed: a command nobody was shown
         // does not run.
         let shown = self
             .notifier()
-            .shell_command(&request, &new_job.to_row())
+            .shell_command(&request, &new_job.to_row(), scope.as_ref())
             .await;
         let tx = self.store.begin().await?;
         if !shown {
@@ -172,11 +303,25 @@ impl HostExec {
             ));
         }
         // Again, now: the operator was shown it a moment ago.
-        if let Err(e) = self.shell_grant(&tx, agent, grant_id, now_utc()).await {
+        match self.shell_grant(&tx, agent, grant_id, now_utc()).await {
+            Ok((_, _, again)) if again == mode => {}
+            Ok(_) => {
+                drop(tx);
+                return Err(ShellExecError::Refused("that shell has changed".into()));
+            }
+            Err(e) => {
+                drop(tx);
+                return Err(e);
+            }
+        }
+        if let Err(e) = Self::command_scope(&tx, grant.id, mode, scope_id).await {
             drop(tx);
             return Err(e);
         }
         let job = store::insert(&tx, &new_job).await?;
+        if let Some(s) = &scope {
+            shell_scopes::link_job(&tx, job_id, s.id).await?;
+        }
         let sent = self
             .call(
                 &host,
@@ -185,18 +330,24 @@ impl HostExec {
                 CALL_TIMEOUT,
             )
             .await;
+        // A guarded command was rated before it ran: no watcher after.
+        let watch = |me: &Self| {
+            if watch_after {
+                me.watch(job_id);
+            }
+        };
         match sent {
             Ok(_) => {
                 store::set_status(&tx, job_id, &host, JobStatus::Running, None, None).await?;
                 tx.commit().await?;
-                self.watch(job_id);
+                watch(self);
                 Ok(self.reload(job_id).await?.unwrap_or(job))
             }
             Err(e) if e.timed_out => {
                 // As for job.start (bug 2): it may run; its result, if any,
                 // is stored, otherwise it becomes lost.
                 tx.commit().await?;
-                self.watch(job_id);
+                watch(self);
                 Err(ShellExecError::Refused(e.message))
             }
             Err(e) => {
@@ -219,6 +370,174 @@ impl HostExec {
         }
     }
 
+    /// A command that was not sent (the guard refused it), on record as
+    /// refused, in its scope if that is still open.
+    async fn record_refused(
+        &self,
+        new_job: &NewJob<'_>,
+        scope: Option<&ScopeRow>,
+        why: &str,
+    ) -> Result<JobRow, ShellExecError> {
+        let tx = self.store.begin().await?;
+        store::insert(&tx, new_job).await?;
+        if let Some(s) = scope
+            && shell_scopes::open_for_share(&tx, s.grant_id, s.id)
+                .await?
+                .is_some()
+        {
+            shell_scopes::link_job(&tx, new_job.id, s.id).await?;
+        }
+        store::set_status(
+            &tx,
+            new_job.id,
+            new_job.host,
+            JobStatus::Refused,
+            Some(&cut(why, 1000)),
+            None,
+        )
+        .await?;
+        let job = store::get(&tx, new_job.id)
+            .await?
+            .ok_or_else(|| ShellExecError::Internal("the refused command vanished".into()))?;
+        tx.commit().await?;
+        self.job_events.notify(&new_job.id);
+        Ok(job)
+    }
+
+    /// Open a scoped shell in the caller's umbrella shell `grant_id`, for
+    /// `purpose`, if the scope check finds it within the umbrella's concept
+    /// (the request's justification). Fail closed: no model, no scope.
+    pub async fn open_scope(
+        &self,
+        agent: AgentId,
+        grant_id: GrantId,
+        purpose: &str,
+    ) -> Result<ScopeRow, ShellExecError> {
+        let purpose = purpose.trim();
+        if purpose.is_empty() {
+            return Err(ShellExecError::Spec(
+                "a scoped shell needs a purpose".into(),
+            ));
+        }
+        let now = now_utc();
+        let (host, tier, request, agent_name) = {
+            let tx = self.store.begin().await?;
+            let (issuable, tier, mode) = self.shell_grant(&tx, agent, grant_id, now).await?;
+            if mode != ShellMode::Umbrella {
+                return Err(ShellExecError::Refused(format!(
+                    "only an umbrella shell has scoped shells (this one is {mode})"
+                )));
+            }
+            let g = issuable.grant().clone();
+            if shell_scopes::count_open(&tx, g.id).await? >= shell_scopes::MAX_OPEN {
+                return Err(ShellExecError::Refused(format!(
+                    "at most {} scoped shells are open at once: close one first",
+                    shell_scopes::MAX_OPEN
+                )));
+            }
+            let request = agent_auth_store::requests::get(&tx, g.request_id)
+                .await?
+                .ok_or(ShellExecError::NotFound)?
+                .into_row();
+            let name = agent_auth_store::agents::get(&tx, agent)
+                .await?
+                .map_or_else(|| "?".to_owned(), |a| a.name);
+            tx.commit().await?;
+            (g.resource, tier, request, name)
+        };
+        let verdict = match &self.watcher {
+            None => None,
+            Some(w) => {
+                w.scope_fits(
+                    &agent_name,
+                    &host,
+                    tier.as_str(),
+                    &request.justification,
+                    purpose,
+                )
+                .await
+            }
+        };
+        let summary = match verdict {
+            Some((true, summary)) => summary,
+            Some((false, why)) => {
+                self.notifier()
+                    .shell_event(&request, ShellEvent::ScopeRefused { purpose, why: &why })
+                    .await;
+                return Err(ShellExecError::Refused(format!(
+                    "the umbrella's guard refused that purpose: {why}"
+                )));
+            }
+            None => {
+                let why =
+                    "the guard could not be asked (umbrella shells fail closed); try again shortly";
+                self.notifier()
+                    .shell_event(&request, ShellEvent::ScopeRefused { purpose, why })
+                    .await;
+                return Err(ShellExecError::Refused(why.to_owned()));
+            }
+        };
+        let tx = self.store.begin().await?;
+        let (issuable, _, mode) = self.shell_grant(&tx, agent, grant_id, now_utc()).await?;
+        if mode != ShellMode::Umbrella {
+            return Err(ShellExecError::Refused("that shell has changed".into()));
+        }
+        if shell_scopes::count_open(&tx, grant_id).await? >= shell_scopes::MAX_OPEN {
+            return Err(ShellExecError::Refused(format!(
+                "at most {} scoped shells are open at once: close one first",
+                shell_scopes::MAX_OPEN
+            )));
+        }
+        let scope = shell_scopes::open(
+            &tx,
+            &issuable,
+            ScopeId::new(),
+            &cut(purpose, 2000),
+            &cut(&summary, 1000),
+            now_utc(),
+        )
+        .await?;
+        drop(issuable);
+        tx.commit().await?;
+        self.notifier()
+            .shell_event(&request, ShellEvent::ScopeOpened { scope: &scope })
+            .await;
+        Ok(scope)
+    }
+
+    /// Close one of the caller's scoped shells. False if it was not open.
+    pub async fn close_scope(
+        &self,
+        agent: AgentId,
+        grant_id: GrantId,
+        scope_id: ScopeId,
+    ) -> Result<bool, ShellExecError> {
+        let tx = self.store.begin().await?;
+        let Some(scope) = shell_scopes::get_owned(&tx, agent, scope_id).await? else {
+            return Err(ShellExecError::NotFound);
+        };
+        if scope.grant_id != grant_id {
+            return Err(ShellExecError::NotFound);
+        }
+        let closed = shell_scopes::close(&tx, grant_id, scope_id, now_utc()).await?;
+        let request = match closed {
+            true => match grants::get_owned(&tx, agent, grant_id).await? {
+                Some(g) => agent_auth_store::requests::get(&tx, g.request_id)
+                    .await?
+                    .map(agent_auth_store::requests::AnyRequest::into_row),
+                None => None,
+            },
+            false => None,
+        };
+        tx.commit().await?;
+        if let Some(request) = request {
+            self.notifier()
+                .shell_event(&request, ShellEvent::ScopeClosed { scope: &scope })
+                .await;
+        }
+        Ok(closed)
+    }
+
     async fn reload(&self, job: JobId) -> Result<Option<JobRow>, StoreError> {
         let tx = self.store.begin().await?;
         let j = store::get(&tx, job).await?;
@@ -229,7 +548,7 @@ impl HostExec {
     /// Have the watcher look at a command that is now running: a task of
     /// its own, and only ever a message to the operator.
     pub(crate) fn watch(&self, job: JobId) {
-        if self.watcher.is_none() {
+        if self.watcher.is_none() || !self.policy.platforms().hostexec.watch {
             return;
         }
         let Some(me) = self.self_arc() else {
@@ -266,6 +585,21 @@ impl HostExec {
         let request = agent_auth_store::requests::get(&tx, job.request_id)
             .await?
             .map(agent_auth_store::requests::AnyRequest::into_row);
+        // A general shell's watcher holds it to no purpose.
+        let general = match job.grant_id {
+            Some(g) => agent_auth_store::grants::get(&tx, g)
+                .await?
+                .is_some_and(|g| {
+                    matches!(
+                        g.authority,
+                        Authority::Hostexec(HostexecAuthority::Shell {
+                            mode: ShellMode::General,
+                            ..
+                        })
+                    )
+                }),
+            None => false,
+        };
         let earlier: Vec<Vec<String>> = match job.shell_id {
             Some(shell) => store::earlier_in_shell(&tx, shell, job.id)
                 .await?
@@ -287,6 +621,7 @@ impl HostExec {
                 purpose: &request.justification,
                 earlier: &earlier,
                 argv: &argv,
+                general,
             })
             .await;
         if let Some((Level::Alarming, summary)) = verdict {

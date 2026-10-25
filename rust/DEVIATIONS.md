@@ -1159,6 +1159,36 @@ and why. Keep entries short. Group by area.
 
 ## Daemons, hostd and hostexec (`crates/daemon`, `crates/hostd`, broker `daemons`, `hostexec`, `desktop`, `attention`)
 
+- **Shell modes (new, 2026-10-25, Jacob's request)**: a shell's authority
+  carries a mode, `{"tier", "mode"?}` on the wire: `watched` (the default
+  and the Python's behavior), `general` (the watcher holds it to no purpose
+  and alerts on danger only: catch-all shells no longer alert for being
+  "off purpose"), `guarded` (a guard model clears each command against the
+  justification before it is shown or sent; it can only refuse, and a guard
+  that cannot be asked refuses: fail closed), `umbrella` (the justification
+  is a concept; the agent opens scoped shells, `POST
+  /v1/hostexec/shells/{grant}/scopes` / MCP `host_shell_scope(grant_id,
+  purpose)`, each purpose checked by a model against the concept, vague or
+  catch-all purposes refused; commands run only in an open scope,
+  `scope_id` on exec, guarded against its purpose with the concept as
+  context; at most 16 open at once; `host_shell_close(grant_id, scope_id)`
+  closes one). Why scopes are the broker's: hostd opens a shell only on a
+  TOTP code for that exact shell (INV-23), and minting host shells without
+  a human would end that; an umbrella is one TOTP-opened host shell, its
+  scopes end with it, and hostd cannot tell scopes apart (a broker that
+  ignored them could run anything in the umbrella, as in any shell). Shown
+  on the approval card ("Checks"); scopes opened, refused and closed, and
+  every guard refusal, posted in the shell's thread; each scoped command is
+  shown with its scope. Guarded commands are not watched again afterwards.
+  Rows: `shell_scopes` (only for an active umbrella grant; immutable but for
+  closing, once) and `shell_scope_jobs` (a command's scope, open when
+  linked, never changed), both trigger-guarded; a watched shell's stored
+  authority has no `mode` key (so rows from before stay canonical). The
+  decision (scope rule, then the guard's answer) is `core::shell_mode`,
+  model-checked (`proofs_shell`). The model client now exists whenever
+  `OPENROUTER_API_KEY` is set; `platforms.hostexec.watch` still alone turns
+  the after-the-fact watcher on. Tool count 35 → 36.
+
 - **TOTP lockout escalates and ends in a hard lock** (daemons-hostd §7, bug
   6). Five wrong codes in a row lock a secret for 5 min, then 10, 20, …
   (doubling up to ~21 h) until a code is accepted; 20 wrong codes within 30

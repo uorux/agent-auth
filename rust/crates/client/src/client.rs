@@ -855,6 +855,7 @@ impl BrokerClient {
     /// `POST /v1/hostexec/shells/{grant}/exec` (it must not be sent twice),
     /// waiting at most a slice there; the rest of `wait` is spent on the job
     /// it started.
+    #[allow(clippy::too_many_arguments)]
     pub async fn host_shell_exec(
         &self,
         grant: &str,
@@ -863,18 +864,25 @@ impl BrokerClient {
         stdin: Option<&str>,
         timeout: Option<i64>,
         wait: f64,
+        scope: Option<&str>,
     ) -> Result<agent_auth_wire::hostexec::JobOut, ClientError> {
         self.ready(Auth::Agent)?;
         let wait = crate::poll::clamp_total(wait);
         let first = wait.min(crate::poll::POLL_SLICE);
-        let body = checked::<agent_auth_wire::hostexec::ShellExecBody>(json!({
+        let mut body = json!({
             "argv": argv, "cwd": cwd, "stdin": stdin, "timeout": timeout, "wait": first,
-        }))?;
+        });
+        if let (Some(scope), Value::Object(m)) = (scope.filter(|s| !s.is_empty()), &mut body) {
+            m.insert("scope_id".into(), json!(scope));
+        }
+        let body = checked::<agent_auth_wire::hostexec::ShellExecBody>(body)?;
         let job: agent_auth_wire::hostexec::JobOut = self
             .call(
+                // A guarded shell's guard may take up to 20 s before the
+                // broker even shows the command: give up only well after.
                 Call::post(&["v1", "hostexec", "shells", grant, "exec"])
                     .body(body)
-                    .timeout_secs(first + 30.0),
+                    .timeout_secs(first + 60.0),
             )
             .await?;
         if wait > first && !job.status.has_ended() {
@@ -892,6 +900,38 @@ impl BrokerClient {
     ) -> Result<agent_auth_wire::hostexec::ShellClosed, ClientError> {
         self.call(Call::post(&["v1", "hostexec", "shells", grant, "close"]))
             .await
+    }
+
+    /// `POST /v1/hostexec/shells/{grant}/scopes`: open a scoped shell in an
+    /// umbrella shell. Its purpose is checked by a model first (which may
+    /// take a while).
+    pub async fn host_shell_scope(
+        &self,
+        grant: &str,
+        purpose: &str,
+    ) -> Result<agent_auth_wire::hostexec::ShellScopeOut, ClientError> {
+        self.ready(Auth::Agent)?;
+        let body = checked::<agent_auth_wire::hostexec::ShellScopeBody>(json!({
+            "purpose": purpose,
+        }))?;
+        self.call(
+            Call::post(&["v1", "hostexec", "shells", grant, "scopes"])
+                .body(body)
+                .timeout_secs(90.0),
+        )
+        .await
+    }
+
+    /// `POST /v1/hostexec/shells/{grant}/scopes/{scope}/close`.
+    pub async fn host_shell_close_scope(
+        &self,
+        grant: &str,
+        scope: &str,
+    ) -> Result<agent_auth_wire::hostexec::ScopeClosed, ClientError> {
+        self.call(Call::post(&[
+            "v1", "hostexec", "shells", grant, "scopes", scope, "close",
+        ]))
+        .await
     }
 
     // ----------------------------------------------------------------- admin

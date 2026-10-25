@@ -12,7 +12,33 @@ use agent_auth_store::grants::GrantRow;
 use agent_auth_store::hostexec::JobRow;
 use agent_auth_store::requests::RequestRow;
 use agent_auth_store::rules::RuleRow;
+use agent_auth_store::shell_scopes::ScopeRow;
 use serde_json::Value;
+
+/// What happened in a guarded or umbrella shell besides a command being
+/// sent (posted in the shell's thread).
+#[derive(Debug, Clone, Copy)]
+pub enum ShellEvent<'a> {
+    /// The guard refused a command (it did not run). `alarming` pings.
+    GuardRefused {
+        job: &'a JobRow,
+        scope: Option<&'a ScopeRow>,
+        why: &'a str,
+        alarming: bool,
+    },
+    /// The guard could not be asked, so a command did not run.
+    GuardUnavailable {
+        job: &'a JobRow,
+        scope: Option<&'a ScopeRow>,
+    },
+    /// A scoped shell was opened in an umbrella.
+    ScopeOpened { scope: &'a ScopeRow },
+    /// A scoped shell was refused (its purpose is outside the umbrella, or
+    /// the check could not be made).
+    ScopeRefused { purpose: &'a str, why: &'a str },
+    /// The agent closed a scoped shell.
+    ScopeClosed { scope: &'a ScopeRow },
+}
 
 pub trait Notify {
     /// A request awaits a human: post the approval card.
@@ -40,13 +66,21 @@ pub trait Notify {
     ) -> impl Future<Output = ()> + Send;
     /// A host command's result is in.
     fn job_finished(&self, request: &RequestRow, job: &JobRow) -> impl Future<Output = ()> + Send;
-    /// A shell command is about to go to its host. False: it could not be
-    /// shown to a human, and then it must not run.
+    /// A shell command is about to go to its host (`scope`: the scoped
+    /// shell it runs in). False: it could not be shown to a human, and
+    /// then it must not run.
     fn shell_command(
         &self,
         request: &RequestRow,
         job: &JobRow,
+        scope: Option<&ScopeRow>,
     ) -> impl Future<Output = bool> + Send;
+    /// Something else happened in a guarded or umbrella shell.
+    fn shell_event(
+        &self,
+        request: &RequestRow,
+        event: ShellEvent<'_>,
+    ) -> impl Future<Output = ()> + Send;
     /// The watcher found a running command alarming (advisory).
     fn watch_alert(
         &self,
@@ -116,9 +150,18 @@ impl Notify for Notifier {
     async fn job_finished(&self, request: &RequestRow, job: &JobRow) {
         dispatch!(self, n => n.job_finished(request, job).await, null => ())
     }
-    async fn shell_command(&self, request: &RequestRow, job: &JobRow) -> bool {
+    async fn shell_command(
+        &self,
+        request: &RequestRow,
+        job: &JobRow,
+        scope: Option<&ScopeRow>,
+    ) -> bool {
         // Headless: the host's journal is the record (as the Python).
-        dispatch!(self, n => n.shell_command(request, job).await, null => true)
+        dispatch!(self, n => n.shell_command(request, job, scope).await, null => true)
+    }
+    async fn shell_event(&self, request: &RequestRow, event: ShellEvent<'_>) {
+        dispatch!(self, n => n.shell_event(request, event).await,
+            null => tracing::info!(request = %request.id, ?event, "shell event (no notifier)"))
     }
     async fn watch_alert(&self, request: &RequestRow, job: &JobRow, text: &str) {
         dispatch!(self, n => n.watch_alert(request, job, text).await,
@@ -186,8 +229,16 @@ impl Notify for Recorder {
     async fn job_finished(&self, _request: &RequestRow, job: &JobRow) {
         self.record(format!("job_finished {}", job.id));
     }
-    async fn shell_command(&self, _request: &RequestRow, job: &JobRow) -> bool {
-        self.record(format!("shell_command {}", job.id));
+    async fn shell_command(
+        &self,
+        _request: &RequestRow,
+        job: &JobRow,
+        scope: Option<&ScopeRow>,
+    ) -> bool {
+        match scope {
+            Some(s) => self.record(format!("shell_command {} scope {}", job.id, s.id)),
+            None => self.record(format!("shell_command {}", job.id)),
+        }
         let delay = self
             .shell_delay_ms
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -198,6 +249,17 @@ impl Notify for Recorder {
     }
     async fn watch_alert(&self, _request: &RequestRow, job: &JobRow, _text: &str) {
         self.record(format!("watch_alert {}", job.id));
+    }
+    async fn shell_event(&self, request: &RequestRow, event: ShellEvent<'_>) {
+        self.record(match event {
+            ShellEvent::GuardRefused { job, alarming, .. } => {
+                format!("guard_refused {} alarming={alarming}", job.id)
+            }
+            ShellEvent::GuardUnavailable { job, .. } => format!("guard_unavailable {}", job.id),
+            ShellEvent::ScopeOpened { scope } => format!("scope_opened {}", scope.id),
+            ShellEvent::ScopeRefused { .. } => format!("scope_refused {}", request.id),
+            ShellEvent::ScopeClosed { scope } => format!("scope_closed {}", scope.id),
+        });
     }
     async fn attention(&self, agent: &AgentRow, _text: &str, urgency: &str, _desks: &[String]) {
         self.record(format!("attention {} {urgency}", agent.name));

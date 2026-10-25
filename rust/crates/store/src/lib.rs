@@ -59,6 +59,9 @@
 //!    all: a credential fetch takes it after everything `grants::issuable`
 //!    locked (a delegation's thread included), and its holder locks nothing
 //!    more, so waiting on it closes no cycle;
+//!    A **shell scope** (`shell_scopes`) after its grant: a command
+//!    share-locks the grant (`issuable`), then its scope; closing a scope
+//!    locks only scope rows;
 //! 5. **a2a threads** (a thread is locked after the grants it depends on;
 //!    look the backing grant id up without a lock, lock the grant, then the
 //!    thread);
@@ -100,6 +103,7 @@ pub mod requests;
 pub mod rules;
 pub mod sandboxes;
 pub mod sessions;
+pub mod shell_scopes;
 mod tx;
 mod values;
 

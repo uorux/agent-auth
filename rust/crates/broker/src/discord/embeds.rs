@@ -474,6 +474,12 @@ pub fn hostexec_embed(
             format_duration(u64::from(request.requested_duration_secs)),
             true,
         );
+        // How a model checks its commands (the agent chose; approving
+        // approves that mode).
+        let mode = scope_str(&scope, "mode")
+            .and_then(agent_auth_core::ShellMode::parse)
+            .unwrap_or_default();
+        add_field(&mut e, "Checks", mode.describe().to_owned(), false);
     } else if let Some(t) = scope
         .get("timeout")
         .and_then(Value::as_u64)

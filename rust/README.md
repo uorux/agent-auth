@@ -240,6 +240,28 @@ with hostctl), `user-shell` (if enrolled, user shells take it instead of
 the direct code). Five wrong codes lock a secret for escalating periods; 20
 in 30 days lock it until `sudo agent-auth-hostctl totp-unlock NAME`.
 
+### Shell modes
+
+A shell request's scope may name a `mode` (the agent picks it; the approval
+card shows it under "Checks", and approving approves that mode; every mode
+still needs your TOTP code to open the shell on the host, and every command
+is still shown in the shell's thread before it runs):
+
+| mode | before a command runs | after it starts |
+|---|---|---|
+| `watched` (default) | shown to you | the watcher alerts on danger or off-purpose work (with `platforms.hostexec.watch`) |
+| `general` | shown to you | the watcher alerts on danger only: for catch-all shells |
+| `guarded` | a guard model checks it against the justification and refuses what doesn't serve it | — |
+| `umbrella` | the agent opens scoped shells (`host_shell_scope`), each purpose checked against the justification (the umbrella's concept); commands run only in a scope, guarded against its purpose | — |
+
+The guard and the scope check use `platforms.hostexec.risk_model` (default
+`llm.model`) through OpenRouter: without `OPENROUTER_API_KEY` a guarded or
+umbrella shell is refused at request time, and when the model can't be
+reached a command (or scope) is refused, never let through. Refusals are
+posted in the shell's thread (an alarming one pings you). hostd knows
+nothing of modes: an umbrella is one host shell, and its scopes live in the
+broker.
+
 ### sandboxd (`agent-auth-sandboxd`)
 
 One JSON file from the NixOS module (`/etc/agent-auth/sandboxd.json`,

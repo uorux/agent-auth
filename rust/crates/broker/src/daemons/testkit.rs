@@ -28,6 +28,7 @@ use agent_auth_hostd::daemon::Hostd;
 use agent_auth_hostd::executor::direct::DirectExecutor;
 use agent_auth_store::Store;
 use agent_auth_store::agents::{self, AgentRow, NewAgent};
+use axum::response::IntoResponse as _;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
@@ -78,6 +79,27 @@ impl Broker {
         heartbeat_secs: u32,
         trust_x_real_ip: bool,
     ) -> Broker {
+        Broker::start_inner(pool, policy, heartbeat_secs, trust_x_real_ip, None).await
+    }
+
+    /// With the shell models (watcher, guard, scope check) asking `model`.
+    pub async fn start_with_model(pool: sqlx::PgPool, policy: &str, model: &FakeModel) -> Broker {
+        let watcher = crate::hostexec::watcher::Watcher::new(
+            Secret::new("test-key".to_owned()),
+            &model.url,
+            "test-model",
+        )
+        .unwrap();
+        Broker::start_inner(pool, policy, 30, false, Some(watcher)).await
+    }
+
+    async fn start_inner(
+        pool: sqlx::PgPool,
+        policy: &str,
+        heartbeat_secs: u32,
+        trust_x_real_ip: bool,
+        watcher: Option<crate::hostexec::watcher::Watcher>,
+    ) -> Broker {
         let store = Store::from_pool(pool);
         let policy = Policy::from_yaml(policy).unwrap();
         let key = SigningKey::generate().unwrap();
@@ -98,7 +120,7 @@ impl Broker {
                 ..DaemonsConfig::default()
             },
             Arc::clone(&st.policy),
-            None,
+            watcher,
         )
         .unwrap();
         let mut registry = Registry::default();
@@ -346,6 +368,75 @@ impl Host {
             .code_at(now / 30 + offset)
             .expose()
             .clone()
+    }
+}
+
+/// A stand-in for the model gateway's `/chat/completions`: answers with
+/// the JSON object `answer(system, user)` gives (`None`: a 500), and
+/// records every `(system, user)` it was sent.
+pub struct FakeModel {
+    pub url: String,
+    pub calls: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+type Answer = dyn Fn(&str, &str) -> Option<Value> + Send + Sync;
+
+impl FakeModel {
+    pub async fn start(
+        answer: impl Fn(&str, &str) -> Option<Value> + Send + Sync + 'static,
+    ) -> FakeModel {
+        let calls: Arc<std::sync::Mutex<Vec<(String, String)>>> = Arc::default();
+        let answer: Arc<Answer> = Arc::new(answer);
+        let recorded = Arc::clone(&calls);
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let answer = Arc::clone(&answer);
+                let recorded = Arc::clone(&recorded);
+                async move {
+                    let msg = |i: usize| {
+                        body["messages"][i]["content"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_owned()
+                    };
+                    let (system, user) = (msg(0), msg(1));
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push((system.clone(), user.clone()));
+                    match answer(&system, &user) {
+                        Some(a) => axum::Json(json!({
+                            "choices": [{"message": {"content": a.to_string()}}]
+                        }))
+                        .into_response(),
+                        None => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        FakeModel {
+            url: format!("http://{addr}"),
+            calls,
+            _task: task,
+        }
+    }
+
+    /// The user messages of the calls made with system prompt `prompt`.
+    pub fn calls_to(&self, prompt: &str) -> Vec<String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(s, _)| s == prompt)
+            .map(|(_, u)| u.clone())
+            .collect()
     }
 }
 

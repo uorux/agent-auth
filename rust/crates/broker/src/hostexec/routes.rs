@@ -5,11 +5,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use agent_auth_core::authority::HostexecAuthority;
-use agent_auth_core::{Authority, GrantId, JobId, Platform, Tier};
+use agent_auth_core::{Authority, GrantId, JobId, Platform, ScopeId, Tier};
 use agent_auth_wire::admin::{
     ArmBody, HostsOut, LockdownBody, LockdownFlag, LockdownResult, UnlockBody, UnlockResult,
 };
-use agent_auth_wire::hostexec::{JobOut, ShellClosed, ShellExecBody};
+use agent_auth_wire::hostexec::{
+    JobOut, ScopeClosed, ShellClosed, ShellExecBody, ShellScopeBody, ShellScopeOut,
+};
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
@@ -29,6 +31,11 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/hostexec/jobs/{job_id}", get(get_job))
         .route("/v1/hostexec/shells/{grant_id}/exec", post(shell_exec))
         .route("/v1/hostexec/shells/{grant_id}/close", post(shell_close))
+        .route("/v1/hostexec/shells/{grant_id}/scopes", post(scope_open))
+        .route(
+            "/v1/hostexec/shells/{grant_id}/scopes/{scope_id}/close",
+            post(scope_close),
+        )
         .route("/admin/hosts", get(hosts))
         .route("/admin/hosts/{name}/arm", post(arm))
         .route("/admin/hosts/{name}/disarm", post(disarm))
@@ -109,18 +116,67 @@ async fn shell_exec(
     let job = hostexec
         .shell_exec(caller.id(), grant, &body)
         .await
-        .map_err(|e| match e {
-            ShellExecError::NotFound => ApiError::not_found("unknown shell"),
-            ShellExecError::Spec(m) => ApiError::bad_request(m),
-            ShellExecError::Refused(m) => ApiError::conflict(m),
-            ShellExecError::Internal(m) => ApiError::internal(&m),
-        })?;
+        .map_err(shell_error)?;
     let wait = clamp_wait(body.wait, 0.0, 300.0);
     let job = hostexec
         .get_job(caller.id(), job.id, wait, &st.shutdown)
         .await?
         .unwrap_or(job);
     Ok(Json(job_out(&job, true)))
+}
+
+fn shell_error(e: ShellExecError) -> ApiError {
+    match e {
+        ShellExecError::NotFound => ApiError::not_found("unknown shell"),
+        ShellExecError::Spec(m) => ApiError::bad_request(m),
+        ShellExecError::Refused(m) => ApiError::conflict(m),
+        ShellExecError::Internal(m) => ApiError::internal(&m),
+    }
+}
+
+/// Open a scoped shell in an umbrella shell (409 with the reason when the
+/// purpose is outside it, or it could not be checked).
+async fn scope_open(
+    caller: AgentCaller,
+    State(st): State<AppState>,
+    Path(grant_id): Path<String>,
+    bytes: Bytes,
+) -> ApiResult<Json<ShellScopeOut>> {
+    let hostexec = agent_side(&st)?;
+    let body: ShellScopeBody = body(&bytes)?;
+    let grant: GrantId = grant_id
+        .parse()
+        .map_err(|_| ApiError::not_found("unknown shell"))?;
+    let scope = hostexec
+        .open_scope(caller.id(), grant, body.purpose.as_str())
+        .await
+        .map_err(shell_error)?;
+    Ok(Json(ShellScopeOut {
+        scope_id: scope.id.to_string(),
+        grant_id: scope.grant_id.to_string(),
+        purpose: scope.purpose,
+        verdict: scope.verdict,
+        opened_at: scope.opened_at,
+    }))
+}
+
+async fn scope_close(
+    caller: AgentCaller,
+    State(st): State<AppState>,
+    Path((grant_id, scope_id)): Path<(String, String)>,
+) -> ApiResult<Json<ScopeClosed>> {
+    let hostexec = agent_side(&st)?;
+    let unknown = || ApiError::not_found("unknown scoped shell");
+    let grant: GrantId = grant_id.parse().map_err(|_| unknown())?;
+    let scope: ScopeId = scope_id.parse().map_err(|_| unknown())?;
+    let closed = hostexec
+        .close_scope(caller.id(), grant, scope)
+        .await
+        .map_err(|e| match e {
+            ShellExecError::NotFound => unknown(),
+            other => shell_error(other),
+        })?;
+    Ok(Json(ScopeClosed { closed }))
 }
 
 async fn shell_close(

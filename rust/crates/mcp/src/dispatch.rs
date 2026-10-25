@@ -435,6 +435,7 @@ async fn run<C: Caller>(caller: &C, name: &str, a: &Args) -> Result<String, Stri
                         a.opt_str("stdin"),
                         a.opt_int("timeout_secs"),
                         a.num("wait_secs"),
+                        a.opt_str("scope_id"),
                     )
                     .await?)
             })
@@ -442,7 +443,25 @@ async fn run<C: Caller>(caller: &C, name: &str, a: &Args) -> Result<String, Stri
         }
         "host_shell_close" => {
             safe(caller, || async {
-                Ok(plain().host_shell_close(a.str("grant_id")).await?)
+                // Either way the answer is {"closed": bool}.
+                let closed = match a.opt_str("scope_id").filter(|s| !s.is_empty()) {
+                    Some(scope) => {
+                        plain()
+                            .host_shell_close_scope(a.str("grant_id"), scope)
+                            .await?
+                            .closed
+                    }
+                    None => plain().host_shell_close(a.str("grant_id")).await?.closed,
+                };
+                Ok(json!({"closed": closed}))
+            })
+            .await
+        }
+        "host_shell_scope" => {
+            safe(caller, || async {
+                Ok(plain()
+                    .host_shell_scope(a.str("grant_id"), a.str("purpose"))
+                    .await?)
             })
             .await
         }

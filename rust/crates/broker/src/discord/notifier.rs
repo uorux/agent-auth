@@ -27,7 +27,8 @@ use super::model::{File, Message, MessageReference, add_field, embed, mentions, 
 use super::rest::RestError;
 use super::text::{code, code_block, cut, display_lines, escape, said};
 use super::views::{disabled_view, hostexec_pending_view, pending_view, shell_view};
-use crate::notify::Notify;
+use crate::notify::{Notify, ShellEvent};
+use agent_auth_store::shell_scopes::ScopeRow;
 
 #[derive(Debug, thiserror::Error)]
 enum Failure {
@@ -61,6 +62,15 @@ fn is_shell(request: &RequestRow) -> bool {
 
 fn short(id: impl ToString) -> String {
     cut(&id.to_string(), 8)
+}
+
+/// A scoped shell as its thread shows it: short id and purpose.
+fn scope_label(scope: &ScopeRow) -> String {
+    format!(
+        "scope {}: {}",
+        code(&short(scope.id)),
+        escape(&cut(&scope.purpose, 300))
+    )
 }
 
 fn job_argv(job: &JobRow) -> Vec<String> {
@@ -376,13 +386,20 @@ impl DiscordNotifier {
         Ok(())
     }
 
-    async fn try_shell_command(&self, request: &RequestRow, job: &JobRow) -> Result<bool, Failure> {
+    async fn try_shell_command(
+        &self,
+        request: &RequestRow,
+        job: &JobRow,
+        scope: Option<&ScopeRow>,
+    ) -> Result<bool, Failure> {
         let Some(thread) = self.shell_thread(request, true).await? else {
             return Ok(false);
         };
         let full = shell_command_text(job);
-        let msg = if full.chars().count() <= 1900 {
-            Message::text(code_block(&full, 1900))
+        // In a scoped shell: which one, and what it is for.
+        let label = scope.map_or(String::new(), |s| format!("{}\n", scope_label(s)));
+        let msg = if full.chars().count() <= 1700 {
+            Message::text(format!("{label}{}", code_block(&full, 1700)))
         } else {
             Message {
                 files: vec![File {
@@ -390,13 +407,79 @@ impl DiscordNotifier {
                     bytes: full.as_bytes().to_vec(),
                 }],
                 ..Message::text(format!(
-                    "{}\n(the whole command is attached)",
-                    code_block(&full, 1500)
+                    "{label}{}\n(the whole command is attached)",
+                    code_block(&full, 1300)
                 ))
             }
         };
         self.send(thread, &msg).await?;
         Ok(true)
+    }
+
+    async fn try_shell_event(
+        &self,
+        request: &RequestRow,
+        event: ShellEvent<'_>,
+    ) -> Result<(), Failure> {
+        let Some(thread) = self.shell_thread(request, false).await? else {
+            return Ok(());
+        };
+        let command = |job: &JobRow| code_block(&shlex_join(&job_argv(job)), embeds::MAX_CODE);
+        let in_scope = |scope: Option<&ScopeRow>| {
+            scope.map_or(String::new(), |s| format!(" in {}", scope_label(s)))
+        };
+        let (ping, content) = match event {
+            ShellEvent::GuardRefused {
+                job,
+                scope,
+                why,
+                alarming,
+            } => (
+                alarming,
+                format!(
+                    "{} **Guard refused**{}: {}\n> {}\nIt did not run.",
+                    if alarming { "🚨" } else { "🛡️" },
+                    in_scope(scope),
+                    command(job),
+                    escape(why)
+                ),
+            ),
+            ShellEvent::GuardUnavailable { job, scope } => (
+                false,
+                format!(
+                    "🛡️ **Guard unavailable**{}: {}\nIt did not run (guarded shells fail closed).",
+                    in_scope(scope),
+                    command(job)
+                ),
+            ),
+            ShellEvent::ScopeOpened { scope } => (
+                false,
+                format!(
+                    "🔹 **Scoped shell opened**: {}\n> {}",
+                    scope_label(scope),
+                    escape(&scope.verdict)
+                ),
+            ),
+            ShellEvent::ScopeRefused { purpose, why } => (
+                false,
+                format!(
+                    "🛡️ **Scoped shell refused**: {}\n> {}",
+                    escape(&cut(purpose, 400)),
+                    escape(why)
+                ),
+            ),
+            ShellEvent::ScopeClosed { scope } => (
+                false,
+                format!("▫️ Scoped shell closed: {}", scope_label(scope)),
+            ),
+        };
+        let (mention, base) = self.owner_ping(ping);
+        let msg = Message {
+            content: Some(cut(&format!("{mention}{content}"), 2000)),
+            ..base
+        };
+        self.send(thread, &msg).await?;
+        Ok(())
     }
 
     async fn try_watch_alert(
@@ -588,14 +671,26 @@ impl Notify for DiscordNotifier {
         );
     }
 
-    async fn shell_command(&self, request: &RequestRow, job: &JobRow) -> bool {
-        match self.try_shell_command(request, job).await {
+    async fn shell_command(
+        &self,
+        request: &RequestRow,
+        job: &JobRow,
+        scope: Option<&ScopeRow>,
+    ) -> bool {
+        match self.try_shell_command(request, job, scope).await {
             Ok(shown) => shown,
             Err(e) => {
                 tracing::warn!("discord: failed to mirror shell command {}: {e}", job.id);
                 false
             }
         }
+    }
+
+    async fn shell_event(&self, request: &RequestRow, event: ShellEvent<'_>) {
+        swallow!(
+            "post a shell event",
+            self.try_shell_event(request, event).await
+        );
     }
 
     async fn watch_alert(&self, request: &RequestRow, job: &JobRow, text: &str) {
