@@ -1455,10 +1455,20 @@ async fn a_delegated_request_on_an_operator_thread_is_provisioned(pool: sqlx::Pg
     let r = create(&st, &caller(&responder), delegated("svc-gitea", thread.id))
         .await
         .unwrap();
-    assert_eq!(r.status, RequestStatus::AwaitingHuman, "{:?}", r.decision_reason);
+    assert_eq!(
+        r.status,
+        RequestStatus::AwaitingHuman,
+        "{:?}",
+        r.decision_reason
+    );
     assert!(r.risk_notes[0].starts_with("on behalf of operator (a2a thread topic \"t\")"));
     let done = decide(&st, r.id, &jrt(), approve(None)).await.unwrap();
-    assert_eq!(done.status, RequestStatus::Granted, "{:?}", done.decision_reason);
+    assert_eq!(
+        done.status,
+        RequestStatus::Granted,
+        "{:?}",
+        done.decision_reason
+    );
     let g = grant_of(&st, r.id).await.unwrap();
     // No backing grant: the grant's own hour is its only cap.
     let hour = g.expires_at - g.granted_at;
@@ -1470,9 +1480,16 @@ async fn a_delegated_request_on_an_operator_thread_is_provisioned(pool: sqlx::Pg
             .unwrap()
             .is_ok()
     );
-    a2a::close(&tx, thread.id, a2a::CloseReason::Closed, Some(operator.id), None, now)
-        .await
-        .unwrap();
+    a2a::close(
+        &tx,
+        thread.id,
+        a2a::CloseReason::Closed,
+        Some(operator.id),
+        None,
+        now,
+    )
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
     let tx = st.store.begin().await.unwrap();
     assert!(
@@ -1483,7 +1500,10 @@ async fn a_delegated_request_on_an_operator_thread_is_provisioned(pool: sqlx::Pg
     );
     drop(tx);
     assert_eq!(revoke_delegated_for_closed_threads(&st).await, 1);
-    assert_eq!(grant_of(&st, r.id).await.unwrap().status, GrantStatus::Revoked);
+    assert_eq!(
+        grant_of(&st, r.id).await.unwrap().status,
+        GrantStatus::Revoked
+    );
 }
 
 // ----------------------------------------------------------- containment

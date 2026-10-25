@@ -746,3 +746,32 @@ async fn globs_with_capitals_still_match(pool: PgPool) {
     );
     assert!(v("jrt/cactus").await.is_ok());
 }
+
+/// The wiki's repo is never brokered, whether or not the operator listed
+/// it (upstream review 2026-10): the policy puts it on the denylist the
+/// provisioner reads.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn the_wiki_repo_is_never_brokered(pool: PgPool) {
+    let policy = agent_auth_core::Policy::from_value(json!({
+        "wiki": {"repo": "jrt/Agent-Wiki"},
+        "platforms": {"github": {
+            "repo_allowlist": ["jrt/*"],
+            "permission_ceiling": {"contents": "write"},
+        }},
+    }))
+    .unwrap();
+    let t = setup_with(pool, policy.platforms().github.clone(), None).await;
+    let a = agent(&t.store, "gh-agent").await;
+    let err = validate(
+        &t.store,
+        &t.p,
+        &a,
+        Platform::Github,
+        "repo",
+        json!({"permissions": {"contents": "write"}}),
+        "JRT/agent-wiki",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, "repo 'jrt/agent-wiki' is never brokered (denylist)");
+}

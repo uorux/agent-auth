@@ -6,7 +6,8 @@
 //!   and constant-time verification.
 //! - [`secretbox`]: encryption at rest (ChaCha20-Poly1305, bound to the row
 //!   and column a ciphertext belongs to).
-//! - [`webhook`]: the `X-Agent-Auth-Signature` HMAC on outbound webhooks.
+//! - [`webhook`]: the `X-Agent-Auth-Signature` HMAC on outbound webhooks
+//!   (timestamped for the broker's pings).
 //! - [`jwt`]: the broker's own ES256 tokens (derived from its Ed25519 key)
 //!   and GitHub App RS256 JWTs.
 //! - [`oidc`]: verifying an OpenID provider's ID token against its JWKS

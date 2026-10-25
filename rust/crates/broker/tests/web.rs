@@ -1244,6 +1244,10 @@ async fn registration(pool: sqlx::PgPool) {
         "https://Claude.AI/api/mcp/auth_callback",
         "https://claude.ai/cb",
         "not a url",
+        // Userinfo, backslashes, whitespace (upstream review 2026-10).
+        "https://evil.example\\@claude.ai/api/mcp/auth_callback",
+        "https://u@claude.ai/api/mcp/auth_callback",
+        "https://claude.ai/api/mcp/auth_callback ",
     ] {
         let r = register(&s, json!({"redirect_uris": [uri]})).await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}");

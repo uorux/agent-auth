@@ -215,7 +215,8 @@ pub struct A2aCheckOut {
 }
 
 /// A webhook ping (a2a spec §4.3): notify-only, never the payload. Signed
-/// with `X-Agent-Auth-Signature: sha256=<hex HMAC of the body>`.
+/// with `X-Agent-Auth-Timestamp: <unix seconds>` and `X-Agent-Auth-Signature:
+/// sha256=<hex HMAC of "<timestamp>." + body>` (`crypto::webhook`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WebhookPing {

@@ -495,6 +495,21 @@ and why. Keep entries short. Group by area.
   an https URL with a host (plain http only to the hosts in
   A2A_WEBHOOK_HTTP_HOSTS)`); delivery re-checks. No redirects, no proxy,
   5 s timeout, one shared client.
+- **Webhook pings are signed with a timestamp** (upstream review 2026-10,
+  flagged there). `X-Agent-Auth-Timestamp: <unix seconds>`, and the
+  signature (same header and `sha256=<hex>` form) is the HMAC of
+  `"<timestamp>." + body`, so a receiver can refuse replays
+  (`crypto::webhook::verify_timestamped`, 5 minutes by default). The Python
+  signed the body alone; receivers must change their check (README
+  "Verifying webhook pings"). `a2a serve`'s POSTs to a local runtime keep
+  the body-only GitHub-style form those runtimes verify.
+- **No broker-wide webhook key** (flagged upstream). `WEBHOOK_SIGNING_SECRET`
+  is ignored (a warning at startup): every receiver holding a shared key
+  could forge pings to every other. An agent is pinged only with its own
+  `webhook_secret`, which the admin routes always set with the webhook
+  (create, set-webhook; rotate-webhook-secret replaces it), so only rows
+  made outside those routes lack one; they get no pings (as before when
+  neither key existed), never unsigned ones.
 - **Long-poll rounds touch liveness throttled** (a2a B10), at 20 s like the
   extractor. Waiters with a session wake on their session key or their
   agent key; senders wake the peer's session (if bound) and agent.

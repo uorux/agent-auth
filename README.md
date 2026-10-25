@@ -189,11 +189,12 @@ open (carries first message) ─▶ pending_open ─▶ accept / first reply ─
   reverse grant needed.
 - **Webhook pings** (service agents only): notify-only —
   `{type: a2a_thread_open|a2a_message|a2a_thread_closed, thread_id, seq, from,
-  topic}` with **no payload**; fetch via the cursor read. Signed
-  `X-Agent-Auth-Signature: sha256=<hmac>` with the agent's `webhook_secret`
-  (shown ONCE at admin create / `rotate-webhook-secret` — record it then; it
-  is not readable afterwards, by design), falling back to the global
-  `WEBHOOK_SIGNING_SECRET`. Delivery is best-effort; the poll is authoritative.
+  topic}` with **no payload**; fetch via the cursor read. Signed with the
+  agent's own `webhook_secret` (shown ONCE at admin create / `set-webhook` /
+  `rotate-webhook-secret` — record it then; it is not readable afterwards, by
+  design) and the time of sending; see "Verifying webhook pings" below. An
+  agent without a secret of its own gets no pings (there is no broker-wide
+  fallback key). Delivery is best-effort; the poll is authoritative.
 
 Retrofit: `agent-auth admin agents` lists `kind` and `last_seen_at`; anything
 `service` that has never been seen (or is never seen polling) is the shape to
@@ -1062,7 +1063,6 @@ LLDAP_URL=http://lldap:17170
 LLDAP_ADMIN_USER=agent-auth-svc
 LLDAP_ADMIN_PASSWORD=...
 #LLDAP_SET_PASSWORD_BIN=lldap_set_password   # for managed accounts; needs ENCRYPTION_KEY
-WEBHOOK_SIGNING_SECRET=...    # optional; fallback HMAC key for a2a webhook pings
 # a2a thread lifecycle knobs (defaults shown)
 #A2A_OPEN_TIMEOUT_SECS=600
 #A2A_THREAD_IDLE_TIMEOUT_SECS=3600
@@ -1073,10 +1073,34 @@ WEBHOOK_SIGNING_SECRET=...    # optional; fallback HMAC key for a2a webhook ping
 `webhook_url` on a registered agent must be an `http(s)` URL (admin-set; the
 broker POSTs to it verbatim, so keep it that way — self-service URLs would be
 an SSRF vector). Webhook POSTs are notify-only pings (no message payload — pull
-via the cursor read) signed with the agent's own `webhook_secret` when set,
-else `WEBHOOK_SIGNING_SECRET`: `X-Agent-Auth-Signature: sha256=<hmac>` over the
-raw body. If neither secret exists the ping is skipped entirely — unsigned
-pings are never sent, and polling remains authoritative.
+via the cursor read) signed with the agent's own `webhook_secret`. An agent
+without one gets no pings — unsigned pings are never sent, and polling remains
+authoritative. (`WEBHOOK_SIGNING_SECRET`, the old broker-wide fallback key, is
+ignored with a warning: every receiver holding it could forge pings to the
+others. `rotate-webhook-secret` gives an agent its own.)
+
+**Verifying webhook pings.** Each ping carries two headers:
+
+- `X-Agent-Auth-Timestamp: <unix seconds when it was sent>`
+- `X-Agent-Auth-Signature: sha256=<lowercase hex HMAC-SHA256>`, keyed with
+  the agent's `webhook_secret` (its UTF-8 bytes), over the timestamp, a
+  `.`, and the raw request body: `"<timestamp>." + body`.
+
+A receiver recomputes the HMAC over exactly those bytes (the body as
+received, before any JSON parsing), compares it in constant time, and
+refuses a timestamp more than about 5 minutes from its own clock, so a
+captured ping cannot be replayed later:
+
+```python
+t = request.headers["X-Agent-Auth-Timestamp"]
+want = "sha256=" + hmac.new(secret.encode(), t.encode() + b"." + raw_body, "sha256").hexdigest()
+ok = t.isdigit() and abs(time.time() - int(t)) <= 300 and hmac.compare_digest(
+    want, request.headers.get("X-Agent-Auth-Signature", ""))
+```
+
+Pings are a doorbell either way: act on what the cursor read returns, never
+on a ping's contents. (`agent-auth a2a serve` signs its own POSTs to a local
+runtime over the body alone, the GitHub-style form such runtimes check.)
 
 The unit runs as a `DynamicUser` with systemd hardening, stores SQLite state in
 `/var/lib/agent-auth/`, and self-migrates on start. Secret files may stay

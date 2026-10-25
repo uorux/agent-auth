@@ -1,6 +1,5 @@
 //! a2a settings (a2a spec §1.4), read from the environment.
 
-use agent_auth_crypto::Secret;
 use time::Duration;
 
 /// Environment settings and their defaults.
@@ -9,9 +8,6 @@ pub struct A2aConfig {
     /// `A2A_RELAY_ENABLED` (default true): false → every `/v1/a2a/*` and
     /// `/admin/chat/*` route answers 404 `a2a is disabled on this broker`.
     pub enabled: bool,
-    /// `WEBHOOK_SIGNING_SECRET`: the HMAC key for pings to agents without
-    /// their own secret. Unset or empty: such pings are not sent.
-    pub webhook_signing_secret: Option<Secret<String>>,
     /// `A2A_WEBHOOK_HTTP_HOSTS`: comma-separated host names (or IPs) to which
     /// a webhook may use plain `http`. Every other webhook must be `https`.
     pub webhook_http_hosts: Vec<String>,
@@ -39,7 +35,6 @@ impl Default for A2aConfig {
     fn default() -> Self {
         A2aConfig {
             enabled: true,
-            webhook_signing_secret: None,
             webhook_http_hosts: Vec::new(),
             open_timeout: Duration::seconds(600),
             thread_idle_timeout: Duration::seconds(3600),
@@ -87,9 +82,14 @@ impl A2aConfig {
         if let Some(v) = get("A2A_RELAY_ENABLED") {
             c.enabled = boolean("A2A_RELAY_ENABLED", &v)?;
         }
-        c.webhook_signing_secret = get("WEBHOOK_SIGNING_SECRET")
-            .filter(|s| !s.is_empty())
-            .map(Secret::new);
+        // No broker-wide fallback key any more: every webhook has its own
+        // secret, and a shared one let any receiver forge pings to others.
+        if get("WEBHOOK_SIGNING_SECRET").is_some_and(|s| !s.is_empty()) {
+            tracing::warn!(
+                "WEBHOOK_SIGNING_SECRET is ignored: pings are signed with each agent's own \
+                 webhook secret (rotate-webhook-secret gives one to an agent without)"
+            );
+        }
         c.webhook_http_hosts = get("A2A_WEBHOOK_HTTP_HOSTS")
             .map(|v| {
                 v.split(',')
@@ -148,7 +148,6 @@ mod tests {
         assert!(!c.enabled);
         assert_eq!(c.webhook_http_hosts, ["hooks.internal", "127.0.0.1"]);
         assert_eq!(c.session_idle_timeout, Duration::seconds(60));
-        assert!(c.webhook_signing_secret.is_none());
         assert_eq!(c.max_messages_per_thread, 1000);
         let c =
             A2aConfig::from_lookup(|k| (k == "A2A_MAX_LONG_POLLS_PER_AGENT").then(|| "2".into()))

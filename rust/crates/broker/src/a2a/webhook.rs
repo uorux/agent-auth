@@ -8,8 +8,11 @@
 //! is not a full SSRF filter: private addresses are allowed over https.
 //! Requests never follow redirects, never use a proxy from the environment,
 //! time out after 5 s, and carry nothing but the ping (thread id, names,
-//! topic, sequence numbers), signed with the target's own secret or the
-//! broker-wide `WEBHOOK_SIGNING_SECRET`; without either, nothing is sent.
+//! topic, sequence numbers), signed with the target's own secret and the
+//! time of sending (`X-Agent-Auth-Timestamp`; the HMAC covers
+//! `"<timestamp>." + body`, so a receiver can refuse replays). An agent
+//! without a secret of its own gets no pings: there is no broker-wide
+//! fallback key (any receiver holding it could forge pings to the others).
 //!
 //! Delivery (a2a B9): pings go out from a background task, one batch per
 //! operation, so a blackholed webhook never delays or fails an API call;
@@ -20,7 +23,7 @@ use std::time::Duration;
 
 use agent_auth_core::containment::AgentKind;
 use agent_auth_crypto::Secret;
-use agent_auth_crypto::webhook::{SIGNATURE_HEADER, sign_body};
+use agent_auth_crypto::webhook::{SIGNATURE_HEADER, TIMESTAMP_HEADER, sign_timestamped};
 use agent_auth_store::agents::AgentRow;
 use agent_auth_wire::a2a::WebhookPing;
 use url::Url;
@@ -75,9 +78,9 @@ impl std::fmt::Debug for Ping {
 }
 
 /// The ping for `agent`, if it receives pings: a service agent with a
-/// webhook and a signing secret (its own, else the broker's). Never
-/// unsigned (a2a INV-12).
-pub(crate) fn target(config: &A2aConfig, agent: &AgentRow, event: WebhookPing) -> Option<Ping> {
+/// webhook and its own signing secret (set with the webhook, by the admin
+/// routes). Never unsigned (a2a INV-12).
+pub(crate) fn target(_config: &A2aConfig, agent: &AgentRow, event: WebhookPing) -> Option<Ping> {
     if agent.kind != AgentKind::Service {
         return None;
     }
@@ -86,13 +89,7 @@ pub(crate) fn target(config: &A2aConfig, agent: &AgentRow, event: WebhookPing) -
         .webhook_secret
         .as_ref()
         .filter(|s| !s.is_empty())
-        .map(|s| Secret::new(s.clone()))
-        .or_else(|| {
-            config
-                .webhook_signing_secret
-                .as_ref()
-                .map(|s| Secret::new(s.expose().clone()))
-        });
+        .map(|s| Secret::new(s.clone()));
     let Some(secret) = secret else {
         tracing::warn!(agent = %agent.name, "no webhook signing secret; skipping ping");
         return None;
@@ -167,10 +164,12 @@ async fn send(client: &reqwest::Client, ping: Ping, url: Url) {
             return;
         }
     };
-    let signature = sign_body(ping.secret.expose().as_bytes(), &body);
+    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
+    let signature = sign_timestamped(ping.secret.expose().as_bytes(), timestamp, &body);
     let sent = client
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(TIMESTAMP_HEADER, timestamp.to_string())
         .header(SIGNATURE_HEADER, signature)
         .body(body)
         .send()

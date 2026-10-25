@@ -1715,15 +1715,28 @@ async fn webhook_ping_shape_and_signature(pool: PgPool) {
     );
     assert_eq!(headers["content-type"], "application/json");
     let sig = headers["x-agent-auth-signature"].to_str().unwrap();
-    assert!(agent_auth_crypto::webhook::verify_body(
+    let ts = headers["x-agent-auth-timestamp"].to_str().unwrap();
+    let sent_at: i64 = ts.parse().unwrap();
+    assert!((now().unix_timestamp() - sent_at).abs() < 60);
+    assert!(agent_auth_crypto::webhook::verify_timestamped(
+        secret.as_bytes(),
+        ts,
+        body,
+        sig,
+        now().unix_timestamp(),
+        agent_auth_crypto::webhook::DEFAULT_TOLERANCE_SECS,
+    ));
+    assert_eq!(
+        sig,
+        agent_auth_crypto::webhook::sign_timestamped(secret.as_bytes(), sent_at, body)
+    );
+    // The body alone is not what is signed: a replay with another
+    // timestamp, or the old untimestamped check, fails.
+    assert!(!agent_auth_crypto::webhook::verify_body(
         secret.as_bytes(),
         body,
         sig
     ));
-    assert_eq!(
-        sig,
-        agent_auth_crypto::webhook::sign_body(secret.as_bytes(), body)
-    );
 
     // A message ping to the initiator? It has no webhook: only the
     // responder's side is pinged when the initiator writes.
@@ -1762,39 +1775,34 @@ async fn webhook_ping_shape_and_signature(pool: PgPool) {
     );
 }
 
+/// No broker-wide fallback key (upstream review 2026-10): an agent without
+/// its own secret gets no ping, never an unsigned one or one signed with a
+/// key other receivers hold.
 #[sqlx::test(migrations = "../store/migrations")]
-async fn webhook_secrets_fallback_and_never_unsigned(pool: PgPool) {
+async fn webhook_pings_need_the_agents_own_secret(pool: PgPool) {
     let (url, captured) = hook_server().await;
-    let cfg = A2aConfig {
-        webhook_signing_secret: Some(Secret::new("global-fallback".to_owned())),
-        ..config()
-    };
+    let cfg = A2aConfig::from_lookup(|k| match k {
+        "WEBHOOK_SIGNING_SECRET" => Some("global-fallback".to_owned()),
+        "A2A_WEBHOOK_HTTP_HOSTS" => Some("127.0.0.1".to_owned()),
+        _ => None,
+    })
+    .unwrap();
     let t = setup_with(pool.clone(), Policy::default(), cfg);
     let (s_row, s) = t.service("auto-hook2").await;
     let (r_row, _) = t.agent("svc-hook2", AgentKind::Service).await;
     t.set_webhook(r_row.id, &url, None).await;
     t.grant(&s_row, "svc-hook2", None).await;
     t.open_ok(&s, "svc-hook2").await;
-    let got = captured.wait_for(1).await;
-    let sig = got[0].0["x-agent-auth-signature"].to_str().unwrap();
-    assert!(agent_auth_crypto::webhook::verify_body(
-        b"global-fallback",
-        &got[0].1,
-        sig
-    ));
-
-    // Without any secret, nothing is sent (and the open still works).
-    let t = setup_with(pool, Policy::default(), config());
-    t.open_ok(&s, "svc-hook2").await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(captured.0.lock().unwrap().len(), 1);
+    assert_eq!(captured.0.lock().unwrap().len(), 0);
+
+    // With its own secret, it is pinged.
+    t.set_webhook(r_row.id, &url, Some("own")).await;
+    t.open_ok(&s, "svc-hook2").await;
+    assert_eq!(captured.wait_for(1).await.len(), 1);
 
     // Plain http to a host not listed: not sent.
-    let strict = A2aConfig {
-        webhook_signing_secret: Some(Secret::new("k".to_owned())),
-        ..A2aConfig::default()
-    };
-    let t = setup_with(t.pool.clone(), Policy::default(), strict);
+    let t = setup_with(t.pool.clone(), Policy::default(), A2aConfig::default());
     t.open_ok(&s, "svc-hook2").await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(captured.0.lock().unwrap().len(), 1);

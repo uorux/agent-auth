@@ -702,14 +702,16 @@ pub const REMOTE_MCP_REDIRECT_URIS: [&str; 3] = [
 ];
 
 /// Whether `uri` may be a registrable callback: `https://`, a host, no
-/// fragment, no whitespace or control characters, at most 512 characters.
+/// fragment, no userinfo (`@`), no backslashes (browsers and URL parsers
+/// disagree on both), no whitespace or control characters, at most 512
+/// characters.
 #[must_use]
 pub fn redirect_uri_ok(uri: &str) -> bool {
     uri.len() <= 512
         && uri
             .strip_prefix("https://")
             .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))
-        && !uri.contains('#')
+        && !uri.contains(['#', '@', '\\'])
         && !uri.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
@@ -886,6 +888,25 @@ mod tests {
         assert!(!http_url("https://a b"));
         assert!(!http_url("https:///x"));
         assert!(http_url("https://a/"));
+    }
+
+    #[test]
+    fn redirect_uris_with_userinfo_or_backslashes_are_refused() {
+        assert!(redirect_uri_ok("https://claude.ai/api/mcp/auth_callback"));
+        for bad in [
+            "https://evil.example\\@claude.ai/cb",
+            "https://u@claude.ai/cb",
+            "https://claude.ai/a b",
+            "https://claude.ai/a\tb",
+            "https://claude.ai/cb#x",
+            "http://claude.ai/cb",
+        ] {
+            assert!(!redirect_uri_ok(bad), "{bad}");
+        }
+        assert!(!redirect_uri_ok(&format!(
+            "https://claude.ai/{}",
+            "a".repeat(600)
+        )));
     }
 
     #[test]
