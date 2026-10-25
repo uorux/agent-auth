@@ -633,6 +633,77 @@ and why. Keep entries short. Group by area.
 - Query parameters missing on `/v1/wiki/page` (`path`) or `/search` (`q`)
   are 422 `{"detail": "query parameter '<p>' is required"}`.
 
+## Request lifecycle, routes and startup (broker `service`, `http`, `containment`, `scheduler`, `server`)
+
+- **LLM evaluations survive a restart** (core B-3). The scheduler's first
+  tick re-runs every LLM_EVALUATING request (or, with no reviewer, sends it
+  to a human with `llm evaluator unavailable after a restart`); later ticks
+  do the same for one untouched for 15 minutes.
+- **An LLM approval re-runs the policy** (core B-4). The approve path routes
+  the request again with today's rules, zones and gates and needs
+  `Route::Llm` (its `LlmClearance`); anything else goes to a human with the
+  note `LLM approved, but the policy no longer routes this to the LLM: …`.
+  A retry likewise needs the policy still to route to the LLM, else 409
+  `the policy no longer routes this request to LLM review; use escalate`.
+- **Human edits are zone-checked** (core B-5): an edited (or unedited)
+  approval is refused with `edited approval rejected by validator: <the
+  platform's not-brokered text>` when a restricted zone now hides it.
+- **A window rule passes every gate** (core B-6): `apply_rule_to_pending`
+  routes each waiting request again and approves it only when the new rule
+  decides it and the route is still `approve` (so a web connector's, a
+  shell's or a zone's request keeps waiting); an expired rule applies to
+  nothing.
+- **Disabled is held** (core B-15): a request of an agent disabled or past
+  its lease since it authenticated is recorded denied (`agent is
+  disabled`), and nothing is provisioned for it.
+- **Saved-rule pinning for sensitive namespaces**: a saved rule pinned to an
+  authority clears a request sensitive only because of its Kubernetes
+  namespace when the rule names that exact namespace (the Python's
+  `pinned_here`, commit 4da3f4e); otherwise the request surfaces with the
+  sensitive note. (Implemented in the service; core's evaluation does not
+  carry it yet.)
+- **"Exact" rules from a decision take the resource literally**: the
+  resource pattern is the resource glob-escaped (`team*` → `team[*]`).
+  A rule's duration cap from a decision is at most 365 days.
+- **LLM suggestions**: a non-positive or non-integer
+  `suggested_duration_secs` is ignored (core B-14), a `reasoning` that is
+  not a string is an error (human).
+- **The reviewer's prompt** follows the Python's later B-13 fix rather than
+  the spec §7 text: the resource and scope are JSON-quoted and labelled
+  agent-chosen, and each context note is one JSON string on its own line;
+  the system prompt says so. Scope keys are in sorted order (no insertion
+  order in serde_json).
+- **Credentials are not issued to web UI connectors** (surfaces Bug-C1):
+  a caller authenticated by an OAuth access token, or any agent whose
+  runtime is `web`, gets 403 `credentials are not issued to a web UI
+  connector`. A platform disabled since its grant was made answers 403
+  `platform 'x' is not enabled on this broker` (was a 500).
+- **A request whose capability/scope does not parse** for its platform is
+  recorded denied with `validator: <why>` (the Python stored whatever
+  `fold` made of it).
+- **Admin agents**: a webhook is refused on an ephemeral agent (create 422,
+  set-webhook 409; http-api §8.14), and must pass the a2a webhook URL rules
+  (https, or http to `A2A_WEBHOOK_HTTP_HOSTS`); rotate-webhook-secret of a
+  non-service agent is 409; disable refuses the operator's row (§8.13).
+  Admin-token decisions are `decided_by: admin-api`, a panel user's are
+  their name.
+- **Agent containment of "everyone"** (core B-2, http-api §8.2): refused
+  without `allow_all` when the match means everyone
+  (`AgentMatch::matches_everyone`: `{}`, `{"name": "*"}`, every placement
+  or kind…) or holds every enabled agent today. Discord's contain applies
+  the same check unless its "everyone" option is chosen.
+- **Audit**: membership in `audit.readers` is checked before any query
+  parameter (http-api §8.3); `limit=x` from a reader is 422.
+- **Transport**: a 2 MiB body limit, a 330 s request timeout (longer than
+  any long-poll), and `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy:
+  no-referrer`, `Cache-Control: no-store` and a deny-all CSP on every
+  response that does not set its own. 404/405 answer `{"detail": ...}`.
+- **Startup**: a missing `POLICY_FILE` stops the broker (core B-12);
+  `DATABASE_URL` must be a postgres URL; one broker per database (a session
+  advisory lock; a second one exits — B-19, ARCHITECTURE.md "Deployment").
+  `./.env` is read without changing the process environment (no `set_var`):
+  parts that read the environment themselves see only the real one.
+
 ## Open questions
 
 (for Jacob; nothing here is implemented until decided)
@@ -667,6 +738,10 @@ and why. Keep entries short. Group by area.
   existing gateways' accounting.
 - **B19**: should the credential route refuse web-UI OAuth callers? (The
   spine's route.)
+
+- **Rotating a VM-minted agent's key** (http-api §8.13): still allowed, as
+  in the Python, although it breaks the sandbox daemon's copy. Refuse it
+  (like rename and attributes), or keep it as the operator's escape hatch?
 
 ## To do (engineering, tracked here until done)
 

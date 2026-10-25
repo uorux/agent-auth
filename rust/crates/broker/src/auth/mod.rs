@@ -140,9 +140,14 @@ impl HumanDecider {
 }
 
 impl From<&AdminCaller> for HumanDecider {
+    /// `decided_by`: `admin-api` for the admin token (as the Python's admin
+    /// decide route), the panel user's name for a panel session.
     fn from(admin: &AdminCaller) -> HumanDecider {
         HumanDecider {
-            label: admin.label(),
+            label: match admin.identity() {
+                AdminIdentity::Token => "admin-api".to_owned(),
+                AdminIdentity::Panel { user } => user.clone(),
+            },
         }
     }
 }

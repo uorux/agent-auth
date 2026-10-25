@@ -141,6 +141,17 @@ no aws-lc, no HTTP/2. Prefer writing 50 lines over adding a crate.
   suite talks to the network.
 - Port the tests listed in the spec's "tests worth porting" section.
 
+## Deployment
+
+Exactly one broker per database: long-poll wake-ups, the a2a activity
+stamps, the security log, background LLM evaluations and the daemon hub
+live in the process, and the boot-time reaper fails every PROVISIONING
+grant. The broker takes a session-level advisory lock
+(`store::instance::try_lock`) on a connection it holds for its whole life;
+a second broker on the same database logs why and exits. On Kubernetes:
+`replicas: 1`, `strategy: Recreate` (a rolling update would start the new
+pod while the old one holds the lock).
+
 ## Working on a part (subagents)
 
 1. Work in your own worktree:

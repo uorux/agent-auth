@@ -18,6 +18,7 @@ use crate::events::KeyedEvents;
 use crate::notify::Notifier;
 use crate::provisioners::{PlatformServices, Registry};
 use crate::security_log::SecurityLog;
+use crate::service::Spine;
 use crate::webui::Web;
 
 #[derive(Debug, Clone)]
@@ -37,6 +38,9 @@ pub struct AppState {
     pub a2a: Arc<A2a>,
     /// The provisioners' part: MCP token issuer, wiki, GitHub App.
     pub platform_services: Arc<PlatformServices>,
+    /// The request lifecycle's own state: LLM reviewer, risk summarizer,
+    /// approval gates and the hooks other parts plug in (`service`).
+    pub spine: Arc<Spine>,
 }
 
 impl AppState {
@@ -64,6 +68,7 @@ impl AppState {
             web: Arc::default(),
             a2a: Arc::default(),
             platform_services: Arc::default(),
+            spine: Arc::default(),
         }
     }
 }

@@ -1,0 +1,258 @@
+//! Startup (core-lifecycle-policy §9.2): configuration, the database, the
+//! policy, the provisioners, the scheduler and the HTTP server, stopped
+//! together on SIGTERM or Ctrl-C.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use agent_auth_core::{AgentId, Policy};
+use agent_auth_store::{Store, agents};
+use anyhow::Context;
+use tokio::sync::watch;
+
+use crate::auth::AuthConfig;
+use crate::config::{Config, Env};
+use crate::discord::Services;
+use crate::llm::{LlmReviewer, RiskSummarizer};
+use crate::notify::Notifier;
+use agent_auth_crypto::daemon::SigningKey;
+use agent_auth_crypto::secretbox::SecretBox;
+
+use crate::provisioners::setup::{self, Keys, PlatformServices};
+use crate::provisioners::{AnyProvisioner, Registry};
+use crate::service::Spine;
+use crate::service::SpineOps;
+use crate::state::AppState;
+
+/// How long shutdown waits for background LLM evaluations.
+const SETTLE: Duration = Duration::from_secs(10);
+
+/// The enabled provisioners (provisioners spec §1.3) and the provisioners'
+/// shared services: a2a always, the others when configured
+/// (`provisioners::setup::build`).
+pub fn register_provisioners(
+    env: &Env,
+    config: &Config,
+    policy: &Arc<Policy>,
+) -> anyhow::Result<(Registry, PlatformServices)> {
+    let secret_box = match &config.encryption_key {
+        Some(k) => Some(Arc::new(
+            SecretBox::from_base64(k.expose())
+                .map_err(|e| anyhow::anyhow!("ENCRYPTION_KEY: {e}"))?,
+        )),
+        None => None,
+    };
+    let signing_key = match env.get("BROKER_SIGNING_KEY") {
+        Some(k) => {
+            Some(SigningKey::from_text(k).map_err(|e| anyhow::anyhow!("BROKER_SIGNING_KEY: {e}"))?)
+        }
+        None => None,
+    };
+    let lookup = |k: &str| env.get(k).map(str::to_owned);
+    let built = setup::build(
+        &setup::Env::new(&lookup),
+        policy,
+        Keys {
+            secret_box: secret_box.as_ref(),
+            signing_key: signing_key.as_ref(),
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut registry = Registry::default();
+    registry.register(AnyProvisioner::A2a(crate::a2a::provisioner::A2aProvisioner));
+    for p in built.provisioners {
+        registry.register(p);
+    }
+    Ok((registry, built.services))
+}
+
+/// The spine's own state: the LLM reviewer and the risk summarizer.
+pub fn spine(config: &Config, policy: &Policy) -> anyhow::Result<Spine> {
+    let mut spine = Spine::default();
+    if let Some(key) = &config.openrouter_api_key {
+        spine.llm = Some(LlmReviewer::new(
+            agent_auth_crypto::Secret::new(key.expose().clone()),
+            &config.openrouter_base_url,
+            Duration::from_secs(u64::from(policy.llm().timeout_secs)),
+        )?);
+        if config.daemons_enabled && policy.platforms().hostexec.risk_summary {
+            let model = policy
+                .platforms()
+                .hostexec
+                .risk_model
+                .clone()
+                .unwrap_or_else(|| policy.llm().model.clone());
+            spine.risk = Some(RiskSummarizer::new(
+                agent_auth_crypto::Secret::new(key.expose().clone()),
+                &config.openrouter_base_url,
+                model,
+            )?);
+        }
+    } else {
+        tracing::warn!("OPENROUTER_API_KEY not set: llm-routed requests go to a human");
+    }
+    Ok(spine)
+}
+
+/// The operator's row (the panel's chat identity), created once.
+async fn ensure_operator(store: &Store) -> anyhow::Result<()> {
+    let tx = store.begin().await?;
+    let key_id = crate::random::token_hex(6).context("random key id")?;
+    let row = agents::ensure_operator(
+        &tx,
+        AgentId::new(),
+        &key_id,
+        time::OffsetDateTime::now_utc(),
+    )
+    .await?;
+    tx.commit().await?;
+    if row.is_none() {
+        tracing::warn!("an agent named 'operator' exists: the admin panel's chat has no identity");
+    }
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %e, "listening for Ctrl-C failed");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "listening for SIGTERM failed");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => {},
+        () = term => {},
+    }
+    tracing::info!("shutting down");
+}
+
+/// Run the broker until a signal (or the server failing).
+pub async fn run(env: Env) -> anyhow::Result<()> {
+    let config = Config::from_env(&env)?;
+    let policy = config.load_policy()?;
+    let store = Store::connect(config.database_url.expose(), 20)
+        .await
+        .context("connecting to PostgreSQL")?;
+    // One broker per database (wake-ups and more are in-process): a second
+    // replica stops here.
+    let Some(instance) = agent_auth_store::instance::try_lock(&store).await? else {
+        anyhow::bail!(
+            "another agent-auth broker is running on this database; \
+             run exactly one (replicas: 1, strategy: Recreate)"
+        );
+    };
+    store.migrate().await.context("migrating the database")?;
+    ensure_operator(&store).await?;
+
+    let policy = Arc::new(policy);
+    let (registry, platform_services) = register_provisioners(&env, &config, &policy)?;
+    let spine = spine(&config, &policy)?;
+    let a2a = crate::a2a::A2a::new(
+        crate::a2a::A2aConfig::from_env().map_err(|e| anyhow::anyhow!("a2a: {e}"))?,
+    );
+    let web = crate::webui::Web::from_policy(
+        &policy,
+        config.encryption_key.as_ref().map(|k| k.expose().as_str()),
+    )
+    .map_err(|e| anyhow::anyhow!("web UI: {e}"))?;
+    let discord = match crate::discord::DiscordConfig::from_env()
+        .map_err(|e| anyhow::anyhow!("discord: {e}"))?
+    {
+        Some(cfg) => Some(
+            crate::discord::Discord::new(cfg, store.clone())
+                .map_err(|e| anyhow::anyhow!("discord: {e}"))?,
+        ),
+        None => {
+            tracing::warn!("DISCORD_TOKEN not set: requests await a human via the admin API only");
+            None
+        }
+    };
+    let auth = AuthConfig {
+        admin_token: config
+            .admin_token
+            .as_ref()
+            .map(|t| agent_auth_crypto::Secret::new(t.expose().clone())),
+        oauth_enabled: false,
+        trust_x_real_ip: config.trust_proxy_headers,
+    };
+    if auth.admin_token.is_none() {
+        tracing::warn!("ADMIN_TOKEN not set: the admin API is disabled");
+    }
+    let mut state = AppState::new(store, Policy::clone(&policy), auth);
+    state.policy = policy;
+    state.registry = Arc::new(registry);
+    state.platform_services = Arc::new(platform_services);
+    state.spine = Arc::new(spine);
+    state.a2a = Arc::new(a2a);
+    if let Some(d) = &discord {
+        state.notifier = Arc::new(Notifier::Discord(d.notifier()));
+    }
+    let state = crate::webui::install(state, web);
+
+    let mut tasks = Vec::new();
+    if let Some(d) = discord {
+        let ops = Arc::new(SpineOps::new(state.clone()));
+        d.attach(Services {
+            requests: Some(ops.clone()),
+            containment: Some(ops.clone()),
+            hosts: Some(ops),
+        });
+        tasks.push(tokio::spawn(d.run()));
+    }
+
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let scheduler = tokio::spawn(crate::scheduler::run(state.clone(), stop_rx));
+
+    let addr: SocketAddr = format!("{}:{}", config.listen_host, config.listen_port)
+        .parse()
+        .with_context(|| {
+            format!(
+                "listen address {}:{}",
+                config.listen_host, config.listen_port
+            )
+        })?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding {addr}"))?;
+    tracing::info!(%addr, "agent-auth broker listening");
+    let app = crate::http::router(state.clone());
+    let served = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await;
+
+    let _ = stop_tx.send(true);
+    if let Err(e) = scheduler.await {
+        tracing::error!(error = %e, "scheduler task failed");
+    }
+    for t in tasks {
+        t.abort();
+    }
+    if tokio::time::timeout(SETTLE, state.spine.settle())
+        .await
+        .is_err()
+    {
+        tracing::warn!("LLM evaluations still running at shutdown; they resume at the next start");
+    }
+    if let Err(e) = instance.release().await {
+        tracing::warn!(error = %e, "releasing the instance lock");
+    }
+    served.context("HTTP server")
+}

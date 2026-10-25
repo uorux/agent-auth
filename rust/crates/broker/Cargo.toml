@@ -9,13 +9,18 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[[bin]]
+name = "agent-auth-server"
+path = "src/main.rs"
+
 [dependencies]
 agent-auth-core.workspace = true
 agent-auth-crypto.workspace = true
 agent-auth-wire.workspace = true
 agent-auth-store.workspace = true
 agent-auth-tls = { workspace = true, features = ["reqwest"] }
-tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "net"] }
+ring.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "sync", "macros", "net", "signal"] }
 axum.workspace = true
 tower = { workspace = true, features = ["util"] }
 tower-http.workspace = true

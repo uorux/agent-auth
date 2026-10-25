@@ -76,6 +76,7 @@ mod error;
 pub mod flags;
 pub mod grants;
 pub mod hostexec;
+pub mod instance;
 pub mod lldap;
 pub mod llm;
 pub mod lockdown;
