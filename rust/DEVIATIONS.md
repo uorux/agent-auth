@@ -299,9 +299,13 @@ and why. Keep entries short. Group by area.
   request (trigger), and a request's spec (authority, resource, what was
   asked) is immutable once stored (trigger).
 - **One lock order** (store `lib.rs`): requests → containment advisory lock
-  → agents → grants → threads. Disabling takes the containment lock
-  exclusively, so it waits for in-flight checks rather than deadlocking
-  with a provisioning (reproduced with psql and in a test).
+  → agents → grants → threads, with one argued exception (finishing and
+  the reaper lock their grant, then its own request). Disabling takes the
+  containment lock exclusively, so it waits for in-flight checks rather
+  than deadlocking with a provisioning (reproduced with psql and in a
+  test). The admin rename took a2a grants before the agent's row, which
+  deadlocked against a concurrent `send` to that agent (a 500 for one
+  side); it now renames the agent first.
 
 ## Admin panel, OAuth server, remote MCP (broker `webui`, `oauth`, `remote_mcp`)
 
@@ -1775,5 +1779,3 @@ Final review (sandboxes), fixed:
   deprecated `test::rand::FixedSliceRandom` (ring has no scalar-to-key
   constructor). Pinned by known-answer tests against the Python; revisit
   (a dedicated PKCS#8 key) in review.
-- Store lock-order doc vs. the finish phase (grant before request row):
-  verify in the next review that no path locks request then grant.

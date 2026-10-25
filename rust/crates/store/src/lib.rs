@@ -62,7 +62,12 @@
 //!
 //! So: provisioning is `transition` → `lockdown::check` → `grants::begin`;
 //! finishing is `lockdown::check` → `grants::load_provisioning` →
-//! `grants::activate` → the request's `transition`.
+//! `grants::activate` → the request's `transition`. Finishing and the
+//! reaper thus lock their grant before its own request, which is safe: the
+//! only grant locks taken while holding a request are the insert of a new
+//! grant and `FOR SHARE` on a delegation's backing grant (another
+//! request's), and no exclusive grant locker (revoke, expiry, containment,
+//! the admin rename) ever locks a request.
 //!
 //! # Adding a query
 //!

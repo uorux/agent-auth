@@ -279,9 +279,11 @@ async fn rename(
     if agents::by_name(&tx, new).await?.is_some() {
         return Err(ApiError::conflict(format!("agent '{new}' already exists")));
     }
+    // The agent's row before its grants (the store's lock order: every
+    // a2a send share-locks both agents, then the talk grant).
+    agents::rename(&tx, a.id, new).await?;
     let renamed = rules::rename_agent(&tx, &a.name, new).await?;
     let grants_n = grants::rename_a2a_target(&tx, &a.name, new).await?;
-    agents::rename(&tx, a.id, new).await?;
     let row = agents::get(&tx, a.id).await?.ok_or_else(unknown_agent)?;
     tx.commit().await?;
     tracing::info!(from = %a.name, to = %new, "agent renamed");

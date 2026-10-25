@@ -2388,6 +2388,41 @@ async fn an_agent_named_operator_blocks_the_chat_until_renamed(pool: PgPool) {
     );
 }
 
+/// A rename retargets the active talk grants to the agent, and the grantee
+/// reaches it under its new name.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_rename_retargets_talk_grants(pool: PgPool) {
+    let t = setup(pool);
+    let h = hermes(&t).await;
+    let (s_row, s) = t.service("caller").await;
+    t.grant(&s_row, "hermes-homelab-recusant", None).await;
+    // The admin routes are not among the a2a part's.
+    let full = T {
+        app: agent_auth_broker::http::router(t.state.clone()),
+        state: t.state.clone(),
+        pool: t.pool.clone(),
+    };
+    let (st, v) = full
+        .post(
+            "/admin/agents/hermes-homelab-recusant/rename",
+            Who::Admin,
+            json!({"name": "hermes-renamed"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["grants"], 1);
+    assert_eq!(v["previous_name"], "hermes-homelab-recusant");
+    let (st, v) = t
+        .post(
+            "/v1/a2a/threads",
+            ag(&s),
+            json!({"to": "hermes-renamed", "topic": "t", "payload": {}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    drop(h);
+}
+
 /// An operator thread backs a delegated request (as the Python now does):
 /// the operator is the delegator.
 #[sqlx::test(migrations = "../store/migrations")]
