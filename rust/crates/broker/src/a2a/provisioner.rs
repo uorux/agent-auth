@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use time::OffsetDateTime;
 
 use crate::provisioners::{
-    Credential, ProvisionError, Provisioner, Refused, RequestSpec, Validated,
+    Credential, CredentialKind, ProvisionError, Provisioner, Refused, RequestSpec, Validated,
 };
 
 #[derive(Debug, Default)]
@@ -88,11 +88,10 @@ impl Provisioner for A2aProvisioner {
         _now: OffsetDateTime,
     ) -> Result<Credential, ProvisionError> {
         Ok(Credential {
-            kind: "a2a_grant".to_owned(),
             note: Some(
                 "a2a grants are check-based; open a thread via POST /v1/a2a/threads".to_owned(),
             ),
-            ..Credential::default()
+            ..Credential::of(CredentialKind::A2aGrant)
         })
     }
 

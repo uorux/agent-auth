@@ -239,6 +239,7 @@ mod tests {
             K::LldapGroup,
             K::McpToken,
             K::ModelGatewayKey,
+            K::GoogleAccessToken,
             K::A2aGrant,
             K::AgentIdentity,
             K::ProjectAccess,
@@ -256,6 +257,7 @@ mod tests {
                 | K::LldapGroup
                 | K::McpToken
                 | K::ModelGatewayKey
+                | K::GoogleAccessToken
                 | K::A2aGrant
                 | K::AgentIdentity
                 | K::ProjectAccess
@@ -278,6 +280,7 @@ mod tests {
             K::LldapAccount,
             K::McpToken,
             K::ModelGatewayKey,
+            K::GoogleAccessToken,
             K::PoolItem,
         ];
         for (i, kind) in all_kinds().into_iter().enumerate() {

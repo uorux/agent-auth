@@ -27,7 +27,9 @@ use time::OffsetDateTime;
 use super::common::{at, repr, secs_until, store_failed};
 use super::http::{self, Http, MAX_BODY, Reply};
 use super::setup::{ConfigError, Env};
-use super::{Credential, ProvisionError, Provisioner, Refused, RequestSpec, Validated};
+use super::{
+    Credential, CredentialKind, ProvisionError, Provisioner, Refused, RequestSpec, Validated,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 /// The role the broker gives its gateway users.
@@ -444,14 +446,13 @@ impl Provisioner for ModelsProvisioner {
             .ok_or_else(|| ProvisionError::failed("no key was issued for this grant"))?;
         let base = self.config.url.trim_end_matches('/').to_owned();
         Ok(Credential {
-            kind: "model_gateway_key".to_owned(),
             value: Some(key),
             url: Some(base.clone()),
             expires_at: Some(grant.expires_at),
             note: Some(format!(
                 "Claude Code: ANTHROPIC_BASE_URL={base} and ANTHROPIC_AUTH_TOKEN=<this key>. OpenAI-compatible clients (codex): base URL {base}/v1 with this key. The key is yours alone and ends with the grant."
             )),
-            ..Credential::default()
+            ..Credential::of(CredentialKind::ModelGatewayKey)
         })
     }
 

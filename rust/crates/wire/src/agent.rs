@@ -209,6 +209,8 @@ pub enum CredentialKind {
     McpToken,
     /// A key for the model gateway (`url` is the gateway).
     ModelGatewayKey,
+    /// A Google OAuth access token (`username` is the account).
+    GoogleAccessToken,
     /// Check-based: nothing to hand out.
     A2aGrant,
     /// A minted identity's name; its key went to the sandbox daemon.
@@ -226,12 +228,27 @@ pub enum CredentialKind {
     MailGateway,
 }
 
+/// The most characters a credential's `value` may have (1 MiB of
+/// characters; at most 4 MiB of UTF-8, well under the client's 16 MiB
+/// answer cap even JSON-escaped). The Python had no cap; the port's
+/// default secret cap (16 KiB) was too small for a hostexec job summary,
+/// which carries the whole argv (up to 64 KiB, JSON-escaped at most six
+/// times over), and for a pool item's secret file (a certificate bundle, a
+/// kubeconfig). Whatever a provisioner hands out must fit: the hostexec
+/// summary always does (its parts are bounded where the job is made), and
+/// a pool secret file is read with this cap
+/// ([`CREDENTIAL_VALUE_MAX`] bytes) and refused, clearly, when larger.
+pub const CREDENTIAL_VALUE_MAX: usize = 1 << 20;
+
+/// A credential's `value` on the wire.
+pub type CredentialValue = WireSecret<CREDENTIAL_VALUE_MAX>;
+
 /// `GET /v1/grants/{id}/credential` (Python `CredentialOut`). All seven
 /// keys always present.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CredentialOut {
     pub kind: CredentialKind,
-    pub value: Option<WireSecret>,
+    pub value: Option<CredentialValue>,
     /// The login name when the credential is an account.
     pub username: Option<String>,
     /// Where to use it, when that is part of it (the model gateway).

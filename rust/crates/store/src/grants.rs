@@ -555,7 +555,7 @@ impl IssuableGrant<'_> {
     }
 
     /// Was this decided in `tx`? (Writes made on its behalf, such as
-    /// `credentials::replace`, check it.)
+    /// `credentials::lock_minting`, check it.)
     #[must_use]
     pub fn belongs_to(&self, tx: &Tx<'_>) -> bool {
         self.tx == tx.addr()

@@ -1,5 +1,12 @@
 //! `credentials`: cached, encrypted credentials of a grant (e.g. GitHub
 //! installation tokens), newest wins.
+//!
+//! Every credential minted for a grant is recorded until it has run out, so
+//! revoking the grant can revoke each one ([`live`]), and minting is
+//! serialized per grant ([`lock_minting`]), so two concurrent fetches make
+//! one token, not two.
+
+use std::marker::PhantomData;
 
 use agent_auth_core::{CredentialId, GrantId};
 
@@ -51,25 +58,79 @@ pub async fn latest(tx: &Tx<'_>, grant: GrantId) -> Result<Option<CredentialRow>
     }))
 }
 
-/// Replace a grant's cached credentials with one, while issuing for it
-/// (the [`IssuableGrant`] must come from this transaction).
-pub async fn replace(
+/// Advisory-lock class of credential minting (two-key form, its own key
+/// space): "cred".
+const MINT_CLASS: i32 = 0x6372_6564;
+
+/// Proof that this transaction holds a grant's mint lock (from
+/// [`lock_minting`], so for a grant cleared by [`crate::grants::issuable`]
+/// in this transaction). Only [`record`] takes it.
+#[derive(Debug)]
+pub struct MintLock<'t> {
+    tx: usize,
+    grant: GrantId,
+    borrow: PhantomData<&'t ()>,
+}
+
+impl MintLock<'_> {
+    #[must_use]
+    pub fn grant(&self) -> GrantId {
+        self.grant
+    }
+}
+
+/// Serialize minting for one grant until the transaction ends: a fetch
+/// takes it, then reads the cache ([`latest`]), and mints only if nothing
+/// usable is there; a concurrent fetch waits here and then finds the first
+/// one's token. Lock order: last of all, after everything `issuable`
+/// locked (containment, agent, grant, thread); its holder locks nothing
+/// more (it inserts a `credentials` row, whose foreign key needs only the
+/// grant share lock it already holds).
+pub async fn lock_minting<'t>(
+    tx: &'t Tx<'_>,
+    issuing: &IssuableGrant<'t>,
+) -> Result<MintLock<'t>, StoreError> {
+    if !issuing.belongs_to(tx) {
+        return Err(StoreError::WrongProof);
+    }
+    let grant = issuing.grant().id;
+    let key = grant.to_string();
+    let mut c = tx.conn().await;
+    sqlx::query!(
+        "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+        MINT_CLASS,
+        key
+    )
+    .execute(&mut **c)
+    .await?;
+    Ok(MintLock {
+        tx: tx.addr(),
+        grant,
+        borrow: PhantomData,
+    })
+}
+
+/// Record a credential just minted under `lock` (taken in this
+/// transaction). Earlier ones stay recorded until they have run out, so a
+/// revoke reaches them too; those already run out are dropped here.
+pub async fn record(
     tx: &Tx<'_>,
+    lock: &MintLock<'_>,
     id: CredentialId,
-    issuing: &IssuableGrant<'_>,
     kind: &str,
     value_encrypted: &str,
     expires_at: OffsetDateTime,
     now: OffsetDateTime,
 ) -> Result<(), StoreError> {
-    if !issuing.belongs_to(tx) {
+    if lock.tx != tx.addr() {
         return Err(StoreError::WrongProof);
     }
-    let grant = issuing.grant().id;
+    let grant = lock.grant;
     let mut c = tx.conn().await;
     sqlx::query!(
-        "DELETE FROM credentials WHERE grant_id = $1",
-        Uuid::from(grant)
+        "DELETE FROM credentials WHERE grant_id = $1 AND expires_at <= $2",
+        Uuid::from(grant),
+        now
     )
     .execute(&mut **c)
     .await?;
@@ -86,6 +147,35 @@ pub async fn replace(
     .execute(&mut **c)
     .await?;
     Ok(())
+}
+
+/// Every recorded credential of a grant that has not run out yet, oldest
+/// first: what a revoke must revoke.
+pub async fn live(
+    tx: &Tx<'_>,
+    grant: GrantId,
+    now: OffsetDateTime,
+) -> Result<Vec<CredentialRow>, StoreError> {
+    let mut c = tx.conn().await;
+    let rows = sqlx::query!(
+        "SELECT * FROM credentials WHERE grant_id = $1 AND expires_at > $2
+         ORDER BY created_at, id",
+        Uuid::from(grant),
+        now
+    )
+    .fetch_all(&mut **c)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| CredentialRow {
+            id: CredentialId::from_uuid(r.id),
+            grant_id: GrantId::from_uuid(r.grant_id),
+            kind: r.kind,
+            value_encrypted: r.value_encrypted,
+            expires_at: r.expires_at,
+            created_at: r.created_at,
+        })
+        .collect())
 }
 
 /// Forget a grant's cached credentials (revocation).

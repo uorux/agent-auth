@@ -29,6 +29,9 @@ pub struct LldapState {
     removes: Vec<(String, i64)>,
     creates: Vec<Value>,
     logins: usize,
+    /// Every GraphQL call fails: `Some(503)` with that status, `Some(200)`
+    /// with a GraphQL error (LLDAP's database down).
+    outage: Option<u16>,
 }
 
 fn gql_error() -> R {
@@ -47,6 +50,11 @@ fn lldap_handler(s: &Arc<Mutex<LldapState>>, c: &Call) -> R {
     }
     if !c.is("POST", "/api/graphql") || c.header("authorization") != "Bearer jwt-1" {
         return r(401, json!({}));
+    }
+    match st.outage {
+        Some(200) => return gql_error(),
+        Some(status) => return r(status, json!({})),
+        None => {}
     }
     let q = c.body["query"].as_str().unwrap_or("");
     let v = &c.body["variables"];
@@ -93,6 +101,11 @@ fn lldap_handler(s: &Arc<Mutex<LldapState>>, c: &Call) -> R {
             ),
             None => gql_error(),
         }
+    } else if q.contains("ListUsers") {
+        r(
+            200,
+            json!({"data": {"users": st.users.keys().map(|id| json!({"id": id})).collect::<Vec<_>>()}}),
+        )
     } else if q.contains("UserGroups") {
         match st.users.get(&user) {
             Some((_, gs)) => r(
@@ -268,7 +281,7 @@ async fn grant_then_expiry_adds_then_removes(pool: PgPool) {
         json!({"lldap_user": "svc-homelab-agent", "group": "svc-gitea", "group_id": 4})
     );
     let c = credential(&t.store, &t.p, &g).await.unwrap();
-    assert_eq!(c.kind, "lldap_group");
+    assert_eq!(kind_name(&c), "lldap_group");
     assert!(c.value.is_none());
     assert_eq!(c.username.as_deref(), Some("svc-homelab-agent"));
     assert_eq!(
@@ -470,7 +483,7 @@ async fn a_managed_account_is_made_once_and_handed_out(pool: PgPool) {
 
     let c = credential(&t.store, &t.p, &g).await.unwrap();
     assert_eq!(
-        (c.kind.as_str(), expose(&c), c.username.as_deref()),
+        (kind_name(&c).as_str(), expose(&c), c.username.as_deref()),
         ("lldap_account", password.as_str(), Some("svc-worker"))
     );
     assert_eq!(
@@ -608,6 +621,57 @@ async fn a_user_deleted_out_of_band_does_not_wedge_revocation(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../store/migrations")]
+async fn an_lldap_outage_during_revoke_keeps_the_grant_for_a_retry(pool: PgPool) {
+    let t = setup_with(pool, config(&[]), false).await;
+    let a = hand_registered(&t, "homelab-agent", "svc-homelab-agent").await;
+    let g = granted(&t.store, &t.p, a.id, &Authority::Homelab, "svc-gitea").await;
+    // Unreachable-ish (503), then up but failing every query: neither is
+    // "the user is gone", so the revoke fails and the grant stays ACTIVE
+    // (expired now) for the expiry sweep to retry. The Python re-raised;
+    // the port used to read both as "deleted" and end the grant with the
+    // membership (and its Authelia access) still in place.
+    for outage in [503, 200] {
+        t.state.lock().unwrap().outage = Some(outage);
+        let err = expire(&t.store, &t.p, g.id).await.unwrap_err();
+        assert!(err.starts_with("LLDAP GraphQL error"), "{err}");
+        assert_eq!(
+            grant(&t.store, g.id).await.status,
+            agent_auth_core::GrantStatus::Active
+        );
+        assert!(t.member("svc-homelab-agent", 4));
+    }
+    t.state.lock().unwrap().outage = None;
+    revoke_due(&t.store, &t.p, g.id).await.unwrap();
+    assert_eq!(t.removes(), [("svc-homelab-agent".to_owned(), 4)]);
+    assert!(!t.member("svc-homelab-agent", 4));
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_failed_lookup_of_a_listed_user_is_not_a_deletion(pool: PgPool) {
+    let t = setup_with(pool, config(&[]), false).await;
+    let a = hand_registered(&t, "homelab-agent", "svc-homelab-agent").await;
+    let g = granted(&t.store, &t.p, a.id, &Authority::Homelab, "svc-gitea").await;
+    // Removing and the user's lookups fail, but LLDAP still lists the
+    // user: it exists, so the revoke must not count as done.
+    let state = t.state.clone();
+    t.fake.set(move |c| {
+        let q = c.body["query"].as_str().unwrap_or("");
+        if q.contains("RemoveUserFromGroup") || q.contains("UserGroups") || q.contains("UserExists")
+        {
+            gql_error()
+        } else {
+            lldap_handler(&state, c)
+        }
+    });
+    let err = expire(&t.store, &t.p, g.id).await.unwrap_err();
+    assert_eq!(err, "LLDAP GraphQL error (see broker logs)");
+    assert_eq!(
+        grant(&t.store, g.id).await.status,
+        agent_auth_core::GrantStatus::Active
+    );
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
 async fn a_missing_group_fails_with_its_name(pool: PgPool) {
     let t = setup_with(pool, config(&[]), false).await;
     let a = hand_registered(&t, "homelab-agent", "svc-homelab-agent").await;
@@ -712,4 +776,27 @@ async fn concurrent_first_provisions_make_one_account(pool: PgPool) {
     assert_eq!(t.creates().len(), 1);
     assert_eq!(t.ldap.passwords.lock().unwrap().len(), 1);
     assert!(t.member("svc-worker", 4) && t.member("svc-worker", 5));
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn the_credential_route_serves_accounts_and_groups(pool: PgPool) {
+    let t = setup_with(pool, config(&[]), true).await;
+    let hand = hand_registered(&t, "hand-agent", "svc-hand").await;
+    let managed = agent(&t.store, "Worker").await;
+    let group = granted(&t.store, &t.p, hand.id, &Authority::Homelab, "svc-gitea").await;
+    let account = granted(&t.store, &t.p, managed.id, &Authority::Homelab, "svc-gitea").await;
+    let (_, password) = t.ldap.last_password().unwrap();
+    let out = credentials_over_http(
+        &t.store,
+        agent_auth_broker::provisioners::AnyProvisioner::Homelab(t.p),
+        &[&group, &account],
+    )
+    .await;
+    assert_eq!(out[0].0, axum::http::StatusCode::OK, "{}", out[0].1);
+    assert_eq!(out[0].1["kind"], "lldap_group");
+    assert_eq!(out[0].1["username"], "svc-hand");
+    assert_eq!(out[1].0, axum::http::StatusCode::OK, "{}", out[1].1);
+    assert_eq!(out[1].1["kind"], "lldap_account");
+    assert_eq!(out[1].1["username"], "svc-worker");
+    assert_eq!(out[1].1["value"], password.as_str());
 }

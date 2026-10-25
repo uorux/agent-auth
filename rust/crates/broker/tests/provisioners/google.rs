@@ -473,7 +473,7 @@ async fn provision_and_credential(pool: PgPool) {
     assert_eq!(s.fake.calls().len(), 1);
     let cred = credential(&store, &p, &g).await.unwrap();
     assert_eq!(s.fake.calls().len(), 1, "cached");
-    assert_eq!(cred.kind, "google_access_token");
+    assert_eq!(kind_name(&cred), "google_access_token");
     assert_eq!(expose(&cred), "ya29.tok");
     assert_eq!(cred.username.as_deref(), Some("me@example.com"));
     assert!(cred.expires_at.unwrap() <= g.expires_at + time::Duration::HOUR);
@@ -692,4 +692,27 @@ async fn review_delegated_accounts_show_their_subject(pool: PgPool) {
           hour past the grant's end"
         ]
     );
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn the_credential_route_serves_a_google_token(pool: PgPool) {
+    // Every google credential used to be a 500 here: the route did not know
+    // the kind "google_access_token" (only a direct provisioner call was
+    // tested). Kinds are typed now; this goes through the route.
+    let store = Store::from_pool(pool);
+    let s = oauth(|_| token_answer(&cal())).await;
+    let p = provisioner(&s);
+    let a = agent(&store, "g-agent").await;
+    let g = granted(&store, &p, a.id, &google("calendar.read"), "main").await;
+    let out = credentials_over_http(
+        &store,
+        agent_auth_broker::provisioners::AnyProvisioner::Google(p),
+        &[&g],
+    )
+    .await;
+    let (status, body) = &out[0];
+    assert_eq!(*status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(body["kind"], "google_access_token");
+    assert_eq!(body["value"], "ya29.tok");
+    assert_eq!(body["username"], "me@example.com");
 }

@@ -259,7 +259,7 @@ async fn a_repo_grant_mints_caches_and_stops_when_it_ends(pool: PgPool) {
 
     let c = credential(&t.store, &t.p, &g).await.unwrap();
     assert_eq!(
-        (c.kind.as_str(), expose(&c)),
+        (kind_name(&c).as_str(), expose(&c)),
         ("github_installation_token", "ghs_2")
     );
     assert!(c.expires_at.is_some() && c.username.is_none() && c.url.is_none() && c.note.is_none());
@@ -403,7 +403,7 @@ async fn a_private_create_end_to_end(pool: PgPool) {
     assert_eq!(g.provisioner_state["repo_id"], json!(1001));
 
     let c = credential(&t.store, &t.p, &g).await.unwrap();
-    assert_eq!(c.kind, "github_repo");
+    assert_eq!(kind_name(&c), "github_repo");
     assert_eq!(expose(&c), "https://github.com/acme/new");
     assert_eq!(
         c.note.as_deref(),
@@ -891,4 +891,149 @@ async fn a_slow_platform_is_cut_off(pool: PgPool) {
             .await
             .is_none()
     );
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn the_credential_route_serves_tokens_and_created_repos(pool: PgPool) {
+    let t = setup(pool).await;
+    let a = agent(&t.store, "gh-agent").await;
+    let token = granted(
+        &t.store,
+        &t.p,
+        a.id,
+        &repo(&[("contents", GithubAccess::Write)]),
+        "jrt/cactus",
+    )
+    .await;
+    let made = granted(
+        &t.store,
+        &t.p,
+        a.id,
+        &create(Visibility::Private),
+        "acme/new",
+    )
+    .await;
+    let out = credentials_over_http(
+        &t.store,
+        agent_auth_broker::provisioners::AnyProvisioner::Github(t.p),
+        &[&token, &made],
+    )
+    .await;
+    assert_eq!(out[0].0, axum::http::StatusCode::OK, "{}", out[0].1);
+    assert_eq!(out[0].1["kind"], "github_installation_token");
+    assert_eq!(out[0].1["value"], "ghs_2");
+    assert_eq!(out[1].0, axum::http::StatusCode::OK, "{}", out[1].1);
+    assert_eq!(out[1].1["kind"], "github_repo");
+    assert_eq!(out[1].1["value"], "https://github.com/acme/new");
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn concurrent_fetches_mint_one_token(pool: PgPool) {
+    // B8: two fetches racing used to mint a token each (the grant is only
+    // share-locked); the revoke then reached only the newest. Minting is
+    // serialized per grant now: the second fetch waits and finds the
+    // first one's token.
+    let t = setup(pool).await;
+    let a = agent(&t.store, "gh-agent").await;
+    let g = granted(
+        &t.store,
+        &t.p,
+        a.id,
+        &repo(&[("contents", GithubAccess::Read)]),
+        "jrt/cactus",
+    )
+    .await;
+    let mints = || t.fake.count("POST", "/app/installations/42/access_tokens");
+    let before = mints();
+    // A slow mint, so both fetches are past their cache read before the
+    // first token could be recorded (without the lock).
+    let n = t.n.clone();
+    t.fake.set(move |c| {
+        let R(status, body, _) = github_default(c, &n);
+        if c.path.ends_with("/access_tokens") {
+            R(status, body, 300)
+        } else {
+            R(status, body, 0)
+        }
+    });
+    let (c1, c2) = tokio::join!(
+        credential(&t.store, &t.p, &g),
+        credential(&t.store, &t.p, &g)
+    );
+    let (c1, c2) = (c1.unwrap(), c2.unwrap());
+    assert_eq!(mints() - before, 1, "one mint for two fetches");
+    assert_eq!(expose(&c1), expose(&c2));
+    assert_eq!(credential_rows(&t.store, &g).await, 1);
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_revoke_reaches_every_live_token_of_the_grant(pool: PgPool) {
+    // Tokens recorded for a grant stay recorded until they run out (two
+    // left by a race before the fix, or the old one after a refresh), and
+    // revoking the grant revokes each of them, not only the newest.
+    let t = setup(pool).await;
+    let a = agent(&t.store, "gh-agent").await;
+    let g = granted(
+        &t.store,
+        &t.p,
+        a.id,
+        &repo(&[("contents", GithubAccess::Read)]),
+        "jrt/cactus",
+    )
+    .await;
+    let first = credential(&t.store, &t.p, &g).await.unwrap();
+    assert_eq!(expose(&first), "ghs_2");
+    // Make the cached token look about to run out (4 minutes left): the
+    // next fetch mints a fresh one, and the old one is still alive.
+    sqlx::query(
+        "UPDATE credentials SET expires_at = now() + interval '4 minutes' WHERE grant_id = $1",
+    )
+    .bind(uuid::Uuid::from(g.id))
+    .execute(t.store.pool())
+    .await
+    .unwrap();
+    let second = credential(&t.store, &t.p, &g).await.unwrap();
+    assert_eq!(expose(&second), "ghs_3");
+    assert_eq!(credential_rows(&t.store, &g).await, 2);
+    // A recorded token that has already run out needs no revoking.
+    sqlx::query("INSERT INTO credentials (id, grant_id, kind, value_encrypted, expires_at, created_at) VALUES ($1, $2, 'github_installation_token', 'x', now() - interval '1 minute', now() - interval '61 minutes')")
+        .bind(uuid::Uuid::new_v4())
+        .bind(uuid::Uuid::from(g.id))
+        .execute(t.store.pool())
+        .await
+        .unwrap();
+    // One revoke fails: the grant stays for a retry, and the retry sends
+    // both again (a 401 for the one already dead counts as done).
+    let n = t.n.clone();
+    let failed_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let f2 = failed_once.clone();
+    t.fake.set(move |c| {
+        if c.is("DELETE", "/installation/token")
+            && c.header("authorization") == "token ghs_3"
+            && !f2.swap(true, Ordering::SeqCst)
+        {
+            r(502, json!({}))
+        } else {
+            github_default(c, &n)
+        }
+    });
+    let before = t.fake.find("DELETE", "/installation/token").len();
+    assert_eq!(
+        expire(&t.store, &t.p, g.id).await.unwrap_err(),
+        "GitHub token revoke failed (502)"
+    );
+    assert_eq!(
+        grant(&t.store, g.id).await.status,
+        agent_auth_core::GrantStatus::Active
+    );
+    revoke_due(&t.store, &t.p, g.id).await.unwrap();
+    let sent: Vec<String> = t.fake.find("DELETE", "/installation/token")[before..]
+        .iter()
+        .map(|c| c.header("authorization").to_owned())
+        .collect();
+    assert_eq!(
+        sent,
+        ["token ghs_2", "token ghs_3", "token ghs_2", "token ghs_3"]
+    );
+    assert_eq!(credential_rows(&t.store, &g).await, 0);
 }

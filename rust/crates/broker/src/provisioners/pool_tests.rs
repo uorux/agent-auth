@@ -85,8 +85,11 @@ platforms:
 }
 
 fn pool_state(pool: sqlx::PgPool, rules: bool) -> AppState {
-    let dir = secrets_dir();
-    let text = pool_policy(&dir, rules);
+    pool_state_in(pool, rules, &secrets_dir())
+}
+
+fn pool_state_in(pool: sqlx::PgPool, rules: bool, dir: &std::path::Path) -> AppState {
+    let text = pool_policy(dir, rules);
     let mut st = state_with(pool, &text);
     let policy = Policy::from_yaml(&text).unwrap();
     let mut reg = Registry::default();
@@ -170,7 +173,7 @@ async fn any_lease_gets_an_item_and_its_secret(pool: sqlx::PgPool) {
     let it = item(&g);
     assert!(["alt-1", "alt-2"].contains(&it.as_str()));
     let cred = credential(&st, &g).await.unwrap();
-    assert_eq!(cred.kind, "pool_item");
+    assert_eq!(cred.kind, super::CredentialKind::PoolItem);
     assert_eq!(
         cred.value.unwrap().expose(),
         &format!("{{\"email\": \"{it}@example.org\", \"password\": \"pw-{it}\"}}")
@@ -585,4 +588,62 @@ async fn an_item_made_sensitive_since_approval_is_not_taken(pool: sqlx::PgPool) 
     )
     .unwrap();
     assert_eq!(any, vec!["alt-1".to_owned()]);
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn large_secrets_are_served_and_oversized_ones_refused_clearly(pool: sqlx::PgPool) {
+    use agent_auth_wire::agent::CREDENTIAL_VALUE_MAX;
+    use axum::http::StatusCode;
+    let dir = secrets_dir();
+    let st = pool_state_in(pool, true, &dir);
+    let a = bot(&st, "bot-a").await;
+    // 200 KiB (a certificate bundle, say): over the old 16 KiB cap on a
+    // credential's value, which made the fetch a 500. Served now.
+    let big = "k".repeat(200 * 1024);
+    std::fs::write(dir.join("alt-1"), format!("{big}\n")).unwrap();
+    let r = mc(&st, &a, json!({"item": "alt-1"})).await;
+    assert_eq!(r.status, RequestStatus::Granted, "{}", reason(&r));
+    let g = grant_of(&st, &r).await;
+    let fetch = || crate::http::agent::credential_over_route(&st, a.id, g.id);
+    let (status, cred) = fetch().await;
+    assert_eq!(status, StatusCode::OK, "{cred}");
+    assert_eq!(cred["kind"], "pool_item");
+    assert_eq!(cred["value"].as_str(), Some(big.as_str()));
+    // Exactly the cap, plus the newline that is dropped: served.
+    let most = "k".repeat(CREDENTIAL_VALUE_MAX);
+    std::fs::write(dir.join("alt-1"), format!("{most}\n")).unwrap();
+    let (status, cred) = fetch().await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        cred["value"].as_str().map(str::len),
+        Some(CREDENTIAL_VALUE_MAX)
+    );
+    // Grown past it after the grant: a clear refusal at the fetch, not a
+    // 500 (and not read whole into memory).
+    std::fs::write(dir.join("alt-1"), "k".repeat(CREDENTIAL_VALUE_MAX + 1)).unwrap();
+    let (status, cred) = fetch().await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        cred["detail"],
+        "the secret of alt-1 is larger than 1048576 bytes, the most a credential carries; ask the operator to shorten it"
+    );
+    // Not text: a clean refusal, as before.
+    std::fs::write(dir.join("alt-1"), [0xff, 0xfe]).unwrap();
+    let (status, cred) = fetch().await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        cred["detail"],
+        "cannot read the secret of alt-1 (stream did not contain valid UTF-8)"
+    );
+    // Already too large when it would be leased: the request fails with
+    // the reason, before a grant exists that could never be fetched.
+    std::fs::write(dir.join("alt-2"), "k".repeat(CREDENTIAL_VALUE_MAX + 2)).unwrap();
+    let b = bot(&st, "bot-b").await;
+    let r = mc(&st, &b, json!({"item": "alt-2"})).await;
+    assert_eq!(r.status, RequestStatus::ProvisionFailed);
+    assert!(
+        reason(&r).contains("the secret of alt-2 is larger than 1048576 bytes"),
+        "{}",
+        reason(&r)
+    );
 }

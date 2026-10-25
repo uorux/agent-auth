@@ -18,7 +18,9 @@ use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 
 use super::common::{repr, secs_until, store_failed};
-use super::{Credential, ProvisionError, Provisioner, Refused, RequestSpec, Validated};
+use super::{
+    Credential, CredentialKind, ProvisionError, Provisioner, Refused, RequestSpec, Validated,
+};
 
 /// What a token's audience is for a server.
 #[must_use]
@@ -158,14 +160,13 @@ impl McpProvisioner {
                 ProvisionError::failed("could not mint a token (see broker logs)")
             })?;
         Ok(Credential {
-            kind: "mcp_token".to_owned(),
             value: Some(token),
             expires_at: OffsetDateTime::from_unix_timestamp(exp).ok(),
             note: Some(format!(
                 "Send it to {} as `Authorization: Bearer <value>`. It is short-lived: call get_credential again for a fresh one (nothing new is issued once the grant ends).",
                 server.url
             )),
-            ..Credential::default()
+            ..Credential::of(CredentialKind::McpToken)
         })
     }
 }

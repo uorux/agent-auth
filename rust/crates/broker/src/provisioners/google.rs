@@ -41,7 +41,9 @@ use time::OffsetDateTime;
 use super::common::{repr, repr_list};
 use super::http::{Http, MAX_BODY};
 use super::setup::ConfigError;
-use super::{Credential, ProvisionError, Provisioner, Refused, RequestSpec, Validated};
+use super::{
+    Credential, CredentialKind, ProvisionError, Provisioner, Refused, RequestSpec, Validated,
+};
 
 /// What ending a grant does (catalog and README): tokens are shared per
 /// (account, scope) and Google cannot revoke one minted from a refresh
@@ -686,7 +688,6 @@ impl Provisioner for GoogleProvisioner {
             .await?;
         let api = action.split('.').next().map_or_else(String::new, title);
         Ok(Credential {
-            kind: "google_access_token".to_owned(),
             value: Some(token),
             username: Some(account.address.clone()),
             expires_at: Some(expires.min(grant.expires_at.saturating_add(time::Duration::HOUR))),
@@ -695,7 +696,7 @@ impl Provisioner for GoogleProvisioner {
                  runs out; none is issued once the grant ends.",
                 acting_as(account)
             )),
-            ..Credential::default()
+            ..Credential::of(CredentialKind::GoogleAccessToken)
         })
     }
 

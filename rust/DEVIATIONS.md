@@ -100,6 +100,35 @@ and why. Keep entries short. Group by area.
   runs; the Python left status/expiry to each provisioner and several
   checked nothing. Consequence: an expired hostexec run grant no longer
   returns its job summary here; `GET /v1/hostexec/jobs/{id}` still does.
+- **Credential kinds are typed** (security review, credentials #1).
+  Provisioners return the wire's `CredentialKind`, not a string the route
+  parsed. Before, the Google provisioner's `google_access_token` was not a
+  wire kind, so every Google credential fetch was a 500 (tests called the
+  provisioner, never the route); now a kind the route cannot serve does not
+  compile, and each provisioner's credential is also fetched through the
+  route in tests. Wire: `CredentialKind` gains `google_access_token`.
+- **A credential's value may be up to 1 MiB** (security review,
+  credentials #4). The Python had no cap; the port capped every credential
+  value at 16 KiB (`WireSecret`'s default), so a hostexec run grant's job
+  summary (it carries the whole argv: up to 64 KiB, JSON-escaped up to six
+  times over) or a pool item with a large secret file was a 500 at fetch.
+  The cap is now `CREDENTIAL_VALUE_MAX` = 1 MiB of characters (at most
+  4 MiB of UTF-8, under the client's 16 MiB answer cap even escaped),
+  checked by the broker and by the client. Why 1 MiB: every job summary core
+  can admit fits (about 400 KiB at worst: argv 64 KiB, error 256
+  characters, tail 1500 characters, all escaped), and it covers any
+  realistic secret file (keys, certificate bundles, kubeconfigs) while
+  still bounding what one fetch reads.
+- **Pool secret files are read with a bound** (credentials #4): at most
+  1 MiB (plus one trailing newline, dropped as before). A file over it is
+  refused clearly: at provisioning, when the chosen item's file is already
+  too large (the request fails: `the secret of <item> is larger than
+  1048576 bytes, the most a credential carries; ask the operator to shorten
+  it`), and at fetch (403, same text) when it grew after the grant. The
+  Python read any size, and the port read the whole file before the wire
+  cap turned it into a 500. A missing or unreadable file is still only
+  reported at fetch (it may appear later). Non-UTF-8 content reads `cannot
+  read the secret of <item> (stream did not contain valid UTF-8)`.
 ## Store (schema and kernel)
 
 - **Requests keep what was asked** (core §2.3). New columns
@@ -664,10 +693,25 @@ and why. Keep entries short. Group by area.
   the allowlist, or whose permission exceeds the ceiling, gets `policy no
   longer allows this grant (<reason>); refusing to mint a token`.
 - **GitHub provisioning does not cache its proof token** (store review:
-  `credentials::replace` needs an `IssuableGrant`). Provision still mints a
+  recording a token needs an `IssuableGrant`). Provision still mints a
   repo token (proving the installation covers the repo) and revokes it at
   once; the first credential fetch mints and caches. One more mint per
-  grant; no unused token lives on (B8).
+  grant; no unused token lives on (B8, provision half).
+- **One GitHub mint at a time per grant, and a revoke reaches every token**
+  (B8, fetch half; security review, credentials #3; an earlier version of
+  this entry called B8 fixed after the provision half only). Two
+  concurrent fetches each minted a token (the grant is only share-locked,
+  and nothing made the cache unique per grant), and a refresh replaced the
+  cached row while the old token still lived; the revoke revoked only the
+  newest, so another could outlive revoke and containment by up to an hour.
+  Now a fetch takes the grant's mint lock (`credentials::lock_minting`, a
+  transaction advisory lock, last in the lock order) before reading the
+  cache, so the second fetch waits and gets the first one's token; every
+  minted token stays recorded until it runs out (`credentials::record`
+  drops only those already expired); and revoke, expiry and containment
+  revoke each live recorded token (`credentials::live`). If GitHub does not
+  confirm any one, the revoke fails as before and all stay recorded for the
+  retry (re-sending one already revoked gets 401, which counts as done).
 - **A GitHub token revoke counts only when GitHub confirms it** (review):
   204, or 401 (the token is already dead). Any other status, or no
   answer, fails the revoke (`GitHub token revoke failed (<status>)`): the
@@ -738,6 +782,18 @@ and why. Keep entries short. Group by area.
 - **LLDAP group ids are looked up for every add** (B5), never cached.
 - **LLDAP revoke treats a deleted user as not a member** (B17): a grant no
   longer stays ACTIVE forever when its account was deleted out of band.
+  "Deleted" is decided carefully (security review, credentials #2): LLDAP
+  answers an unknown user with a GraphQL error, but an outage, a refused
+  login or a database error are errors too, and the port first read any
+  failure as "deleted", so a revoke during an LLDAP outage reported
+  success, ended the grant, and left the agent in the group (and its
+  Authelia access) with nothing retrying. A failed lookup now counts as
+  "no such user" only when LLDAP's full user list (`users { id }`), read
+  successfully, does not hold it; otherwise the revoke fails, the grant
+  stays ACTIVE (expired now), and the expiry sweep retries it. The Python
+  re-raised (never treated anything as deleted). The managed-account path
+  (`ensure_account`) likewise fails on a lookup error instead of trying to
+  create the account.
 - **LLDAP `UserExists` also reads `displayName`** (for the B2 check).
 - **Kubernetes ServiceAccounts live in a namespace of their own**
   (review). The Python put a namespaced grant's ServiceAccount in the

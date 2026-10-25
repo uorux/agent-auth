@@ -36,7 +36,9 @@ use super::common::{at, repr, store_failed};
 use super::http::{Http, MAX_BODY, Reply};
 use super::ldap::LdapTarget;
 use super::setup::{ConfigError, Env};
-use super::{Credential, ProvisionError, Provisioner, Refused, RequestSpec, Validated};
+use super::{
+    Credential, CredentialKind, ProvisionError, Provisioner, Refused, RequestSpec, Validated,
+};
 
 /// LLDAP's built-in groups that confer administration of LLDAP itself.
 pub const ADMIN_GROUPS: [&str; 3] = [
@@ -51,6 +53,7 @@ const CREATE_USER: &str =
     "mutation CreateUser($user: CreateUserInput!) { createUser(user: $user) { id } }";
 const GROUPS: &str = "query { groups { id displayName } }";
 const USER: &str = "query UserExists($user: String!) { user(userId: $user) { id displayName } }";
+const LIST_USERS: &str = "query ListUsers { users { id } }";
 const USER_GROUPS: &str =
     "query UserGroups($user: String!) { user(userId: $user) { groups { id } } }";
 
@@ -290,20 +293,50 @@ impl LldapProvisioner {
             })
     }
 
-    /// The user's display name, or `None` when there is no such user
-    /// (LLDAP answers an unknown user with an error).
-    async fn user(&self, username: &str) -> Option<String> {
-        let data = self
-            .graphql(USER, json!({"user": username}), false)
-            .await
-            .ok()?;
-        let user = at(&data, &["data", "user"]).as_object()?;
-        Some(
-            user.get("displayName")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned(),
-        )
+    /// The user's display name, or `None` when there is no such user.
+    /// LLDAP answers an unknown user with an error, and an outage, a
+    /// refused login or a database error with errors too, so a failed
+    /// lookup counts as "no such user" only when the full user list, read
+    /// successfully, does not hold it (B17). Any other failure is an
+    /// error: the Python re-raised it, and a revoke that read it as "gone"
+    /// would end the grant with the membership still in place.
+    async fn user(&self, username: &str) -> Result<Option<String>, ProvisionError> {
+        let lookup = self.graphql(USER, json!({"user": username}), false).await;
+        if let Ok(data) = &lookup
+            && let Some(user) = at(data, &["data", "user"]).as_object()
+        {
+            return Ok(Some(
+                user.get("displayName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+            ));
+        }
+        let listed = self.graphql(LIST_USERS, json!({}), true).await;
+        let users = match &listed {
+            Ok(data) => at(data, &["data", "users"]).as_array(),
+            Err(_) => None,
+        };
+        let Some(users) = users else {
+            tracing::error!(username, "cannot tell whether the LLDAP user exists");
+            return Err(match (lookup, listed) {
+                (Err(e), _) | (Ok(_), Err(e)) => e,
+                (Ok(_), Ok(_)) => ProvisionError::failed("LLDAP GraphQL error (see broker logs)"),
+            });
+        };
+        let present = users.iter().any(|u| {
+            at(u, &["id"])
+                .as_str()
+                .is_some_and(|id| id.eq_ignore_ascii_case(username))
+        });
+        if present {
+            // Listed, yet the lookup failed: not "gone".
+            tracing::error!(username, "LLDAP lists the user but its lookup failed");
+            return Err(lookup.err().unwrap_or_else(|| {
+                ProvisionError::failed("LLDAP GraphQL error (see broker logs)")
+            }));
+        }
+        Ok(None)
     }
 
     async fn user_group_ids(&self, user: &str) -> Result<Vec<i64>, ProvisionError> {
@@ -339,11 +372,16 @@ impl LldapProvisioner {
                 Ok(())
             }
             Ok(_) => Err(original),
-            // The account itself is gone: it is in no group (B17).
-            Err(_) if !want_member && self.user(user).await.is_none() => {
-                tracing::info!(user, group, "LLDAP user is gone; nothing to remove");
-                Ok(())
-            }
+            // The account itself is gone: it is in no group (B17). Only
+            // a definite "no such user" counts; an outage is an error, so
+            // the revoke is retried.
+            Err(_) if !want_member => match self.user(user).await {
+                Ok(None) => {
+                    tracing::info!(user, group, "LLDAP user is gone; nothing to remove");
+                    Ok(())
+                }
+                Ok(Some(_)) | Err(_) => Err(original),
+            },
             Err(_) => Err(original),
         }
     }
@@ -431,7 +469,7 @@ impl LldapProvisioner {
             )));
         }
         let display = managed_display_name(&row.name);
-        match self.user(&username).await {
+        match self.user(&username).await? {
             None => {
                 self.graphql(
                     CREATE_USER,
@@ -693,7 +731,6 @@ impl Provisioner for LldapProvisioner {
                     )
                 })?;
             return Ok(Credential {
-                kind: "lldap_account".to_owned(),
                 value: Some(password),
                 username: Some(username.clone()),
                 note: Some(format!(
@@ -701,17 +738,16 @@ impl Provisioner for LldapProvisioner {
                     repr(username),
                     repr(&grant.resource)
                 )),
-                ..Credential::default()
+                ..Credential::of(CredentialKind::LldapAccount)
             });
         }
         Ok(Credential {
-            kind: "lldap_group".to_owned(),
             username: agent.and_then(|a| a.lldap_username),
             note: Some(format!(
                 "your service account is now in group {}; authenticate to Authelia-protected services with your own credentials",
                 repr(&grant.resource)
             )),
-            ..Credential::default()
+            ..Credential::of(CredentialKind::LldapGroup)
         })
     }
 

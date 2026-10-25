@@ -36,12 +36,15 @@ use agent_auth_store::agents::{self, AgentRow};
 use agent_auth_store::grants::{GrantRow, IssuableGrant, ProvisioningGrant};
 use agent_auth_store::pool::{self as store_pool, LeaseRow, NewLease};
 use agent_auth_store::{StoreError, Tx};
+use agent_auth_wire::agent::CREDENTIAL_VALUE_MAX;
 use agent_auth_wire::catalog::{PoolEntry, PoolItemEntry};
 use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 
 use super::common::{agent_ref, repr, store_failed};
-use super::{Credential, ProvisionError, Provisioner, Refused, RequestSpec, Validated};
+use super::{
+    Credential, CredentialKind, ProvisionError, Provisioner, Refused, RequestSpec, Validated,
+};
 
 /// How often a provision re-reads the leases after a lost insert.
 const TRIES: usize = 8;
@@ -82,6 +85,68 @@ fn strerror(e: &std::io::Error) -> String {
     match text.find(" (os error ") {
         Some(i) => text.get(..i).unwrap_or(&text).to_owned(),
         None => text,
+    }
+}
+
+/// The largest secret file a pool item may have: what a credential's value
+/// may carry, plus the one trailing newline that is dropped.
+#[allow(clippy::as_conversions)] // usize to u64 cannot truncate
+const MAX_SECRET_FILE: u64 = CREDENTIAL_VALUE_MAX as u64 + 1;
+
+fn too_large(item: &str) -> ProvisionError {
+    ProvisionError::failed(format!(
+        "the secret of {item} is larger than {CREDENTIAL_VALUE_MAX} bytes, the most a credential carries; ask the operator to shorten it"
+    ))
+}
+
+/// An item's secret file, without its trailing newline, read with a bound
+/// (the Python read any size; a value over the wire cap was a 500 at
+/// fetch, and a huge file filled the broker's memory).
+async fn read_secret(item: &str, path: &str) -> Result<Secret<String>, ProvisionError> {
+    let owned = path.to_owned();
+    let read = tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut text = String::new();
+        std::fs::File::open(&owned)?
+            .take(MAX_SECRET_FILE.saturating_add(1))
+            .read_to_string(&mut text)?;
+        Ok::<_, std::io::Error>(Secret::new(text))
+    })
+    .await;
+    let text = match read {
+        Ok(Ok(text)) => text,
+        Ok(Err(e)) => {
+            return Err(ProvisionError::failed(format!(
+                "cannot read the secret of {item} ({})",
+                strerror(&e)
+            )));
+        }
+        Err(e) => {
+            tracing::error!(error = %e, item, "reading a pool secret did not finish");
+            return Err(ProvisionError::failed(format!(
+                "cannot read the secret of {item} (see broker logs)"
+            )));
+        }
+    };
+    let whole = text.expose();
+    let text = Secret::new(whole.strip_suffix('\n').unwrap_or(whole).to_owned());
+    if text.expose().len() > CREDENTIAL_VALUE_MAX {
+        return Err(too_large(item));
+    }
+    Ok(text)
+}
+
+/// Refuse, at provisioning, an item whose secret file is already too
+/// large to hand out, so the request fails with the reason instead of
+/// becoming a grant whose credential never comes. (A missing or
+/// unreadable file is left to the fetch, as before: it may appear later.)
+async fn check_secret_size(item: &str, path: &str) -> Result<(), ProvisionError> {
+    if path.is_empty() {
+        return Ok(());
+    }
+    match tokio::fs::metadata(path).await {
+        Ok(m) if m.len() > MAX_SECRET_FILE => Err(too_large(item)),
+        _ => Ok(()),
     }
 }
 
@@ -362,6 +427,9 @@ impl PoolProvisioner {
                 exhausted = false;
                 break;
             };
+            if let Some(it) = pool.items.get(item) {
+                check_secret_size(item, &it.secret_file).await?;
+            }
             let lease = NewLease {
                 pool: name,
                 item,
@@ -511,16 +579,7 @@ impl Provisioner for PoolProvisioner {
         let value = if item.secret_file.is_empty() {
             None
         } else {
-            let text = tokio::fs::read_to_string(&item.secret_file)
-                .await
-                .map_err(|e| {
-                    ProvisionError::failed(format!(
-                        "cannot read the secret of {item_name} ({})",
-                        strerror(&e)
-                    ))
-                })?;
-            let text = text.strip_suffix('\n').unwrap_or(&text).to_owned();
-            Some(Secret::new(text))
+            Some(read_secret(item_name, &item.secret_file).await?)
         };
         let username = match item.properties.get("username") {
             Some(PropValue::Str(u)) => Some(u.clone()),
@@ -531,7 +590,6 @@ impl Provisioner for PoolProvisioner {
         properties.insert("item".to_owned(), json!(item_name));
         properties.extend(props.clone());
         Ok(Credential {
-            kind: "pool_item".to_owned(),
             value,
             username,
             expires_at: Some(grant.expires_at),
@@ -542,7 +600,7 @@ impl Provisioner for PoolProvisioner {
                 canonical_json::to_python_default_string(&Value::Object(props))
             )),
             properties: Some(properties),
-            ..Credential::default()
+            ..Credential::of(CredentialKind::PoolItem)
         })
     }
 

@@ -205,6 +205,55 @@ async fn the_hosts_policy_refuses_before_a_code_is_spent(pool: sqlx::PgPool) {
 }
 
 #[sqlx::test(migrations = "../store/migrations")]
+async fn a_run_grant_with_the_longest_argv_serves_its_summary(pool: sqlx::PgPool) {
+    // The job summary carries the whole argv. 64 KiB of it (the most core
+    // admits) made of control characters is about 384 KiB once
+    // JSON-escaped: over the old 16 KiB cap on a credential's value, so
+    // fetching it was a 500. Every summary core can make fits the new cap.
+    let b = Broker::start(pool).await;
+    let host = Host::start(&b).await;
+    let a = b.agent("claude-1").await;
+    let max = agent_auth_core::hostexec::MAX_ARG_BYTES;
+    let mut argv = vec!["true".to_owned()];
+    let mut left = agent_auth_core::hostexec::MAX_ARGV_BYTES - "true".len();
+    while left > 0 {
+        let n = left.min(max);
+        argv.push("\u{1}".repeat(n));
+        left -= n;
+    }
+    let r = crate::service::create(
+        &b.st,
+        &caller(&a),
+        body("run", json!({"tier": "user", "argv": argv})),
+    )
+    .await
+    .unwrap();
+    crate::service::decide(&b.st, r.id, &jrt(), totp(host.code("user-direct", 0)))
+        .await
+        .unwrap();
+    let j = job(&b, JobId::for_request(r.id)).await;
+    assert_eq!(j.status, JobStatus::Done, "{:?}", j.error);
+    let tx = b.st.store.begin().await.unwrap();
+    let grant = agent_auth_store::grants::by_request(&tx, r.id)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(tx);
+    let (status, cred) = crate::http::agent::credential_over_route(&b.st, a.id, grant.id).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{cred}");
+    assert_eq!(cred["kind"], "hostexec_job");
+    let value = cred["value"].as_str().unwrap();
+    assert!(value.chars().count() > 16 * 1024);
+    assert!(value.chars().count() < agent_auth_wire::agent::CREDENTIAL_VALUE_MAX / 2);
+    let summary: agent_auth_wire::hostexec::JobSummary = serde_json::from_str(value).unwrap();
+    assert_eq!(
+        summary.command,
+        Some(agent_auth_wire::hostexec::JobCommand::Argv(argv))
+    );
+    drop(host);
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
 async fn armed_approvals_and_templates_expanded_by_the_host(pool: sqlx::PgPool) {
     let b = Broker::start(pool).await;
     let host = Host::start(&b).await;
@@ -307,6 +356,11 @@ async fn a_shell_takes_a_code_and_shows_every_command_first(pool: sqlx::PgPool) 
         .unwrap()
         .unwrap();
     drop(tx);
+    // What the agent fetches: the shell's grant id, through the route.
+    let (status, cred) = crate::http::agent::credential_over_route(&b.st, a.id, grant.id).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{cred}");
+    assert_eq!(cred["kind"], "hostexec_shell");
+    assert_eq!(cred["value"], grant.id.to_string());
     let exec = |argv: &[&str]| -> ShellExecBody {
         serde_json::from_value(json!({"argv": argv, "wait": 5})).unwrap()
     };

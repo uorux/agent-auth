@@ -136,7 +136,7 @@ async fn a_token_names_the_server_tools_and_grant(pool: PgPool) {
     let g = granted(&t.store, &t.p, a.id, &tools(&["read"]), "notes").await;
     assert_eq!(g.provisioner_state, json!({"server": "notes"}));
     let c = credential(&t.store, &t.p, &g).await.unwrap();
-    assert_eq!(c.kind, "mcp_token");
+    assert_eq!(kind_name(&c), "mcp_token");
     let now_f = now().unix_timestamp() as f64;
     let claims = t
         .tokens
@@ -270,4 +270,20 @@ async fn a_server_removed_from_the_catalog_issues_nothing(pool: PgPool) {
         c["servers"],
         json!([{"name": "open", "url": "https://o", "description": "", "tools": null}])
     );
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn the_credential_route_serves_an_mcp_token(pool: PgPool) {
+    let t = setup(pool);
+    let a = agent(&t.store, "mcp-agent").await;
+    let g = granted(&t.store, &t.p, a.id, &tools(&["read"]), "notes").await;
+    let out = credentials_over_http(
+        &t.store,
+        agent_auth_broker::provisioners::AnyProvisioner::Mcp(t.p),
+        &[&g],
+    )
+    .await;
+    assert_eq!(out[0].0, axum::http::StatusCode::OK, "{}", out[0].1);
+    assert_eq!(out[0].1["kind"], "mcp_token");
+    assert!(out[0].1["value"].as_str().is_some_and(|v| !v.is_empty()));
 }
