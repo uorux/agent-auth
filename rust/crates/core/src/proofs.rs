@@ -54,7 +54,12 @@ fn gates_only_downgrade_and_match_spec() {
 
 /// INV-15: terminal statuses have no way out, and the graph only reaches
 /// GRANTED through APPROVED then PROVISIONING.
+///
+/// `can_transition` searches a successor list (at most 4 long), so CBMC's
+/// loop unwinding needs a bound: 4 iterations plus one to show the loop
+/// ends (Kani's unwinding assertions fail the proof if 5 is too small).
 #[kani::proof]
+#[kani::unwind(5)]
 fn status_machine_properties() {
     let from = any_status();
     let to = any_status();

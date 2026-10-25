@@ -24,6 +24,12 @@
       nightly = pkgs.rust-bin.nightly."2026-10-01".default.override {
         extensions = [ "rust-src" "miri" "llvm-tools" ];
       };
+      # Kani is built against one exact nightly (its bundle's
+      # rust-toolchain-version); nix/kani.nix checks they match.
+      kaniNightly = pkgs.rust-bin.nightly."2026-08-21".default.override {
+        extensions = [ "rust-src" "rustc-dev" "llvm-tools" "rustfmt" ];
+      };
+      kani = pkgs.callPackage ./nix/kani.nix { toolchain = kaniNightly; };
       tools = [
         pkgs.cargo-deny
         pkgs.cargo-audit
@@ -39,6 +45,8 @@
       ];
     in
     {
+      packages.${system}.kani = kani;
+
       devShells.${system} = {
         default = pkgs.mkShell {
           packages = [ stable ] ++ tools;
@@ -49,6 +57,12 @@
           packages = [ nightly pkgs.cargo-fuzz ] ++ tools;
           SQLX_OFFLINE = "true";
           NSS_WRAPPER_LIB = "${pkgs.nss_wrapper}/lib/libnss_wrapper.so";
+        };
+        # `cargo kani` (scripts/kani.sh). Kani drives its own nightly; it is
+        # also the shell's cargo so `cargo` and `cargo kani` agree.
+        kani = pkgs.mkShell {
+          packages = [ kani kaniNightly ];
+          SQLX_OFFLINE = "true";
         };
       };
     };
