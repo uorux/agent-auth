@@ -58,7 +58,9 @@ pub fn root_store_with(extra_pem: &[u8]) -> Result<RootCertStore, TlsError> {
     let mut added = 0usize;
     for cert in CertificateDer::pem_slice_iter(extra_pem) {
         let cert = cert.map_err(|e| TlsError::Pem(e.to_string()))?;
-        store.add(cert).map_err(|e| TlsError::Rejected(e.to_string()))?;
+        store
+            .add(cert)
+            .map_err(|e| TlsError::Rejected(e.to_string()))?;
         added = added.saturating_add(1);
     }
     if added == 0 {
@@ -86,7 +88,10 @@ pub fn default_client_config() -> Result<rustls::ClientConfig, TlsError> {
 /// A reqwest builder with this TLS config, no proxy from the environment,
 /// no redirects, and the given timeout. Callers add what else they need.
 #[cfg(feature = "reqwest")]
-pub fn reqwest_builder(config: rustls::ClientConfig, timeout: std::time::Duration) -> reqwest::ClientBuilder {
+pub fn reqwest_builder(
+    config: rustls::ClientConfig,
+    timeout: std::time::Duration,
+) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .tls_backend_preconfigured(config)
         .no_proxy()
@@ -109,7 +114,10 @@ mod tests {
         // The guard really filters: the raw bundle minus ours is exactly
         // the distrusted ones (none, with webpki-roots >= 1.0.11).
         let removed = webpki_roots::TLS_SERVER_ROOTS.len() - store.roots.len();
-        let expected = webpki_roots::TLS_SERVER_ROOTS.iter().filter(|a| distrusted(a.subject.as_ref())).count();
+        let expected = webpki_roots::TLS_SERVER_ROOTS
+            .iter()
+            .filter(|a| distrusted(a.subject.as_ref()))
+            .count();
         assert_eq!(removed, expected);
     }
 
@@ -123,6 +131,9 @@ mod tests {
     #[test]
     fn config_builds() {
         assert!(default_client_config().is_ok());
-        assert!(matches!(root_store_with(b"not pem"), Err(TlsError::NoCertificates)));
+        assert!(matches!(
+            root_store_with(b"not pem"),
+            Err(TlsError::NoCertificates)
+        ));
     }
 }
