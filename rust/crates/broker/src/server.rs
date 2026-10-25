@@ -100,6 +100,37 @@ pub fn spine(config: &Config, policy: &Policy) -> anyhow::Result<Spine> {
     Ok(spine)
 }
 
+/// Paired daemons, commands on hosts, desk prompts and attention
+/// (`BROKER_SIGNING_KEY`, `DAEMON_*`; the watcher with OpenRouter and
+/// `platforms.hostexec.watch`).
+fn hostd_part(
+    config: &Config,
+    store: &Store,
+    policy: &Arc<Policy>,
+) -> anyhow::Result<crate::daemons::HostdPart> {
+    let daemons = crate::daemons::DaemonsConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let hx = &policy.platforms().hostexec;
+    let watcher = match &config.openrouter_api_key {
+        Some(key) if hx.watch && daemons.signing_key.is_some() => {
+            let model = hx
+                .risk_model
+                .clone()
+                .unwrap_or_else(|| policy.llm().model.clone());
+            Some(
+                crate::hostexec::watcher::Watcher::new(
+                    agent_auth_crypto::Secret::new(key.expose().clone()),
+                    &config.openrouter_base_url,
+                    &model,
+                )
+                .map_err(|e| anyhow::anyhow!("watcher: {e}"))?,
+            )
+        }
+        _ => None,
+    };
+    crate::daemons::HostdPart::build(store.clone(), daemons, Arc::clone(policy), watcher)
+        .map_err(|e| anyhow::anyhow!("daemons: {e}"))
+}
+
 /// The operator's row (the panel's chat identity), created once.
 async fn ensure_operator(store: &Store) -> anyhow::Result<()> {
     let tx = store.begin().await?;
@@ -201,8 +232,13 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
     ensure_operator(&store).await?;
 
     let policy = Arc::new(policy);
-    let (registry, platform_services) = register_provisioners(&env, &config, &policy)?;
-    let spine = spine(&config, &policy)?;
+    let (mut registry, platform_services) = register_provisioners(&env, &config, &policy)?;
+    let mut spine = spine(&config, &policy)?;
+    let hostd = hostd_part(&config, &store, &policy)?;
+    if let Some(p) = hostd.provisioner() {
+        registry.register(p);
+    }
+    hostd.install_hooks(&mut spine.hooks);
     // `env` (the process environment over `./.env`), not the process
     // environment alone: the quick start puts DISCORD_TOKEN in `.env`.
     let lookup = |k: &str| env.get(k).map(str::to_owned);
@@ -246,16 +282,25 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
     if let Some(d) = &discord {
         state.notifier = Arc::new(Notifier::Discord(d.notifier()));
     }
+    let primary = Arc::try_unwrap(state.notifier).unwrap_or_default();
+    state.notifier = Arc::new(hostd.wrap_notifier(primary));
+    let hostd = Arc::new(hostd);
+    state.hostd = Some(Arc::clone(&hostd));
     let state = crate::webui::install(state, web);
+    hostd.bind(&state);
     crate::scheduler::boot(&state).await;
 
     let mut tasks = Vec::new();
     if let Some(d) = discord {
         let ops = Arc::new(SpineOps::new(state.clone()));
+        let hosts: Arc<dyn crate::discord::HostsOps> = match &hostd.hostexec {
+            Some(h) => h.clone(),
+            None => ops.clone(),
+        };
         d.attach(Services {
             requests: Some(ops.clone()),
-            containment: Some(ops.clone()),
-            hosts: Some(ops),
+            containment: Some(ops),
+            hosts: Some(hosts),
         });
         tasks.push(tokio::spawn(d.run()));
     }

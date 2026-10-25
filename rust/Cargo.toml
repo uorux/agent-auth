@@ -20,6 +20,7 @@ agent-auth-wire = { path = "crates/wire", version = "0.1.0" }
 agent-auth-store = { path = "crates/store", version = "0.1.0" }
 agent-auth-client = { path = "crates/client", version = "0.1.0" }
 agent-auth-daemon = { path = "crates/daemon", version = "0.1.0" }
+agent-auth-hostd = { path = "crates/hostd", version = "0.1.0" }
 agent-auth-tls = { path = "crates/tls", version = "0.1.0" }
 
 tokio = { version = "1.54.1", default-features = false }

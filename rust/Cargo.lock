@@ -8,6 +8,8 @@ version = "0.1.0"
 dependencies = [
  "agent-auth-core",
  "agent-auth-crypto",
+ "agent-auth-daemon",
+ "agent-auth-hostd",
  "agent-auth-store",
  "agent-auth-tls",
  "agent-auth-wire",

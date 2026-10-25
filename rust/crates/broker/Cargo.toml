@@ -54,3 +54,6 @@ tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true
 ring.workspace = true
 proptest.workspace = true
+agent-auth-daemon.workspace = true
+agent-auth-hostd.workspace = true
+tokio-tungstenite.workspace = true
