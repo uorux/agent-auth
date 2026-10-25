@@ -1901,7 +1901,7 @@ async fn mcp_tools_end_to_end(pool: sqlx::PgPool) {
     assert_eq!(wait["inputSchema"]["required"], json!(["request_id"]));
     assert_eq!(
         wait["inputSchema"]["properties"]["timeout_secs"]["default"],
-        json!(120.0)
+        json!(120) // the Python's pydantic schema: the default as written, an int
     );
 
     // whoami reaches the agent API as the connector, with its own token.

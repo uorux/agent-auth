@@ -52,6 +52,8 @@ url = { version = "2.5.8", default-features = false, features = ["std"] }
 clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "env"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std", "attributes"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt", "env-filter", "ansi"] }
+# Hidden input for the operator's TOTP and arm codes (termios, /dev/tty).
+rpassword = { version = "7.5.4", default-features = false }
 futures = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
 bytes = { version = "1.12.1", default-features = false, features = ["std"] }
 zeroize = { version = "1.9.1", default-features = false, features = ["alloc", "derive"] }

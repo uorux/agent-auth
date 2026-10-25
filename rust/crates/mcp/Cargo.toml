@@ -9,12 +9,28 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[[bin]]
+name = "agent-auth-mcp"
+path = "src/bin/agent-auth-mcp.rs"
+
+[[bin]]
+name = "agent-auth-mcp-bridge"
+path = "src/bin/agent-auth-mcp-bridge.rs"
+
 [dependencies]
 agent-auth-client.workspace = true
+agent-auth-core.workspace = true
+agent-auth-tls = { workspace = true, features = ["reqwest"] }
 agent-auth-wire.workspace = true
-rmcp.workspace = true
-tokio.workspace = true
+reqwest.workspace = true
+# The official MCP SDK: the server side over stdio only.
+rmcp = { workspace = true, features = ["server", "transport-io"] }
 serde.workspace = true
 serde_json.workspace = true
-anyhow.workspace = true
-tracing.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time"] }
+
+[dev-dependencies]
+agent-auth-client = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time", "test-util"] }
