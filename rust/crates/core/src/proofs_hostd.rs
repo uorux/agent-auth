@@ -140,7 +140,9 @@ fn hostd_totp_replay_and_lock() {
             assert!(before.hard_locked || before.locked_until.is_some_and(|u| u > now));
         }
         Ok(attempt) => {
+            // Locked (hard, or until a later time) is refused: both ways.
             assert!(!before.hard_locked);
+            assert!(!before.locked_until.is_some_and(|u| u > now));
             match attempt.conclude(&mut state, Some(matched)) {
                 Ok(code) => {
                     assert!(before.last_step.is_none_or(|l| code.step() > l));
