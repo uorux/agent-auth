@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT encode(sha256(convert_to($1, 'UTF8')), 'hex') AS \"sha!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "sha!",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "c70dfa624da039e69231eb82532aa71cf919aae8e8c77034e4c00dc92f8986ed"
+}

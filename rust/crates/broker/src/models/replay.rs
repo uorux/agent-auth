@@ -48,7 +48,11 @@ pub async fn start(
     let mut selection = replay.selection.clone();
     selection.kind = Some(replay.kind.as_str().to_owned());
     let tx = store.begin().await.map_err(|e| e.to_string())?;
-    let calls = evals::list_calls(&tx, &selection)
+    // One at a time: replays share the live key and its rate limit.
+    if evals::running_runs(&tx).await.map_err(|e| e.to_string())? > 0 {
+        return Err("a replay is still running: wait for it to finish".to_owned());
+    }
+    let calls = evals::select_ids(&tx, &selection)
         .await
         .map_err(|e| e.to_string())?;
     if calls.is_empty() {
@@ -111,19 +115,32 @@ async fn run(
     replay: &Replay,
     system: &str,
     id: Uuid,
-    calls: Vec<CallRow>,
+    calls: Vec<Uuid>,
     concurrency: u8,
 ) -> Result<(), agent_auth_store::StoreError> {
     let r = recipe(replay.kind);
     let permits = Arc::new(tokio::sync::Semaphore::new(usize::from(concurrency.max(1))));
     let mut tasks = Vec::new();
-    for call in calls {
+    for call_id in calls {
         let permit = Arc::clone(&permits);
-        let model = replay.model.clone().unwrap_or_else(|| call.model.clone());
         tasks.push(async move {
             let _p = permit.acquire().await;
+            // Each call read when it is asked (not all of them held at once),
+            // its sealed parts opened.
+            let tx = store.begin().await?;
+            let read = evals::get_call(&tx, call_id).await?;
+            tx.commit().await?;
+            let Some(call) = read else {
+                return Ok(()); // forgotten meanwhile (retention)
+            };
+            let call: Result<CallRow, String> = client.opened(call);
+            let model = match &call {
+                Ok(c) => replay.model.clone().unwrap_or_else(|| c.model.clone()),
+                Err(_) => String::new(),
+            };
             let started = Instant::now();
-            let asked = match (r.build)(&call.facts, &replay.context) {
+            let built = call.and_then(|c| (r.build)(&c.facts, &replay.context));
+            let asked = match built {
                 Ok(user) => {
                     client
                         .complete(
@@ -153,7 +170,7 @@ async fn run(
                 &tx,
                 &NewResult {
                     run: id,
-                    call: call.id,
+                    call: call_id,
                     answer: answer.as_ref(),
                     class: class.as_deref(),
                     error: error.as_deref(),

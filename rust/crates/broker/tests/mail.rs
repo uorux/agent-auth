@@ -489,6 +489,7 @@ impl World {
                         agent_auth_crypto::Secret::new("or-key".to_owned()),
                         &self.judge_url,
                         Some(self.store.clone()),
+                        Some(Arc::new(SecretBox::from_bytes(&[7u8; 32]).unwrap())),
                     )
                     .unwrap(),
                 )
@@ -515,6 +516,7 @@ impl World {
         st.notifier = Arc::clone(&self.recorder);
         gateway.set_notifier(Arc::clone(&self.recorder));
         st.mail = Some(Arc::clone(&gateway));
+        st.models = settings.models.clone();
         self.gateway = gateway;
         self.app = router(st);
     }
@@ -1129,6 +1131,64 @@ async fn send_checks(pool: sqlx::PgPool) {
     assert_eq!(discarded["status"], "discarded");
     assert_eq!(discarded["decided_by"], "admin");
     assert_eq!(w.gmail.sent.lock().unwrap().len(), 1);
+    // Evals: every review recorded, sealed (no draft text in the clear),
+    // its class readable; the released one labelled `send`.
+    let tx = w.store.begin().await.unwrap();
+    let calls = agent_auth_store::evals::list_calls(
+        &tx,
+        &agent_auth_store::evals::Selection {
+            kind: Some("mail_outbound".to_owned()),
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(calls.len(), 3);
+    for c in &calls {
+        let whole = agent_auth_store::evals::get_call(&tx, c.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let raw = format!("{} {} {:?}", whole.facts, whole.user_message, whole.answer);
+        assert!(
+            !raw.contains("charge my card") && !raw.contains("payment"),
+            "{raw}"
+        );
+        assert!(whole.user_message.starts_with("sealed:"));
+        assert!(whole.facts.get("sealed").is_some());
+    }
+    let labels: Vec<(Option<String>, Option<String>)> = calls
+        .iter()
+        .map(|c| {
+            (
+                c.class.clone(),
+                c.label.as_ref().map(|l| l.expected.clone()),
+            )
+        })
+        .collect();
+    assert!(
+        labels.contains(&(Some("hold".into()), Some("send".into()))),
+        "{labels:?}"
+    );
+    drop(tx);
+    // Opened for the operator.
+    let (s, page) = w
+        .call("GET", "/admin/evals/calls?kind=mail_outbound", ADMIN, None)
+        .await;
+    assert_eq!(s, StatusCode::OK, "{page}");
+    let id = page["calls"][1]["id"].as_str().unwrap().to_owned();
+    let (s, detail) = w
+        .call("GET", &format!("/admin/evals/calls/{id}"), ADMIN, None)
+        .await;
+    assert_eq!(s, StatusCode::OK, "{detail}");
+    assert!(
+        detail["user_message"]
+            .as_str()
+            .unwrap()
+            .contains("charge my card"),
+        "{detail}"
+    );
 }
 
 #[sqlx::test(migrations = "../store/migrations")]

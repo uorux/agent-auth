@@ -90,6 +90,7 @@ impl Broker {
                 Secret::new("test-key".to_owned()),
                 &model.url,
                 Some(Store::from_pool(pool.clone())),
+                None,
             )
             .unwrap(),
         );

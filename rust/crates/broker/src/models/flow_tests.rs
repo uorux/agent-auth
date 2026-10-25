@@ -303,8 +303,7 @@ async fn outcome_labels_never_override_the_operator(pool: sqlx::PgPool) {
     crate::models::label_outcome(
         &store,
         crate::models::Kind::RequestReview,
-        "request_id",
-        "r0",
+        json!({"request_id": "r0"}),
         "approve",
         "jrt",
     )
@@ -327,8 +326,7 @@ async fn outcome_labels_never_override_the_operator(pool: sqlx::PgPool) {
     crate::models::label_outcome(
         &store,
         crate::models::Kind::RequestReview,
-        "request_id",
-        "r0",
+        json!({"request_id": "r0"}),
         "approve",
         "jrt",
     )
@@ -344,14 +342,70 @@ async fn outcome_labels_never_override_the_operator(pool: sqlx::PgPool) {
         (l.expected.as_str(), l.source.as_str()),
         ("deny", "operator")
     );
-    // Retention: old unlabelled calls go, labelled ones stay.
+    // Retention: old calls go unless an operator labelled them (a label
+    // from what happened next keeps nothing).
     evals::set_label(&tx, ids[1], "deny", "", "operator", "jrt", now)
         .await
         .unwrap();
-    let forgotten = evals::purge(&tx, now - time::Duration::days(90))
+    evals::set_label(&tx, ids[2], "deny", "", "outcome", "jrt", now)
+        .await
+        .unwrap();
+    let forgotten = evals::purge(&tx, now - time::Duration::days(90), 1000)
         .await
         .unwrap();
     assert_eq!(forgotten, 1);
     assert!(evals::get_call(&tx, ids[1]).await.unwrap().is_some());
     assert!(evals::get_call(&tx, ids[2]).await.unwrap().is_none());
+}
+
+/// A call that cannot be recorded (here: its record would break a
+/// column's limit, and the store refuses it) still decides.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_record_that_fails_leaves_the_decision_alone(pool: sqlx::PgPool) {
+    let m = FakeModel::start(|_s: &str, _u: &str| Some(json!({"level": "fine", "summary": "ok"})))
+        .await;
+    let store = agent_auth_store::Store::from_pool(pool.clone());
+    let client = crate::models::ModelClient::new(
+        agent_auth_crypto::Secret::new("k".to_owned()),
+        &m.url,
+        Some(store),
+        None,
+    )
+    .unwrap();
+    let facts = json!({
+        "agent": "a", "host": "h", "tier": "user", "approved_purpose": "p",
+        "earlier": [], "total": 0, "spec": {"argv": ["true"]},
+    });
+    // A subject past its 4000-byte limit: the insert fails.
+    let d = client
+        .decide(
+            crate::models::Kind::ShellGuard,
+            "m",
+            facts,
+            json!({"pad": "x".repeat(5000)}),
+            Duration::from_secs(5),
+        )
+        .await;
+    assert_eq!(d.class.as_deref(), Some("fine"));
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM model_calls")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+    // Mail is never recorded in the clear: no sealer, no record.
+    let d = client
+        .decide(
+            crate::models::Kind::MailOutbound,
+            "m",
+            json!({"constraints": [], "purpose": "p", "draft": {"body": "secret code 123456"}, "context": []}),
+            json!({}),
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(d.answer.is_some());
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM model_calls")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "mail is not recorded without ENCRYPTION_KEY");
 }

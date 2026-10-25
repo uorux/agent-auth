@@ -87,28 +87,49 @@ static TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1
 const EVALS_EVERY: u64 = 120;
 
 async fn evals_housekeeping(st: &AppState, boot: bool) {
-    let now = st.now();
-    let retention = Duration::seconds(i64::from(st.policy.evals().retention.get()));
-    let done = async {
-        let tx = st.store.begin().await?;
+    // Off the tick: a large backlog must not hold expiry (or startup) up.
+    let st = st.clone();
+    tokio::spawn(async move {
+        let now = st.now();
+        let retention = Duration::seconds(i64::from(st.policy.evals().retention.get()));
         let before = now.checked_sub(retention).unwrap_or(now);
-        let forgotten = agent_auth_store::evals::purge(&tx, before).await?;
-        let failed = if boot {
-            agent_auth_store::evals::fail_unfinished(&tx, now).await?
-        } else {
-            0
-        };
-        tx.commit().await?;
-        Ok::<_, agent_auth_store::StoreError>((forgotten, failed))
-    }
-    .await;
-    match done {
-        Ok((0, 0)) => {}
-        Ok((forgotten, failed)) => {
-            tracing::info!(forgotten, failed, "evals housekeeping");
+        if boot {
+            let failed = async {
+                let tx = st.store.begin().await?;
+                let n = agent_auth_store::evals::fail_unfinished(&tx, now).await?;
+                tx.commit().await?;
+                Ok::<_, agent_auth_store::StoreError>(n)
+            }
+            .await;
+            match failed {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(n, "evals: replays cut off by a restart marked failed"),
+                Err(e) => tracing::error!(error = %e, "evals: marking replays failed"),
+            }
         }
-        Err(e) => tracing::error!(error = %e, "evals housekeeping failed"),
-    }
+        // In batches, each its own transaction.
+        let mut forgotten = 0u64;
+        loop {
+            let batch = async {
+                let tx = st.store.begin().await?;
+                let n = agent_auth_store::evals::purge(&tx, before, 1000).await?;
+                tx.commit().await?;
+                Ok::<_, agent_auth_store::StoreError>(n)
+            }
+            .await;
+            match batch {
+                Ok(0) => break,
+                Ok(n) => forgotten = forgotten.saturating_add(n),
+                Err(e) => {
+                    tracing::error!(error = %e, "evals housekeeping failed");
+                    break;
+                }
+            }
+        }
+        if forgotten > 0 {
+            tracing::info!(forgotten, "evals: recorded calls past retention forgotten");
+        }
+    });
 }
 
 async fn resume_llm(st: &AppState, boot: bool) -> usize {

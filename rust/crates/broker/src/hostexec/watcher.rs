@@ -210,6 +210,15 @@ fn s<'a>(facts: &'a Value, key: &str) -> &'a str {
     facts.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
+/// A fact the prompt cannot do without (a build fails without it: never a
+/// prompt about nothing).
+fn need<'a>(facts: &'a Value, key: &str) -> Result<&'a Value, String> {
+    facts
+        .get(key)
+        .filter(|v| !v.is_null())
+        .ok_or_else(|| format!("facts lack {key}"))
+}
+
 /// `"key": value` lines, in this order, as one JSON object's text.
 fn ordered(fields: &[(&str, Value)]) -> String {
     let lines: Vec<String> = fields
@@ -230,9 +239,21 @@ fn ordered(fields: &[(&str, Value)]) -> String {
 /// What the watcher's prompt is built from.
 #[must_use]
 pub fn watch_facts(w: &Watched<'_>) -> Value {
+    // At most what a replay could show (the knob's maximum), as the
+    // prompt shows them (40 arguments each): a record does not grow with
+    // the shell.
+    let max = WATCH_KNOBS.first().map_or(100, |k| k.max);
+    let max = usize::try_from(max).unwrap_or(100);
+    let earlier: Vec<Vec<&String>> = w
+        .earlier
+        .get(w.earlier.len().saturating_sub(max)..)
+        .unwrap_or_default()
+        .iter()
+        .map(|c| c.iter().take(40).collect())
+        .collect();
     let mut facts = json!({
         "agent": w.agent, "host": w.host, "tier": w.tier,
-        "earlier": w.earlier, "command": w.argv,
+        "earlier": earlier, "command": w.argv,
     });
     if !w.general
         && let Value::Object(m) = &mut facts
@@ -243,6 +264,11 @@ pub fn watch_facts(w: &Watched<'_>) -> Value {
 }
 
 fn build_watch_for(facts: &Value, ctx: &Context, kind: Kind) -> Result<String, String> {
+    need(facts, "agent")?;
+    need(facts, "command")?;
+    if kind == Kind::ShellWatch {
+        need(facts, "purpose")?;
+    }
     let earlier: Vec<Vec<String>> = facts
         .get("earlier")
         .and_then(Value::as_array)
@@ -307,6 +333,7 @@ pub const WATCH_RECIPE: Recipe = Recipe {
     classify: classify_level,
     classes: &["fine", "odd", "alarming"],
     knobs: WATCH_KNOBS,
+    sealed: false,
 };
 
 /// The watcher of a general shell as a decision recipe (evals).
@@ -319,6 +346,7 @@ pub const GENERAL_WATCH_RECIPE: Recipe = Recipe {
     classify: classify_level,
     classes: &["fine", "odd", "alarming"],
     knobs: WATCH_KNOBS,
+    sealed: false,
 };
 
 // --------------------------------------------------------------- guard
@@ -358,6 +386,8 @@ fn spec_fields(spec: &Value) -> Value {
 }
 
 fn build_guard(facts: &Value, ctx: &Context) -> Result<String, String> {
+    need(facts, "agent")?;
+    need(facts, "approved_purpose")?;
     let kind = Kind::ShellGuard;
     let all: Vec<&Value> = facts
         .get("earlier")
@@ -385,7 +415,18 @@ fn build_guard(facts: &Value, ctx: &Context) -> Result<String, String> {
                 m.insert("scope_purpose".into(), p.clone());
             }
         }
-        let size = v.to_string().len();
+        // Measured as the guard always measured it: the whole spec, the
+        // error and the scope purpose.
+        let len = |k: &str| {
+            e.get(k).map_or(0, |v| {
+                v.as_str().map_or_else(|| v.to_string().len(), str::len)
+            })
+        };
+        let size = e
+            .get("spec")
+            .map_or(0, |s| s.to_string().len())
+            .saturating_add(len("error"))
+            .saturating_add(len("scope_purpose"));
         if used.saturating_add(size) > max_chars {
             break;
         }
@@ -447,6 +488,7 @@ pub const GUARD_RECIPE: Recipe = Recipe {
             doc: "characters of earlier commands shown at most",
         },
     ],
+    sealed: false,
 };
 
 // --------------------------------------------------------- scope check
@@ -468,6 +510,9 @@ pub fn scope_facts(
 }
 
 fn build_scope(facts: &Value, ctx: &Context) -> Result<String, String> {
+    need(facts, "agent")?;
+    need(facts, "concept")?;
+    need(facts, "purpose")?;
     let earlier: Vec<&str> = facts
         .get("earlier")
         .and_then(Value::as_array)
@@ -526,6 +571,7 @@ pub const SCOPE_RECIPE: Recipe = Recipe {
         max: 200,
         doc: "the umbrella's earlier scope purposes shown (the newest)",
     }],
+    sealed: false,
 };
 
 impl Watcher {

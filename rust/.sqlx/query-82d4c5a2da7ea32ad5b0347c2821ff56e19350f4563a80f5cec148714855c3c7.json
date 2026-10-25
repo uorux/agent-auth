@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT spec FROM host_jobs\n         WHERE shell_id = $1 AND id <> $2\n           AND created_at < (SELECT created_at FROM host_jobs WHERE id = $2)\n         ORDER BY created_at",
+  "query": "SELECT spec FROM host_jobs\n         WHERE shell_id = $1 AND id <> $2\n           AND created_at < (SELECT created_at FROM host_jobs WHERE id = $2)\n         ORDER BY created_at DESC, id DESC LIMIT 100",
   "describe": {
     "columns": [
       {
@@ -25,5 +25,5 @@
       false
     ]
   },
-  "hash": "263d7e0e5b3c3d6b1cacbbdd5b844d7ef63efdd60385242449b124fc23131aa6"
+  "hash": "82d4c5a2da7ea32ad5b0347c2821ff56e19350f4563a80f5cec148714855c3c7"
 }

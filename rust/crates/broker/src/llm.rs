@@ -272,10 +272,11 @@ pub const REVIEW_RECIPE: Recipe = Recipe {
     classes: &["approve", "deny"],
     knobs: &[Knob {
         name: "priors",
-        default: 20,
-        max: 100,
-        doc: "earlier verdicts on the same request shown (the newest)",
+        default: 1000,
+        max: 1000,
+        doc: "earlier verdicts on the same request shown (the newest; by default all)",
     }],
+    sealed: false,
 };
 
 /// The reviewer (`OPENROUTER_API_KEY`).
@@ -491,6 +492,7 @@ pub const RISK_RECIPE: Recipe = Recipe {
     classify: classify_risk,
     classes: &["low", "medium", "high"],
     knobs: &[],
+    sealed: false,
 };
 
 impl RiskSummarizer {

@@ -354,13 +354,24 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
 
     let policy = Arc::new(policy);
     // One model client for every decision a model makes, recording each
-    // (evals) unless `evals.record` is off.
+    // (evals) unless `evals.record` is off; mail's records sealed with
+    // ENCRYPTION_KEY (without it, mail decisions are not recorded).
     let models = match &config.openrouter_api_key {
-        Some(key) => Some(Arc::new(crate::models::ModelClient::new(
-            agent_auth_crypto::Secret::new(key.expose().clone()),
-            &config.openrouter_base_url,
-            policy.evals().record.then(|| store.clone()),
-        )?)),
+        Some(key) => {
+            let sealer = match &config.encryption_key {
+                Some(k) => Some(Arc::new(
+                    SecretBox::from_base64(k.expose())
+                        .map_err(|e| anyhow::anyhow!("ENCRYPTION_KEY: {e}"))?,
+                )),
+                None => None,
+            };
+            Some(Arc::new(crate::models::ModelClient::new(
+                agent_auth_crypto::Secret::new(key.expose().clone()),
+                &config.openrouter_base_url,
+                policy.evals().record.then(|| store.clone()),
+                sealer,
+            )?))
+        }
         None => None,
     };
     let (mut registry, platform_services) = register_provisioners(&env, &config, &policy)?;

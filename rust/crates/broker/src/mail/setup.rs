@@ -85,6 +85,7 @@ pub fn build(
                     Secret::new(key.clone()),
                     &settings.openrouter_base_url,
                     None,
+                    None,
                 )?),
             };
             Some(MailJudge::new(client, &model))

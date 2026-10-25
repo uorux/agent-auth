@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id FROM model_calls WHERE kind = $1 AND subject->>$2 = $3\n         ORDER BY created_at DESC, id DESC LIMIT 1",
+  "query": "SELECT id FROM model_calls WHERE subject @> $2 AND kind = $1\n         ORDER BY created_at DESC, id DESC LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -18,13 +18,12 @@
     "parameters": {
       "Left": [
         "Text",
-        "Text",
-        "Text"
+        "Jsonb"
       ]
     },
     "nullable": [
       false
     ]
   },
-  "hash": "97c92b5de7b85f217cad1dfed1d3268d64d7af9d2cff656d5e49b6df508ec64a"
+  "hash": "edae2f94dc7ce94f6020c3de9ad0323027915051b7b66450860c89c443573111"
 }

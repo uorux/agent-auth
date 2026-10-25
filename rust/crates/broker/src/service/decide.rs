@@ -124,8 +124,7 @@ pub async fn decide_attested(
     crate::models::label_outcome(
         &st.store,
         crate::models::Kind::RequestReview,
-        "request_id",
-        &id.to_string(),
+        serde_json::json!({"request_id": id.to_string()}),
         if approve { "approve" } else { "deny" },
         decider.label(),
     )

@@ -1883,8 +1883,7 @@ impl Mail {
             crate::models::label_outcome(
                 &self.store,
                 crate::models::Kind::MailOutbound,
-                "item_id",
-                &id.to_string(),
+                json!({"item_id": id.to_string()}),
                 "send",
                 by,
             )

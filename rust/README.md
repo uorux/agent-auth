@@ -308,8 +308,12 @@ evals:
 ```
 
 Records hold what the models saw: agents' justifications and commands
-(with their stdin and env), mail an outsider sent, drafts. They live in the
-broker's database next to the same data; set `record: false` to keep none.
+(with their stdin and env), mail an outsider sent, drafts. Mail's records
+are sealed with `ENCRYPTION_KEY`, like the held mail itself (without the
+key, mail decisions are not recorded); the rest sits in the database next
+to the same data (`host_jobs`, requests). Calls you labelled are kept until
+you unlabel them; everything else goes after `retention`. Set
+`record: false` to keep none. One replay runs at a time.
 
 ### sandboxd (`agent-auth-sandboxd`)
 

@@ -329,16 +329,19 @@ pub async fn earlier_in_shell(
     job: JobId,
 ) -> Result<Vec<Value>, StoreError> {
     let mut c = tx.conn().await;
-    Ok(sqlx::query_scalar!(
+    // The newest 100 (what the watcher can be shown), oldest first.
+    let mut specs = sqlx::query_scalar!(
         "SELECT spec FROM host_jobs
          WHERE shell_id = $1 AND id <> $2
            AND created_at < (SELECT created_at FROM host_jobs WHERE id = $2)
-         ORDER BY created_at",
+         ORDER BY created_at DESC, id DESC LIMIT 100",
         Uuid::from(shell),
         Uuid::from(job)
     )
     .fetch_all(&mut **c)
-    .await?)
+    .await?;
+    specs.reverse();
+    Ok(specs)
 }
 
 /// Newest first, optionally on one host (admin command log).

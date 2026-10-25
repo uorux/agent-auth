@@ -9,24 +9,38 @@
 //! same facts under another variant and asks again, recording only results
 //! (nothing a replay does reaches a decision).
 //!
-//! Recording is best effort: a call that cannot be recorded is logged and
-//! the decision stands.
+//! Recording is best effort and bounded: a call that cannot be recorded in
+//! [`RECORD_TIMEOUT`] is logged and the decision stands. The records of
+//! sealed kinds (mail) are sealed with `ENCRYPTION_KEY`, as the mail they
+//! hold is elsewhere; without a key they are not recorded.
 
 #[cfg(test)]
 mod flow_tests;
 pub mod replay;
 pub mod routes;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_auth_crypto::Secret;
+use agent_auth_crypto::secretbox::{Binding, SecretBox};
 use agent_auth_store::Store;
+use agent_auth_store::evals::CallRow;
 use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 /// The largest answer read from the model gateway.
 const MAX_ANSWER_BYTES: usize = 1 << 20;
+/// How long recording may hold a decision up.
+pub const RECORD_TIMEOUT: Duration = Duration::from_secs(2);
+/// A record's facts and user message at most, together; a larger one keeps
+/// its outcome but not its inputs (it cannot be replayed).
+pub const RECORD_MAX_BYTES: usize = 1_000_000;
+/// The key of a sealed part (`{"sealed": "<ciphertext>"}`).
+const SEALED: &str = "sealed";
+/// The prefix of a sealed user message.
+const SEALED_PREFIX: &str = "sealed:";
 
 /// The decision kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -103,6 +117,10 @@ pub struct Recipe {
     pub classify: fn(&Map<String, Value>) -> Option<String>,
     pub classes: &'static [&'static str],
     pub knobs: &'static [Knob],
+    /// Its records hold what the broker otherwise keeps sealed (mail):
+    /// facts, user message and answer are sealed with `ENCRYPTION_KEY`,
+    /// and without one the kind is not recorded.
+    pub sealed: bool,
 }
 
 impl std::fmt::Debug for Recipe {
@@ -196,6 +214,7 @@ pub struct ModelClient {
     base_url: String,
     api_key: Secret<String>,
     store: Option<Store>,
+    sealer: Option<Arc<SecretBox>>,
 }
 
 impl std::fmt::Debug for ModelClient {
@@ -203,16 +222,35 @@ impl std::fmt::Debug for ModelClient {
         f.debug_struct("ModelClient")
             .field("base_url", &self.base_url)
             .field("records", &self.store.is_some())
+            .field("seals", &self.sealer.is_some())
             .finish_non_exhaustive()
     }
 }
 
+/// What one record holds.
+struct Recording<'a> {
+    kind: Kind,
+    model: &'a str,
+    facts: &'a Value,
+    context: &'a Context,
+    system: &'a str,
+    user: &'a str,
+    answer: Option<&'a Map<String, Value>>,
+    class: Option<&'a str>,
+    error: Option<&'a str>,
+    latency: Duration,
+    subject: &'a Value,
+}
+
 impl ModelClient {
-    /// `store`: where calls are recorded (`None`: not recorded).
+    /// `store`: where calls are recorded (`None`: not recorded); `sealer`:
+    /// what seals the records of sealed kinds (mail; `None`: those are not
+    /// recorded).
     pub fn new(
         api_key: Secret<String>,
         base_url: &str,
         store: Option<Store>,
+        sealer: Option<Arc<SecretBox>>,
     ) -> anyhow::Result<Self> {
         let tls = agent_auth_tls::default_client_config()?;
         // Each call sets its own timeout; this is the ceiling.
@@ -222,6 +260,7 @@ impl ModelClient {
             base_url: base_url.trim_end_matches('/').to_owned(),
             api_key,
             store,
+            sealer,
         })
     }
 
@@ -316,87 +355,172 @@ impl ModelClient {
         };
         let class = answer.as_ref().and_then(|a| (r.classify)(a));
         let latency = started.elapsed();
-        if let Some(store) = &self.store {
-            let recorded = record(
-                store,
-                kind,
-                model,
-                &facts,
-                &context,
-                r.default_system,
-                &user,
-                answer.as_ref(),
-                class.as_deref(),
-                error.as_deref(),
-                latency,
-                &subject,
+        let sealer = match (r.sealed, &self.sealer) {
+            (false, _) => Some(None),
+            (true, Some(s)) => Some(Some(s.as_ref())),
+            // Never in the clear: not recorded at all.
+            (true, None) => None,
+        };
+        if let (Some(store), Some(sealer)) = (&self.store, sealer) {
+            // Best effort, and never long: the decision waits for nothing
+            // but the model.
+            let recorded = tokio::time::timeout(
+                RECORD_TIMEOUT,
+                record(
+                    store,
+                    sealer,
+                    &Recording {
+                        kind,
+                        model,
+                        facts: &facts,
+                        context: &context,
+                        system: r.default_system,
+                        user: &user,
+                        answer: answer.as_ref(),
+                        class: class.as_deref(),
+                        error: error.as_deref(),
+                        latency,
+                        subject: &subject,
+                    },
+                ),
             )
             .await;
-            if let Err(e) = recorded {
-                tracing::warn!(kind = kind.as_str(), "could not record a model call: {e}");
+            match recorded {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(kind = kind.as_str(), "could not record a model call: {e}");
+                }
+                Err(_) => tracing::warn!(kind = kind.as_str(), "recording a model call timed out"),
             }
         }
         Decision { answer, class }
     }
+
+    /// A record as it was made: sealed parts opened (an error without the
+    /// key that sealed them).
+    pub fn opened(&self, mut c: CallRow) -> Result<CallRow, String> {
+        let id = c.id.to_string();
+        let open = |text: &str, column: &str| -> Result<String, String> {
+            let sealer = self
+                .sealer
+                .as_ref()
+                .ok_or_else(|| "this record is sealed and ENCRYPTION_KEY is not set".to_owned())?;
+            sealer
+                .open_str(text, &Binding::new("model_calls", column, &id))
+                .map(|s| s.expose().clone())
+                .map_err(|_| "this record does not open".to_owned())
+        };
+        if let Some(sealed) = c.facts.get(SEALED).and_then(Value::as_str) {
+            c.facts = serde_json::from_str(&open(sealed, "facts")?).map_err(|e| e.to_string())?;
+        }
+        if let Some(sealed) = c.user_message.strip_prefix(SEALED_PREFIX) {
+            c.user_message = open(sealed, "user_message")?;
+        }
+        if let Some(sealed) = c
+            .answer
+            .as_ref()
+            .and_then(|a| a.get(SEALED))
+            .and_then(Value::as_str)
+        {
+            let opened = open(sealed, "answer")?;
+            c.answer = Some(serde_json::from_str(&opened).map_err(|e| e.to_string())?);
+        }
+        Ok(c)
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Text Postgres can store: no NUL (jsonb and text refuse it, and a record
+/// that cannot be written is one an agent or a sender could avoid).
+fn storable(text: &str) -> String {
+    text.replace('\0', "\u{fffd}")
+}
+
+fn storable_json(v: &Value) -> Value {
+    match v {
+        Value::String(s) => Value::String(storable(s)),
+        Value::Array(a) => Value::Array(a.iter().map(storable_json).collect()),
+        Value::Object(m) => Value::Object(
+            m.iter()
+                .map(|(k, v)| (storable(k), storable_json(v)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 async fn record(
     store: &Store,
-    kind: Kind,
-    model: &str,
-    facts: &Value,
-    context: &Context,
-    system: &str,
-    user: &str,
-    answer: Option<&Map<String, Value>>,
-    class: Option<&str>,
-    error: Option<&str>,
-    latency: Duration,
-    subject: &Value,
-) -> Result<(), agent_auth_store::StoreError> {
-    let sha = agent_auth_crypto::digest::sha256_hex(system.as_bytes());
-    let answer = answer.map(|a| Value::Object(a.clone()));
-    let error = error.map(|e| e.chars().take(2000).collect::<String>());
-    let tx = store.begin().await?;
-    agent_auth_store::evals::put_prompt(&tx, &sha, system).await?;
-    agent_auth_store::evals::record_call(
-        &tx,
-        &agent_auth_store::evals::NewCall {
-            id: Uuid::new_v4(),
-            kind: kind.as_str(),
-            model,
-            facts,
-            context: &context.to_json(),
-            system_sha256: &sha,
-            user_message: user,
-            answer: answer.as_ref(),
-            class,
-            error: error.as_deref(),
-            latency_ms: i32::try_from(latency.as_millis()).unwrap_or(i32::MAX),
-            subject,
-            now: OffsetDateTime::now_utc(),
-        },
-    )
-    .await?;
-    tx.commit().await
+    sealer: Option<&SecretBox>,
+    r: &Recording<'_>,
+) -> Result<(), String> {
+    let id = Uuid::new_v4();
+    let row = id.to_string();
+    let sha = agent_auth_crypto::digest::sha256_hex(r.system.as_bytes());
+    let mut facts = storable_json(r.facts);
+    let mut user = storable(r.user);
+    let size = facts.to_string().len().saturating_add(user.len());
+    if size > RECORD_MAX_BYTES {
+        facts = json!({"omitted": "too large to record", "bytes": size});
+        user = format!(
+            "{}\n[... cut: a record keeps at most {RECORD_MAX_BYTES} bytes]",
+            user.chars().take(64 * 1024).collect::<String>()
+        );
+    }
+    let mut answer = r.answer.map(|a| storable_json(&Value::Object(a.clone())));
+    if let Some(sealer) = sealer {
+        let seal = |text: &str, column: &str| {
+            sealer
+                .seal_str(text, &Binding::new("model_calls", column, &row))
+                .map_err(|_| "sealing failed".to_owned())
+        };
+        facts = json!({SEALED: seal(&facts.to_string(), "facts")?});
+        user = format!("{SEALED_PREFIX}{}", seal(&user, "user_message")?);
+        answer = match answer {
+            Some(a) => Some(json!({SEALED: seal(&a.to_string(), "answer")?})),
+            None => None,
+        };
+    }
+    let error: Option<String> = r.error.map(|e| storable(e).chars().take(2000).collect());
+    let subject = storable_json(r.subject);
+    let model: String = storable(r.model).chars().take(128).collect();
+    let go = async {
+        let tx = store.begin().await?;
+        agent_auth_store::evals::put_prompt(&tx, &sha, r.system).await?;
+        agent_auth_store::evals::record_call(
+            &tx,
+            &agent_auth_store::evals::NewCall {
+                id,
+                kind: r.kind.as_str(),
+                model: &model,
+                facts: &facts,
+                context: &r.context.to_json(),
+                system_sha256: &sha,
+                user_message: &user,
+                answer: answer.as_ref(),
+                class: r.class,
+                error: error.as_deref(),
+                latency_ms: i32::try_from(r.latency.as_millis()).unwrap_or(i32::MAX),
+                subject: &subject,
+                now: OffsetDateTime::now_utc(),
+            },
+        )
+        .await?;
+        tx.commit().await
+    };
+    go.await
+        .map_err(|e: agent_auth_store::StoreError| e.to_string())
 }
 
-/// Label the newest call of `kind` whose subject has `key` = `value` with
-/// what happened next (`outcome`: never over an operator's label). Best
-/// effort: a failure is logged.
-pub async fn label_outcome(
-    store: &Store,
-    kind: Kind,
-    key: &str,
-    value: &str,
-    expected: &str,
-    by: &str,
-) {
+/// Label the newest call of `kind` about `subject` (a JSON object it
+/// contains, e.g. `{"request_id": ...}`) with what happened next
+/// (`outcome`: never over an operator's label). Best effort: a failure is
+/// logged.
+pub async fn label_outcome(store: &Store, kind: Kind, subject: Value, expected: &str, by: &str) {
+    let by: String = by.chars().take(128).collect();
     let labelled = async {
         let tx = store.begin().await?;
         if let Some(call) =
-            agent_auth_store::evals::latest_for_subject(&tx, kind.as_str(), key, value).await?
+            agent_auth_store::evals::latest_about(&tx, kind.as_str(), &subject).await?
         {
             agent_auth_store::evals::set_label(
                 &tx,
@@ -404,7 +528,7 @@ pub async fn label_outcome(
                 expected,
                 "",
                 "outcome",
-                by,
+                &by,
                 OffsetDateTime::now_utc(),
             )
             .await?;
@@ -454,6 +578,15 @@ mod tests {
             }
             assert!(!valid_pattern(kind, "nonsense"));
             assert_eq!(Kind::parse(kind.as_str()), Some(kind));
+            // Mail, and only mail, is sealed.
+            assert_eq!(
+                r.sealed,
+                matches!(kind, Kind::MailInbound | Kind::MailOutbound),
+                "{kind:?}"
+            );
+            // A build from nothing fails, never a prompt about nothing.
+            let built = (r.build)(&json!({}), &Context::default());
+            assert!(built.is_err(), "{kind:?}: {built:?}");
         }
         assert!(
             !valid_pattern(Kind::MailInbound, "*/*"),
@@ -472,5 +605,12 @@ mod tests {
         let mut m = Map::new();
         m.insert("history_items".into(), json!(-1));
         assert!(Context::checked(Kind::ShellGuard, &m).is_err());
+    }
+
+    #[test]
+    fn nul_is_storable() {
+        let v = storable_json(&json!({"a\u{0}": ["x\u{0}y", 1, {"k": "\u{0}"}]}));
+        assert!(!v.to_string().contains("\\u0000"), "{v}");
+        assert_eq!(storable("a\u{0}b"), "a\u{fffd}b");
     }
 }

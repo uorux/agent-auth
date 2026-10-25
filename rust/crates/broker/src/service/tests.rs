@@ -108,6 +108,7 @@ fn with_llm(mut st: AppState, url: &str) -> AppState {
                     Secret::new("k".to_owned()),
                     url,
                     Some(st.store.clone()),
+                    None,
                 )
                 .unwrap(),
             ),
@@ -869,7 +870,14 @@ async fn llm_deny_retry_then_escalate(pool: sqlx::PgPool) {
     drop(tx);
     assert_eq!(recorded.len(), 2);
     assert!(recorded.iter().all(|c| c.class.as_deref() == Some("deny")));
-    assert!(recorded[0].facts["justification"] == "a much better reason");
+    // (A list leaves facts out; the call read whole has them.)
+    let tx = st.store.begin().await.unwrap();
+    let whole = agent_auth_store::evals::get_call(&tx, recorded[0].id)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(tx);
+    assert_eq!(whole.facts["justification"], "a much better reason");
     decide(
         &st,
         r.id,

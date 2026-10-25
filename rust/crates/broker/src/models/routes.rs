@@ -165,6 +165,14 @@ async fn calls(
     let tx = st.store.begin().await?;
     let rows = evals::list_calls(&tx, &selection).await?;
     tx.commit().await?;
+    // Sealed answers opened for their summaries (left out if they don't).
+    let rows: Vec<CallRow> = rows
+        .into_iter()
+        .map(|c| match &st.models {
+            Some(m) => m.opened(c.clone()).unwrap_or(CallRow { answer: None, ..c }),
+            None => c,
+        })
+        .collect();
     let next = (i64::try_from(rows.len()).unwrap_or(0) == limit)
         .then(|| rows.last())
         .flatten()
@@ -194,6 +202,11 @@ async fn call(
         .await?
         .unwrap_or_default();
     tx.commit().await?;
+    // Mail's records are sealed: opened here, for the operator.
+    let c = match &st.models {
+        Some(m) => m.opened(c).map_err(ApiError::conflict)?,
+        None => c,
+    };
     Ok(Json(CallDetail {
         call: call_out(&c),
         facts: c.facts.clone(),

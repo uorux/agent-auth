@@ -423,6 +423,7 @@ pub const INBOUND_RECIPE: Recipe = Recipe {
         "unclear/likely",
     ],
     knobs: MAIL_KNOBS,
+    sealed: true,
 };
 
 /// The outbound review as a decision recipe (evals).
@@ -435,6 +436,7 @@ pub const OUTBOUND_RECIPE: Recipe = Recipe {
     classify: classify_outbound,
     classes: &["send", "hold", "refuse"],
     knobs: MAIL_KNOBS,
+    sealed: true,
 };
 
 /// The judge (`OPENROUTER_API_KEY`).

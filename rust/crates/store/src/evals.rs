@@ -2,7 +2,6 @@
 //! `eval_results`). Nothing here takes part in a decision: rows are written
 //! after a decision is made, and replays only read calls and write results.
 
-use agent_auth_core::RequestId;
 use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -10,30 +9,27 @@ use uuid::Uuid;
 use crate::{StoreError, Tx};
 
 /// Keep a system prompt (once) under `sha256`, its lowercase hex SHA-256
-/// (computed by the caller, checked here: a wrong digest stores nothing
-/// and is an error).
+/// (computed by the caller, checked here: a wrong digest is an error and
+/// stores nothing).
 pub async fn put_prompt(tx: &Tx<'_>, sha256: &str, text: &str) -> Result<(), StoreError> {
     let mut c = tx.conn().await;
+    let actual = sqlx::query_scalar!(
+        r#"SELECT encode(sha256(convert_to($1, 'UTF8')), 'hex') AS "sha!""#,
+        text
+    )
+    .fetch_one(&mut **c)
+    .await?;
+    if actual != sha256 {
+        return Err(StoreError::WrongProof);
+    }
     sqlx::query!(
-        "INSERT INTO model_prompts (sha256, text)
-         SELECT $1, $2 WHERE $1 = encode(sha256(convert_to($2, 'UTF8')), 'hex')
-         ON CONFLICT (sha256) DO NOTHING",
+        "INSERT INTO model_prompts (sha256, text) VALUES ($1, $2) ON CONFLICT (sha256) DO NOTHING",
         sha256,
         text
     )
     .execute(&mut **c)
     .await?;
-    let kept = sqlx::query_scalar!(
-        r#"SELECT count(*) AS "n!" FROM model_prompts WHERE sha256 = $1"#,
-        sha256
-    )
-    .fetch_one(&mut **c)
-    .await?;
-    if kept == 1 {
-        Ok(())
-    } else {
-        Err(StoreError::WrongProof)
-    }
+    Ok(())
 }
 
 pub async fn get_prompt(tx: &Tx<'_>, sha: &str) -> Result<Option<String>, StoreError> {
@@ -200,15 +196,19 @@ pub struct Selection {
     pub limit: i64,
 }
 
+/// Calls matching `s`, newest first, without their facts and user message.
 pub async fn list_calls(tx: &Tx<'_>, s: &Selection) -> Result<Vec<CallRow>, StoreError> {
     let mut c = tx.conn().await;
     let (before_at, before_id) = match s.before {
         Some((t, id)) => (Some(t), Some(id)),
         None => (None, None),
     };
+    // Without the large columns (facts, user message): a list shows
+    // summaries; `get_call` reads one whole.
     let raw = sqlx::query_as!(
         RawCall,
-        r#"SELECT c.id, c.kind, c.model, c.facts, c.context, c.system_sha256, c.user_message,
+        r#"SELECT c.id, c.kind, c.model, '{}'::jsonb AS "facts!", c.context, c.system_sha256,
+                  '' AS "user_message!",
                   c.answer, c.class, c.error, c.latency_ms, c.subject, c.created_at,
                   l.expected AS "expected?", l.note AS "note?", l.source AS "source?",
                   l.labeled_by AS "labeled_by?", l.labeled_at AS "labeled_at?"
@@ -276,57 +276,49 @@ pub async fn delete_label(tx: &Tx<'_>, call: Uuid) -> Result<bool, StoreError> {
     Ok(n == 1)
 }
 
-/// The newest call of `kind` about request `request`.
-pub async fn latest_for_request(
+/// The newest call of `kind` whose subject contains `subject` (e.g.
+/// `{"request_id": "..."}`).
+pub async fn latest_about(
     tx: &Tx<'_>,
     kind: &str,
-    request: RequestId,
+    subject: &Value,
 ) -> Result<Option<Uuid>, StoreError> {
     let mut c = tx.conn().await;
     Ok(sqlx::query_scalar!(
-        "SELECT id FROM model_calls WHERE kind = $1 AND subject->>'request_id' = $2
+        "SELECT id FROM model_calls WHERE subject @> $2 AND kind = $1
          ORDER BY created_at DESC, id DESC LIMIT 1",
         kind,
-        request.to_string()
+        subject
     )
     .fetch_optional(&mut **c)
     .await?)
 }
 
-/// The newest call of `kind` whose subject has `key` = `value`.
-pub async fn latest_for_subject(
-    tx: &Tx<'_>,
-    kind: &str,
-    key: &str,
-    value: &str,
-) -> Result<Option<Uuid>, StoreError> {
-    let mut c = tx.conn().await;
-    Ok(sqlx::query_scalar!(
-        "SELECT id FROM model_calls WHERE kind = $1 AND subject->>$2 = $3
-         ORDER BY created_at DESC, id DESC LIMIT 1",
-        kind,
-        key,
-        value
-    )
-    .fetch_optional(&mut **c)
-    .await?)
-}
-
-/// Forget unlabelled calls older than `before` (labelled ones are the eval
-/// set and stay); and runs older than it with their results.
-pub async fn purge(tx: &Tx<'_>, before: OffsetDateTime) -> Result<u64, StoreError> {
+/// Forget at most `batch` calls older than `before`, except those an
+/// operator labelled (the eval set; labels from what happened next do not
+/// keep a call); and replays older than it. How many calls went.
+pub async fn purge(tx: &Tx<'_>, before: OffsetDateTime, batch: i64) -> Result<u64, StoreError> {
     let mut c = tx.conn().await;
     let calls = sqlx::query!(
-        "DELETE FROM model_calls c WHERE c.created_at < $1
-           AND NOT EXISTS (SELECT 1 FROM model_call_labels l WHERE l.call_id = c.id)",
-        before
+        "DELETE FROM model_calls WHERE id IN (
+           SELECT c.id FROM model_calls c WHERE c.created_at < $1
+             AND NOT EXISTS (SELECT 1 FROM model_call_labels l
+                             WHERE l.call_id = c.id AND l.source = 'operator')
+           LIMIT $2)",
+        before,
+        batch
     )
     .execute(&mut **c)
     .await?
     .rows_affected();
-    sqlx::query!("DELETE FROM eval_runs WHERE created_at < $1", before)
-        .execute(&mut **c)
-        .await?;
+    sqlx::query!(
+        "DELETE FROM eval_runs WHERE id IN (
+           SELECT id FROM eval_runs WHERE created_at < $1 AND status <> 'running' LIMIT $2)",
+        before,
+        batch
+    )
+    .execute(&mut **c)
+    .await?;
     Ok(calls)
 }
 
@@ -493,4 +485,19 @@ pub async fn fail_unfinished(tx: &Tx<'_>, now: OffsetDateTime) -> Result<u64, St
     .execute(&mut **c)
     .await?
     .rows_affected())
+}
+
+/// Replays still running.
+pub async fn running_runs(tx: &Tx<'_>) -> Result<i64, StoreError> {
+    let mut c = tx.conn().await;
+    Ok(
+        sqlx::query_scalar!(r#"SELECT count(*) AS "n!" FROM eval_runs WHERE status = 'running'"#)
+            .fetch_one(&mut **c)
+            .await?,
+    )
+}
+
+/// The ids of the calls `s` selects, newest first.
+pub async fn select_ids(tx: &Tx<'_>, s: &Selection) -> Result<Vec<Uuid>, StoreError> {
+    Ok(list_calls(tx, s).await?.into_iter().map(|c| c.id).collect())
 }

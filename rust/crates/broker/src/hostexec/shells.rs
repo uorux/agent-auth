@@ -23,10 +23,11 @@ use super::{CALL_TIMEOUT, HostExec};
 use crate::notify::{Notify as _, ShellEvent};
 
 /// Earlier commands of the shell the guard is shown at most (newest).
-const GUARD_HISTORY: i64 = 80;
+const GUARD_HISTORY: i64 = 40;
 /// ... and at most this much of their text is kept for the guard (and its
-/// record); its context settings choose what it is shown.
-const GUARD_RECORD_CHARS: usize = 320_000;
+/// record): what the guard is shown by default, so a record holds no more
+/// than the live guard saw.
+const GUARD_RECORD_CHARS: usize = 160_000;
 /// Refusals after which a guarded shell is ended (an alarming one ends it
 /// at once).
 const MAX_REFUSALS: i64 = 5;

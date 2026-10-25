@@ -15,25 +15,27 @@ CREATE TABLE model_calls (
     kind          text NOT NULL CHECK (kind ~ '^[a-z_]{1,32}$'),
     model         text NOT NULL CHECK (length(model) BETWEEN 1 AND 128),
     -- What the prompt was built from (replays rebuild it from these).
-    facts         jsonb NOT NULL CHECK (jsonb_typeof(facts) = 'object'),
+    facts         jsonb NOT NULL CHECK (jsonb_typeof(facts) = 'object'
+                                        AND octet_length(facts::text) <= 2000000),
     -- The variant's context settings the prompt was built with.
     context       jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(context) = 'object'),
     system_sha256 text NOT NULL REFERENCES model_prompts (sha256),
-    user_message  text NOT NULL,
+    user_message  text NOT NULL CHECK (octet_length(user_message) <= 2000000),
     -- The model's object, if it answered one.
-    answer        jsonb CHECK (answer IS NULL OR jsonb_typeof(answer) = 'object'),
+    answer        jsonb CHECK (answer IS NULL OR (jsonb_typeof(answer) = 'object'
+                                                    AND octet_length(answer::text) <= 2000000)),
     -- The decision class read from the answer (kind-specific; NULL: none).
     class         text CHECK (class IS NULL OR length(class) <= 64),
     error         text CHECK (error IS NULL OR length(error) <= 2000),
     latency_ms    integer NOT NULL CHECK (latency_ms >= 0),
     -- What the call was about: {"request_id": ...}, {"job_id": ...}, ...
-    subject       jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(subject) = 'object'),
+    subject       jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(subject) = 'object'
+                                                     AND octet_length(subject::text) <= 4000),
     created_at    timestamptz NOT NULL
 );
 
 CREATE INDEX model_calls_kind_time ON model_calls (kind, created_at DESC, id DESC);
-CREATE INDEX model_calls_request ON model_calls ((subject->>'request_id'))
-    WHERE subject ? 'request_id';
+CREATE INDEX model_calls_subject ON model_calls USING gin (subject jsonb_path_ops);
 
 -- What a call should have decided: a class pattern ('*' for any part
 -- between '/'), from the operator or from what happened next.

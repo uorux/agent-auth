@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO model_prompts (sha256, text) VALUES ($1, $2) ON CONFLICT (sha256) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b69eb15a8c3b1a7d03a08a8ca1003329d860e456df6ed49a40b9b4fd3a532b58"
+}

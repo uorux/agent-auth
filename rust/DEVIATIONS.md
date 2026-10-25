@@ -40,15 +40,26 @@ and why. Keep entries short. Group by area.
   `/admin/evals/*`, CLI `agent-auth admin evals`) rebuild calls from their
   facts under another model, system prompt or context setting (each
   kind's knobs; unknown ones refused) and compare with labels and the
-  originals; they write only their own results. Recording is best effort
-  (a failure is logged; the decision stands), on by default
-  (`evals.record`); unlabelled calls and replays are forgotten after
-  `evals.retention` (90 d), labelled ones kept; replays a restart cut off
-  are marked failed. The reviewer's `llm_evaluations` rows are unchanged.
-  The Python had none of this. Prompts are byte-for-byte as before (the
-  existing prompt tests pass unchanged); the mail judge now uses the
-  broker's default TLS roots for OpenRouter instead of the mail ones (it
-  never needed the mail CA).
+  originals; they write only their own results. Recording is bounded and
+  best effort: at most 2 s (a slow database never holds a decision up),
+  a failure is logged and the decision stands; NUL is stored as U+FFFD (a
+  record nobody can avoid); facts and user message together at most 1 MB
+  (larger: the outcome is kept, the inputs are not, and the call cannot be
+  replayed), with column limits in the schema; the watcher's record keeps
+  at most the 100 newest earlier commands (40 arguments each), the guard's
+  only the history the live guard saw (160 000 characters). Mail's records
+  (facts, user message, answer) are sealed with `ENCRYPTION_KEY`, bound to
+  the row and column, as mail is everywhere else; without the key mail
+  decisions are not recorded; the admin API opens them. Recording is on
+  by default (`evals.record`); calls and replays older than
+  `evals.retention` (90 d) are forgotten in batches, off the scheduler's
+  tick, except calls an operator labelled (outcome labels keep nothing);
+  replays a restart cut off are marked failed; one replay runs at a time
+  (they share the live key and its rate limit), and reads each call when
+  it asks it. The reviewer's `llm_evaluations` rows are unchanged. The
+  Python had none of this. Live prompts are as before (the reviewer
+  still shows every prior verdict; the guard's history budget is measured
+  as before); the existing prompt tests pass unchanged.
 
 ## Policy
 

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT c.id, c.kind, c.model, c.facts, c.context, c.system_sha256, c.user_message,\n                  c.answer, c.class, c.error, c.latency_ms, c.subject, c.created_at,\n                  l.expected AS \"expected?\", l.note AS \"note?\", l.source AS \"source?\",\n                  l.labeled_by AS \"labeled_by?\", l.labeled_at AS \"labeled_at?\"\n           FROM model_calls c LEFT JOIN model_call_labels l ON l.call_id = c.id\n           WHERE ($1::text IS NULL OR c.kind = $1)\n             AND ($2::boolean IS NULL OR (l.call_id IS NOT NULL) = $2)\n             AND ($3::timestamptz IS NULL OR c.created_at >= $3)\n             AND ($4::timestamptz IS NULL OR c.created_at < $4)\n             AND ($5::timestamptz IS NULL OR (c.created_at, c.id) < ($5, $6::uuid))\n             AND ($7::uuid[] IS NULL OR c.id = ANY($7))\n           ORDER BY c.created_at DESC, c.id DESC\n           LIMIT $8",
+  "query": "SELECT c.id, c.kind, c.model, '{}'::jsonb AS \"facts!\", c.context, c.system_sha256,\n                  '' AS \"user_message!\",\n                  c.answer, c.class, c.error, c.latency_ms, c.subject, c.created_at,\n                  l.expected AS \"expected?\", l.note AS \"note?\", l.source AS \"source?\",\n                  l.labeled_by AS \"labeled_by?\", l.labeled_at AS \"labeled_at?\"\n           FROM model_calls c LEFT JOIN model_call_labels l ON l.call_id = c.id\n           WHERE ($1::text IS NULL OR c.kind = $1)\n             AND ($2::boolean IS NULL OR (l.call_id IS NOT NULL) = $2)\n             AND ($3::timestamptz IS NULL OR c.created_at >= $3)\n             AND ($4::timestamptz IS NULL OR c.created_at < $4)\n             AND ($5::timestamptz IS NULL OR (c.created_at, c.id) < ($5, $6::uuid))\n             AND ($7::uuid[] IS NULL OR c.id = ANY($7))\n           ORDER BY c.created_at DESC, c.id DESC\n           LIMIT $8",
   "describe": {
     "columns": [
       {
@@ -38,14 +38,9 @@
       },
       {
         "ordinal": 3,
-        "name": "facts",
+        "name": "facts!",
         "type_info": "Jsonb",
-        "origin": {
-          "Table": {
-            "table": "model_calls",
-            "name": "facts"
-          }
-        }
+        "origin": "Expression"
       },
       {
         "ordinal": 4,
@@ -71,14 +66,9 @@
       },
       {
         "ordinal": 6,
-        "name": "user_message",
+        "name": "user_message!",
         "type_info": "Text",
-        "origin": {
-          "Table": {
-            "table": "model_calls",
-            "name": "user_message"
-          }
-        }
+        "origin": "Expression"
       },
       {
         "ordinal": 7,
@@ -218,10 +208,10 @@
       false,
       false,
       false,
+      null,
       false,
       false,
-      false,
-      false,
+      null,
       true,
       true,
       true,
@@ -235,5 +225,5 @@
       false
     ]
   },
-  "hash": "158eed76b13549ec43ca37ee669de5d882e366a20de3d3a9f960ae4a12ffde24"
+  "hash": "8ffc5cb5a658411c95f38fde18745a19223b6150a6514e3de7b0454f417dc2f3"
 }
