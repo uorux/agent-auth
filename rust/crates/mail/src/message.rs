@@ -95,6 +95,26 @@ fn parser() -> MessageParser {
         .header_raw("Authentication-Results")
 }
 
+/// Drop a parsed message without recursing into the messages nested in
+/// it. mail-parser parses `message/rfc822` parts iteratively, without a
+/// depth limit, but its types drop recursively: a 2 MB message of nested
+/// `message/rfc822` headers is 60,000 levels deep, and dropping it
+/// overflowed the stack, which aborts the whole broker (not a panic: it
+/// cannot be caught), on every list until the message is gone.
+fn dismantle(msg: mail_parser::Message<'_>) {
+    let mut todo = vec![msg];
+    while let Some(mut m) = todo.pop() {
+        for part in &mut m.parts {
+            if matches!(part.body, PartType::Message(_))
+                && let PartType::Message(inner) = std::mem::take(&mut part.body)
+            {
+                todo.push(inner);
+            }
+        }
+        // `m` has no nested message left: it drops flat.
+    }
+}
+
 /// `<msg-id>` tokens (`_msg_ids`): a decoded or hostile header can hold
 /// anything (a newline would break a reply), so only these are kept.
 #[must_use]
@@ -529,6 +549,7 @@ pub fn parse(raw: &[u8]) -> ParsedMessage {
         .map(|(i, p)| attachment_meta(i, p))
         .collect();
     out.hidden_text = chars(&hidden, 4000);
+    dismantle(msg);
     out.hints = injection_hints(&out);
     out
 }
@@ -538,8 +559,12 @@ pub fn parse(raw: &[u8]) -> ParsedMessage {
 pub fn attachment_bytes(raw: &[u8], index: usize) -> Option<(Attachment, Vec<u8>)> {
     let raw = raw.get(..MAX_RAW_BYTES).unwrap_or(raw);
     let msg = parser().parse(raw)?;
-    let part = msg.attachments().nth(index)?;
-    Some((attachment_meta(index, part), part.contents().to_vec()))
+    let found = msg
+        .attachments()
+        .nth(index)
+        .map(|part| (attachment_meta(index, part), part.contents().to_vec()));
+    dismantle(msg);
+    found
 }
 
 // ---------------------------------------------------------------- hints

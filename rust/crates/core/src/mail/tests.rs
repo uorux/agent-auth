@@ -408,8 +408,106 @@ fn sensitivity() {
         assert!(!auth(cap, json!({})).sensitive_by_resource(&cfg, "me@mail.example"));
         assert!(!auth(cap, json!({"topic": "t"})).is_sensitive(&cfg, "x@me.example"));
         assert!(!auth(cap, corr.clone()).is_sensitive(&cfg, "x@me.example"));
+        // Correspondents that keep nobody out are no constraint (the
+        // Python, and the port before, took any list as one).
+        for loose in [
+            json!(["*@*"]),
+            json!(["*@*.com"]),
+            json!(["*@*.example"]),
+            json!(["bookings@*.airline.example"]),
+            json!(["*@q.exampl?"]),
+            json!(["*@[a-z].example"]),
+            json!(["*@q.example", "*@*"]),
+        ] {
+            let scope = json!({ "correspondents": loose });
+            assert!(
+                auth(cap, scope.clone()).is_sensitive(&cfg, "x@me.example"),
+                "{scope}"
+            );
+            assert!(!auth(cap, scope.clone()).sensitive_by_resource(&cfg, "x@me.example"));
+            // A topic still keeps it in (judged per message).
+            let mut topical = scope.as_object().unwrap().clone();
+            topical.insert("topic".into(), json!("t"));
+            assert!(!auth(cap, Value::Object(topical)).is_sensitive(&cfg, "x@me.example"));
+        }
+        let pinned = json!({"correspondents": ["*@q.example", "jane@r.example", "a*b@x.example"]});
+        assert!(!auth(cap, pinned).is_sensitive(&cfg, "x@me.example"));
     }
+    // Reading is never sensitive by its correspondents.
+    assert!(!auth("read", json!({"correspondents": ["*@*"]})).is_sensitive(&cfg, "x@me.example"));
     assert!(auth("read", json!({})).needs_explicit_rule());
+}
+
+#[test]
+fn domain_pinning() {
+    for pinned in [
+        "*@q.example",
+        "jane@q.example",
+        "[!x]*@q.example",
+        "a?@com",
+        "*@x-y.example",
+    ] {
+        assert!(pins_domain(pinned), "{pinned}");
+    }
+    for loose in [
+        "*@*",
+        "*@*.com",
+        "x@*.q.example",
+        "*@q.exampl?",
+        "*@[q].example",
+        "*@q]example",
+        "*",
+        "@q.example",
+        "*@",
+        "a@b@q.example",
+        "*[@]q.example",
+    ] {
+        assert!(!pins_domain(loose), "{loose}");
+    }
+}
+
+/// Exhaustively over short globs and addresses: an address a pinned glob
+/// matches (as the gateway matches correspondents) is at exactly the
+/// glob's domain.
+#[test]
+fn pinned_globs_match_only_their_domain() {
+    if cfg!(miri) {
+        return;
+    }
+    fn strings(alphabet: &[char], max: usize) -> Vec<String> {
+        let mut out = vec![String::new()];
+        let mut last = vec![String::new()];
+        for _ in 0..max {
+            let next: Vec<String> = last
+                .iter()
+                .flat_map(|s| alphabet.iter().map(move |c| format!("{s}{c}")))
+                .collect();
+            out.extend(next.iter().cloned());
+            last = next;
+        }
+        out
+    }
+    let addresses = strings(&['a', 'b', '@', '.'], 5);
+    let mut checked = 0usize;
+    for glob in strings(&['a', '@', '.', '*', '?', '[', ']', '!', '-'], 5) {
+        if !(is_glob(&glob) && pins_domain(&glob)) {
+            continue;
+        }
+        let (_, domain) = glob.split_once('@').unwrap();
+        let compiled = crate::glob::Glob::new(&glob);
+        for address in &addresses {
+            if compiled.matches(address) {
+                assert!(matches_any(address, &[&glob]));
+                assert_eq!(
+                    domain_of(address).as_deref(),
+                    Some(domain),
+                    "{glob} {address}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 1000, "{checked}");
 }
 
 proptest! {

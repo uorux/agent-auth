@@ -204,3 +204,106 @@ async fn imap_memory_is_bounded() {
     );
     srv.abort();
 }
+
+/// Fragments of markup that steer the tokenizer into each of its scans
+/// (comments and their closes, tags, attributes, references, raw text,
+/// stylesheets).
+const FRAGMENTS: [&str; 24] = [
+    "<!--",
+    "-->",
+    "--!>",
+    "-",
+    "<!--x-->",
+    "<",
+    "</",
+    "<!",
+    "<?",
+    "<a ",
+    "b='",
+    "c=",
+    ">",
+    "&",
+    "&#",
+    "&amp",
+    "<div>",
+    "</div>",
+    "<style>",
+    "</style>",
+    "{",
+    ".a{display:none}",
+    "<script>",
+    "/*",
+];
+
+/// Fixes review finding (mail, HIGH): every `<!--` searched the rest of
+/// the document for `-->` and for `--!>`, so a message of repeated
+/// comments took time quadratic in its size (400 KB: ~10 s unoptimized;
+/// 2 MB: minutes, on the broker's async workers).
+#[test]
+fn repeated_comments_are_linear() {
+    if cfg!(miri) {
+        return;
+    }
+    for unit in ["<!--x-->", "<!--x--!>", "<!-- -->", "<!---->-->"] {
+        let html = unit.repeat(2_000_000 / unit.len());
+        let started = std::time::Instant::now();
+        let _ = html_to_text(&html);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{unit}: {:?}",
+            started.elapsed()
+        );
+    }
+    // Through the whole message path too.
+    let raw = format!(
+        "From: a@x.example\r\nContent-Type: text/html\r\n\r\n{}",
+        "<!--x-->".repeat(250_000)
+    );
+    let started = std::time::Instant::now();
+    let m = parse(raw.as_bytes());
+    assert!(m.hidden_text.starts_with('x'));
+    assert!(started.elapsed() < std::time::Duration::from_secs(60));
+}
+
+/// A message of `message/rfc822` parts nested 60,000 deep (2 MB): parsed
+/// without a depth limit, and dropping the parse recursed once per level,
+/// overflowing the stack (an abort of the whole process, not a panic).
+#[test]
+fn deeply_nested_messages_do_not_overflow() {
+    if cfg!(miri) {
+        return;
+    }
+    let raw = "Content-Type: message/rfc822\r\n\r\n".repeat(60_000);
+    let m = parse(raw.as_bytes());
+    assert!(m.text.is_empty());
+    let _ = crate::message::attachment_bytes(raw.as_bytes(), 0);
+    // On a small stack too (a tokio worker's is 2 MiB, this is 256 KiB).
+    let handle = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || parse(raw.as_bytes()).attachments.len())
+        .unwrap();
+    assert!(handle.join().is_ok());
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig {
+        cases: if cfg!(miri) { 0 } else { 12 },
+        ..proptest::prelude::ProptestConfig::default()
+    })]
+
+    /// Linear time, as a property: any mix of the fragments above, a
+    /// megabyte of it, is read in well under the time a quadratic scan
+    /// takes (a quadratic scan of a megabyte is a minute or more).
+    #[test]
+    fn html_reading_is_linear(picks in proptest::collection::vec(0..FRAGMENTS.len(), 1..5)) {
+        let unit: String = picks.iter().map(|&i| FRAGMENTS[i]).collect();
+        let html = unit.repeat(1_000_000 / unit.len() + 1);
+        let started = std::time::Instant::now();
+        let _ = html_to_text(&html);
+        proptest::prop_assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{unit:?}: {:?}",
+            started.elapsed()
+        );
+    }
+}

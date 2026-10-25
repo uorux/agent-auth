@@ -355,10 +355,16 @@ impl MailAuthority {
     }
 
     /// Sending (create included: from a new alias on the person's own
-    /// domain) with neither a topic nor correspondents to keep it in.
+    /// domain) with neither a topic nor correspondents that keep it in
+    /// (each pinning a domain: [`pins_domain`]): `*@*` or `*@*.com` name
+    /// correspondents but keep nobody out.
     #[must_use]
     pub fn sends_unconstrained(&self) -> bool {
-        self.action.sends() && self.topic.is_none() && self.correspondents.is_empty()
+        unconstrained_by(
+            self.action.sends(),
+            self.topic.is_some(),
+            self.correspondents.iter().map(|g| pins_domain(g)),
+        )
     }
 
     /// `_mail_covers`: does a rule pinned to `self` cover `request`? It does
@@ -385,6 +391,23 @@ impl MailAuthority {
             since: self.since,
         }
     }
+}
+
+/// Correspondents keep sending in when there is at least one and each
+/// pins its domain (`pins`: [`pins_domain`] of each).
+pub(crate) fn pinned_by(mut pins: impl Iterator<Item = bool>) -> bool {
+    let mut any = false;
+    pins.all(|p| {
+        any = true;
+        p
+    }) && any
+}
+
+/// The "unconstrained sending" gate on its parts (model-checked in
+/// `proofs_mail`): it sends, with no topic, and its correspondents do not
+/// all pin a domain (none named counts as not pinned).
+pub(crate) fn unconstrained_by(sends: bool, topic: bool, pins: impl Iterator<Item = bool>) -> bool {
+    sends && !topic && !pinned_by(pins)
 }
 
 /// What coverage compares of an authority, generic over the values (so the
@@ -481,6 +504,22 @@ pub fn is_glob(s: &str) -> bool {
         && domain
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"*?.[]-".contains(&b))
+}
+
+/// Does a correspondent glob keep to one concrete domain? It does when it
+/// has exactly one `@` and nothing after it is special to a glob (`*`,
+/// `?`, `[`, `]`): then every address it matches is at exactly that
+/// domain. `*@example.com` and `jane@example.com` pin a domain;
+/// `*@*`, `*@*.com`, `*@example.c?m` and `bookings@*.airline.com` do not.
+/// (Without the public-suffix list, `*.airline.com` cannot be told from
+/// `*.co.uk`, so no wildcard in a domain counts; a rule pinned to such an
+/// authority, or a human, can still allow it.)
+#[must_use]
+pub fn pins_domain(glob: &str) -> bool {
+    let Some((local, domain)) = glob.split_once('@') else {
+        return false;
+    };
+    !local.is_empty() && !domain.is_empty() && !domain.contains(['@', '*', '?', '[', ']'])
 }
 
 /// `PREFIX_RE`: a new alias's local part.

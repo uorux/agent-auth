@@ -1386,6 +1386,70 @@ characters stripped; `mail_attachment` never served remotely). Beyond it:
 - **`store::mail::set_created_alias` checks its `ProvisioningGrant`**
   belongs to the transaction (`ProvisioningGrant::verify` is crate-wide).
 
+### Mail: security review 2026-10
+
+- **Linear-time HTML comments.** Every `<!--` searched the rest of the
+  document for `-->` and again for `--!>`, so a message of repeated
+  comments cost time quadratic in its size (400 KB: ~10 s unoptimized;
+  2 MB: ~10^11 comparisons), on the async workers. The close is now
+  found in one forward scan that stops at it. Port-specific: Python's
+  `html.parser` finds the close with one regex search for `--!?>`. The
+  rest of the reading path was probed with
+  adversarial inputs (tags, attributes, references, raw text, CSS rules
+  and comments, headers, addresses, Authentication-Results, References,
+  multipart, quoted-printable) and is linear; `review_tests::
+  html_reading_is_linear` keeps the tokenizer so (property test over
+  mixes of markup fragments, a megabyte each). The injection hints scan
+  the whole text with Unicode word boundaries (about 0.4 s per MB,
+  linear).
+- **Nested `message/rfc822` no longer aborts the broker.** mail-parser
+  parses nested messages without a depth limit but drops them
+  recursively: a 2 MB message of nested `message/rfc822` headers (60,000
+  levels) overflowed the stack when the parse was dropped, which aborts
+  the process (not a panic), on every list while the message is in the
+  mailbox. The parse is now taken apart iteratively before it is dropped
+  (`message::dismantle`). Port-specific (mail-parser).
+- **Parsing is off the async runtime.** Parsing a fetched message (MIME,
+  HTML, hints; up to 25 MiB) for a list, a read or an attachment runs on
+  the blocking pool, at most 2 at a time across the gateway; the
+  permit goes with the work, so a caller that gives up does not free a
+  slot early. Before, it ran on the async workers (up to 4 per list), so
+  a few large messages stalled approvals, Discord and a2a.
+- **An unsigned `X-SimpleLogin-Original-From` is not shown as the
+  sender** (upstream). Review #4 promised that an alias trusts that
+  header only on a message SimpleLogin (or the alias's domain) signed,
+  but on an alias grant without correspondents nothing depends on the
+  sender, so the message was delivered and the header shown, to the
+  agent and the judge, as `from`. Now `from` (list, read, the judge's
+  `<email>`, the reply-to default) is SimpleLogin's original sender only
+  on a signed message, and the From otherwise. `sender_verified` is
+  given for alias grants too (it was mailbox only): true for a signed
+  forward's original sender, else whether the provider saw DMARC or
+  DKIM pass for the From's domain (false on a failure, null when it said
+  nothing or no authserv-id is configured), and the judge gets it on
+  alias grants as well. A deployment whose mailbox has no authserv-id
+  (an IMAP mailbox without `authserv_id`) now shows SimpleLogin's reverse
+  alias as the sender of every forward. "Signed by SimpleLogin" means
+  SimpleLogin forwarded it; it vouches for the original sender only as
+  far as SimpleLogin's own DMARC check on arrival does.
+- **"Unconstrained sending" means correspondents that keep nobody out
+  too** (upstream). The sensitivity gate (`sends_unconstrained`) took any
+  non-empty correspondents list as a constraint, so `*@*` or `*@*.com`
+  passed and a YAML rule routing mail sends to `llm` or `approve` let an
+  agent mail anyone without a human. Now a sending authority without a
+  topic is sensitive unless every correspondent pins a domain
+  (`mail::pins_domain`: exactly one `@` and no `*`, `?`, `[` or `]` after
+  it). This is conservative: `bookings@*.airline.com` counts as
+  unconstrained, because without the public-suffix list it cannot be
+  told from `*@*.co.uk`; an operator who wants it writes a rule pinned
+  to that authority (or a human approves it). `*@gmail.com` still counts
+  as constrained (one domain, however large). A topic still counts as a
+  constraint, as before (see Open questions). Proved: `proofs_mail::
+  mail_unconstrained_gate`; a pinned glob matches only its own domain:
+  `mail::tests::pinned_globs_match_only_their_domain` (exhaustive over
+  short globs and addresses; a Kani harness over the real `fnmatch` on
+  four-character strings did not finish in 25 minutes, so it is a test).
+
 ## Agent VMs (`crates/sandboxd`, broker `sandboxes`)
 
 Broker side:
@@ -1684,6 +1748,16 @@ Final review (sandboxes), fixed:
 ## Open questions
 
 (for Jacob; nothing here is implemented until decided)
+
+- **Mail: a topic counts as a constraint for the sensitivity gate**
+  (security review 2026-10): a sending authority with any topic (even
+  "anything") and `*@*` correspondents is not sensitive, so a YAML rule
+  routing it to `llm` lets the judge alone keep the agent on topic, for
+  any recipient. Kept as in the Python; make a topic without pinned
+  correspondents sensitive too?
+- **Mail: `*@<free-mail domain>` pins a domain** (`*@gmail.com`): the
+  gate treats it as constrained. A list of such domains to treat as
+  unconstrained?
 
 - **Shells "one at a time"** (daemons bug 11): neither side enforces it
   (as in the Python); enforce on hostd (refuse a command while another of
