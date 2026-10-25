@@ -1,0 +1,20 @@
+[package]
+name = "agent-auth-tls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustls.workspace = true
+webpki-roots.workspace = true
+rustls-pki-types.workspace = true
+reqwest = { workspace = true, optional = true }
+thiserror.workspace = true
+
+[features]
+reqwest = ["dep:reqwest"]

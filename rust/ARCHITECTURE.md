@@ -32,6 +32,7 @@ change in `DEVIATIONS.md`.
 |---|---|---|
 | `agent-auth-core` | pure domain: ids, `Platform`, request/grant state machines (typestate), `Authority`, globs, routing gates, policy file schema + evaluation, zones logic, hostexec job specs, durations, validated names. **No I/O, no async, no time source** (time is passed in). | serde, serde_json, thiserror, time, uuid, regex (policy patterns) |
 | `agent-auth-crypto` | `ring`-based: API keys, at-rest `SecretBox` (AEAD), webhook HMAC, daemon pairing/hello/envelopes, TOTP, canonical JSON + digests, `Secret<T>`. | ring, base64, hex, zeroize, serde_json |
+| `agent-auth-tls` | the one rustls client config (ring, TLS 1.2/1.3, Mozilla roots minus distrusted ones, optional extra CA) and a reqwest builder with no proxy/redirects/compression. Every outbound connection uses it. | rustls, webpki-roots, reqwest |
 | `agent-auth-wire` | serde types of every JSON body on the wire: agent API, admin API, daemon channel messages, credential shapes. Shared by broker, client, CLI, MCP, daemons. | core |
 | `agent-auth-store` | Postgres: migrations (`crates/store/migrations`), row types, **all SQL**, and the state-transition kernel (guarded transitions, `IssuableGrant`, containment checks inside the transaction). | core, sqlx |
 | `agent-auth-broker` | the server binary `agent-auth-server`: config, HTTP API (axum), auth extractors, request service, LLM review, provisioners, a2a, wiki, desktop, Discord bot, admin panel, OAuth + remote MCP, daemon hub, hostexec, sandboxes, scheduler. | everything above |
@@ -102,9 +103,8 @@ e6640af: a code approves a job of its own tier only).
 - HTTP errors keep the Python shape `{"detail": "..."}` and status codes.
 - Every request body has a size limit; every list/map/string from the wire
   has a bound; every long-poll clamps its wait (NaN → no wait).
-- Outbound HTTP: one shared client builder (`broker::http_client`) with
-  rustls + ring, the shared root store (webpki-roots minus the distrusted
-  eMudhra roots), timeouts on every call, redirects off unless needed, no
+- Outbound HTTP: `agent-auth-tls::reqwest_builder` (rustls + ring, the
+  shared root store: webpki-roots minus the distrusted eMudhra roots), timeouts on every call, redirects off unless needed, no
   compression, no proxy from the environment.
 - Constant-time comparison for every secret comparison.
 

@@ -20,6 +20,7 @@ agent-auth-wire = { path = "crates/wire", version = "0.1.0" }
 agent-auth-store = { path = "crates/store", version = "0.1.0" }
 agent-auth-client = { path = "crates/client", version = "0.1.0" }
 agent-auth-daemon = { path = "crates/daemon", version = "0.1.0" }
+agent-auth-tls = { path = "crates/tls", version = "0.1.0" }
 
 tokio = { version = "1.54.1", default-features = false }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "form", "tokio", "matched-path"] }
@@ -29,6 +30,7 @@ hyper = { version = "1.12.0", default-features = false }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 webpki-roots = { version = "1.0.11", default-features = false }
+rustls-pki-types = { version = "1.15.1", default-features = false, features = ["std"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "macros", "migrate", "json", "time", "uuid", "tls-rustls-ring-webpki"] }
 ring = { version = "0.17.14", default-features = false, features = ["alloc", "std"] }

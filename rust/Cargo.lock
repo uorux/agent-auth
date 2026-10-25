@@ -159,6 +159,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-auth-tls"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "rustls",
+ "rustls-pki-types",
+ "thiserror",
+ "webpki-roots",
+]
+
+[[package]]
 name = "agent-auth-wire"
 version = "0.1.0"
 dependencies = [
