@@ -343,7 +343,7 @@ impl GithubApp {
         if let Some(body) = body {
             rb = rb.json(body);
         }
-        http::send(rb, timeout, MAX_BODY).await.map_err(|e| {
+        self.http.send(rb, timeout, MAX_BODY).await.map_err(|e| {
             tracing::warn!(error = %e, path, "GitHub API call failed");
             ProvisionError::failed("GitHub API unreachable (see broker logs)")
         })
@@ -1025,7 +1025,7 @@ impl Provisioner for GithubProvisioner {
         &self,
         tx: &Tx<'_>,
         grant: &GrantRow,
-        _now: OffsetDateTime,
+        now: OffsetDateTime,
     ) -> Result<(), ProvisionError> {
         if Self::permissions_of(grant).is_none() {
             return Ok(()); // a create: the broker never deletes repos
@@ -1033,19 +1033,36 @@ impl Provisioner for GithubProvisioner {
         let cached = credentials::latest(tx, grant.id)
             .await
             .map_err(|e| store_failed(&e))?;
-        if let Some(cred) = cached {
+        if let Some(cred) = cached
+            // One that has run out needs no revoking.
+            && cred.expires_at > now
+        {
             let row = cred.id.to_string();
             let token = self.secret_box.open_str(
                 &cred.value_encrypted,
                 &Binding::new("credentials", "value_encrypted", &row),
             );
             match token {
-                // Best effort: enforcement is the refusal to mint again.
-                Ok(token) => {
-                    if self.app.revoke_token(token.expose()).await.is_none() {
-                        tracing::warn!(grant = %grant.id, "failed to revoke cached token");
+                // Revoked (204), or already dead (401): done. Anything
+                // else is retried: the grant stays ACTIVE and the token
+                // cached until GitHub confirms.
+                Ok(token) => match self.app.revoke_token(token.expose()).await {
+                    Some(204 | 401) => {}
+                    Some(status) => {
+                        tracing::warn!(grant = %grant.id, status, "revoking the cached token failed");
+                        return Err(ProvisionError::failed(format!(
+                            "GitHub token revoke failed ({status})"
+                        )));
                     }
-                }
+                    None => {
+                        tracing::warn!(grant = %grant.id, "revoking the cached token failed");
+                        return Err(ProvisionError::failed(
+                            "GitHub API unreachable (see broker logs)",
+                        ));
+                    }
+                },
+                // Unreadable (the key changed): nothing to send; retrying
+                // would never succeed.
                 Err(_) => {
                     tracing::warn!(grant = %grant.id, "cached token does not open; not revoked")
                 }

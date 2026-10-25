@@ -13,10 +13,17 @@ use super::setup::ConfigError;
 /// Responses larger than this are refused (upstream answers are small).
 pub const MAX_BODY: usize = 4 << 20;
 
+/// The longest any one upstream call may take (connecting included: at
+/// most 10 s of it). Provisioning runs while the finishing transaction
+/// holds the containment lock shared, so a slow platform must not hold
+/// back a containment for long (see also [`super::PROVISION_DEADLINE`]).
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// A client for one upstream.
 #[derive(Debug, Clone)]
 pub struct Http {
     client: reqwest::Client,
+    cap: Duration,
 }
 
 impl Http {
@@ -29,10 +36,30 @@ impl Http {
 
     /// A client with this TLS configuration (e.g. a cluster's own CA).
     pub fn with_tls(tls: rustls::ClientConfig) -> Result<Http, ConfigError> {
-        let client = agent_auth_tls::reqwest_builder(tls, Duration::from_secs(30))
+        let client = agent_auth_tls::reqwest_builder(tls, CALL_TIMEOUT)
             .build()
             .map_err(|e| ConfigError(format!("HTTP client: {e}")))?;
-        Ok(Http { client })
+        Ok(Http {
+            client,
+            cap: CALL_TIMEOUT,
+        })
+    }
+
+    /// A tighter bound than [`CALL_TIMEOUT`] on every call (tests).
+    #[must_use]
+    pub fn with_cap(mut self, cap: Duration) -> Http {
+        self.cap = cap.min(CALL_TIMEOUT);
+        self
+    }
+
+    /// [`send`] with `timeout`, never more than this client's cap.
+    pub async fn send(
+        &self,
+        rb: RequestBuilder,
+        timeout: Duration,
+        max: usize,
+    ) -> Result<Reply, HttpError> {
+        send(rb, timeout.min(self.cap), max).await
     }
 
     pub fn request(&self, method: Method, url: &str) -> RequestBuilder {

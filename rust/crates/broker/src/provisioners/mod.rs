@@ -130,6 +130,21 @@ pub trait Provisioner {
         now: OffsetDateTime,
     ) -> impl Future<Output = Result<(), ProvisionError>> + Send;
 
+    /// Run by the finishing phase before it takes any lock, in transactions
+    /// of the provisioner's own: work that writes rows the finish only
+    /// reads (LLDAP's managed account on the agent row), so the finishing
+    /// transaction never locks an agent after its grant (store lock
+    /// order). Idempotent; an error fails the grant like `provision`'s.
+    fn prepare(
+        &self,
+        store: &agent_auth_store::Store,
+        grant: &GrantRow,
+        now: OffsetDateTime,
+    ) -> impl Future<Output = Result<(), ProvisionError>> + Send {
+        let _ = (store, grant, now);
+        async { Ok(()) }
+    }
+
     /// For a grant `store::grants::issuable` cleared in this transaction.
     fn credential<'t>(
         &self,
@@ -141,6 +156,28 @@ pub trait Provisioner {
     /// This platform's entry in `GET /v1/catalog` (`None`: not listed).
     fn catalog(&self, agent: &AgentRow) -> Option<Value>;
 }
+
+/// The longest a whole `provision` may take. The finishing transaction
+/// holds the containment lock shared meanwhile, so a containment of any
+/// agent waits at most this long for it.
+pub const PROVISION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `provision` within `deadline`. `Ok(None)`: it did not finish in time
+/// (what it did may need undoing: the caller reverts with `revoke`).
+pub async fn provision_within<'t, P: Provisioner>(
+    p: &P,
+    tx: &'t Tx<'_>,
+    grant: &ProvisioningGrant<'t>,
+    now: OffsetDateTime,
+    deadline: std::time::Duration,
+) -> Option<Result<Value, ProvisionError>> {
+    tokio::time::timeout(deadline, p.provision(tx, grant, now))
+        .await
+        .ok()
+}
+
+/// What an agent reads when a platform did not answer in time.
+pub const TOO_SLOW: &str = "the platform did not answer in time; try again later";
 
 /// `platform '{p}' is not enabled on this broker`
 #[must_use]
@@ -248,6 +285,14 @@ impl Provisioner for AnyProvisioner {
     fn platform(&self) -> Platform {
         dispatch!(self, p => p.platform())
     }
+    async fn prepare(
+        &self,
+        store: &agent_auth_store::Store,
+        grant: &GrantRow,
+        now: OffsetDateTime,
+    ) -> Result<(), ProvisionError> {
+        dispatch!(self, p => p.prepare(store, grant, now).await)
+    }
     async fn validate(
         &self,
         tx: &Tx<'_>,
@@ -295,6 +340,8 @@ pub struct FakeProvisioner {
     pub fail_provision: Option<String>,
     /// `(resource, text)`: validation refuses that resource with that text.
     pub refusals: Vec<(String, String)>,
+    /// When set, provision takes this long.
+    pub delay: Option<std::time::Duration>,
 }
 
 impl FakeProvisioner {
@@ -305,6 +352,7 @@ impl FakeProvisioner {
             calls: std::sync::Mutex::new(Vec::new()),
             fail_provision: None,
             refusals: Vec::new(),
+            delay: None,
         }
     }
     fn record(&self, what: String) {
@@ -341,6 +389,9 @@ impl Provisioner for FakeProvisioner {
         _now: OffsetDateTime,
     ) -> Result<Value, ProvisionError> {
         self.record(format!("provision {}", grant.grant().id));
+        if let Some(d) = self.delay {
+            tokio::time::sleep(d).await;
+        }
         match &self.fail_provision {
             Some(msg) => Err(ProvisionError::failed(msg.clone())),
             None => Ok(serde_json::json!({"fake": true})),

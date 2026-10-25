@@ -641,3 +641,75 @@ async fn concurrent_revokes_of_the_last_two_grants_remove_the_membership(pool: P
         );
     }
 }
+
+/// Wait until some transaction waits on a lock (a condition, not a sleep).
+async fn someone_waits(store: &Store) {
+    for _ in 0..500 {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE NOT granted")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        if n > 0 {
+            return;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("nobody ever waited");
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_credential_fetch_during_a_first_provision_does_not_deadlock(pool: PgPool) {
+    // Review: the finish held the grant and then locked the agent row for
+    // the managed account, while `issuable` held the agent (share) and
+    // waited for the grant: a deadlock. The account is now made before.
+    let t = setup_with(pool, config(&[]), true).await;
+    let a = agent(&t.store, "worker").await;
+    let g = provisioning(&t.store, a.id, &Authority::Homelab, "svc-gitea", 3600).await;
+    t.p.prepare(&t.store, &g, now()).await.unwrap();
+    let tx = t.store.begin().await.unwrap();
+    let nh = agent_auth_store::lockdown::check(&tx, a.id, now())
+        .await
+        .unwrap()
+        .unwrap();
+    let pg = agent_auth_store::grants::load_provisioning(&tx, g.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let store = t.store.clone();
+    let fetch = tokio::spawn(async move {
+        let tx = store.begin().await.unwrap();
+        let out = agent_auth_store::grants::issuable(&tx, a.id, g.id, now()).await;
+        let ok = matches!(out, Ok(Ok(_)));
+        drop(out);
+        tx.rollback().await.unwrap();
+        ok
+    });
+    someone_waits(&t.store).await;
+    let state = t.p.provision(&tx, &pg, now()).await.unwrap();
+    agent_auth_store::grants::activate(&tx, pg, &nh, &state)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(nh);
+    tx.commit().await.unwrap();
+    assert!(fetch.await.unwrap(), "the fetch sees the active grant");
+    assert_eq!(t.adds(), [("svc-worker".to_owned(), 4)]);
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn concurrent_first_provisions_make_one_account(pool: PgPool) {
+    let t = setup_with(pool, config(&[]), true).await;
+    let a = agent(&t.store, "worker").await;
+    let g1 = provisioning(&t.store, a.id, &Authority::Homelab, "svc-gitea", 3600).await;
+    let g2 = provisioning(&t.store, a.id, &Authority::Homelab, "media", 3600).await;
+    let (r1, r2) = tokio::join!(
+        provision(&t.store, &t.p, &g1),
+        provision(&t.store, &t.p, &g2)
+    );
+    r1.unwrap();
+    r2.unwrap();
+    assert_eq!(t.creates().len(), 1);
+    assert_eq!(t.ldap.passwords.lock().unwrap().len(), 1);
+    assert!(t.member("svc-worker", 4) && t.member("svc-worker", 5));
+}

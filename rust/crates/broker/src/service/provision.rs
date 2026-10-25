@@ -159,6 +159,13 @@ async fn finish_inner(st: &AppState, grant_id: GrantId) -> ServiceResult<()> {
     if row.status != GrantStatus::Provisioning {
         return Ok(());
     }
+    // Work the provisioner does in its own transactions before this one
+    // locks anything (an LLDAP managed account: the agent row is written
+    // before, never after, the grant is locked).
+    let prepared = match st.registry.get(row.platform) {
+        Some(p) => p.prepare(&st.store, &row, now).await,
+        None => Ok(()),
+    };
     // Lock order: containment and the agent, then the grant, then the
     // request.
     let held = lockdown::check(&tx, row.agent_id, now).await?;
@@ -183,7 +190,44 @@ async fn finish_inner(st: &AppState, grant_id: GrantId) -> ServiceResult<()> {
         tx.commit().await?;
         return Ok(());
     };
-    match provisioner.provision(&tx, &grant, now).await {
+    let outcome = match prepared {
+        Ok(()) => match crate::provisioners::provision_within(
+            provisioner,
+            &tx,
+            &grant,
+            now,
+            crate::provisioners::PROVISION_DEADLINE,
+        )
+        .await
+        {
+            Some(r) => r,
+            None => {
+                // Too slow: undo what it may have done, then fail the
+                // grant; if undoing fails, leave it PROVISIONING for the
+                // reaper (which reverts before failing it).
+                tracing::error!(grant = %grant_id, "provisioning did not finish in time");
+                let snapshot = grant.grant().clone();
+                let undone = tokio::time::timeout(
+                    crate::provisioners::PROVISION_DEADLINE,
+                    provisioner.revoke(&tx, &snapshot, now),
+                )
+                .await;
+                if !matches!(undone, Ok(Ok(()))) {
+                    tracing::error!(grant = %grant_id, "reverting a slow provision failed; the reaper will retry");
+                    tx.rollback().await?;
+                    return Ok(());
+                }
+                let why = crate::provisioners::TOO_SLOW.to_owned();
+                let _ = grants::fail_provisioning(&tx, grant, &why, Some(now)).await?;
+                fail_request(&tx, row.request_id, &why, now).await?;
+                tx.commit().await?;
+                notify_request(st, row.request_id);
+                return Ok(());
+            }
+        },
+        Err(e) => Err(e),
+    };
+    match outcome {
         Err(e) => {
             tracing::error!(request = %row.request_id, error = %e, "provisioning failed");
             let why = agent_visible(&e);

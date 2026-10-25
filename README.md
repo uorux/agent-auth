@@ -745,8 +745,11 @@ recorded a decision; they never become tokens): agents ask again.
 
 What it does not protect against: those scopes reach the whole account
 (every calendar, every file); Google has nothing per calendar or folder. A
-token is not revoked at the grant's end and lives up to an hour: revoking a
-token Google issued from a refresh token revokes the refresh token too.
+token is not revoked at the grant's end: revoking a google grant stops new
+tokens; one already fetched lives up to 1 h. Tokens are shared per (account,
+scope) between grants, and Google offers no per-token revocation that leaves
+the login in place: revoking a token Google issued from a refresh token
+revokes the refresh token too.
 Without accounts the platform is the old stub (decisions recorded, 501 on
 the credential).
 
