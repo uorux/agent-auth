@@ -126,6 +126,13 @@ no aws-lc, no HTTP/2. Prefer writing 50 lines over adding a crate.
 
 - Unit tests next to the code; property tests (proptest) for parsers and
   predicates; Kani harnesses for pure security logic.
+- Kani: `scripts/kani.sh` runs every harness (`#[kani::proof]`) in every
+  crate that has one, inside the `kani` dev shell (`nix develop .#kani`,
+  Kani 0.68.0 from `nix/kani.nix`: the release bundle patched for NixOS,
+  plus the exact nightly it was built against). Extra arguments go to
+  `cargo kani`, e.g. `scripts/kani.sh --harness status_machine`. A harness
+  that loops needs `#[kani::unwind(N)]`; Kani's unwinding assertions fail
+  the proof when N is too small, so a bound can never pass silently.
 - Database tests: `#[sqlx::test(migrations = "../store/migrations")]`
   (a fresh database per test) against `scripts/pg.sh start`.
 - HTTP tests drive the axum `Router` with `tower::ServiceExt::oneshot`.
