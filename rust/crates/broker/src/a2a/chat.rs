@@ -35,7 +35,8 @@ use crate::state::AppState;
 
 /// The panel's long-poll cap.
 const MAX_WAIT_SECS: f64 = 25.0;
-const POLL_ROUND: Duration = Duration::from_secs(5);
+/// The panel re-reads at least this often while parked.
+const POLL_ROUND: Duration = Duration::from_secs(10);
 const UNKNOWN: &str = "unknown conversation";
 
 pub(super) fn routes() -> Router<AppState> {

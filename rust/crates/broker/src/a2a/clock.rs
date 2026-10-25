@@ -98,15 +98,23 @@ impl ActivityClock {
 
     /// Activity strictly below this is settled: committed and visible to a
     /// query started after this call. Every later stamp is at or above it.
+    #[cfg(test)]
     pub(crate) fn horizon(&self) -> OffsetDateTime {
+        self.horizon_settling().0
+    }
+
+    /// [`ActivityClock::horizon`], and whether a writer is still in flight
+    /// (then committed activity at or above the horizon may be held back:
+    /// a long-poll re-reads soon instead of waiting for its next round).
+    pub(crate) fn horizon_settling(&self) -> (OffsetDateTime, bool) {
         let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(oldest) = s.in_flight.values().min() {
-            return *oldest;
+            return (*oldest, true);
         }
         let h = now().max(s.last.saturating_add(TICK));
         // Even if the wall clock steps back, no later stamp goes below h.
         s.last = s.last.max(h.saturating_sub(TICK));
-        h
+        (h, false)
     }
 }
 

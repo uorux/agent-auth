@@ -2465,3 +2465,207 @@ async fn delegation_rules(pool: PgPool) {
         "unknown thread (you must be a participant of the thread you cite)"
     );
 }
+
+// ------------------------------------------------------------ DoS caps
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn open_sessions_are_capped_per_agent(pool: PgPool) {
+    let t = setup_with(
+        pool,
+        Policy::default(),
+        A2aConfig {
+            max_sessions_per_agent: 2,
+            ..config()
+        },
+    );
+    let (_, key) = t.agent("claude-many", AgentKind::Ephemeral).await;
+    let a = t.session(&key, "a").await;
+    t.session(&key, "b").await;
+    let (st, v) = t
+        .post("/v1/sessions", ag(&key), json!({"label": "c"}))
+        .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert!(detail(&v).starts_with("too many open sessions for this agent (at most 2)"));
+    // Another agent is not affected; closing one makes room.
+    let (_, other) = t.agent("claude-other", AgentKind::Ephemeral).await;
+    t.session(&other, "a").await;
+    t.post("/v1/sessions/close", ses(&key, &a), json!({})).await;
+    t.session(&key, "c").await;
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn messages_per_thread_are_capped(pool: PgPool) {
+    let t = setup_with(
+        pool,
+        Policy::default(),
+        A2aConfig {
+            max_messages_per_thread: 3,
+            ..config()
+        },
+    );
+    let (s_row, s) = t.service("auto-chatty").await;
+    let (_, r) = t.service("svc-chatty").await;
+    t.grant(&s_row, "svc-chatty", None).await;
+    let tid = t.open_ok(&s, "svc-chatty").await;
+    for key in [&r, &s] {
+        let (st, _) = t
+            .post(
+                &format!("/v1/a2a/threads/{tid}/messages"),
+                ag(key),
+                json!({"payload": {}}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    let (st, v) = t
+        .post(
+            &format!("/v1/a2a/threads/{tid}/messages"),
+            ag(&r),
+            json!({"payload": {}}),
+        )
+        .await;
+    assert_eq!(
+        (st, detail(&v)),
+        (
+            StatusCode::CONFLICT,
+            "thread has reached its limit of 3 messages; close it and open a new one"
+        )
+    );
+    assert_eq!(t.thread_row(&tid).await.last_seq, 3);
+    assert_eq!(
+        t.post(&format!("/v1/a2a/threads/{tid}/close"), ag(&r), json!({}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+}
+
+fn spawn_get(t: &T, path: String, key: &str) -> tokio::task::JoinHandle<(StatusCode, Value)> {
+    let app = t.app.clone();
+    let key = key.to_owned();
+    tokio::spawn(async move {
+        let req = HttpRequest::builder()
+            .uri(path)
+            .header("authorization", format!("Bearer {key}"))
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    })
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn concurrent_long_polls_are_capped_per_agent(pool: PgPool) {
+    let t = setup_with(
+        pool,
+        Policy::default(),
+        A2aConfig {
+            max_long_polls_per_agent: 1,
+            ..config()
+        },
+    );
+    let (s_row, s) = t.service("auto-poller").await;
+    let (_, r) = t.service("svc-poller").await;
+    t.grant(&s_row, "svc-poller", None).await;
+    let tid = t.open_ok(&s, "svc-poller").await;
+    let parked = spawn_get(
+        &t,
+        format!("/v1/a2a/threads/{tid}/messages?after_seq=1&wait=10"),
+        &s,
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (st, v) = t
+        .get("/v1/a2a/events?wait=5&after=2100-01-01T00:00:00Z", ag(&s))
+        .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        detail(&v).starts_with("too many concurrent a2a long-polls for this agent (at most 1)")
+    );
+    // A read that does not wait needs no slot; another agent has its own.
+    assert_eq!(
+        t.get(&format!("/v1/a2a/threads/{tid}/messages"), ag(&s))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        t.get("/v1/a2a/events?wait=0", ag(&s)).await.0,
+        StatusCode::OK
+    );
+    t.post(
+        &format!("/v1/a2a/threads/{tid}/messages"),
+        ag(&r),
+        json!({"payload": {"x": 1}}),
+    )
+    .await;
+    assert_eq!(parked.await.unwrap().0, StatusCode::OK);
+    // The slot is free again.
+    let (st, _) = t
+        .get(
+            &format!("/v1/a2a/threads/{tid}/messages?after_seq=9&wait=0.2"),
+            ag(&s),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+}
+
+/// A parked long-poll stops when its agent is disabled, its key rotated or
+/// its session closed: each re-read re-checks the caller.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_long_poll_stops_for_a_caller_no_longer_valid(pool: PgPool) {
+    let t = setup(pool);
+    let (s_row, s) = t.service("auto-gone").await;
+    let (_, r) = t.service("svc-gone").await;
+    t.grant(&s_row, "svc-gone", None).await;
+    let tid = t.open_ok(&s, "svc-gone").await;
+    t.post(&format!("/v1/a2a/threads/{tid}/accept"), ag(&r), json!({}))
+        .await;
+
+    // Disabled while waiting: the next wake-up answers 401, not the message.
+    let parked = spawn_get(
+        &t,
+        format!("/v1/a2a/threads/{tid}/messages?after_seq=1&wait=10"),
+        &s,
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let tx = t.state.store.begin().await.unwrap();
+    agents::set_disabled(&tx, s_row.id, true).await.unwrap();
+    tx.commit().await.unwrap();
+    // (A send to a disabled agent is refused; a close still wakes it.)
+    let started = std::time::Instant::now();
+    t.post(&format!("/v1/a2a/threads/{tid}/close"), ag(&r), json!({}))
+        .await;
+    let (st, v) = parked.await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "on the wake-up, not the deadline"
+    );
+    assert_eq!(
+        (st, detail(&v)),
+        (StatusCode::UNAUTHORIZED, "invalid API key")
+    );
+
+    // Key rotated while waiting on events.
+    let (r2_row, r2) = t.service("svc-rotated").await;
+    let parked = spawn_get(&t, "/v1/a2a/events?wait=10".to_owned(), &r2);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let fresh = api_key::generate().unwrap();
+    let tx = t.state.store.begin().await.unwrap();
+    agents::set_key(&tx, r2_row.id, fresh.key_id.as_str(), fresh.hash.as_str())
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    // Any write that concerns it wakes it: a thread opened to it.
+    let (s2_row, s2) = t.service("auto-waker").await;
+    t.grant(&s2_row, "svc-rotated", None).await;
+    t.open_ok(&s2, "svc-rotated").await;
+    let started = std::time::Instant::now();
+    let (st, _) = parked.await.unwrap();
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    assert!(started.elapsed() < Duration::from_secs(5));
+}

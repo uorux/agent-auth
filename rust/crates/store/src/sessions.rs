@@ -182,3 +182,15 @@ pub async fn close_idle(
     .await?;
     Ok(ids.into_iter().map(SessionId::from_uuid).collect())
 }
+
+/// How many open sessions the agent holds.
+pub async fn count_open(tx: &Tx<'_>, agent: AgentId) -> Result<i64, StoreError> {
+    let mut c = tx.conn().await;
+    let n = sqlx::query_scalar!(
+        r#"SELECT count(*) AS "n!" FROM agent_sessions WHERE agent_id = $1 AND closed_at IS NULL"#,
+        Uuid::from(agent)
+    )
+    .fetch_one(&mut **c)
+    .await?;
+    Ok(n)
+}

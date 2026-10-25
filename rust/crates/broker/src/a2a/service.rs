@@ -384,6 +384,7 @@ pub(crate) async fn create_session(
     caller: &AgentCaller,
     label: &str,
 ) -> ApiResult<SessionRow> {
+    let cap = state.a2a.config.max_sessions_per_agent;
     for _ in 0..5 {
         let bytes = uuid::Uuid::new_v4().into_bytes();
         let name = format!(
@@ -391,6 +392,16 @@ pub(crate) async fn create_session(
             hex::encode(bytes.get(..2).unwrap_or_default())
         );
         let tx = state.store.begin().await?;
+        // The agent row serializes this agent's session creations, so the
+        // count cannot be raced past the cap (lock order: agents, then
+        // sessions).
+        agents::get_for_update(&tx, caller.id()).await?;
+        if sessions::count_open(&tx, caller.id()).await? >= i64::from(cap) {
+            return Err(ApiError::conflict(format!(
+                "too many open sessions for this agent (at most {cap}); close one \
+                 (POST /v1/sessions/close with its X-Agent-Session) or let idle ones expire"
+            )));
+        }
         match sessions::insert(&tx, SessionId::new(), caller.id(), &name, state.now()).await {
             Ok(row) => {
                 tx.commit().await?;
@@ -545,6 +556,12 @@ pub(crate) async fn send(
     require_not_closed(&thread)?;
     let is_initiator = me.id == thread.initiator_agent_id;
     let stored = if grant_live {
+        let cap = a2a.config.max_messages_per_thread;
+        if thread.last_seq >= cap {
+            return Err(ApiError::conflict(format!(
+                "thread has reached its limit of {cap} messages; close it and open a new one"
+            )));
+        }
         if is_initiator && thread.state == ThreadState::PendingOpen {
             return Err(ApiError::conflict(
                 "thread is pending_open: your opening message already rides the open; \
@@ -789,11 +806,22 @@ pub(crate) async fn read_messages(
 /// One events snapshot (§3.10): pending opens (sessionless callers only)
 /// and activity strictly after `after` and below the activity horizon
 /// (a2a B3), oldest first, at most [`LIST_LIMIT`].
+#[cfg(test)]
 pub(crate) async fn events_snapshot(
     state: &AppState,
     caller: &AgentCaller,
     after: Option<OffsetDateTime>,
 ) -> ApiResult<EventsSnapshot> {
+    Ok(events_snapshot_settling(state, caller, after).await?.0)
+}
+
+/// One events snapshot, and whether a writer was in flight (activity may
+/// have been held back: re-read soon).
+pub(crate) async fn events_snapshot_settling(
+    state: &AppState,
+    caller: &AgentCaller,
+    after: Option<OffsetDateTime>,
+) -> ApiResult<(EventsSnapshot, bool)> {
     let a2a = enabled(state)?;
     require_session(&Actor::agent_caller(caller))?;
     let tx = state.store.begin().await?;
@@ -803,7 +831,7 @@ pub(crate) async fn events_snapshot(
         Vec::new()
     };
     // The horizon before the query's snapshot: see `clock`.
-    let horizon = a2a.clock.horizon();
+    let (horizon, settling) = a2a.clock.horizon_settling();
     let limit = LIST_LIMIT.saturating_add(1);
     let mut activity =
         store_a2a::activity_before(&tx, viewer(caller), after, horizon, limit).await?;
@@ -836,11 +864,12 @@ pub(crate) async fn events_snapshot(
     for t in &activity {
         activity_out.push(thread_out(&tx, &a2a.config, t, caller.id(), now).await?);
     }
-    Ok(EventsSnapshot {
+    let snapshot = EventsSnapshot {
         pending_opens,
         activity: activity_out,
         cursor,
-    })
+    };
+    Ok((snapshot, settling))
 }
 
 /// `GET /v1/a2a/check` (§3.13): permission and reachability, separately.

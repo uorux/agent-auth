@@ -29,9 +29,34 @@ use crate::error::{ApiError, ApiResult};
 use crate::events::{KeyedEvents, Listener, clamp_wait};
 use crate::state::AppState;
 
-/// Re-read at least this often while parked, so a missed wake-up only adds
-/// latency.
-const POLL_ROUND: Duration = Duration::from_secs(2);
+/// A parked long-poll sleeps on its wake-up keys (no wake-up is lost: the
+/// listener subscribes before the first read) and re-reads at least this
+/// often anyway, re-checking that the caller is still enabled and its key
+/// and session still valid.
+pub(super) const POLL_ROUND: Duration = Duration::from_secs(15);
+/// The re-read delay while a writer is in flight (activity held back by
+/// the activity clock settles within milliseconds).
+const SETTLE_ROUND: Duration = Duration::from_millis(100);
+
+/// The slot a parked long-poll holds, or 429.
+fn poll_slot<'a>(a2a: &'a A2a, caller: &AgentCaller) -> ApiResult<super::limits::PollSlot<'a>> {
+    let cap = a2a.config.max_long_polls_per_agent;
+    a2a.polls.take(caller.id(), cap).ok_or_else(|| {
+        ApiError::new(
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "too many concurrent a2a long-polls for this agent (at most {cap}); \
+                 wait for one to return"
+            ),
+        )
+    })
+}
+
+/// One parked round's bookkeeping: still the caller it was, and alive.
+async fn recheck(state: &AppState, caller: &AgentCaller) -> ApiResult<()> {
+    caller.revalidate(state).await?;
+    service::touch(state, caller).await
+}
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
@@ -294,13 +319,14 @@ async fn read_messages(
     if !last.messages.is_empty() || wait.is_zero() || start == WireState::Closed {
         return Ok(Json(last));
     }
+    let _slot = poll_slot(a2a, &caller)?;
     loop {
         let left = remaining(deadline);
         if left.is_zero() {
             return Ok(Json(last));
         }
         waiter.wait(left.min(POLL_ROUND)).await;
-        service::touch(&state, &caller).await?;
+        recheck(&state, &caller).await?;
         let r = service::read_messages(&state, &caller, id, after_seq).await?;
         if !r.messages.is_empty() || r.thread.state != start {
             return Ok(Json(r));
@@ -329,8 +355,10 @@ async fn events(
     service::mark_listening(&state, caller.id()).await?;
     let deadline = deadline_in(wait);
     let mut waiter = Waiter::new(a2a, keys(&caller));
+    let mut slot = None;
     loop {
-        let snapshot = service::events_snapshot(&state, &caller, after).await?;
+        let (snapshot, settling) =
+            service::events_snapshot_settling(&state, &caller, after).await?;
         if !snapshot.pending_opens.is_empty() || !snapshot.activity.is_empty() {
             return Ok(Json(snapshot));
         }
@@ -338,8 +366,12 @@ async fn events(
         if left.is_zero() {
             return Ok(Json(snapshot));
         }
-        waiter.wait(left.min(POLL_ROUND)).await;
-        service::touch(&state, &caller).await?;
+        if slot.is_none() {
+            slot = Some(poll_slot(a2a, &caller)?);
+        }
+        let round = if settling { SETTLE_ROUND } else { POLL_ROUND };
+        waiter.wait(left.min(round)).await;
+        recheck(&state, &caller).await?;
     }
 }
 

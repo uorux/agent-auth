@@ -25,6 +25,14 @@ pub struct A2aConfig {
     pub liveness_threshold: Duration,
     /// `A2A_LISTEN_THRESHOLD_SECS` (300): `reachable` on `last_listen_at`.
     pub listen_threshold: Duration,
+    /// `A2A_MAX_SESSIONS_PER_AGENT` (64): open sessions one agent may hold.
+    pub max_sessions_per_agent: u32,
+    /// `A2A_MAX_MESSAGES_PER_THREAD` (1000): then the thread must be closed
+    /// and a new one opened.
+    pub max_messages_per_thread: u32,
+    /// `A2A_MAX_LONG_POLLS_PER_AGENT` (8): concurrent waiting message reads
+    /// and events polls of one agent; past it, 429.
+    pub max_long_polls_per_agent: u32,
 }
 
 impl Default for A2aConfig {
@@ -38,6 +46,9 @@ impl Default for A2aConfig {
             session_idle_timeout: Duration::seconds(900),
             liveness_threshold: Duration::seconds(120),
             listen_threshold: Duration::seconds(300),
+            max_sessions_per_agent: 64,
+            max_messages_per_thread: 1000,
+            max_long_polls_per_agent: 8,
         }
     }
 }
@@ -47,6 +58,13 @@ fn boolean(name: &str, value: &str) -> Result<bool, String> {
         "1" | "true" | "yes" | "on" | "t" | "y" => Ok(true),
         "0" | "false" | "no" | "off" | "f" | "n" => Ok(false),
         _ => Err(format!("{name} must be a boolean")),
+    }
+}
+
+fn count(name: &str, value: &str) -> Result<u32, String> {
+    match value.trim().parse::<u32>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err(format!("{name} must be a positive integer")),
     }
 }
 
@@ -91,6 +109,21 @@ impl A2aConfig {
                 *field = seconds(name, &v)?;
             }
         }
+        for (name, field) in [
+            ("A2A_MAX_SESSIONS_PER_AGENT", &mut c.max_sessions_per_agent),
+            (
+                "A2A_MAX_MESSAGES_PER_THREAD",
+                &mut c.max_messages_per_thread,
+            ),
+            (
+                "A2A_MAX_LONG_POLLS_PER_AGENT",
+                &mut c.max_long_polls_per_agent,
+            ),
+        ] {
+            if let Some(v) = get(name) {
+                *field = count(name, &v)?;
+            }
+        }
         Ok(c)
     }
 }
@@ -116,6 +149,15 @@ mod tests {
         assert_eq!(c.webhook_http_hosts, ["hooks.internal", "127.0.0.1"]);
         assert_eq!(c.session_idle_timeout, Duration::seconds(60));
         assert!(c.webhook_signing_secret.is_none());
+        assert_eq!(c.max_messages_per_thread, 1000);
+        let c =
+            A2aConfig::from_lookup(|k| (k == "A2A_MAX_LONG_POLLS_PER_AGENT").then(|| "2".into()))
+                .unwrap();
+        assert_eq!(c.max_long_polls_per_agent, 2);
+        assert!(
+            A2aConfig::from_lookup(|k| (k == "A2A_MAX_SESSIONS_PER_AGENT").then(|| "0".into()))
+                .is_err()
+        );
         assert!(
             A2aConfig::from_lookup(|k| (k == "A2A_OPEN_TIMEOUT_SECS").then(|| "0".into())).is_err()
         );

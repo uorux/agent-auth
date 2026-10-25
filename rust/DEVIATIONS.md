@@ -477,6 +477,21 @@ and why. Keep entries short. Group by area.
   the access on your own behalf`.
 - **Legacy thread-less messages** do not exist (`a2a_messages.thread_id` is
   NOT NULL), so `test_legacy_null_thread_messages_invisible` is not ported.
+- **Resource caps** (security review #2; the Python had none):
+  `A2A_MAX_SESSIONS_PER_AGENT` (64) open sessions per agent, then 409
+  `too many open sessions for this agent (at most N); …` (counted under a
+  lock on the agent row); `A2A_MAX_MESSAGES_PER_THREAD` (1000), then 409
+  `thread has reached its limit of N messages; close it and open a new
+  one`; `A2A_MAX_LONG_POLLS_PER_AGENT` (8) concurrently parked message
+  reads and events polls per agent, then 429 `too many concurrent a2a
+  long-polls for this agent (at most N); wait for one to return` (a read
+  that does not wait needs no slot).
+- **Long-polls sleep on wake-ups**, re-reading the database at least every
+  15 s (the panel 10 s; Python: every 2 s and 5 s), or every 100 ms while
+  a writer the events cursor waits for is in flight. At every re-read the
+  caller is re-checked (agent enabled, API key not rotated or OAuth token
+  still live, session still open): a caller that is no longer valid gets
+  the extractor's 401 mid-wait instead of further data.
 - **Not changed**: a sessionless caller still lists, and gets activity for,
   its agent's session-bound threads (a2a B8, metadata only; every read is
   403).

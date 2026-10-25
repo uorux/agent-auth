@@ -21,6 +21,7 @@ pub(crate) mod clock;
 mod config;
 pub mod delegation;
 mod grant;
+mod limits;
 pub mod provisioner;
 mod reach;
 mod routes;
@@ -58,6 +59,7 @@ pub struct A2a {
     pub(crate) events: Arc<KeyedEvents<WakeKey>>,
     pub(crate) clock: clock::ActivityClock,
     pub(crate) webhooks: webhook::Webhooks,
+    pub(crate) polls: limits::PollSlots,
 }
 
 impl A2a {

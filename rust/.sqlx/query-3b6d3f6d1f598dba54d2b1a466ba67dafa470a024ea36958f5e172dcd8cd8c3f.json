@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT count(*) AS \"n!\" FROM agent_sessions WHERE agent_id = $1 AND closed_at IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "3b6d3f6d1f598dba54d2b1a466ba67dafa470a024ea36958f5e172dcd8cd8c3f"
+}

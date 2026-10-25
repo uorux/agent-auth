@@ -30,6 +30,9 @@ pub struct AgentCaller {
     agent: AgentRow,
     session: Option<SessionRow>,
     via: AgentCredentialKind,
+    /// The SHA-256 of the OAuth access token it presented (for
+    /// [`AgentCaller::revalidate`]); `None` for an API key.
+    oauth_token_hash: Option<String>,
 }
 
 impl AgentCaller {
@@ -42,6 +45,7 @@ impl AgentCaller {
             agent,
             session,
             via,
+            oauth_token_hash: None,
         }
     }
     #[must_use]

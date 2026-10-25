@@ -159,7 +159,49 @@ impl FromRequestParts<AppState> for AgentCaller {
         let session = with_session(&tx, parts, &agent, now).await?;
         agents::touch_seen(&tx, agent.id, now, now.saturating_sub(TOUCH_INTERVAL)).await?;
         tx.commit().await?;
-        Ok(AgentCaller::new(agent, session, via))
+        let mut caller = AgentCaller::new(agent, session, via);
+        if via == AgentCredentialKind::OAuthConnector {
+            caller.oauth_token_hash = Some(sha256_hex(token));
+        }
+        Ok(caller)
+    }
+}
+
+impl AgentCaller {
+    /// Is this caller still who it authenticated as? For a request that
+    /// lives on (a long-poll), checked at each re-read: the agent still
+    /// exists, is enabled and not the operator row; its API key is the one
+    /// it presented (not rotated since), or its OAuth access token is still
+    /// live; and its session, if it named one, is still open. Otherwise the
+    /// 401 the extractor would give now.
+    pub(crate) async fn revalidate(&self, state: &AppState) -> Result<(), ApiError> {
+        let now = state.now();
+        let tx = state.store.begin().await?;
+        let row = agents::get(&tx, self.agent.id).await?;
+        let agent_ok = row.as_ref().is_some_and(|a| {
+            !a.disabled
+                && a.kind != AgentKind::Operator
+                && (self.via == AgentCredentialKind::OAuthConnector
+                    || (a.key_id == self.agent.key_id && a.api_key_hash == self.agent.api_key_hash))
+        });
+        let token_ok = match &self.oauth_token_hash {
+            None => true,
+            Some(hash) => oauth::agent_for_access(&tx, hash, now).await? == Some(self.agent.id),
+        };
+        if !agent_ok || !token_ok {
+            return Err(ApiError::unauthorized(match self.via {
+                AgentCredentialKind::ApiKey => "invalid API key",
+                AgentCredentialKind::OAuthConnector => "invalid or expired access token",
+            }));
+        }
+        if let Some(s) = &self.session
+            && sessions::get_open(&tx, self.agent.id, s.id)
+                .await?
+                .is_none()
+        {
+            return Err(ApiError::unauthorized("unknown or closed session"));
+        }
+        Ok(())
     }
 }
 
