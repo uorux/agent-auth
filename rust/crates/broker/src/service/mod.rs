@@ -31,8 +31,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use agent_auth_core::Platform;
-use agent_auth_core::containment::{AgentKind, Placement};
-use agent_auth_core::policy::{AgentKind as PolicyKind, AgentRef, Placement as PolicyPlacement};
+use agent_auth_core::policy::AgentRef;
 use agent_auth_store::StoreError;
 use agent_auth_store::agents::AgentRow;
 use agent_auth_store::requests::RequestRow;
@@ -249,25 +248,6 @@ pub(crate) async fn detached<T: Send + 'static>(
     rx.await.ok()
 }
 
-/// Convert the store's agent enums to policy's (two crates' copies of the
-/// same values).
-#[must_use]
-pub fn policy_kind(kind: AgentKind) -> PolicyKind {
-    match kind {
-        AgentKind::Service => PolicyKind::Service,
-        AgentKind::Ephemeral => PolicyKind::Ephemeral,
-        AgentKind::Operator => PolicyKind::Operator,
-    }
-}
-
-#[must_use]
-pub fn policy_placement(p: Placement) -> PolicyPlacement {
-    match p {
-        Placement::Host => PolicyPlacement::Host,
-        Placement::Sandbox => PolicyPlacement::Sandbox,
-    }
-}
-
 /// An agent as policy sees it.
 #[must_use]
 pub fn agent_ref_of(agent: &AgentRow) -> AgentRef<'_> {
@@ -276,7 +256,7 @@ pub fn agent_ref_of(agent: &AgentRow) -> AgentRef<'_> {
         runtime: agent.runtime.as_deref(),
         project: agent.project.as_deref(),
         host: agent.host.as_deref(),
-        placement: policy_placement(agent.placement),
-        kind: policy_kind(agent.kind),
+        placement: agent.placement,
+        kind: agent.kind,
     }
 }

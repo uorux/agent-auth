@@ -16,63 +16,9 @@ use serde_json::{Map, Value};
 
 use crate::glob::Glob;
 
-/// `agents.kind`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AgentKind {
-    /// Always on; may receive a2a threads and webhook pings.
-    Service,
-    /// Short-lived CLI instances working through sessions; initiate only.
-    Ephemeral,
-    /// The admin panel's own row: never held, never authenticates by key.
-    Operator,
-}
-
-impl AgentKind {
-    pub const ALL: [AgentKind; 3] = [
-        AgentKind::Service,
-        AgentKind::Ephemeral,
-        AgentKind::Operator,
-    ];
-
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            AgentKind::Service => "service",
-            AgentKind::Ephemeral => "ephemeral",
-            AgentKind::Operator => "operator",
-        }
-    }
-
-    #[must_use]
-    pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|k| k.as_str() == s)
-    }
-}
-
-/// `agents.placement`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Placement {
-    Host,
-    /// Runs in an agent VM.
-    Sandbox,
-}
-
-impl Placement {
-    pub const ALL: [Placement; 2] = [Placement::Host, Placement::Sandbox];
-
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Placement::Host => "host",
-            Placement::Sandbox => "sandbox",
-        }
-    }
-
-    #[must_use]
-    pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|p| p.as_str() == s)
-    }
-}
+/// One definition of an agent's kind and placement for the whole crate
+/// (policy patterns, zones and containment read the same values).
+pub use crate::policy::agents::{AgentKind, Placement};
 
 /// The agent attributes an entry can name.
 #[derive(Debug, Clone, Copy)]

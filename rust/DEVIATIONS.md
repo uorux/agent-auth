@@ -753,12 +753,15 @@ and why. Keep entries short. Group by area.
 - **Disabled is held** (core B-15): a request of an agent disabled or past
   its lease since it authenticated is recorded denied (`agent is
   disabled`), and nothing is provisioned for it.
-- **Saved-rule pinning for sensitive namespaces**: a saved rule pinned to an
-  authority clears a request sensitive only because of its Kubernetes
-  namespace when the rule names that exact namespace (the Python's
-  `pinned_here`, commit 4da3f4e); otherwise the request surfaces with the
-  sensitive note. (Implemented in the service; core's evaluation does not
-  carry it yet.)
+- **Saved-rule pinning for resource-driven sensitivity** (not a change: the
+  Python's `engine.sensitive_by_resource` / `pinned_here`). A saved rule
+  pinned to an authority clears a request sensitive only because of its
+  resource (a sensitive Kubernetes namespace, a pool's sensitive item) when
+  the rule names exactly that resource; otherwise the request surfaces with
+  the sensitive note. Core's evaluation and gates carry it
+  (`RuleStrength::names_resource`, `GateFacts::sensitive_by_resource`),
+  proven with the other gates. "Exactly" is the resource as a literal glob,
+  since exact rules store it escaped.
 - **"Exact" rules from a decision take the resource literally**: the
   resource pattern is the resource glob-escaped (`team*` → `team[*]`).
   A rule's duration cap from a decision is at most 365 days.
@@ -1037,10 +1040,6 @@ Upstream fixes of review 2026-10, adopted:
   deprecated `test::rand::FixedSliceRandom` (ring has no scalar-to-key
   constructor). Pinned by known-answer tests against the Python; revisit
   (a dedicated PKCS#8 key) in review.
-- Core defines `AgentKind` and `Placement` twice (containment and policy);
-  provisioners map between them. Unify in core.
-- Move the sensitive-namespace pinning rule (`pinned_here`) from the spine's
-  service into core's evaluation, where the other gates are proven.
 - Refuse `rotate-key` for an agent minted in an agent VM (as rename and
   attributes are): rotating would strand the sandbox daemon's copy. The way
   out for a suspect minted agent is disable, then re-mint.

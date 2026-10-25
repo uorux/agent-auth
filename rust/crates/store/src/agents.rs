@@ -69,6 +69,19 @@ impl AgentRow {
             placement: self.placement,
         }
     }
+
+    /// The agent as policy patterns, zones and rules see it.
+    #[must_use]
+    pub fn policy_ref(&self) -> agent_auth_core::policy::AgentRef<'_> {
+        agent_auth_core::policy::AgentRef {
+            name: &self.name,
+            runtime: self.runtime.as_deref(),
+            project: self.project.as_deref(),
+            host: self.host.as_deref(),
+            placement: self.placement,
+            kind: self.kind,
+        }
+    }
 }
 
 pub(crate) struct RawAgent {

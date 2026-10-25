@@ -13,8 +13,8 @@
 
 use std::collections::HashMap;
 
-use agent_auth_core::containment::{AgentKind, Placement};
-use agent_auth_core::policy::{self, AgentRef};
+use agent_auth_core::containment::AgentKind;
+use agent_auth_core::policy::AgentRef;
 use agent_auth_core::pyfmt::repr;
 use agent_auth_core::{AgentId, MessageId, Platform, SessionId, ThreadId, zones};
 use agent_auth_store::a2a::{
@@ -81,21 +81,7 @@ impl<'a> Actor<'a> {
 // ------------------------------------------------------------- helpers
 
 pub(crate) fn agent_ref(a: &AgentRow) -> AgentRef<'_> {
-    AgentRef {
-        name: &a.name,
-        runtime: a.runtime.as_deref(),
-        project: a.project.as_deref(),
-        host: a.host.as_deref(),
-        placement: match a.placement {
-            Placement::Host => policy::Placement::Host,
-            Placement::Sandbox => policy::Placement::Sandbox,
-        },
-        kind: match a.kind {
-            AgentKind::Service => policy::AgentKind::Service,
-            AgentKind::Ephemeral => policy::AgentKind::Ephemeral,
-            AgentKind::Operator => policy::AgentKind::Operator,
-        },
-    }
+    a.policy_ref()
 }
 
 fn wire_state(s: ThreadState) -> WireState {

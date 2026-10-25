@@ -1,7 +1,6 @@
 //! Small helpers the provisioners share.
 
-use agent_auth_core::containment;
-use agent_auth_core::policy::agents::{self as policy_agents, AgentRef};
+use agent_auth_core::policy::agents::AgentRef;
 use agent_auth_store::StoreError;
 use agent_auth_store::agents::AgentRow;
 use time::OffsetDateTime;
@@ -11,25 +10,10 @@ use super::ProvisionError;
 
 pub(crate) use agent_auth_core::pyfmt::repr;
 
-/// The policy view of an agent row. (core has two copies of `Placement`
-/// and `AgentKind`, containment's and policy's; mapped here.)
+/// The policy view of an agent row.
 #[must_use]
 pub(crate) fn agent_ref(agent: &AgentRow) -> AgentRef<'_> {
-    AgentRef {
-        name: &agent.name,
-        runtime: agent.runtime.as_deref(),
-        project: agent.project.as_deref(),
-        host: agent.host.as_deref(),
-        placement: match agent.placement {
-            containment::Placement::Host => policy_agents::Placement::Host,
-            containment::Placement::Sandbox => policy_agents::Placement::Sandbox,
-        },
-        kind: match agent.kind {
-            containment::AgentKind::Service => policy_agents::AgentKind::Service,
-            containment::AgentKind::Ephemeral => policy_agents::AgentKind::Ephemeral,
-            containment::AgentKind::Operator => policy_agents::AgentKind::Operator,
-        },
-    }
+    agent.policy_ref()
 }
 
 static NULL: serde_json::Value = serde_json::Value::Null;
