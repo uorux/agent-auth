@@ -107,9 +107,12 @@ pub struct DiscordOwner {
 }
 
 impl DiscordOwner {
-    #[expect(dead_code, reason = "called by the Discord bot, not yet written")]
-    pub(crate) fn new(user_id: u64, name: String) -> DiscordOwner {
-        DiscordOwner { user_id, name }
+    /// The interaction's user, if it is the configured owner: `configured`
+    /// is non-zero and equal to `user_id` (spec A.3, INV-A1). The only way
+    /// to make a `DiscordOwner`; the Discord bot calls it for every
+    /// interaction, modal submissions included (INV-A2).
+    pub(crate) fn check(configured: u64, user_id: u64, name: String) -> Option<DiscordOwner> {
+        (configured != 0 && user_id == configured).then_some(DiscordOwner { user_id, name })
     }
     #[must_use]
     pub fn user_id(&self) -> u64 {

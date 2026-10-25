@@ -6,6 +6,7 @@
 //! Layout (one module per area; see rust/ARCHITECTURE.md):
 //! - `auth`: principals (`AgentCaller`, `AdminCaller`, `DiscordOwner`,
 //!   `HumanDecider`) and their extractors.
+//! - `discord`: the Discord bot and its notifier.
 //! - `error`: `ApiError` (`{"detail": ...}`).
 //! - `events`: subscribe-first wake-ups for long-polls.
 //! - `notify`: the human surface (`Notifier`).
@@ -14,6 +15,7 @@
 //!   OAuth server for web-UI connectors; `remote_mcp`: `/mcp` for them.
 
 pub mod auth;
+pub mod discord;
 pub mod error;
 pub mod events;
 pub mod notify;

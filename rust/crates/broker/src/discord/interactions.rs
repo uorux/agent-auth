@@ -1,0 +1,513 @@
+//! Interactions: buttons, modals, slash commands and autocomplete (spec
+//! A.6, A.7).
+//!
+//! Every interaction first goes through the owner check, which is the only
+//! way to a [`DiscordOwner`] (INV-A1, INV-A2: modal submissions included).
+//! Anyone else gets the ephemeral refusal and nothing happens (an
+//! autocomplete from anyone else gets no choices). What a button acts on
+//! comes only from its custom id (INV-A3), and decisions go through the
+//! request service ([`RequestOps::decide`]).
+
+use agent_auth_core::{GrantStatus, HumanApproval, RequestId, RuleId};
+use agent_auth_store::{StoreError, grants, lockdown, requests, rules as rule_store};
+use serde_json::{Map, Value, json};
+use twilight_model::application::interaction::application_command::{
+    CommandData, CommandOptionValue,
+};
+use twilight_model::application::interaction::modal::{
+    ModalInteractionComponent, ModalInteractionData,
+};
+use twilight_model::application::interaction::{Interaction, InteractionData, InteractionType};
+use twilight_model::user::User;
+
+use super::Bot;
+use super::model::{EPHEMERAL, Message, Modal};
+use super::ops::{HumanDecision, OpError};
+use super::rest::RestError;
+use super::rules::{paginate, render};
+use super::text::{cut, escape};
+use super::views::{self, CustomId, Refusal, Submitted};
+use crate::auth::{DiscordOwner, HumanDecider};
+
+/// The refusal for anyone but the owner (verbatim, spec A.3).
+pub const NOT_OWNER: &str = "Only the configured owner can decide access requests.";
+pub const GONE: &str = "Request no longer exists.";
+pub const NO_CONTAINMENT: &str = "Containment is not set up on this broker.";
+pub const NOT_READY: &str = "The broker is still starting; try again in a moment.";
+
+/// Answers one interaction.
+struct Reply<'a> {
+    bot: &'a Bot,
+    id: u64,
+    token: String,
+    app: u64,
+}
+
+impl Reply<'_> {
+    async fn callback(&self, body: Value) -> Result<(), RestError> {
+        self.bot.rest.respond(self.id, &self.token, &body).await
+    }
+
+    async fn ephemeral(&self, text: &str) -> Result<(), RestError> {
+        let msg = Message::ephemeral(text);
+        self.callback(json!({"type": 4, "data": msg_value(&msg)}))
+            .await
+    }
+
+    async fn message(&self, msg: &Message) -> Result<(), RestError> {
+        self.callback(json!({"type": 4, "data": msg_value(msg)}))
+            .await
+    }
+
+    /// Replace the message the component is on (the rules browser).
+    async fn update(&self, msg: &Message) -> Result<(), RestError> {
+        self.callback(json!({"type": 7, "data": msg_value(msg)}))
+            .await
+    }
+
+    /// "Thinking…", ephemeral; the answer follows.
+    async fn defer(&self) -> Result<(), RestError> {
+        self.callback(json!({"type": 5, "data": {"flags": EPHEMERAL}}))
+            .await
+    }
+
+    async fn followup(&self, text: &str) -> Result<(), RestError> {
+        self.bot
+            .rest
+            .followup(self.app, &self.token, &Message::ephemeral(text))
+            .await
+    }
+
+    async fn modal(&self, modal: &Modal) -> Result<(), RestError> {
+        let components: Vec<_> = modal
+            .inputs
+            .iter()
+            .map(super::model::Input::component)
+            .collect();
+        self.callback(json!({
+            "type": 9,
+            "data": {"custom_id": modal.custom_id, "title": modal.title, "components": components},
+        }))
+        .await
+    }
+
+    async fn choices(&self, choices: Vec<(String, String)>) -> Result<(), RestError> {
+        let choices: Vec<Value> = choices
+            .into_iter()
+            .map(|(name, value)| json!({"name": name, "value": value}))
+            .collect();
+        self.callback(json!({"type": 8, "data": {"choices": choices}}))
+            .await
+    }
+}
+
+fn msg_value(msg: &Message) -> Value {
+    serde_json::to_value(msg).unwrap_or(Value::Null)
+}
+
+/// `str(user)` as discord.py prints it.
+#[must_use]
+pub fn user_label(u: &User) -> String {
+    if u.discriminator == 0 {
+        u.name.clone()
+    } else {
+        format!("{}#{:04}", u.name, u.discriminator)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum Failure {
+    #[error(transparent)]
+    Rest(#[from] RestError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+/// Handle one interaction. Errors are logged; nothing propagates.
+pub(crate) async fn handle(bot: &Bot, interaction: Interaction) {
+    let reply = Reply {
+        bot,
+        id: interaction.id.get(),
+        token: interaction.token.clone(),
+        app: interaction.application_id.get(),
+    };
+    let owner = interaction
+        .author()
+        .and_then(|u| DiscordOwner::check(bot.cfg.owner_id, u.id.get(), user_label(u)));
+    if let Err(e) = dispatch(bot, &reply, owner, interaction).await {
+        tracing::warn!("discord interaction failed: {e}");
+    }
+}
+
+async fn dispatch(
+    bot: &Bot,
+    reply: &Reply<'_>,
+    owner: Option<DiscordOwner>,
+    interaction: Interaction,
+) -> Result<(), Failure> {
+    let Some(owner) = owner else {
+        return match interaction.kind {
+            InteractionType::Ping => Ok(()),
+            // Autocomplete has no ephemeral reply: no choices.
+            InteractionType::ApplicationCommandAutocomplete => {
+                Ok(reply.choices(Vec::new()).await?)
+            }
+            _ => Ok(reply.ephemeral(NOT_OWNER).await?),
+        };
+    };
+    let who = HumanDecider::from(&owner);
+    match (interaction.kind, interaction.data) {
+        (InteractionType::ApplicationCommand, Some(InteractionData::ApplicationCommand(c))) => {
+            command(bot, reply, &who, &c).await
+        }
+        (
+            InteractionType::ApplicationCommandAutocomplete,
+            Some(InteractionData::ApplicationCommand(c)),
+        ) => autocomplete(bot, reply, &c).await,
+        (InteractionType::MessageComponent, Some(InteractionData::MessageComponent(c))) => {
+            match CustomId::parse(&c.custom_id) {
+                Some(id) => component(bot, reply, &who, id, &c.values).await,
+                None => {
+                    tracing::debug!("discord: a component that is not ours");
+                    Ok(())
+                }
+            }
+        }
+        (InteractionType::ModalSubmit, Some(InteractionData::ModalSubmit(m))) => {
+            match CustomId::parse(&m.custom_id) {
+                Some(id) => modal_submit(bot, reply, &who, id, &submitted(&m)).await,
+                None => Ok(()),
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+async fn load_request(
+    bot: &Bot,
+    id: RequestId,
+) -> Result<Option<requests::RequestRow>, StoreError> {
+    let tx = bot.store.begin().await?;
+    let row = requests::get(&tx, id)
+        .await?
+        .map(requests::AnyRequest::into_row);
+    tx.commit().await?;
+    Ok(row)
+}
+
+async fn component(
+    bot: &Bot,
+    reply: &Reply<'_>,
+    who: &HumanDecider,
+    id: CustomId,
+    values: &[String],
+) -> Result<(), Failure> {
+    match id {
+        CustomId::Approve(rid) => reply.modal(&views::decision_modal(rid, true)).await?,
+        CustomId::Deny(rid) => reply.modal(&views::decision_modal(rid, false)).await?,
+        CustomId::Edit(rid) => match load_request(bot, rid).await? {
+            None => reply.ephemeral(GONE).await?,
+            Some(r) => match views::edit_modal(&r) {
+                Some(m) => reply.modal(&m).await?,
+                None => reply.ephemeral(views::EDIT_TOO_LONG).await?,
+            },
+        },
+        CustomId::Totp(rid) => match load_request(bot, rid).await? {
+            None => reply.ephemeral(GONE).await?,
+            Some(r) => reply.modal(&views::totp_modal(&r)).await?,
+        },
+        CustomId::EndShell(rid) => end_shell(bot, reply, who, rid).await?,
+        CustomId::RulesSelect { page } => {
+            let selected = values.first().and_then(|v| v.parse::<RuleId>().ok());
+            reply
+                .update(&rules_page(bot, page, selected).await?)
+                .await?;
+        }
+        CustomId::RulesPage { target } => {
+            reply.update(&rules_page(bot, target, None).await?).await?
+        }
+        CustomId::RulesToggle { page, rule } => {
+            let tx = bot.store.begin().await?;
+            if let Some(r) = rule_store::get(&tx, rule).await? {
+                rule_store::set_enabled(&tx, rule, !r.enabled).await?;
+                tracing::info!(rule = %rule, enabled = !r.enabled, by = who.label(), "rule toggled from Discord");
+            }
+            tx.commit().await?;
+            reply
+                .update(&rules_page(bot, page, Some(rule)).await?)
+                .await?;
+        }
+        CustomId::RulesDelete { page, rule } => {
+            let tx = bot.store.begin().await?;
+            if rule_store::delete(&tx, rule).await? {
+                tracing::info!(rule = %rule, by = who.label(), "rule deleted from Discord");
+            }
+            tx.commit().await?;
+            reply.update(&rules_page(bot, page, None).await?).await?;
+        }
+        // Modal ids never arrive as components.
+        CustomId::DecisionModal { .. } | CustomId::EditModal(_) | CustomId::TotpModal(_) => {}
+    }
+    Ok(())
+}
+
+async fn rules_page(bot: &Bot, page: i64, selected: Option<RuleId>) -> Result<Message, StoreError> {
+    let tx = bot.store.begin().await?;
+    let all = rule_store::list(&tx).await?;
+    tx.commit().await?;
+    Ok(render(&paginate(all, page), selected))
+}
+
+async fn end_shell(
+    bot: &Bot,
+    reply: &Reply<'_>,
+    who: &HumanDecider,
+    rid: RequestId,
+) -> Result<(), Failure> {
+    reply.defer().await?;
+    let tx = bot.store.begin().await?;
+    let grant = grants::by_request(&tx, rid).await?;
+    tx.commit().await?;
+    let Some(grant) = grant.filter(|g| g.status == GrantStatus::Active) else {
+        reply.followup("That shell has already ended.").await?;
+        return Ok(());
+    };
+    let Some(ops) = bot.services().requests else {
+        reply.followup(NOT_READY).await?;
+        return Ok(());
+    };
+    match ops.revoke_grant(who, grant.id, "shell ended").await {
+        Ok(()) => {
+            reply
+                .followup("Shell ended; anything it was running is killed.")
+                .await?
+        }
+        Err(OpError(e)) => reply.followup(&format!("Could not end it: {e}")).await?,
+    }
+    Ok(())
+}
+
+/// The text inputs of a submitted modal, by custom id (inside labels or
+/// action rows).
+#[must_use]
+pub fn submitted(m: &ModalInteractionData) -> Submitted {
+    fn walk(c: &ModalInteractionComponent, out: &mut Vec<(String, String)>) {
+        match c {
+            ModalInteractionComponent::TextInput(t) => {
+                out.push((t.custom_id.clone(), t.value.clone()))
+            }
+            ModalInteractionComponent::Label(l) => walk(&l.component, out),
+            ModalInteractionComponent::ActionRow(r) => {
+                r.components.iter().for_each(|c| walk(c, out))
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    m.components.iter().for_each(|c| walk(c, &mut out));
+    Submitted(out)
+}
+
+async fn modal_submit(
+    bot: &Bot,
+    reply: &Reply<'_>,
+    who: &HumanDecider,
+    id: CustomId,
+    form: &Submitted,
+) -> Result<(), Failure> {
+    let (rid, read): (RequestId, Result<HumanDecision, Refusal>) = match id {
+        CustomId::DecisionModal { approve, request } => {
+            (request, views::read_decision(approve, form))
+        }
+        CustomId::EditModal(request) => (request, views::read_edit(form)),
+        CustomId::TotpModal(request) => (request, views::read_totp(form)),
+        _ => return Ok(()),
+    };
+    reply.defer().await?;
+    let decision = match read {
+        Ok(d) => d,
+        Err(Refusal(text)) => {
+            reply.followup(&text).await?;
+            return Ok(());
+        }
+    };
+    let Some(ops) = bot.services().requests else {
+        reply.followup(NOT_READY).await?;
+        return Ok(());
+    };
+    // The owner's attestation, for this request only (core::approval).
+    let approval = decision
+        .approve
+        .then(|| HumanApproval::attest(rid, who.label()));
+    match ops.decide(who, rid, decision.clone(), approval).await {
+        Ok(row) => {
+            reply
+                .followup(&views::decided_text(rid, &decision, &row))
+                .await?
+        }
+        Err(OpError(e)) => {
+            reply
+                .followup(&format!("Could not apply decision: {e}"))
+                .await?
+        }
+    }
+    Ok(())
+}
+
+fn option<'a>(c: &'a CommandData, name: &str) -> Option<&'a CommandOptionValue> {
+    c.options.iter().find(|o| o.name == name).map(|o| &o.value)
+}
+
+fn string_option(c: &CommandData, name: &str) -> Option<String> {
+    match option(c, name) {
+        Some(CommandOptionValue::String(s) | CommandOptionValue::Focused(s, _)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+async fn command(
+    bot: &Bot,
+    reply: &Reply<'_>,
+    who: &HumanDecider,
+    c: &CommandData,
+) -> Result<(), Failure> {
+    match c.name.as_str() {
+        "rules" => {
+            let mut msg = rules_page(bot, 0, None).await?;
+            msg.flags = Some(EPHEMERAL);
+            reply.message(&msg).await?;
+        }
+        "contain" => contain(bot, reply, who, c).await?,
+        "contained" => {
+            let entries = containment_entries(bot).await?;
+            let text: Vec<String> = entries
+                .iter()
+                .map(|e| format!("• `{}` {}", e.id, escape(&describe(e))))
+                .collect();
+            let text = cut(&text.join("\n"), 2000);
+            reply
+                .ephemeral(if text.is_empty() {
+                    "Nothing is contained."
+                } else {
+                    &text
+                })
+                .await?;
+        }
+        "release" => release(bot, reply, who, c).await?,
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn containment_entries(bot: &Bot) -> Result<Vec<lockdown::ContainmentEntry>, StoreError> {
+    let tx = bot.store.begin().await?;
+    let entries = lockdown::entries(&tx).await?;
+    tx.commit().await?;
+    Ok(entries)
+}
+
+fn describe(e: &lockdown::ContainmentEntry) -> String {
+    e.describe(&agent_auth_wire::timestamp::format(e.at).unwrap_or_default())
+}
+
+async fn contain(
+    bot: &Bot,
+    reply: &Reply<'_>,
+    who: &HumanDecider,
+    c: &CommandData,
+) -> Result<(), Failure> {
+    let Some(ops) = bot.services().containment else {
+        reply.ephemeral(NO_CONTAINMENT).await?;
+        return Ok(());
+    };
+    let mut m = Map::new();
+    for key in ["name", "project", "host", "runtime"] {
+        if let Some(v) = string_option(c, key).filter(|v| !v.is_empty()) {
+            m.insert(key.to_owned(), Value::String(v));
+        }
+    }
+    let everyone = matches!(
+        option(c, "everyone"),
+        Some(CommandOptionValue::Boolean(true))
+    );
+    if m.is_empty() && !everyone {
+        reply
+            .ephemeral("Say which agents (name, project, host, runtime), or everyone:True.")
+            .await?;
+        return Ok(());
+    }
+    let reason = string_option(c, "reason").unwrap_or_default();
+    reply.defer().await?;
+    match ops.contain(who, Value::Object(m), &reason, everyone).await {
+        Ok(out) => {
+            reply
+                .followup(&format!(
+                    "Contained `{}`: {} agent(s), {} grant(s) revoked.",
+                    out.id, out.agents, out.grants_revoked
+                ))
+                .await?;
+        }
+        Err(OpError(e)) => reply.followup(&e).await?,
+    }
+    Ok(())
+}
+
+async fn release(
+    bot: &Bot,
+    reply: &Reply<'_>,
+    who: &HumanDecider,
+    c: &CommandData,
+) -> Result<(), Failure> {
+    let Some(ops) = bot.services().containment else {
+        reply.ephemeral(NO_CONTAINMENT).await?;
+        return Ok(());
+    };
+    let entry = string_option(c, "entry").filter(|e| !e.is_empty());
+    reply.defer().await?;
+    match ops.lift(who, entry.as_deref()).await {
+        Ok(lifted) => reply.followup(&released_text(&lifted)).await?,
+        Err(OpError(e)) => reply.followup(&e).await?,
+    }
+    Ok(())
+}
+
+/// `/release`'s answer.
+#[must_use]
+pub fn released_text(lifted: &[lockdown::ContainmentEntry]) -> String {
+    let ids: Vec<String> = lifted.iter().map(|e| format!("`{}`", e.id)).collect();
+    let list = if ids.is_empty() {
+        "nothing was contained".to_owned()
+    } else {
+        ids.join(", ")
+    };
+    let tail = if lifted
+        .iter()
+        .any(|e| e.source == lockdown::ContainmentSource::Lockdown)
+    {
+        ". A lockdown's hosts stay locked until /unlock with their codes."
+    } else {
+        "."
+    };
+    format!("Lifted: {list}{tail}")
+}
+
+async fn autocomplete(bot: &Bot, reply: &Reply<'_>, c: &CommandData) -> Result<(), Failure> {
+    if c.name != "release" {
+        return Ok(reply.choices(Vec::new()).await?);
+    }
+    let current = string_option(c, "entry").unwrap_or_default().to_lowercase();
+    let entries = containment_entries(bot).await?;
+    let choices = entries
+        .iter()
+        .filter(|e| e.id.contains(&current))
+        .take(25)
+        .map(|e| {
+            (
+                cut(&format!("{} · {}", e.id, describe(e)), 100),
+                e.id.clone(),
+            )
+        })
+        .collect();
+    reply.choices(choices).await?;
+    Ok(())
+}

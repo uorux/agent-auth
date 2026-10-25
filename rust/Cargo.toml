@@ -31,7 +31,9 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json", "r
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 webpki-roots = { version = "1.0.11", default-features = false }
 rustls-pki-types = { version = "1.15.1", default-features = false, features = ["std"] }
-tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
+# `__rustls-tls`: TLS through a rustls config we pass in (agent-auth-tls),
+# with no bundled root store of its own.
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "__rustls-tls"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "macros", "migrate", "json", "time", "uuid", "tls-rustls-ring-webpki"] }
 ring = { version = "0.17.14", default-features = false, features = ["alloc", "std"] }
 serde = { version = "1.0.229", default-features = false, features = ["std", "derive"] }
@@ -54,8 +56,10 @@ futures = { version = "0.3.34", default-features = false, features = ["std", "as
 bytes = { version = "1.12.1", default-features = false, features = ["std"] }
 zeroize = { version = "1.9.1", default-features = false, features = ["alloc", "derive"] }
 rmcp = { version = "3.5.1", default-features = false }
-twilight-gateway = { version = "0.17.1", default-features = false }
-twilight-http = { version = "0.17.1", default-features = false }
+# Discord types only (serde). twilight-http and twilight-gateway are not
+# used: twilight-http always enables HTTP/2 (h2), and both bring their own
+# TLS roots. The broker speaks REST over reqwest and the gateway over
+# tokio-tungstenite, both through agent-auth-tls.
 twilight-model = { version = "0.17.1", default-features = false }
 
 # dev/test only

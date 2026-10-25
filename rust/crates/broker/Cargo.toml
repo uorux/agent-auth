@@ -15,7 +15,7 @@ agent-auth-crypto.workspace = true
 agent-auth-wire.workspace = true
 agent-auth-store.workspace = true
 agent-auth-tls = { workspace = true, features = ["reqwest"] }
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "net"] }
 axum.workspace = true
 tower = { workspace = true, features = ["util"] }
 tower-http.workspace = true
@@ -38,9 +38,12 @@ futures.workspace = true
 base64.workspace = true
 # The remote MCP endpoint (/mcp): the server side and streamable HTTP only.
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
+twilight-model.workspace = true
+tokio-tungstenite.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true
 ring.workspace = true
+proptest.workspace = true
