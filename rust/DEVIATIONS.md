@@ -24,6 +24,14 @@ and why. Keep entries short. Group by area.
 
 ## Policy
 
+- **Default model: `deepseek/deepseek-v4.1-flash-1017`** (2026-10-25, at
+  Jacob's request; the Python defaulted to `anthropic/claude-sonnet-4.5`).
+  `llm.model` is what the reviewer, the mail judge, the risk line and the
+  shell watcher and guard use unless the policy names another (`llm.model`,
+  `platforms.hostexec.risk_model`, a rule's `llm_model`). A dated snapshot,
+  so the model does not change under a deployed policy; it supports the
+  strict JSON-schema answers every caller asks for. A policy file that sets
+  `llm.model` keeps its own.
 - **Unknown keys are errors everywhere** (§5.2, bug B-1). Every section of
   the policy file (rules, `match`, `constraints`, `defaults`, `llm`, each
   platform, desktop, notify, containment, audit…) refuses keys it does not

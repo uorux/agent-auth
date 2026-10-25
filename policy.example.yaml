@@ -11,7 +11,7 @@ defaults:
   max_duration: 24h
 
 llm:
-  model: anthropic/claude-sonnet-4.5   # OpenRouter model id; per-rule override below
+  model: deepseek/deepseek-v4.1-flash-1017   # OpenRouter model id; per-rule override below
   retry_budget: 2          # LLM denials the agent may retry before human escalation
   timeout_secs: 60
 
@@ -36,7 +36,7 @@ platforms:
   #       tier: root
   #       argv: ["nixos-rebuild", "switch", "--flake", "{flake}"]
   #       params: {flake: "git\\+https://git\\.example/me/[a-z0-9-]+#[a-z0-9-]+"}
-  #   risk_model: deepseek/deepseek-chat   # the advisory risk line (default: llm.model)
+  #   risk_model: deepseek/deepseek-v4.1-flash-1017   # the advisory risk line (default: llm.model)
   #   watch: true    # that model also watches shell commands, and commands no human saw
   #                  # one by one, as they run, and pings you about an alarming one
   #   window_default: 30m                  # "Approve all…"

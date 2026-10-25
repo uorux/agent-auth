@@ -109,7 +109,7 @@ pub struct LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         LlmConfig {
-            model: "anthropic/claude-sonnet-4.5".to_owned(),
+            model: "deepseek/deepseek-v4.1-flash-1017".to_owned(),
             retry_budget: 2,
             timeout_secs: 60,
         }

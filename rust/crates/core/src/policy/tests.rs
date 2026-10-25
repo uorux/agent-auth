@@ -1248,7 +1248,7 @@ fn defaults_are_the_pythons() {
     let p = Policy::default();
     assert_eq!(p.defaults().action, PolicyAction::Surface);
     assert_eq!(p.defaults().max_duration.get(), 86_400);
-    assert_eq!(p.llm().model, "anthropic/claude-sonnet-4.5");
+    assert_eq!(p.llm().model, "deepseek/deepseek-v4.1-flash-1017");
     assert_eq!(p.llm().retry_budget, 2);
     assert_eq!(p.platforms().kubernetes.role_allowlist, vec!["view"]);
     assert_eq!(p.platforms().agents.runtimes, vec!["claude", "codex"]);
