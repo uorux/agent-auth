@@ -459,7 +459,11 @@ impl World {
             ))
             .unwrap(),
         );
-        let tokens = Arc::new(GoogleTokens::new(&policy.platforms().google).unwrap());
+        let tokens = Arc::new(GoogleTokens::with_http(
+            &policy.platforms().google,
+            agent_auth_broker::provisioners::http::Http::new().unwrap(),
+            agent_auth_broker::provisioners::google::TOKEN_URL,
+        ));
         let settings = MailSettings {
             secret_box: Some(Arc::new(SecretBox::from_bytes(&[7u8; 32]).unwrap())),
             openrouter_api_key: judge_on.then(|| "or-key".to_owned()),

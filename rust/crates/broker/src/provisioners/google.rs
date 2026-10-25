@@ -45,6 +45,13 @@ use super::{Credential, ProvisionError, Provisioner, Refused, RequestSpec, Valid
 
 /// Google's token endpoint, unless a login file names another.
 pub const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+/// The token endpoints a login file may name (Google's current and legacy
+/// ones). Anything else would receive the refresh token or the signed
+/// assertion.
+pub const TOKEN_URLS: [&str; 2] = [
+    "https://oauth2.googleapis.com/token",
+    "https://accounts.google.com/o/oauth2/token",
+];
 const BASE: &str = "https://www.googleapis.com/auth/";
 /// What Google adds to a token that grants nothing beyond who it is.
 const IDENTITY: [&str; 5] = [
@@ -95,7 +102,9 @@ fn shown(scope: &str) -> String {
 struct Cached {
     token: Secret<String>,
     expires: OffsetDateTime,
-    granted: BTreeSet<String>,
+    /// The scopes Google says the token carries; None when its answer did
+    /// not say (then it is never handed to an agent).
+    granted: Option<BTreeSet<String>>,
 }
 
 type Slot = Arc<tokio::sync::Mutex<Option<Cached>>>;
@@ -110,6 +119,9 @@ pub struct GoogleTokens {
     config: GoogleConfig,
     http: Http,
     token_url: String,
+    /// Tests only: any https endpoint, or plain http to a loopback one
+    /// (fake token endpoints), besides Google's.
+    any_endpoint: bool,
     slots: Mutex<HashMap<(String, BTreeSet<String>), Slot>>,
 }
 
@@ -153,9 +165,16 @@ fn io_reason(e: &std::io::Error) -> String {
     }
 }
 
-/// A token endpoint named by a login file: https, or plain http only to a
-/// loopback address (a test's fake endpoint).
-fn token_url_ok(url: &str) -> bool {
+/// A token endpoint named by a login file: one of Google's
+/// ([`TOKEN_URLS`]); with `any_endpoint` (tests), any https one or plain
+/// http to a loopback address.
+fn token_url_ok(url: &str, any_endpoint: bool) -> bool {
+    if TOKEN_URLS.contains(&url) {
+        return true;
+    }
+    if !any_endpoint {
+        return false;
+    }
     let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
@@ -172,17 +191,22 @@ fn token_url_ok(url: &str) -> bool {
 }
 
 impl GoogleTokens {
+    /// Production: only Google's token endpoints.
     pub fn new(config: &GoogleConfig) -> Result<GoogleTokens, ConfigError> {
-        Ok(GoogleTokens::with_http(config, Http::new()?, TOKEN_URL))
+        let mut t = GoogleTokens::with_http(config, Http::new()?, TOKEN_URL);
+        t.any_endpoint = false;
+        Ok(t)
     }
 
-    /// With this client and default token endpoint (tests).
+    /// With this client and default token endpoint, and any https (or
+    /// loopback http) endpoint allowed: tests' fake token endpoints.
     #[must_use]
     pub fn with_http(config: &GoogleConfig, http: Http, token_url: &str) -> GoogleTokens {
         GoogleTokens {
             config: config.clone(),
             http,
             token_url: token_url.to_owned(),
+            any_endpoint: true,
             slots: Mutex::new(HashMap::new()),
         }
     }
@@ -235,9 +259,21 @@ impl GoogleTokens {
                 }
             }
         };
+        let granted = match &cached.granted {
+            Some(g) => g.clone(),
+            // Google did not say what the token carries: the broker's own
+            // use takes it; an agent never gets a token of unknown reach.
+            None if exact => {
+                return Err(failed(format!(
+                    "google account {name}: Google's answer did not say which scopes the token \
+                     carries; not handed out"
+                )));
+            }
+            None => wanted.clone(),
+        };
         let missing: Vec<&str> = wanted
             .iter()
-            .filter(|s| !cached.granted.contains(*s))
+            .filter(|s| !granted.contains(*s))
             .map(|s| short(s))
             .collect();
         if !missing.is_empty() {
@@ -247,8 +283,7 @@ impl GoogleTokens {
                 missing.join(", ")
             )));
         }
-        let extra: Vec<String> = cached
-            .granted
+        let extra: Vec<String> = granted
             .iter()
             .filter(|s| !wanted.contains(*s) && !IDENTITY.contains(&s.as_str()))
             .take(10)
@@ -277,9 +312,9 @@ impl GoogleTokens {
         } else {
             self.delegated(account, &scope, now)?
         };
-        if !token_url_ok(&req.url) {
+        if !token_url_ok(&req.url, self.any_endpoint) {
             return Err(failed(format!(
-                "google account {}: its token_uri is not an https URL",
+                "google account {}: its token_uri is not Google's token endpoint",
                 account.address
             )));
         }
@@ -315,9 +350,9 @@ impl GoogleTokens {
                 account.address
             )));
         };
-        let granted: BTreeSet<String> = match answer.get("scope").and_then(Value::as_str) {
-            Some(s) if !s.is_empty() => s.split_whitespace().map(str::to_owned).collect(),
-            _ => scopes.clone(),
+        let granted: Option<BTreeSet<String>> = match answer.get("scope").and_then(Value::as_str) {
+            Some(s) if !s.is_empty() => Some(s.split_whitespace().map(str::to_owned).collect()),
+            _ => None,
         };
         let lifetime = answer
             .get("expires_in")
@@ -558,13 +593,13 @@ impl GoogleProvisioner {
             return Err(unknown_capability(action));
         };
         let name = self.account_name(&spec.resource)?;
-        let address = self
+        let who = self
             .config
             .accounts
             .get(&name)
-            .map_or("", |a| a.address.as_str());
+            .map_or_else(String::new, acting_as);
         let note = format!(
-            "an account-wide Google token: {} of {address} (scope {scope}), for up to an hour \
+            "an account-wide Google token: {} of {who} (scope {scope}), for up to an hour \
              past the grant's end",
             reach(action)
         );
@@ -627,6 +662,9 @@ impl Provisioner for GoogleProvisioner {
         if grant.status != GrantStatus::Active || grant.expires_at <= now {
             return Err(failed("grant is not active"));
         }
+        if !minted_here(grant) {
+            return Err(failed(STUB_ERA));
+        }
         let action = action_of(&grant.authority);
         let (Some(scope), Some(account)) = (
             capability_scope(action),
@@ -649,7 +687,7 @@ impl Provisioner for GoogleProvisioner {
             note: Some(format!(
                 "Bearer token for the Google {api} API (scope {scope}), as {}. Re-fetch when it \
                  runs out; none is issued once the grant ends.",
-                account.address
+                acting_as(account)
             )),
             ..Credential::default()
         })
@@ -676,6 +714,65 @@ impl Provisioner for GoogleProvisioner {
                 .collect()
         });
         serde_json::to_value(c).ok()
+    }
+}
+
+/// Who a token acts as: the address, and for domain-wide delegation the
+/// subject the service account impersonates (which may be someone else).
+fn acting_as(account: &GoogleAccount) -> String {
+    if account.service_account_file.is_empty() {
+        return account.address.clone();
+    }
+    let subject = account.subject.as_deref().unwrap_or(&account.address);
+    format!(
+        "{} (acting as {subject}, by domain-wide delegation)",
+        account.address
+    )
+}
+
+/// The refusal for a grant the real provisioner never minted for.
+pub const STUB_ERA: &str = "this grant was approved while google had no account configured \
+     (nothing was issued then); request it again";
+
+/// Was this grant provisioned by the real provisioner (its state names
+/// its account)? A grant approved under the stub (`{"stub": true}`) was
+/// a recorded decision only, not an approval of a real token.
+#[must_use]
+pub fn minted_here(grant: &GrantRow) -> bool {
+    grant
+        .provisioner_state
+        .get("account")
+        .and_then(Value::as_str)
+        == Some(grant.resource.as_str())
+}
+
+/// At startup, with accounts configured: end every active grant approved
+/// while google was a stub. Approving one then issued nothing; it must not
+/// turn into a real, account-wide token now.
+pub async fn end_stub_era_grants(st: &crate::state::AppState) {
+    if st.policy.platforms().google.accounts.is_empty() {
+        return;
+    }
+    let ids = async {
+        let tx = st.store.begin().await?;
+        let ids = agent_auth_store::grants::active_without_state(&tx, Platform::Google, "account")
+            .await?;
+        tx.rollback().await?;
+        Ok::<_, StoreError>(ids)
+    }
+    .await;
+    let ids = match ids {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::error!(error = %e, "listing stub-era google grants");
+            return;
+        }
+    };
+    for id in ids {
+        tracing::warn!(grant = %id, "ending a google grant approved while google was a stub");
+        if let Err(e) = crate::service::revoke_grant(st, id, STUB_ERA, "broker").await {
+            tracing::error!(grant = %id, error = %e, "ending a stub-era google grant");
+        }
     }
 }
 
@@ -775,13 +872,21 @@ mod tests {
 
     #[test]
     fn token_urls() {
-        assert!(token_url_ok("https://oauth2.googleapis.com/token"));
-        assert!(token_url_ok("http://127.0.0.1:5555/token"));
-        assert!(token_url_ok("http://[::1]:5555/token"));
-        assert!(token_url_ok("http://localhost/token"));
-        assert!(!token_url_ok("http://oauth2.googleapis.com/token"));
-        assert!(!token_url_ok("ftp://x/"));
-        assert!(!token_url_ok("not a url"));
+        // Production: Google's endpoints only.
+        assert!(token_url_ok("https://oauth2.googleapis.com/token", false));
+        assert!(token_url_ok(
+            "https://accounts.google.com/o/oauth2/token",
+            false
+        ));
+        assert!(!token_url_ok("https://evil.example/token", false));
+        assert!(!token_url_ok("http://127.0.0.1:5555/token", false));
+        // Tests' fake endpoints.
+        assert!(token_url_ok("http://127.0.0.1:5555/token", true));
+        assert!(token_url_ok("http://[::1]:5555/token", true));
+        assert!(token_url_ok("http://localhost/token", true));
+        assert!(!token_url_ok("http://oauth2.googleapis.com/token", true));
+        assert!(!token_url_ok("ftp://x/", true));
+        assert!(!token_url_ok("not a url", true));
     }
 
     #[test]

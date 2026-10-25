@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id FROM grants WHERE status = 'active' AND platform = $1\n           AND (provisioner_state ->> $2) IS DISTINCT FROM resource\n         ORDER BY granted_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "grants",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1cf47e62d3397fac6177c596d30343de7800bc99815b3a3ae9b074d82011ee5c"
+}

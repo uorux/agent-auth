@@ -159,8 +159,22 @@ pub fn auth_url(
     ))
 }
 
-/// https, or plain http to a loopback host only.
+/// The token endpoints a client JSON may name: Google's (current and
+/// legacy). The code and verifier go nowhere else.
+pub const TOKEN_URLS: [&str; 2] = [
+    "https://oauth2.googleapis.com/token",
+    "https://accounts.google.com/o/oauth2/token",
+];
+
+/// One of Google's token endpoints; in this crate's tests also a fake one
+/// (https, or plain http to a loopback host).
 fn endpoint_ok(endpoint: &str) -> bool {
+    if TOKEN_URLS.contains(&endpoint) {
+        return true;
+    }
+    if !cfg!(test) {
+        return false;
+    }
     let Ok(u) = url::Url::parse(endpoint) else {
         return false;
     };
@@ -187,7 +201,7 @@ pub async fn exchange(
     let endpoint = client.token_uri.as_deref().unwrap_or(TOKEN_URL);
     if !endpoint_ok(endpoint) {
         return err(format!(
-            "the client's token_uri {} is not an https URL",
+            "the client's token_uri {} is not Google's token endpoint",
             repr(endpoint)
         ));
     }
@@ -241,25 +255,33 @@ pub async fn exchange(
     Ok(answer)
 }
 
-fn non_empty_file(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|m| !m.is_file() || m.len() > 0)
+/// Anything at `path` (a file, a link, even a dangling one)?
+fn exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
 }
 
-/// Write `value` to `path`, mode 0600 from creation on. An existing file is
-/// replaced only if it is an empty regular file (never through a link).
+fn already_there(path: &str) -> ConsentError {
+    ConsentError(format!("{path} already exists; remove it first"))
+}
+
+/// Write `value` to a new file at `path`, mode 0600 from creation on
+/// (`O_CREAT|O_EXCL`: nothing that exists is written into, and a link at
+/// the name, even a dangling one, is not followed).
 pub fn write_secret(path: &str, value: &str) -> Result<(), ConsentError> {
     let p = Path::new(path);
-    if non_empty_file(p) {
-        return err(format!("{path} exists and is not empty; remove it first"));
-    }
     let io = |e: std::io::Error| ConsentError(format!("cannot write {path}: {}", strerror(&e)));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(p)
-        .map_err(io)?;
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                already_there(path)
+            } else {
+                io(e)
+            }
+        })?;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
         .map_err(io)?;
     file.write_all(value.as_bytes()).map_err(io)?;
@@ -348,11 +370,8 @@ pub async fn consent(
 ) -> Result<ConsentResult, ConsentError> {
     let client = load_client(&opts.client_secret_file)?;
     full_scopes(&opts.scopes)?;
-    if non_empty_file(Path::new(&opts.out)) {
-        return err(format!(
-            "{} exists and is not empty; remove it first",
-            opts.out
-        ));
+    if exists(Path::new(&opts.out)) {
+        return Err(already_there(&opts.out));
     }
     let (verifier, challenge) = pkce()?;
     let state = token_urlsafe(24).map_err(|e| ConsentError(e.to_string()))?;
@@ -633,7 +652,14 @@ mod tests {
         let e = exchange(&client, "c", "v", "http://127.0.0.1:1/")
             .await
             .unwrap_err();
-        assert!(e.0.contains("is not an https URL"), "{e}");
+        assert!(e.0.contains("is not Google's token endpoint"), "{e}");
+    }
+
+    #[test]
+    fn only_googles_token_endpoints_outside_tests() {
+        assert!(TOKEN_URLS.contains(&TOKEN_URL));
+        assert!(endpoint_ok("https://accounts.google.com/o/oauth2/token"));
+        assert!(!endpoint_ok("http://oauth2.example/token"));
     }
 
     #[test]
@@ -645,13 +671,8 @@ mod tests {
         let mode = std::fs::metadata(&out).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         let e = write_secret(&out, "again").unwrap_err();
-        assert!(e.0.contains("not empty"), "{e}");
-        let empty = dir.path("empty");
-        std::fs::write(&empty, "").unwrap();
-        std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o644)).unwrap();
-        write_secret(&empty, "x").unwrap();
-        let mode = std::fs::metadata(&empty).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        assert!(e.0.contains("already exists"), "{e}");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "1//secret");
     }
 
     /// The browser, played by a request to the callback.
@@ -750,10 +771,16 @@ mod tests {
             port: 0,
         };
         let e = consent(&opts, |_| panic!("no URL")).await.unwrap_err();
-        assert_eq!(
-            e.0,
-            format!("{out} exists and is not empty; remove it first")
-        );
+        assert_eq!(e.0, format!("{out} already exists; remove it first"));
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "old");
+        // Nor an empty one, nor through a link (even a dangling one).
+        let empty = dir.path("empty");
+        std::fs::write(&empty, "").unwrap();
+        assert!(write_secret(&empty, "x").is_err());
+        assert_eq!(std::fs::read_to_string(&empty).unwrap(), "");
+        let link = dir.path("link");
+        std::os::unix::fs::symlink(dir.path("target"), &link).unwrap();
+        assert!(write_secret(&link, "x").is_err());
+        assert!(!Path::new(&dir.path("target")).exists());
     }
 }

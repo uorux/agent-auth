@@ -727,13 +727,15 @@ run on your own machine (a *Desktop app* OAuth client; loopback redirect with
 PKCE; the token goes to a new 0600 file and is never printed). An OAuth app
 in "Testing" status issues refresh tokens that last 7 days: set it to "In
 production" (or Internal on Workspace). The consent screen lets you untick
-scopes; the command says what was not granted. A login file's `token_uri`
-must be https (plain http only to a loopback address).
+scopes; the command says what was not granted. `--out` must not exist yet
+(it is created 0600, never written through a link). A login file's
+`token_uri`, if it names one, must be Google's token endpoint.
 
 At startup, if accounts are configured and saved rules for `google` exist,
 the broker logs a loud warning: rules saved while google was a stub would
 now approve real, account-wide tokens. Review them with `agent-auth admin
-rules`.
+rules`. Grants approved while it was a stub are revoked at startup (they
+recorded a decision; they never become tokens): agents ask again.
 
 What it does not protect against: those scopes reach the whole account
 (every calendar, every file); Google has nothing per calendar or folder. A

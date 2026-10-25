@@ -389,6 +389,7 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
     if let Some(s) = &sandboxes {
         s.bind(state.clone());
     }
+    crate::provisioners::google::end_stub_era_grants(&state).await;
     crate::scheduler::boot(&state).await;
 
     let mut tasks = Vec::new();

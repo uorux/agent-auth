@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_auth_broker::provisioners::google::{
-    GoogleProvisioner, GoogleStubProvisioner, GoogleTokens, scope_url,
+    GoogleProvisioner, GoogleStubProvisioner, GoogleTokens, STUB_ERA, TOKEN_URLS, scope_url,
 };
 use agent_auth_broker::provisioners::http::Http;
 use agent_auth_broker::provisioners::{ProvisionError, Provisioner};
@@ -261,7 +261,10 @@ async fn a_plain_http_token_endpoint_is_refused() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(err.contains("token_uri is not an https URL"), "{err}");
+    assert!(
+        err.contains("token_uri is not Google's token endpoint"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
@@ -559,5 +562,124 @@ async fn stub(pool: PgPool) {
     assert_eq!(
         p.catalog(&a).unwrap()["capabilities"],
         json!(["calendar.read", "calendar.write", "drive.read"])
+    );
+}
+
+/// Review #4: a grant approved while google was a stub (`{"stub": true}`)
+/// never becomes a real token, and startup finds it to end it.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn review_stub_era_grant_becomes_real_token(pool: PgPool) {
+    let store = Store::from_pool(pool);
+    let stub = GoogleStubProvisioner;
+    let a = agent(&store, "g-agent").await;
+    // Approved while google was a stub: "decision recorded, no credential minted".
+    let g = granted(&store, &stub, a.id, &google("calendar.write"), "main").await;
+    assert_eq!(g.provisioner_state, json!({"stub": true}));
+    // The operator later configures account "main" and restarts the broker.
+    let s = oauth(|_| token_answer(&scope("calendar.events"))).await;
+    let p = provisioner(&s);
+    let err = credential(&store, &p, &g).await.unwrap_err();
+    assert_eq!(err.text(), STUB_ERA);
+    assert!(s.fake.calls().is_empty(), "nothing minted");
+    // A grant the real provisioner made is not one of them.
+    let real = granted(&store, &p, a.id, &google("calendar.write"), "main").await;
+    let tx = store.begin().await.unwrap();
+    let stale = agent_auth_store::grants::active_without_state(&tx, Platform::Google, "account")
+        .await
+        .unwrap();
+    assert_eq!(stale, vec![g.id]);
+    assert!(!stale.contains(&real.id));
+}
+
+/// Review #4: an answer without `scope` says nothing about the token's
+/// reach: never handed to an agent (the broker's own use still takes it).
+#[tokio::test]
+async fn review_no_scope_field_passes_exact() {
+    let s = oauth(|_| {
+        r(
+            200,
+            json!({"access_token": "ya29.wide", "expires_in": 3600}),
+        )
+    })
+    .await;
+    let t = tokens(&s);
+    let err = t
+        .token("main", &["calendar.readonly"], true, now())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("did not say which scopes"),
+        "{err}"
+    );
+    let (tok, _) = t
+        .token("main", &["calendar.readonly"], false, now())
+        .await
+        .unwrap();
+    assert_eq!(tok.expose(), "ya29.wide");
+}
+
+/// Review #4: outside tests, a login file may name only Google's token
+/// endpoints; the refresh token goes nowhere else.
+#[tokio::test]
+async fn review_only_googles_token_endpoints() {
+    let dir = tempdir::Dir::new();
+    let client = dir.file(
+        "client.json",
+        &json!({"client_id": "cid", "token_uri": "https://evil.example/token"}).to_string(),
+    );
+    let refresh = dir.file("refresh", "r");
+    let c = config(json!({"main": {
+        "address": "a@b.example", "client_secret_file": client, "refresh_token_file": refresh,
+    }}));
+    let err = GoogleTokens::new(&c)
+        .unwrap()
+        .token("main", &["calendar.readonly"], false, now())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("token_uri is not Google's token endpoint"),
+        "{err}"
+    );
+    assert_eq!(TOKEN_URLS.len(), 2);
+}
+
+/// Review #4: approvers see whom a delegated account acts as.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn review_delegated_accounts_show_their_subject(pool: PgPool) {
+    let store = Store::from_pool(pool);
+    let dir = tempdir::Dir::new();
+    let sa = dir.file("sa.json", "{}");
+    let c = config(
+        json!({"ws": {"address": "jacob@corp.example", "service_account_file": sa,
+                                 "subject": "ceo@corp.example"}}),
+    );
+    let p = GoogleProvisioner::new(
+        &c,
+        Arc::new(GoogleTokens::with_http(
+            &c,
+            Http::new().unwrap(),
+            "https://x.invalid/",
+        )),
+    );
+    let a = agent(&store, "g-agent").await;
+    let ok = validate(
+        &store,
+        &p,
+        &a,
+        Platform::Google,
+        "calendar.read",
+        json!({}),
+        "ws",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ok.notes,
+        [
+            "an account-wide Google token: reads every calendar of jacob@corp.example (acting as \
+          ceo@corp.example, by domain-wide delegation) (scope calendar.readonly), for up to an \
+          hour past the grant's end"
+        ]
     );
 }
