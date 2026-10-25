@@ -196,3 +196,25 @@ pub async fn enabled_in(tx: &Tx<'_>, sandbox: DaemonId) -> Result<Vec<AgentId>, 
     .await?;
     Ok(out.into_iter().map(AgentId::from_uuid).collect())
 }
+
+/// The project grants (active or being provisioned) of the agents of one
+/// agent VM: what the VM is told on connect, so it revokes anything else.
+pub async fn live_project_grants(
+    tx: &Tx<'_>,
+    sandbox: DaemonId,
+) -> Result<Vec<agent_auth_core::GrantId>, StoreError> {
+    let mut c = tx.conn().await;
+    let ids = sqlx::query_scalar!(
+        "SELECT g.id FROM grants g JOIN agents a ON a.id = g.agent_id
+         WHERE g.platform = 'sandbox' AND g.status IN ('active', 'provisioning')
+           AND a.sandbox_id = $1
+         ORDER BY g.id",
+        Uuid::from(sandbox)
+    )
+    .fetch_all(&mut **c)
+    .await?;
+    Ok(ids
+        .into_iter()
+        .map(agent_auth_core::GrantId::from_uuid)
+        .collect())
+}

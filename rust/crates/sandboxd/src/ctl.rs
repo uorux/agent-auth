@@ -130,22 +130,42 @@ fn out(v: &Value) {
     );
 }
 
-/// `exec setpriv --reuid=uid --regid=uid --clear-groups -- argv` (in `cwd`).
-fn exec_as(uid: u64, argv: &[String], cwd: Option<&str>) -> Fail {
-    let mut cmd = std::process::Command::new("setpriv");
-    cmd.arg(format!("--reuid={uid}"))
-        .arg(format!("--regid={uid}"))
-        .arg("--clear-groups")
-        .arg("--")
-        .args(argv);
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
+/// How the operator runs `argv` as the project's user: `systemd-run
+/// --pty` (see [`crate::host::pty_command`]), never on root's own tty.
+#[must_use]
+pub fn exec_plan(info: &Value, argv: &[String], term: Option<&str>) -> Option<Vec<String>> {
+    let uid = u32::try_from(info.get("uid").and_then(Value::as_u64)?).ok()?;
+    let cwd = info.get("workdir").and_then(Value::as_str).unwrap_or("/");
+    let run = info
+        .get("systemd_run")
+        .and_then(Value::as_str)
+        .unwrap_or("systemd-run");
+    if argv.is_empty() {
+        return None;
     }
-    Fail(format!("exec setpriv: {}", cmd.exec()))
+    Some(crate::host::pty_command(run, uid, cwd, term, argv))
+}
+
+fn exec_as(info: &Value, argv: &[String]) -> Fail {
+    let term = std::env::var("TERM").ok();
+    let Some(plan) = exec_plan(info, argv, term.as_deref()) else {
+        return Fail("sandboxd gave no way to run it".to_owned());
+    };
+    let Some((program, args)) = plan.split_first() else {
+        return Fail("sandboxd gave no way to run it".to_owned());
+    };
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
+        .env_clear()
+        .env("PATH", crate::host::ROOT_PATH)
+        .env("LANG", "C.UTF-8");
+    if let Some(t) = &term {
+        cmd.env("TERM", t);
+    }
+    Fail(format!("exec {program}: {}", cmd.exec()))
 }
 
 fn attach(info: &Value) -> Fail {
-    let uid = info.get("uid").and_then(Value::as_u64).unwrap_or(u64::MAX);
     let argv: Vec<String> = info
         .get("argv")
         .and_then(Value::as_array)
@@ -155,10 +175,7 @@ fn attach(info: &Value) -> Fail {
                 .collect()
         })
         .unwrap_or_default();
-    if argv.is_empty() || uid == u64::MAX {
-        return Fail("sandboxd gave no way to attach".to_owned());
-    }
-    exec_as(uid, &argv, None)
+    exec_as(info, &argv)
 }
 
 /// `HH:MM:SS` (UTC: no local time zone without libc).
@@ -182,13 +199,25 @@ pub fn log_entry(line: &str) -> Option<String> {
     let t = rec.get("t").and_then(Value::as_f64).unwrap_or(0.0);
     let dir = rec.get("dir").and_then(Value::as_str).unwrap_or("");
     let text = rec.get("text").and_then(Value::as_str).unwrap_or("");
-    Some(format!("--- {} {dir}\n{text}", clock(t)))
+    Some(format!(
+        "--- {} {}\n{}",
+        clock(t),
+        crate::names::terminal_safe(dir),
+        crate::names::terminal_safe(text)
+    ))
 }
 
 /// A conversation row of `ls`.
 #[must_use]
 pub fn ls_row(c: &Value, now: f64) -> String {
-    let s = |k: &str| c.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+    let s = |k: &str| {
+        crate::names::terminal_safe(
+            &c.get(k)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .replace('\n', " "),
+        )
+    };
     let last = c
         .get("last_activity")
         .and_then(Value::as_f64)
@@ -313,14 +342,8 @@ async fn run_cmd(cmd: Cmd) -> Result<(), Fail> {
         }
         Cmd::Shell { project } => {
             let info = call("shell", json!({"project": project})).await?;
-            let uid = info.get("uid").and_then(Value::as_u64).unwrap_or(u64::MAX);
-            let workdir = info
-                .get("workdir")
-                .and_then(Value::as_str)
-                .unwrap_or("/")
-                .to_owned();
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".to_owned());
-            return Err(exec_as(uid, &[shell, "-l".to_owned()], Some(&workdir)));
+            return Err(exec_as(&info, &[shell, "-l".to_owned()]));
         }
         Cmd::SecretSet { name } => {
             let mut value = String::new();
@@ -358,6 +381,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn attach_and_shell_run_on_a_pty_of_their_own() {
+        let info = json!({"uid": 40001, "workdir": "/var/lib/sandbox/projects/p",
+                          "systemd_run": "/bin/systemd-run",
+                          "argv": ["tmux", "-S", "/s", "attach", "-t", "conv"]});
+        let plan = exec_plan(&info, &["tmux".into(), "attach".into()], Some("xterm")).unwrap();
+        assert_eq!(&plan[..2], ["/bin/systemd-run", "--pty"]);
+        assert!(plan.contains(&"--uid=40001".to_owned()));
+        assert!(exec_plan(&json!({}), &["x".into()], None).is_none());
+        assert!(exec_plan(&info, &[], None).is_none());
+    }
+
+    #[test]
     fn rows_and_log_lines() {
         let c = json!({"id": "0123456789ab", "state": "parked", "agent": "a", "title": "t",
                        "last_activity": 100.0});
@@ -369,5 +404,11 @@ mod tests {
             Some("--- 01:01:01 in\nhi")
         );
         assert!(log_entry("garbage").is_none());
+        // Escape sequences an agent wrote never reach the terminal.
+        let e = log_entry(r#"{"t": 0, "dir": "out", "text": "\u001b]0;pwned\u0007ok"}"#).unwrap();
+        assert!(!e.contains('\u{1b}') && e.contains("\\u{001b}"));
+        let c = json!({"id": "x", "state": "parked", "agent": "a", "title": "t\u{1b}[2J",
+                       "last_activity": 1.0});
+        assert!(!ls_row(&c, 2.0).contains('\u{1b}'));
     }
 }

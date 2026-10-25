@@ -43,7 +43,6 @@ use std::ffi::OsString;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read as _, Write as _};
 use std::os::fd::AsRawFd as _;
-use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{
     DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
 };
@@ -221,6 +220,23 @@ impl Dir {
         }
     }
 
+    /// Remove the empty-or-not directory `name` and the files directly in
+    /// it (never following anything); missing is fine.
+    pub fn remove_flat_dir(&self, name: &str) -> io::Result<()> {
+        check_name(name)?;
+        let sub = match self.child(name) {
+            Ok(d) => d,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        for n in sub.names()? {
+            if let Some(n) = n.to_str() {
+                sub.remove(n)?;
+            }
+        }
+        fs::remove_dir(self.entry_path(name))
+    }
+
     /// What `name` is, without following it (`None`: nothing there).
     pub fn entry(&self, name: &str) -> io::Result<Option<Entry>> {
         check_name(name)?;
@@ -314,11 +330,8 @@ fn walk_dir(
         let meta = fd.metadata()?;
         let sub = if meta.is_dir() {
             if depth >= MAX_DEPTH {
-                tracing::warn!(
-                    name = %String::from_utf8_lossy(name.as_bytes()),
-                    "directory deeper than {MAX_DEPTH} levels left as it is"
-                );
-                None
+                // Fail closed: what lies below was not looked at.
+                return Err(too_deep());
             } else {
                 Some(Dir {
                     fd: fd.try_clone()?,
@@ -333,6 +346,125 @@ fn walk_dir(
         }
     }
     Ok(())
+}
+
+/// Who a reclaimed entry belongs to (a project: `gid = uid`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Owner {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl Owner {
+    /// A project's user and its group.
+    #[must_use]
+    pub fn project(uid: u32) -> Owner {
+        Owner { uid, gid: uid }
+    }
+}
+
+/// The error of a tree deeper than [`MAX_DEPTH`].
+fn too_deep() -> io::Error {
+    io::Error::other(format!(
+        "a directory deeper than {MAX_DEPTH} levels: stopped, nothing below it was changed"
+    ))
+}
+
+/// After the last write grant of `grantee` on a tree owned by `owner`
+/// ended, what the grantee still owns there is untrusted (a revoked write
+/// grant must leave it controlling nothing in the target). Directories
+/// become the owner's; each regular file is replaced by an owner-owned
+/// copy (a hard link to a file elsewhere keeps that file, and the tree gets
+/// a copy of its own); anything else the grantee owns (symlinks, FIFOs,
+/// sockets) is removed. A tree deeper than [`MAX_DEPTH`] is an error.
+pub fn reclaim_tree(top: &Dir, grantee: u32, owner: Owner) -> io::Result<TreeReport> {
+    let mut report = TreeReport::default();
+    let meta = top.metadata()?;
+    if meta.uid() == grantee {
+        std::os::unix::fs::chown(magic(&top.fd), Some(owner.uid), Some(owner.gid))?;
+        report.changed = report.changed.saturating_add(1);
+    }
+    reclaim_dir(top, 0, grantee, owner, &mut report)?;
+    Ok(report)
+}
+
+fn reclaim_dir(
+    dir: &Dir,
+    depth: usize,
+    grantee: u32,
+    owner: Owner,
+    report: &mut TreeReport,
+) -> io::Result<()> {
+    for name in dir.names()? {
+        let Some(name) = name.to_str().map(str::to_owned) else {
+            // Not UTF-8: still the grantee's to give back.
+            let path = magic(&dir.fd).join(&name);
+            let fd = open_path(&path, libc::O_NOFOLLOW)?;
+            if fd.metadata()?.uid() == grantee {
+                return Err(io::Error::other(
+                    "a file name that is not UTF-8 in the reclaimed tree",
+                ));
+            }
+            continue;
+        };
+        let Some(entry) = dir.entry(&name)? else {
+            continue;
+        };
+        let ft = entry.meta.file_type();
+        let theirs = entry.meta.uid() == grantee;
+        if ft.is_dir() {
+            if depth >= MAX_DEPTH {
+                return Err(too_deep());
+            }
+            if theirs {
+                std::os::unix::fs::chown(entry.magic_path(), Some(owner.uid), Some(owner.gid))?;
+                report.changed = report.changed.saturating_add(1);
+            }
+            let sub = Dir { fd: entry.fd };
+            reclaim_dir(&sub, depth.saturating_add(1), grantee, owner, report)?;
+        } else if !theirs {
+        } else if ft.is_file() {
+            replace_with_copy(dir, &name, &entry, owner)?;
+            report.changed = report.changed.saturating_add(1);
+        } else {
+            dir.remove(&name)?;
+            report.changed = report.changed.saturating_add(1);
+        }
+    }
+    Ok(())
+}
+
+/// Replace `name` in `dir` with an owner-owned copy of the file `entry`.
+fn replace_with_copy(dir: &Dir, name: &str, entry: &Entry, owner: Owner) -> io::Result<()> {
+    let mut src = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(entry.magic_path())?;
+    if !src.metadata()?.is_file() {
+        return Err(io::Error::other(format!(
+            "{name} changed while it was reclaimed"
+        )));
+    }
+    let mode = entry.meta.mode() & 0o777;
+    let tmp = format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple());
+    let tmp_path = dir.entry_path(&tmp);
+    let done = (|| {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp_path)?;
+        io::copy(&mut src, &mut f)?;
+        f.sync_all()?;
+        std::os::unix::fs::fchown(&f, Some(owner.uid), Some(owner.gid))?;
+        f.set_permissions(fs::Permissions::from_mode(mode))?;
+        fs::rename(&tmp_path, dir.entry_path(name))
+    })();
+    if done.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    done
 }
 
 /// What a tree operation did.
@@ -557,6 +689,15 @@ mod tests {
         fs::metadata("/proc/self").unwrap().uid()
     }
 
+    /// Our own uid and group (a test can't give files away).
+    fn mine() -> Owner {
+        let m = fs::metadata("/proc/self").unwrap();
+        Owner {
+            uid: m.uid(),
+            gid: m.gid(),
+        }
+    }
+
     #[test]
     fn names_are_single_components() {
         for bad in ["", ".", "..", "a/b", "a\0b"] {
@@ -687,6 +828,63 @@ mod tests {
             // No setfacl, or a filesystem without ACLs: nothing to check.
             Err(e) => eprintln!("skipped: {e}"),
         }
+    }
+
+    #[test]
+    fn a_revoked_grantee_controls_nothing_left_in_the_tree() {
+        let d = TestDir::new("fs-reclaim");
+        fs::create_dir_all(d.path().join("p/sub")).unwrap();
+        fs::write(d.path().join("p/sub/made"), b"by the grantee").unwrap();
+        fs::write(d.path().join("outside"), b"theirs elsewhere").unwrap();
+        fs::hard_link(d.path().join("outside"), d.path().join("p/linked")).unwrap();
+        symlink("/etc/passwd", d.path().join("p/sub/link")).unwrap();
+        let fifo = Command::new("mkfifo").arg(d.path().join("p/fifo")).status();
+        let uid = me();
+        let before = fs::metadata(d.path().join("p/linked")).unwrap().ino();
+        let top = Dir::open_beneath(d.path(), &["p"]).unwrap();
+        // As a non-root test, the grantee and the owner are both us.
+        reclaim_tree(&top, uid, mine()).unwrap();
+        assert!(
+            fs::symlink_metadata(d.path().join("p/sub/link")).is_err(),
+            "symlink removed"
+        );
+        if fifo.is_ok_and(|s| s.success()) {
+            assert!(
+                fs::symlink_metadata(d.path().join("p/fifo")).is_err(),
+                "FIFO removed"
+            );
+        }
+        let after = fs::metadata(d.path().join("p/linked")).unwrap();
+        assert_ne!(after.ino(), before, "a copy, not the linked inode");
+        assert_eq!(after.nlink(), 1);
+        assert_eq!(
+            fs::read(d.path().join("p/linked")).unwrap(),
+            b"theirs elsewhere"
+        );
+        assert_eq!(fs::metadata(d.path().join("outside")).unwrap().nlink(), 1);
+        assert_eq!(
+            fs::read(d.path().join("p/sub/made")).unwrap(),
+            b"by the grantee"
+        );
+        // Entries of other owners are left alone.
+        let r = reclaim_tree(&top, uid.wrapping_add(9), mine()).unwrap();
+        assert_eq!(r.changed, 0);
+    }
+
+    #[test]
+    fn a_tree_too_deep_fails_closed() {
+        let d = TestDir::new("fs-deep");
+        let mut p = d.path().join("p");
+        for _ in 0..=MAX_DEPTH.saturating_add(1) {
+            p.push("d");
+        }
+        fs::create_dir_all(&p).unwrap();
+        let top = Dir::open_beneath(d.path(), &["p"]).unwrap();
+        let uid = me();
+        let e = reclaim_tree(&top, uid, mine()).unwrap_err();
+        assert!(e.to_string().contains("deeper than"), "{e}");
+        let e = chown_tree(&top, uid, &[uid.wrapping_add(1)]).unwrap_err();
+        assert!(e.to_string().contains("deeper than"), "{e}");
     }
 
     #[test]

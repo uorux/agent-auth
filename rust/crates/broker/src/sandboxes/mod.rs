@@ -79,7 +79,18 @@ pub struct Sandboxes {
     secret_box: Option<Arc<SecretBox>>,
     me: Weak<Sandboxes>,
     st: OnceLock<AppState>,
+    /// The connection of each VM that has had its greeting (lock state and
+    /// held list): keys go only to a greeted connection, so a VM always
+    /// knows it is locked or holding agents before any key arrives.
+    greeted: std::sync::Mutex<std::collections::HashMap<String, Weak<DaemonPeer>>>,
+    /// `key.rotate` per agent name: a token bucket (review #5).
+    rotations: std::sync::Mutex<std::collections::HashMap<String, (f64, tokio::time::Instant)>>,
 }
+
+/// `key.rotate`: at most [`ROTATE_BURST`] at once per agent, then one per
+/// [`ROTATE_EVERY`].
+pub const ROTATE_BURST: f64 = 2.0;
+pub const ROTATE_EVERY: Duration = Duration::from_secs(300);
 
 impl std::fmt::Debug for Sandboxes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -116,6 +127,8 @@ impl Sandboxes {
             secret_box,
             me: weak.clone(),
             st: OnceLock::new(),
+            rotations: std::sync::Mutex::new(std::collections::HashMap::new()),
+            greeted: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
         let s = Arc::clone(&me);
         hub.on_paired(Arc::new(move |role, name, id| {
@@ -212,6 +225,27 @@ impl Sandboxes {
     /// connected. The plaintext key exists only in the sealed `key`
     /// message (INV-1).
     pub async fn push(&self, name: &str, id: DaemonId) {
+        if !self.greeted_now(name) {
+            // Its greeting is still on its way; it pushes the keys itself.
+            return;
+        }
+        self.push_greeted(name, id).await;
+    }
+
+    /// Whether `name`'s current connection has had its greeting.
+    fn greeted_now(&self, name: &str) -> bool {
+        let Some(current) = self.hub.current_peer(Role::Sandbox, name) else {
+            return false;
+        };
+        self.greeted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            .and_then(Weak::upgrade)
+            .is_some_and(|g| Arc::ptr_eq(&g, &current))
+    }
+
+    async fn push_greeted(&self, name: &str, id: DaemonId) {
         let Some(boxed) = self.secret_box.as_ref() else {
             return;
         };
@@ -320,6 +354,14 @@ impl Sandboxes {
             }
             _ => return,
         };
+        if !self.rotation_allowed(&name) {
+            tracing::warn!(
+                daemon = %peer.principal(),
+                agent = %name,
+                "key.rotate refused: asked too often"
+            );
+            return;
+        }
         let done = async {
             let now = OffsetDateTime::now_utc();
             let tx = self.store.begin().await?;
@@ -345,6 +387,44 @@ impl Sandboxes {
             ),
             Err(e) => tracing::error!(daemon = %peer.principal(), error = %e, "key.rotate failed"),
         }
+    }
+
+    /// Take one `key.rotate` token of the agent's bucket, if it has one.
+    fn rotation_allowed(&self, name: &str) -> bool {
+        let now = tokio::time::Instant::now();
+        let mut buckets = self
+            .rotations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (tokens, last) = buckets
+            .entry(name.to_owned())
+            .or_insert((ROTATE_BURST, now));
+        let refill =
+            now.saturating_duration_since(*last).as_secs_f64() / ROTATE_EVERY.as_secs_f64();
+        *tokens = (*tokens + refill).min(ROTATE_BURST);
+        *last = now;
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The operator re-enabled `agent`: a VM agent gets a new key for its
+    /// sandbox (the old one, perhaps the reason it was disabled, never
+    /// works again). Returns the sandbox to push to.
+    pub async fn rekey_enabled(
+        &self,
+        tx: &Tx<'_>,
+        agent: &AgentRow,
+        now: OffsetDateTime,
+    ) -> Result<Option<DaemonId>, QueueError> {
+        let Some(sandbox) = agent.sandbox_id else {
+            return Ok(None);
+        };
+        self.rotate_key(tx, agent.id, sandbox, now).await?;
+        Ok(Some(sandbox))
     }
 
     // ---------------------------------------------------- orchestrator
@@ -424,7 +504,7 @@ impl Sandboxes {
     /// A sandbox (re)connected: its lock state (`lockdown`, or `unlock` so
     /// a missed unlock is not lost: B-3), its held agents, then its keys.
     /// One hook, so the order is fixed.
-    async fn on_connect(&self, peer: &DaemonPeer) {
+    async fn on_connect(&self, peer: &Arc<DaemonPeer>) {
         if !is_sandbox(peer) {
             return;
         }
@@ -432,11 +512,12 @@ impl Sandboxes {
             let tx = self.store.begin().await?;
             let locked = flags::locked(&tx, peer.name()).await?;
             let held = lockdown::held_in(&tx, peer.row_id()).await?;
+            let grants = store::live_project_grants(&tx, peer.row_id()).await?;
             tx.commit().await?;
-            Ok::<_, StoreError>((locked, held))
+            Ok::<_, StoreError>((locked, held, grants))
         }
         .await;
-        let (locked, held) = match facts {
+        let (locked, held, grants) = match facts {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!(daemon = %peer.principal(), error = %e, "sandbox on_connect failed");
@@ -458,7 +539,29 @@ impl Sandboxes {
                 &payload(json!({"type": "agents.contained", "agents": held})),
             )
             .await;
-        self.push(peer.name(), peer.row_id()).await;
+        // The grants it should have (B-7): it revokes any other it holds.
+        let ids: Vec<String> = grants.iter().map(ToString::to_string).collect();
+        self.hub
+            .send_default(
+                Role::Sandbox,
+                peer.name(),
+                &payload(json!({"type": "project.grants", "grants": ids})),
+            )
+            .await;
+        // The grants it should have (B-7): it revokes any other it holds.
+        let ids: Vec<String> = grants.iter().map(ToString::to_string).collect();
+        self.hub
+            .send_default(
+                Role::Sandbox,
+                peer.name(),
+                &payload(json!({"type": "project.grants", "grants": ids})),
+            )
+            .await;
+        self.greeted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(peer.name().to_owned(), Arc::downgrade(peer));
+        self.push_greeted(peer.name(), peer.row_id()).await;
     }
 
     /// Every agent VM gets its complete held list. Returns

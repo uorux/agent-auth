@@ -74,6 +74,41 @@ impl<'de> Deserialize<'de> for ConvId {
     }
 }
 
+/// Text safe for a terminal: C0 and C1 controls (but `\n` and `\t`), DEL
+/// and the bidi controls are shown as `\u{..}` escapes, so no ESC/OSC
+/// sequence an agent wrote reaches the operator's terminal.
+#[must_use]
+pub fn terminal_safe(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        let bidi = matches!(
+            c,
+            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        );
+        let control = (c.is_control() && c != '\n' && c != '\t') || bidi;
+        if control {
+            out.push_str(&format!("\\u{{{:04x}}}", u32::from(c)));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// A conversation title for a thread: a peer that is not an agent name is
+/// `?`, and the topic is made terminal-safe on one line.
+#[must_use]
+pub fn thread_title(peer: Option<&str>, topic: Option<&str>, thread_id: &str) -> String {
+    let peer = peer
+        .filter(|p| agent_auth_core::names::AgentName::parse(p).is_ok())
+        .unwrap_or("?");
+    let topic = topic
+        .filter(|t| !t.is_empty())
+        .map(|t| terminal_safe(&t.replace('\n', " ")))
+        .unwrap_or_else(|| thread_id.chars().take(8).collect());
+    format!("{peer}: {topic}")
+}
+
 /// `sbx-triage-<12 hex>`.
 #[must_use]
 pub fn triage_unit() -> String {
@@ -108,5 +143,23 @@ mod tests {
         assert_eq!(id.unit(), format!("sbx-conv-{id}"));
         assert!(triage_unit().starts_with("sbx-triage-"));
         assert!(mcp_name_ok("gitea") && !mcp_name_ok("Gitea") && !mcp_name_ok("a/b"));
+    }
+
+    #[test]
+    fn terminal_text_is_inert() {
+        assert_eq!(terminal_safe("a\nb\tc"), "a\nb\tc");
+        assert_eq!(
+            terminal_safe("\u{1b}]52;c;x\u{7}"),
+            "\\u{001b}]52;c;x\\u{0007}"
+        );
+        assert_eq!(terminal_safe("\u{9b}2J\u{202e}"), "\\u{009b}2J\\u{202e}");
+        assert_eq!(
+            thread_title(Some("hermes"), Some("deploy\u{1b}[2J"), "abc"),
+            "hermes: deploy\\u{001b}[2J"
+        );
+        assert_eq!(
+            thread_title(Some("bad name\u{1b}"), None, "0123456789"),
+            "?: 01234567"
+        );
     }
 }

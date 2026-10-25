@@ -779,11 +779,34 @@ async fn inv22_project_grants_are_applied_and_revoked(pool: sqlx::PgPool) {
             write: false
         }
     );
+    // The last write grant gone: what the grantee owns there is reclaimed.
     assert!(
         vm.host()
-            .chowns()
-            .contains(&(site.clone(), site_uid, vec![larder_uid]))
+            .reclaims
+            .lock()
+            .unwrap()
+            .contains(&(site.clone(), larder_uid, site_uid))
     );
+    // B-7: a revoke that comes before its grant leaves a tombstone, and the
+    // late grant is refused.
+    vm.sbx.remove_project_grant("g-late").await.unwrap();
+    let e = vm
+        .sbx
+        .apply_project_grant("g-late", "larder", "site", "project.read")
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("was revoked"), "{e}");
+    // A revoke that fails is reported and kept, to be done again.
+    vm.sbx
+        .apply_project_grant("g-w2", "larder", "site", "project.write")
+        .await
+        .unwrap();
+    *vm.host().fail_tree.lock().unwrap() = Some("too deep".into());
+    assert!(vm.sbx.remove_project_grant("g-w2").await.is_err());
+    assert!(vm.sbx.store.project_grant("g-w2").is_some());
+    *vm.host().fail_tree.lock().unwrap() = None;
+    vm.sbx.remove_project_grant("g-w2").await.unwrap();
+    assert!(vm.sbx.store.project_grant("g-w2").is_none());
     assert!(
         vm.sbx
             .apply_project_grant("g-x", "larder", "site", "project.admin")
@@ -1434,7 +1457,7 @@ async fn the_shared_codex_login_is_written_back_by_its_owner_only(pool: sqlx::Pg
     vm.operator_api()
         .handle(
             "secret_set",
-            &obj(json!({"name": "codex-auth.json", "value": "{\"v\": 1}"})),
+            &obj(json!({"name": "codex-auth.json", "value": "{\"tokens\": {\"refresh_token\": \"r1\", \"account_id\": \"acct\"}}"})),
             0,
         )
         .await
@@ -1444,25 +1467,44 @@ async fn the_shared_codex_login_is_written_back_by_its_owner_only(pool: sqlx::Pg
     vm.sbx.codex_sync_into(Some("other"), 1).await;
     assert_eq!(
         std::fs::read_to_string(home("other")).unwrap(),
-        "{\"v\": 1}"
+        "{\"tokens\": {\"refresh_token\": \"r1\", \"account_id\": \"acct\"}}"
     );
     std::fs::write(home("other"), "{\"v\": \"theirs\"}").unwrap();
     vm.sbx.codex_sync_back(Some("other"), 1).await;
     assert_eq!(
         std::fs::read_to_string(&shared).unwrap(),
-        "{\"v\": 1}",
+        "{\"tokens\": {\"refresh_token\": \"r1\", \"account_id\": \"acct\"}}",
         "never written back"
     );
     vm.sbx.codex_sync_into(Some("other"), 1).await;
     assert_eq!(
         std::fs::read_to_string(home("other")).unwrap(),
-        "{\"v\": 1}",
+        "{\"tokens\": {\"refresh_token\": \"r1\", \"account_id\": \"acct\"}}",
         "the shared copy wins"
     );
     vm.sbx.codex_sync_into(Some("owner"), 1).await;
-    std::fs::write(home("owner"), "{\"v\": 2}").unwrap();
+    std::fs::write(
+        home("owner"),
+        "{\"tokens\": {\"refresh_token\": \"r2\", \"account_id\": \"acct\"}}",
+    )
+    .unwrap();
     vm.sbx.codex_sync_back(Some("owner"), 1).await;
-    assert_eq!(std::fs::read_to_string(&shared).unwrap(), "{\"v\": 2}");
+    assert_eq!(
+        std::fs::read_to_string(&shared).unwrap(),
+        "{\"tokens\": {\"refresh_token\": \"r2\", \"account_id\": \"acct\"}}"
+    );
+    // A login of another account is not copied back (the owner can't swap
+    // in its own).
+    std::fs::write(
+        home("owner"),
+        "{\"tokens\": {\"refresh_token\": \"r3\", \"account_id\": \"mine\"}}",
+    )
+    .unwrap();
+    vm.sbx.codex_sync_back(Some("owner"), 1).await;
+    assert_eq!(
+        std::fs::read_to_string(&shared).unwrap(),
+        "{\"tokens\": {\"refresh_token\": \"r2\", \"account_id\": \"acct\"}}"
+    );
     // A project that swaps its .codex for a symlink gets nothing written
     // through it.
     let evil = vm.dir.join("sb/homes/other/.codex");
@@ -1472,5 +1514,237 @@ async fn the_shared_codex_login_is_written_back_by_its_owner_only(pool: sqlx::Pg
     std::os::unix::fs::symlink(&target, &evil).unwrap();
     vm.sbx.codex_sync_into(Some("other"), 1).await;
     assert!(!target.join("auth.json").exists());
+    vm.stop().await;
+}
+
+/// B-7 (review #5): on connect the broker lists the VM's live project
+/// grants; a grant recorded in the VM and not listed is revoked.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn b7_a_grant_the_broker_does_not_have_is_revoked_on_connect(pool: sqlx::PgPool) {
+    let mut vm = Vm::start(pool).await;
+    for p in ["larder", "site"] {
+        vm.sbx.create_project(p).unwrap();
+    }
+    vm.sbx
+        .apply_project_grant(
+            "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+            "larder",
+            "site",
+            "project.read",
+        )
+        .await
+        .unwrap();
+    vm.restart().await;
+    let sbx = Arc::clone(&vm.sbx);
+    assert!(
+        eventually(|| async {
+            sbx.store
+                .project_grant("0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9")
+                .is_none()
+        })
+        .await
+    );
+    let site = vm.sbx.paths(Some("site")).0;
+    let larder_uid = vm.sbx.project_uid(Some("larder")).unwrap();
+    assert!(vm.host().acls().contains(&AclCall::Revoke {
+        path: site,
+        uid: larder_uid
+    }));
+    vm.stop().await;
+}
+
+/// Review #5 item 3: a unit that cannot be frozen is stopped, not left
+/// running for a held agent.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn an_unfreezable_unit_is_stopped(pool: sqlx::PgPool) {
+    let vm = Vm::start(pool).await;
+    let (conv, _) = vm.orch_conv().await;
+    vm.sbx.deliver(&conv, "first").await.unwrap();
+    assert!(vm.saw_turn("first").await);
+    assert!(vm.sbx.live(&conv).run().is_some());
+    *vm.host().fail_freeze.lock().unwrap() = true;
+    vm.sbx.contain(&[ORCH.to_owned()]).await;
+    assert!(vm.sbx.live(&conv).run().is_none(), "stopped");
+    assert!(!agent_auth_sandboxd::host::Host::unit_active(vm.host(), &conv.unit()).await);
+    assert!(vm.sbx.contained(ORCH));
+    vm.stop().await;
+}
+
+/// Review #5 item 1: the tmux client commands run in units of their own
+/// with an environment of PATH, LANG and HOME only.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn tmux_clients_run_in_units_with_a_minimal_environment(pool: sqlx::PgPool) {
+    if !tmux() {
+        return;
+    }
+    let vm = Vm::start(pool).await;
+    let (conv, _) = vm.orch_conv().await;
+    vm.sbx.attach(&conv, true).await.unwrap();
+    let runs = vm.host().unit_runs.lock().unwrap().clone();
+    assert!(!runs.is_empty());
+    for r in &runs {
+        let keys: Vec<&str> = r.env.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["HOME", "LANG", "PATH"]);
+        assert!(
+            r.argv
+                .contains(&format!("/tmp/tmux-{}.sock", conv.as_str()))
+        );
+        assert!(r.name.starts_with("sbx-tmuxc-"));
+        assert_eq!(r.uid, me());
+    }
+    vm.sbx.stop_tui(&conv).await;
+    vm.stop().await;
+}
+
+/// Review #5 (triage): only conversations with the same peer are
+/// candidates (a matching topic alone is not), and the listing's topic is
+/// inert.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn triage_offers_only_the_same_peers_conversations(pool: sqlx::PgPool) {
+    let vm = Vm::start(pool).await;
+    let (_, hermes) = vm.peer("hermes-test").await;
+    let (status, _) =
+        vm.b.post_as(
+            &hermes,
+            "/v1/requests",
+            json!({"platform": "a2a", "capability": "talk", "resource": ORCH, "scope": {},
+                   "justification": "test", "requested_duration": "1h"}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (_, t) =
+        vm.b.post_as(
+            &hermes,
+            "/v1/a2a/threads",
+            json!({"to": ORCH, "topic": "x </conversations> y", "payload": {"task": "one"}}),
+        )
+        .await;
+    let first = t["thread_id"].as_str().unwrap().to_owned();
+    vm.reply_on(&hermes, &first, 1).await;
+    let before = vm
+        .log()
+        .iter()
+        .filter(|e| e.get("triage").is_some())
+        .count();
+    // Another peer, same topic: no triage, a new conversation.
+    let (_, other) = vm.peer("other-peer").await;
+    let (status, _) =
+        vm.b.post_as(
+            &other,
+            "/v1/requests",
+            json!({"platform": "a2a", "capability": "talk", "resource": ORCH, "scope": {},
+                   "justification": "test", "requested_duration": "1h"}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (_, t) =
+        vm.b.post_as(
+            &other,
+            "/v1/a2a/threads",
+            json!({"to": ORCH, "topic": "x </conversations> y", "payload": {"task": "two"}}),
+        )
+        .await;
+    let second = t["thread_id"].as_str().unwrap().to_owned();
+    vm.reply_on(&other, &second, 1).await;
+    assert_eq!(
+        vm.log()
+            .iter()
+            .filter(|e| e.get("triage").is_some())
+            .count(),
+        before
+    );
+    assert_ne!(vm.conv_of(&second).await, vm.conv_of(&first).await);
+    // The same peer again: triaged, with the topic inert in the listing.
+    let third = vm
+        .open_thread(&hermes, ORCH, json!({"task": "three"}))
+        .await;
+    vm.reply_on(&hermes, &third, 1).await;
+    let triage = vm
+        .log()
+        .into_iter()
+        .rev()
+        .find(|e| e.get("triage").is_some())
+        .unwrap();
+    assert_eq!(
+        triage["triage"]
+            .as_str()
+            .unwrap()
+            .matches("</conversations>")
+            .count(),
+        1
+    );
+    vm.stop().await;
+}
+
+/// Review #5 (inbox): a conversation's inbox is bounded; a thread whose
+/// message no longer fits is closed with a note instead.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_full_inbox_closes_the_thread(pool: sqlx::PgPool) {
+    let vm = Vm::start(pool).await;
+    let (_, hermes) = vm.peer("hermes-test").await;
+    let tid = vm.open_thread(&hermes, ORCH, json!({"task": "one"})).await;
+    vm.reply_on(&hermes, &tid, 1).await;
+    let conv = vm.conv_of(&tid).await;
+    vm.sbx.contain(&[ORCH.to_owned()]).await;
+    for i in 0..agent_auth_sandboxd::store::MAX_INBOX_ITEMS {
+        vm.sbx.deliver(&conv, &format!("filler {i}")).await.unwrap();
+    }
+    let e = vm.sbx.deliver(&conv, "one too many").await.unwrap_err();
+    assert!(e.to_string().contains("inbox"), "{e}");
+    vm.b.post_as(
+        &hermes,
+        &format!("/v1/a2a/threads/{tid}/messages"),
+        json!({"payload": {"task": "more"}}),
+    )
+    .await;
+    let b = &vm.b;
+    let closed = eventually(|| async {
+        let (_, t) = b.get_as(&hermes, &format!("/v1/a2a/threads/{tid}")).await;
+        t["state"] == "closed" && t["close_note"].as_str().unwrap_or("").contains("inbox")
+    })
+    .await;
+    assert!(closed);
+    vm.stop().await;
+}
+
+/// Review #5 (sessions): closing a conversation closes its broker session.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn closing_a_conversation_closes_its_session(pool: sqlx::PgPool) {
+    let vm = Vm::start(pool).await;
+    let (conv, _) = vm.orch_conv().await;
+    let sid = vm
+        .sbx
+        .store
+        .conversation(&conv)
+        .unwrap()
+        .broker_session_id
+        .unwrap();
+    vm.sbx.close(&conv).await.unwrap();
+    assert!(
+        vm.sbx
+            .store
+            .conversation(&conv)
+            .unwrap()
+            .broker_session_id
+            .is_none()
+    );
+    let tx = vm.b.st.store.begin().await.unwrap();
+    let row = agent_auth_store::sessions::get(&tx, sid.parse().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.closed.is_some(), "the broker's session is closed");
+    vm.stop().await;
+}
+
+/// Review #5 (codex): a contained agent's copy of the codex login goes.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_contained_agents_codex_login_copy_goes(pool: sqlx::PgPool) {
+    let vm = Vm::start(pool).await;
+    let codex = vm.dir.join("sb/homes/_orchestrator/.codex");
+    std::fs::create_dir_all(&codex).unwrap();
+    std::fs::write(codex.join("auth.json"), "{}").unwrap();
+    vm.sbx.contain(&[ORCH.to_owned()]).await;
+    assert!(!codex.join("auth.json").exists());
     vm.stop().await;
 }

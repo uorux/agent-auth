@@ -22,6 +22,8 @@ mod gateway;
 mod projects;
 pub mod routing;
 pub mod slots;
+#[cfg(test)]
+mod tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -74,6 +76,9 @@ pub enum SbxError {
     /// The broker refused the agent's key (401).
     #[error("{0}")]
     Unauthorized(String),
+    /// A conversation's inbox is full.
+    #[error("{0}")]
+    Full(String),
 }
 
 impl SbxError {
@@ -82,7 +87,9 @@ impl SbxError {
     pub fn api_text(&self) -> String {
         match self {
             SbxError::Internal(m) | SbxError::Unauthorized(m) => format!("internal error: {m}"),
-            SbxError::Lookup(m) | SbxError::Value(m) | SbxError::Runtime(m) => m.clone(),
+            SbxError::Lookup(m) | SbxError::Value(m) | SbxError::Runtime(m) | SbxError::Full(m) => {
+                m.clone()
+            }
         }
     }
 
@@ -420,12 +427,15 @@ impl<H: Host> Sandboxd<H> {
     }
 
     /// The project of an agent's processes (`None` for the orchestrator).
-    #[must_use]
-    pub fn project_of(&self, rec: &AgentRecord) -> Option<String> {
+    /// Any other agent without a project has none to run in: an error,
+    /// never the orchestrator's uid and home.
+    pub fn project_of(&self, rec: &AgentRecord) -> SbxResult<Option<String>> {
         if rec.name == self.orchestrator {
-            None
-        } else {
-            rec.project.clone()
+            return Ok(None);
+        }
+        match &rec.project {
+            Some(p) => Ok(Some(p.clone())),
+            None => Err(SbxError::Runtime(format!("{} has no project", rec.name))),
         }
     }
 
@@ -629,6 +639,16 @@ impl<H: Host> Sandboxd<H> {
             }
             BrokerToSandbox::Lockdown(l) => self.hold(HoldEvent::Lockdown, l.call_id),
             BrokerToSandbox::Unlock(u) => self.hold(HoldEvent::Unlock, u.call_id),
+            BrokerToSandbox::ProjectGrants(g) => {
+                let Some(me) = self.me() else { return };
+                let active: Vec<String> = g.grants.iter().map(ToString::to_string).collect();
+                self.spawn(async move {
+                    me.reconcile_project_grants(&active).await;
+                    if g.call_id.is_some() {
+                        me.reply(g.call_id.as_ref(), Ok(())).await;
+                    }
+                });
+            }
             BrokerToSandbox::AgentsContained(c) => {
                 let set: BTreeSet<String> =
                     c.agents.iter().map(|a| a.as_str().to_owned()).collect();
@@ -648,6 +668,25 @@ impl<H: Host> Sandboxd<H> {
             project: k.project.map(|p| p.as_str().to_owned()),
             api_key: Secret::new(k.api_key.expose().to_owned()),
             updated_at: crate::store::now(),
+        };
+        // Only this VM's orchestrator, or exactly
+        // `<runtime>-<project>-<host>-sandbox` of a project that exists here:
+        // a key for anything else would run as some other uid (an agent
+        // without a project looked like the orchestrator).
+        if !self.key_fits(&rec) {
+            tracing::warn!(
+                "refusing the key of {}: not this VM's orchestrator, nor an agent of one of its projects",
+                rec.name
+            );
+            return;
+        }
+        let rec = if rec.name == self.orchestrator {
+            AgentRecord {
+                project: None,
+                ..rec
+            }
+        } else {
+            rec
         };
         // The same key again (pushed again before the broker saw the ack):
         // acknowledged, nothing restarted.
@@ -678,6 +717,21 @@ impl<H: Host> Sandboxd<H> {
         locked(&self.key_rotations).remove(&rec.name);
         self.key_gen.send_modify(|g| *g = g.wrapping_add(1));
         self.dispatch(&rec.name, true);
+    }
+
+    /// Whether a delivered key names an agent this VM runs.
+    #[must_use]
+    pub fn key_fits(&self, rec: &AgentRecord) -> bool {
+        if rec.name == self.orchestrator {
+            return true;
+        }
+        let (Some(runtime), Some(project)) = (&rec.runtime, &rec.project) else {
+            return false;
+        };
+        agent_auth_core::sandbox::ProjectName::parse(project).is_ok()
+            && self.store.project(project).is_some()
+            && rec.name
+                == agent_auth_core::sandbox::agent_name(runtime, project, self.config.name.as_str())
     }
 
     /// The broker refused an agent's key (401): ask for a new one, at most
@@ -790,6 +844,12 @@ impl<H: Host> Sandboxd<H> {
             if !applied.before.is_contained(a) {
                 tracing::warn!("CONTAINED: freezing the conversations of {a}");
                 locked(&self.gateway_keys).remove(a);
+                // Nor a copy of the VM's codex login (review #5).
+                if let Some(rec) = self.store.agent(a)
+                    && let Ok(project) = self.project_of(&rec)
+                {
+                    self.remove_codex_copy(project.as_deref());
+                }
             }
         }
         for a in applied.before.contained_set() {
@@ -917,11 +977,32 @@ impl<H: Host> Sandboxd<H> {
         let Some(lv) = locked(&self.live).get(conv).cloned() else {
             return;
         };
-        if lv.run().is_some() {
-            self.host.freeze_unit(&conv.unit(), frozen).await;
+        if lv.run().is_some()
+            && let Err(e) = self.host.freeze_unit(&conv.unit(), frozen).await
+        {
+            tracing::error!("conversation {conv}: {e}");
+            if frozen {
+                // Not frozen: not running either (fail closed).
+                let taken = locked(&lv.run).take();
+                if let Some((run, _slot)) = taken {
+                    run.stop(&self.host).await;
+                }
+                let _ = self.store.update_conversation(conv, |c| {
+                    if c.state == crate::store::ConvState::Running {
+                        c.state = crate::store::ConvState::Parked;
+                    }
+                });
+            }
         }
-        if lv.tui() {
-            self.host.freeze_unit(&conv.tui_unit(), frozen).await;
+        if lv.tui()
+            && let Err(e) = self.host.freeze_unit(&conv.tui_unit(), frozen).await
+        {
+            tracing::error!("conversation {conv}: {e}");
+            if frozen {
+                self.host.stop_unit(&conv.tui_unit()).await;
+                lv.tui.store(false, Ordering::SeqCst);
+                locked(&lv.tui_slot).take();
+            }
         }
     }
 

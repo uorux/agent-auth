@@ -508,6 +508,9 @@ async fn admin(cmd: AdminCommand, client: &BrokerClient, io: &mut Io<'_>) -> u8 
         AdminCommand::AgentDisable { agent_id } => {
             show(io, client.admin_disable_agent(&agent_id).await)
         }
+        AdminCommand::AgentEnable { agent_id } => {
+            show(io, client.admin_enable_agent(&agent_id).await)
+        }
         AdminCommand::RotateKey { agent_id } => show(io, client.admin_rotate_key(&agent_id).await),
         AdminCommand::Rules => show(io, client.admin_list_rules().await),
         AdminCommand::RuleDelete { rule_id } => show(io, client.admin_delete_rule(&rule_id).await),

@@ -316,6 +316,32 @@ impl Policy {
     /// remote MCP settings must be complete, and rule resources may only
     /// use the known placeholders.
     fn check_references(&self) -> Result<(), PolicyError> {
+        // The orchestrator is the broker's own runtime (sandboxd review #5):
+        // a mintable runtime of that name could pass for it.
+        if self
+            .platforms
+            .agents
+            .runtimes
+            .iter()
+            .any(|r| r == crate::sandbox::ORCHESTRATOR_RUNTIME)
+        {
+            return Err(PolicyError(
+                "platforms.agents.runtimes: 'orchestrator' is the agent VM's own runtime, not one to mint"
+                    .to_owned(),
+            ));
+        }
+        if let Some(r) = self.platforms.agents.runtimes.iter().find(|r| {
+            r.is_empty()
+                || !r
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        }) {
+            return Err(PolicyError(format!(
+                "platforms.agents.runtimes: {} must be lowercase letters and digits (no '-': \
+                 <runtime>-<project>-<host>-sandbox must read one way)",
+                crate::pyfmt::repr(r)
+            )));
+        }
         let mut patterns: Vec<(String, &AgentPattern)> = Vec::new();
         for (i, r) in self.rules.iter().enumerate() {
             patterns.push((format!("rules[{i}]"), &r.matches.agent));

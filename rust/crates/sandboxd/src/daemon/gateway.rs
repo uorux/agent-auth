@@ -84,6 +84,12 @@ impl<H: Host> Sandboxd<H> {
             // not a reason to run it on the VM's logins.
             Err(e @ ClientError::Broker { .. }) => return Err(NoModelKey(e.to_string())),
             Err(e) => {
+                if self.config.refuse_vm_logins_when_unreachable {
+                    return Err(NoModelKey(format!(
+                        "the broker is unreachable ({e}); not starting on the VM's own logins \
+                         (refuse_vm_logins_when_unreachable)"
+                    )));
+                }
                 tracing::warn!(
                     "model gateway for {}: broker unreachable ({e}); using the VM's logins",
                     rec.name

@@ -1989,3 +1989,16 @@ fn google_accounts_and_pools_load() {
         "is not listed",
     );
 }
+
+#[test]
+fn the_orchestrator_runtime_is_not_mintable() {
+    let e = Policy::from_yaml("platforms:\n  agents: {runtimes: [claude, orchestrator]}\n")
+        .unwrap_err();
+    assert!(e.0.contains("'orchestrator'"), "{e}");
+}
+
+#[test]
+fn mint_runtimes_have_no_hyphen() {
+    let e = Policy::from_yaml("platforms:\n  agents: {runtimes: [claude-x]}\n").unwrap_err();
+    assert!(e.0.contains("no '-'"), "{e}");
+}

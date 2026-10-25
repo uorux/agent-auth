@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use agent_auth_core::containment::{AgentKind, Placement};
-use agent_auth_core::sandbox::{ORCHESTRATOR_RUNTIME, parse_mint_name};
+use agent_auth_core::sandbox::{orchestrator_name, parse_mint_name};
 use agent_auth_core::{AgentId, Authority, DurationSecs, Platform};
 use agent_auth_crypto::api_key;
 use agent_auth_store::agents::{self, AgentRow, DisableReason, NewAgent};
@@ -66,8 +66,23 @@ async fn vm_of(tx: &Tx<'_>, agent: &AgentRow) -> Result<Option<DaemonRow>, Store
         .filter(|d| d.role == DaemonRole::Sandbox))
 }
 
-fn is_orchestrator(agent: &AgentRow) -> bool {
-    agent.runtime.as_deref() == Some(ORCHESTRATOR_RUNTIME)
+/// The VM's orchestrator: by its name for this daemon, its VM and having
+/// no parent (review #5: a runtime called `orchestrator` proves nothing).
+fn is_orchestrator(agent: &AgentRow, daemon: &DaemonRow) -> bool {
+    agent.name == orchestrator_name(&daemon.name)
+        && agent.sandbox_id == Some(daemon.id)
+        && agent.parent_agent_id.is_none()
+}
+
+/// The same without the daemon row (the catalog): the broker sets `host`
+/// (the daemon's name) and nobody can change it for a VM agent.
+fn looks_like_orchestrator(agent: &AgentRow) -> bool {
+    agent.sandbox_id.is_some()
+        && agent.parent_agent_id.is_none()
+        && agent
+            .host
+            .as_deref()
+            .is_some_and(|h| agent.name == orchestrator_name(h))
 }
 
 fn iso(t: OffsetDateTime) -> String {
@@ -107,7 +122,7 @@ impl Provisioner for AgentsProvisioner {
         };
         // B-14: a project's agent minting another project's agent would
         // cross the project boundary without a `sandbox` grant.
-        if !is_orchestrator(spec.agent) {
+        if !is_orchestrator(spec.agent, &daemon) {
             return refuse(NOT_ORCHESTRATOR.into());
         }
         if flags::locked(tx, &daemon.name).await? {
@@ -156,7 +171,7 @@ impl Provisioner for AgentsProvisioner {
         let (Some(parent), Some(daemon)) = (parent, daemon) else {
             return Err(ProvisionError::failed(NO_LONGER_IN_VM));
         };
-        if !is_orchestrator(&parent) {
+        if !is_orchestrator(&parent, &daemon) {
             return Err(ProvisionError::failed(NOT_ORCHESTRATOR));
         }
         let Authority::Agents {
@@ -313,7 +328,7 @@ impl Provisioner for AgentsProvisioner {
 
     fn catalog(&self, agent: &AgentRow) -> Option<Value> {
         // Only the VM's orchestrator may mint (B-14).
-        if agent.sandbox_id.is_none() || !is_orchestrator(agent) {
+        if !looks_like_orchestrator(agent) {
             return None;
         }
         let mut c = PlatformCatalog::new(

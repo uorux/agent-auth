@@ -11,7 +11,7 @@ use agent_auth_core::pyfmt::{repr, shlex_join, shlex_quote};
 use serde_json::{Value, json};
 
 use super::{Live, Sandboxd, SbxError, SbxResult, locked};
-use crate::host::Host;
+use crate::host::{Host, UnitSpec};
 use crate::names::{ConvId, ORCHESTRATOR_USER, mcp_name_ok};
 use crate::runtime::{Event, McpServer, RunRef, SpawnContext};
 use crate::store::{AgentRecord, ConvState, Conversation};
@@ -74,7 +74,7 @@ impl<H: Host> Sandboxd<H> {
         tui: bool,
     ) -> SbxResult<SpawnContext> {
         let rec = self.agent_record(&conv.agent)?;
-        let project = self.project_of(&rec);
+        let project = self.project_of(&rec)?;
         let (workdir, home, tmp) = self.paths(project.as_deref());
         let (_, _, tmp_tree) = self.trees(project.as_deref());
         let uid = self.project_uid(project.as_deref())?;
@@ -289,7 +289,7 @@ impl<H: Host> Sandboxd<H> {
             return Ok(run);
         }
         let rec = self.agent_record(&conv.agent)?;
-        let project = self.project_of(&rec);
+        let project = self.project_of(&rec)?;
         if let Some(p) = &project
             && !self.store.project(p).is_some_and(|r| r.sealed)
         {
@@ -309,8 +309,13 @@ impl<H: Host> Sandboxd<H> {
             .use_gateway(&mut ctx, &rec)
             .await
             .map_err(|e| SbxError::Runtime(e.0))?;
-        if !gateway && conv.runtime == "codex" {
-            self.codex_sync_into(project.as_deref(), ctx.uid).await;
+        if conv.runtime == "codex" {
+            if gateway {
+                // On the gateway: no copy of the VM's login is left with it.
+                self.remove_codex_copy(project.as_deref());
+            } else {
+                self.codex_sync_into(project.as_deref(), ctx.uid).await;
+            }
         }
         let runtime = self.runtime(&conv.runtime).ok_or_else(|| {
             SbxError::Runtime(format!("no runtime configured for {}", conv.agent))
@@ -337,31 +342,53 @@ impl<H: Host> Sandboxd<H> {
     /// Hand `text` to the conversation: a turn now, or queued while it is
     /// held, attached to a claude TUI, or busy with a doorbell.
     pub async fn deliver(&self, conv_id: &ConvId, text: &str) -> SbxResult<()> {
+        match self.deliver_recorded(conv_id, text).await? {
+            None => Ok(()),
+            Some(e) => Err(e),
+        }
+    }
+
+    /// [`Sandboxd::deliver`], telling apart a text that is safe (sent, or
+    /// queued even if its process then failed to start: `Ok(Some(why))`)
+    /// from one that was not recorded at all (`Err`, e.g. a full inbox):
+    /// a thread's cursor moves only past the former.
+    pub async fn deliver_recorded(
+        &self,
+        conv_id: &ConvId,
+        text: &str,
+    ) -> SbxResult<Option<SbxError>> {
         let Some(conv) = self.store.conversation(conv_id) else {
-            return Ok(());
+            return Ok(None);
         };
         if conv.state == ConvState::Closed {
-            return Ok(());
+            return Ok(None);
+        }
+        if !self.store.inbox_room(conv_id, text)? {
+            return Err(SbxError::Full(format!(
+                "the inbox of conversation {conv_id} is full (at most {} messages, {} bytes)",
+                crate::store::MAX_INBOX_ITEMS,
+                crate::store::MAX_INBOX_BYTES
+            )));
         }
         let lv = self.live(conv_id);
         self.log(conv_id, "in", text);
         self.store.touch(conv_id)?;
         if self.held(&conv.agent) {
             self.store.queue(conv_id, text)?;
-            return Ok(());
+            return Ok(None);
         }
         let Some(runtime) = self.runtime(&conv.runtime) else {
             self.store.queue(conv_id, text)?;
-            return Err(SbxError::Runtime(format!(
+            return Ok(Some(SbxError::Runtime(format!(
                 "no runtime configured for {} ({})",
                 conv.agent, conv.runtime
-            )));
+            ))));
         };
         if lv.tui() && !runtime.shares_live_process() {
             // Claude's TUI holds the session: its prompt hook (or the next
             // headless start) picks these up.
             self.store.queue(conv_id, text)?;
-            return Ok(());
+            return Ok(None);
         }
         let _op = lv.op.lock().await;
         if let Some(run) = lv.run()
@@ -371,7 +398,7 @@ impl<H: Host> Sandboxd<H> {
             // Mid-turn: the hook collects it after the next tool call; what
             // is still queued at the turn's end becomes the next turn.
             self.store.queue(conv_id, text)?;
-            return Ok(());
+            return Ok(None);
         }
         lv.cancel_park();
         let mut pending = self.store.drain(conv_id)?;
@@ -383,26 +410,26 @@ impl<H: Host> Sandboxd<H> {
                 // runtime that failed): it waits, and is tried again later.
                 self.store.queue_all(conv_id, &pending)?;
                 self.schedule_retry(&lv);
-                return Err(e);
+                return Ok(Some(e));
             }
         };
         if self.held(&conv.agent) {
             // Held while it was starting: the hold saw no process to
             // freeze. Freeze it here, and send it nothing.
-            self.host.freeze_unit(&conv_id.unit(), true).await;
+            self.freeze_conversation(conv_id, true).await;
             self.store.queue_all(conv_id, &pending)?;
-            return Ok(());
+            return Ok(None);
         }
         for (i, item) in pending.iter().enumerate() {
             if let Err(e) = run.send(item).await {
                 let rest = pending.get(i..).unwrap_or_default();
                 self.store.queue_all(conv_id, rest)?;
                 self.schedule_retry(&lv);
-                return Err(e.into());
+                return Ok(Some(e.into()));
             }
         }
         *locked(&lv.retry) = super::Retry::default();
-        Ok(())
+        Ok(None)
     }
 
     /// What queued up, delivered as one text (after a hold is lifted, a
@@ -553,7 +580,7 @@ impl<H: Host> Sandboxd<H> {
                 let ctx = locked(&lv.ctx).clone();
                 if let Some(ctx) = ctx {
                     let rec = self.store.agent(&conv.agent);
-                    let project = rec.as_ref().and_then(|r| self.project_of(r));
+                    let project = rec.as_ref().and_then(|r| self.project_of(r).ok().flatten());
                     self.codex_sync_back(project.as_deref(), ctx.uid).await;
                 }
             }
@@ -586,9 +613,9 @@ impl<H: Host> Sandboxd<H> {
     /// End a conversation: its TUI and process stop, its broker session
     /// closes (ending its threads), its token stops working.
     pub async fn close(&self, conv_id: &ConvId) -> SbxResult<()> {
-        let Some(conv) = self.store.conversation(conv_id) else {
+        if self.store.conversation(conv_id).is_none() {
             return Ok(());
-        };
+        }
         let lv = self.live(conv_id);
         self.stop_tui(conv_id).await;
         {
@@ -601,16 +628,37 @@ impl<H: Host> Sandboxd<H> {
         }
         self.store
             .update_conversation(conv_id, |c| c.state = ConvState::Closed)?;
-        if let (Some(rec), Some(sid)) = (self.store.agent(&conv.agent), &conv.broker_session_id)
-            && let Err(e) = self.client(&rec, Some(sid)).close_session().await
-        {
-            tracing::info!("closing the session of {conv_id}: {e}");
-        }
+        self.close_session_of(conv_id).await;
         if let Some(w) = locked(&lv.watcher).take() {
             w.abort();
         }
         self.forget_live(conv_id);
         Ok(())
+    }
+
+    /// Close an ended conversation's broker session (ending its threads
+    /// and delegated grants), so sessions don't pile up toward the
+    /// broker's per-agent limit. Forgotten once the broker has it closed
+    /// (or no longer knows it); a failure is retried by the reaper.
+    pub(crate) async fn close_session_of(&self, conv_id: &ConvId) {
+        let Some(conv) = self.store.conversation(conv_id) else {
+            return;
+        };
+        let (Some(rec), Some(sid)) = (
+            self.store.agent(&conv.agent),
+            conv.broker_session_id.clone(),
+        ) else {
+            return;
+        };
+        match self.client(&rec, Some(&sid)).close_session().await {
+            Ok(_) => {}
+            Err(e) if e.is_stale_session() || e.status() == Some(404) => {}
+            Err(e) => {
+                tracing::info!("closing the session of {conv_id}: {e}; tried again later");
+                return;
+            }
+        }
+        self.forget_session(conv_id, &sid);
     }
 
     /// The operator's `stop`: end the TUI, park the process.
@@ -632,6 +680,11 @@ impl<H: Host> Sandboxd<H> {
 
     pub async fn reap_once(&self) {
         let now = tokio::time::Instant::now();
+        for c in self.store.conversations(None, true) {
+            if c.state == ConvState::Closed && c.broker_session_id.is_some() {
+                self.close_session_of(&c.id).await;
+            }
+        }
         for lv in self.lives() {
             let conv = lv.conv.clone();
             if lv.tui() {
@@ -654,20 +707,18 @@ impl<H: Host> Sandboxd<H> {
     /// No client attached, and nothing happened in the session for
     /// `interactive_idle_secs`.
     async fn tui_idle(&self, conv_id: &ConvId) -> bool {
-        let Some((uid, host_sock)) = self.tui_socket(conv_id) else {
-            return false;
-        };
-        let argv = vec![
-            self.config.tmux.clone(),
-            "-S".to_owned(),
-            host_sock,
-            "display-message".to_owned(),
-            "-p".to_owned(),
-            "-t".to_owned(),
-            "conv".to_owned(),
-            "#{session_attached} #{session_activity}".to_owned(),
-        ];
-        let (code, out) = self.host.run_as(uid, &argv).await;
+        let (code, out) = self
+            .tmux(
+                conv_id,
+                &[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    "conv",
+                    "#{session_attached} #{session_activity}",
+                ],
+            )
+            .await;
         if code != 0 {
             return false;
         }
@@ -686,7 +737,7 @@ impl<H: Host> Sandboxd<H> {
     fn tui_socket(&self, conv_id: &ConvId) -> Option<(u32, String)> {
         let conv = self.store.conversation(conv_id)?;
         let rec = self.store.agent(&conv.agent)?;
-        let project = self.project_of(&rec);
+        let project = self.project_of(&rec).ok()?;
         let uid = self.project_uid(project.as_deref()).ok()?;
         let (_, _, tmp) = self.paths(project.as_deref());
         Some((
@@ -695,6 +746,45 @@ impl<H: Host> Sandboxd<H> {
                 .display()
                 .to_string(),
         ))
+    }
+
+    /// A tmux client command for the conversation's TUI, as a unit of its
+    /// own (the project's uid and protections, its tmp at `/tmp`, an
+    /// environment of PATH, LANG and HOME only).
+    fn tmux_client(&self, conv_id: &ConvId, rest: &[&str]) -> Option<UnitSpec> {
+        let conv = self.store.conversation(conv_id)?;
+        let rec = self.store.agent(&conv.agent)?;
+        let project = self.project_of(&rec).ok()?;
+        let uid = self.project_uid(project.as_deref()).ok()?;
+        let (workdir, home, tmp) = self.paths(project.as_deref());
+        let mut argv = vec![
+            self.config.tmux.clone(),
+            "-S".to_owned(),
+            format!("/tmp/tmux-{}.sock", conv_id.as_str()),
+        ];
+        argv.extend(rest.iter().map(|s| (*s).to_owned()));
+        let mut env = BTreeMap::new();
+        env.insert("PATH".to_owned(), self.config.agent_path.clone());
+        env.insert("LANG".to_owned(), "C.UTF-8".to_owned());
+        env.insert("HOME".to_owned(), home.display().to_string());
+        Some(UnitSpec {
+            name: format!("sbx-tmuxc-{}", ConvId::generate().as_str()),
+            uid,
+            argv,
+            workdir,
+            home,
+            tmp,
+            env,
+            read_write: Vec::new(),
+            description: format!("tmux client for {conv_id}"),
+        })
+    }
+
+    async fn tmux(&self, conv_id: &ConvId, rest: &[&str]) -> (i32, String) {
+        match self.tmux_client(conv_id, rest) {
+            Some(spec) => self.host.run_in_unit(&spec).await,
+            None => (-1, format!("no open conversation {conv_id}")),
+        }
     }
 
     /// Put the conversation in a TUI (tmux) and say how to attach.
@@ -764,7 +854,7 @@ impl<H: Host> Sandboxd<H> {
         if let Some(why) = self.hold_refusal(&conv.agent) {
             return Err(SbxError::Runtime(why));
         }
-        let project = self.project_of(&rec);
+        let project = self.project_of(&rec)?;
         let slot = self
             .slots
             .acquire(project.as_deref().unwrap_or("_orchestrator"), SLOT_WAIT)
@@ -777,7 +867,7 @@ impl<H: Host> Sandboxd<H> {
             .update_conversation(conv_id, |c| c.state = ConvState::Attached)?;
         if self.held(&conv.agent) {
             // Arrived while it started.
-            self.host.freeze_unit(&conv_id.tui_unit(), true).await;
+            self.freeze_conversation(conv_id, true).await;
         }
         self.attach_info(conv_id)
     }
@@ -789,7 +879,6 @@ impl<H: Host> Sandboxd<H> {
         tui: &[String],
     ) -> SbxResult<()> {
         let sock_name = format!("tmux-{}.sock", conv_id.as_str());
-        let host_sock = ctx.tmp.join(&sock_name).display().to_string();
         let unit_sock = format!("/tmp/{sock_name}");
         if let Ok(tmp) = ctx.tmp_tree.open() {
             let _ = tmp.remove(&sock_name);
@@ -830,17 +919,11 @@ impl<H: Host> Sandboxd<H> {
             shlex_quote(&tmux),
             shlex_quote(&unit_sock),
         );
-        let client = |rest: &[&str]| -> Vec<String> {
-            let mut v = vec![tmux.clone(), "-S".to_owned(), host_sock.clone()];
-            v.extend(rest.iter().map(|s| (*s).to_owned()));
-            v
-        };
         let workdir = ctx.workdir.display().to_string();
         let (code, out) = self
-            .host
-            .run_as(
-                ctx.uid,
-                &client(&[
+            .tmux(
+                conv_id,
+                &[
                     "new-session",
                     "-d",
                     "-s",
@@ -850,7 +933,7 @@ impl<H: Host> Sandboxd<H> {
                     "/bin/sh",
                     "-c",
                     &command,
-                ]),
+                ],
             )
             .await;
         if code != 0 {
@@ -863,13 +946,9 @@ impl<H: Host> Sandboxd<H> {
         // Don't hand the operator a dead session: give the TUI a moment,
         // then report what it printed if it already failed.
         tokio::time::sleep(TUI_SETTLE).await;
-        let (alive, _) = self
-            .host
-            .run_as(ctx.uid, &client(&["has-session", "-t", "conv"]))
-            .await;
+        let (alive, _) = self.tmux(conv_id, &["has-session", "-t", "conv"]).await;
         let (_, pane) = self
-            .host
-            .run_as(ctx.uid, &client(&["capture-pane", "-p", "-t", "conv"]))
+            .tmux(conv_id, &["capture-pane", "-p", "-t", "conv"])
             .await;
         if alive != 0 || pane.contains(TUI_FAILED) {
             self.host.stop_unit(&conv_id.tui_unit()).await;
@@ -896,10 +975,19 @@ impl<H: Host> Sandboxd<H> {
         let (uid, host_sock) = self
             .tui_socket(conv_id)
             .ok_or_else(|| SbxError::Lookup(format!("no open conversation {conv_id}")))?;
+        let workdir = self
+            .store
+            .conversation(conv_id)
+            .and_then(|c| self.store.agent(&c.agent))
+            .and_then(|r| self.project_of(&r).ok())
+            .map(|p| self.paths(p.as_deref()).0.display().to_string())
+            .unwrap_or_else(|| "/".to_owned());
         Ok(json!({
             "conversation": conv_id.as_str(),
             "uid": uid,
             "argv": [self.config.tmux, "-S", host_sock, "attach", "-t", "conv"],
+            "workdir": workdir,
+            "systemd_run": self.config.systemd_run,
         }))
     }
 

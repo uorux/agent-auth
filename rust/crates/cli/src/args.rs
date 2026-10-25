@@ -339,6 +339,11 @@ pub enum AdminCommand {
     AgentDisable {
         agent_id: String,
     },
+    /// Enable a disabled agent again (not what it minted). An agent of an
+    /// agent VM gets a new key, delivered to its sandbox.
+    AgentEnable {
+        agent_id: String,
+    },
     RotateKey {
         agent_id: String,
     },

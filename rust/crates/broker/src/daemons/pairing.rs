@@ -57,7 +57,21 @@ pub fn identity(role: &str, name: &str) -> Result<ChannelId, PairingError> {
     let name = DaemonName::parse(name).ok_or_else(|| {
         PairingError::Invalid("name must be a lowercase hostname label ([a-z0-9-], ≤63)".into())
     })?;
-    Ok(ChannelId::new(role, name))
+    let id = ChannelId::new(role, name);
+    sandbox_name_ok(&id)?;
+    Ok(id)
+}
+
+/// An agent VM's name has no `-`, so `<runtime>-<project>-<host>-sandbox`
+/// reads one way only (sandboxd review #5).
+pub const SANDBOX_NAME_TEXT: &str =
+    "an agent VM's name has no '-' (its agents are <runtime>-<project>-<name>-sandbox)";
+
+fn sandbox_name_ok(id: &ChannelId) -> Result<(), PairingError> {
+    if id.role == Role::Sandbox && id.name.as_str().contains('-') {
+        return Err(PairingError::Invalid(SANDBOX_NAME_TEXT.into()));
+    }
+    Ok(())
 }
 
 /// A code just issued.
@@ -82,6 +96,7 @@ impl DaemonHub {
         if !self.enabled() {
             return Err(PairingError::Disabled);
         }
+        sandbox_name_ok(id)?;
         let code = generate_pairing_code().map_err(|e| PairingError::Internal(e.to_string()))?;
         let key = PairingKey::from_code(code.expose());
         let now = OffsetDateTime::now_utc();

@@ -210,6 +210,16 @@ pub trait Host: Send + Sync + 'static {
         from: &[u32],
     ) -> impl Future<Output = Result<(), HostError>> + Send;
 
+    /// After `grantee`'s last write grant on the tree ended: everything it
+    /// still owns there becomes `owner`'s, as copies (files) or removed
+    /// (anything else but directories); see [`fsops::reclaim_tree`].
+    fn reclaim_tree(
+        &self,
+        tree: &Tree,
+        grantee: u32,
+        owner: u32,
+    ) -> impl Future<Output = Result<(), HostError>> + Send;
+
     /// Whether files written for a uid get that owner (false in tests,
     /// which can't).
     fn can_chown(&self) -> bool;
@@ -225,11 +235,21 @@ pub trait Host: Send + Sync + 'static {
 
     fn unit_active(&self, name: &str) -> impl Future<Output = bool> + Send;
 
-    /// The cgroup freezer: every process of the unit stops where it is.
-    fn freeze_unit(&self, name: &str, frozen: bool) -> impl Future<Output = ()> + Send;
+    /// The cgroup freezer: every process of the unit stops where it is. A
+    /// freeze is verified; a unit that cannot be frozen is stopped and the
+    /// error says so (fail closed). A unit that is not running is fine.
+    fn freeze_unit(
+        &self,
+        name: &str,
+        frozen: bool,
+    ) -> impl Future<Output = Result<(), HostError>> + Send;
 
-    /// Run `argv` as `uid` outside any unit: (exit code, stdout+stderr).
-    fn run_as(&self, uid: u32, argv: &[String]) -> impl Future<Output = (i32, String)> + Send;
+    /// Run a short command in a transient unit of its own (the spec's uid,
+    /// directories and protections; `/tmp` is the spec's tmp) and wait for
+    /// it: (exit code, stdout+stderr). The tmux client commands run this
+    /// way, never as the project's uid outside a unit (where a process of
+    /// the project could read their environment).
+    fn run_in_unit(&self, spec: &UnitSpec) -> impl Future<Output = (i32, String)> + Send;
 }
 
 /// The env file's line for one variable: `KEY="value"` with systemd's
@@ -262,6 +282,73 @@ pub fn env_line(key: &str, value: &str) -> Result<String, HostError> {
     out.push('"');
     Ok(out)
 }
+
+/// The PATH of the commands sandboxd runs itself (systemd-run, systemctl,
+/// setfacl); configured commands are absolute store paths anyway.
+pub const ROOT_PATH: &str = "/run/current-system/sw/bin:/usr/bin:/bin";
+
+/// A command with nothing of sandboxd's environment: PATH and LANG only.
+#[must_use]
+pub fn clean_command(program: &str) -> Command {
+    let mut c = Command::new(program);
+    c.env_clear().env("PATH", ROOT_PATH).env("LANG", "C.UTF-8");
+    c
+}
+
+/// The operator's interactive commands as the project's user (`attach`,
+/// `shell`): on a fresh pty that `systemd-run --pty` (root) relays, so no
+/// process of the project's uid ever holds an fd of the operator's root
+/// tty (or can TIOCSTI into it after a detach); the unit is a session of
+/// its own with an environment of TERM, LANG, PATH and HOME only.
+#[must_use]
+pub fn pty_command(
+    systemd_run: &str,
+    uid: u32,
+    cwd: &str,
+    term: Option<&str>,
+    argv: &[String],
+) -> Vec<String> {
+    let mut out = vec![
+        systemd_run.to_owned(),
+        "--pty".to_owned(),
+        "--quiet".to_owned(),
+        "--collect".to_owned(),
+        format!("--uid={uid}"),
+        format!("--gid={uid}"),
+        format!("--working-directory={cwd}"),
+        format!("--setenv=PATH={ROOT_PATH}"),
+        "--setenv=LANG=C.UTF-8".to_owned(),
+        format!("--setenv=HOME={cwd}"),
+    ];
+    if let Some(t) = term.filter(|t| {
+        t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-._+".contains(c))
+    }) {
+        out.push(format!("--setenv=TERM={t}"));
+    }
+    for p in [
+        "NoNewPrivileges=yes",
+        "ProtectProc=invisible",
+        "KeyringMode=private",
+        "RestrictSUIDSGID=yes",
+    ] {
+        out.push("-p".to_owned());
+        out.push(p.to_owned());
+    }
+    out.push("--".to_owned());
+    out.extend(argv.iter().map(|a| systemd_escape(a)));
+    out
+}
+
+/// What `systemctl show -p FreezerState --value` says of a frozen unit.
+#[must_use]
+pub fn is_frozen(state: &str) -> bool {
+    state.trim() == "frozen"
+}
+
+/// How many times a freeze is tried (and verified) before the unit is
+/// stopped instead.
+pub const FREEZE_TRIES: u32 = 3;
 
 /// An argument as systemd's ExecStart= takes it literally: `$` as `$$`
 /// (systemd expands `$VAR` in a transient unit's command).
@@ -371,11 +458,12 @@ impl LinuxHost {
         argv
     }
 
-    async fn run(&self, argv: &[String]) -> (i32, String) {
+    /// Run a command of sandboxd's own (clean environment).
+    pub async fn run(&self, argv: &[String]) -> (i32, String) {
         let Some((program, args)) = argv.split_first() else {
             return (-1, "no command".to_owned());
         };
-        match Command::new(program)
+        match clean_command(program)
             .args(args)
             .stdin(Stdio::null())
             .output()
@@ -512,6 +600,14 @@ impl Host for LinuxHost {
         Ok(())
     }
 
+    async fn reclaim_tree(&self, tree: &Tree, grantee: u32, owner: u32) -> Result<(), HostError> {
+        self.tree_op(tree, move |d| {
+            fsops::reclaim_tree(&d, grantee, fsops::Owner::project(owner))
+        })
+        .await
+        .map(|_| ())
+    }
+
     fn can_chown(&self) -> bool {
         true
     }
@@ -522,7 +618,7 @@ impl Host for LinuxHost {
         let Some((program, args)) = argv.split_first() else {
             return Err(HostError("no command".to_owned()));
         };
-        let mut child = Command::new(program)
+        let mut child = clean_command(program)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -583,28 +679,51 @@ impl Host for LinuxHost {
         self.run(&argv).await.0 == 0
     }
 
-    async fn freeze_unit(&self, name: &str, frozen: bool) {
-        let argv = [
-            self.config.systemctl.clone(),
-            if frozen { "freeze" } else { "thaw" }.to_owned(),
-            format!("{name}.service"),
-        ];
-        let (code, out) = self.run(&argv).await;
-        if code != 0 {
-            tracing::warn!(unit = name, frozen, "systemctl: {}", out.trim());
+    async fn freeze_unit(&self, name: &str, frozen: bool) -> Result<(), HostError> {
+        let unit = format!("{name}.service");
+        let ctl = |verb: &str| [self.config.systemctl.clone(), verb.to_owned(), unit.clone()];
+        if !frozen {
+            let (code, out) = self.run(&ctl("thaw")).await;
+            if code != 0 && self.unit_active(name).await {
+                return Err(HostError(format!("thawing {unit}: {}", out.trim())));
+            }
+            return Ok(());
         }
+        for _ in 0..FREEZE_TRIES {
+            if !self.unit_active(name).await {
+                return Ok(());
+            }
+            let _ = self.run(&ctl("freeze")).await;
+            let show = [
+                self.config.systemctl.clone(),
+                "show".to_owned(),
+                "-p".to_owned(),
+                "FreezerState".to_owned(),
+                "--value".to_owned(),
+                unit.clone(),
+            ];
+            let (_, state) = self.run(&show).await;
+            if is_frozen(&state) {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        // Held means held: what cannot be frozen does not keep running.
+        self.stop_unit(name).await;
+        Err(HostError(format!(
+            "{unit} could not be frozen; it was stopped instead"
+        )))
     }
 
-    async fn run_as(&self, uid: u32, argv: &[String]) -> (i32, String) {
-        let mut full = vec![
-            self.config.setpriv.clone(),
-            format!("--reuid={uid}"),
-            format!("--regid={uid}"),
-            "--clear-groups".to_owned(),
-            "--".to_owned(),
-        ];
-        full.extend(argv.iter().cloned());
-        self.run(&full).await
+    async fn run_in_unit(&self, spec: &UnitSpec) -> (i32, String) {
+        let env_file = match self.write_env_file(spec) {
+            Ok(f) => f,
+            Err(e) => return (-1, e.0),
+        };
+        let argv = self.unit_argv(spec, &env_file, true);
+        let out = self.run(&argv).await;
+        self.stop_unit(&spec.name).await;
+        out
     }
 }
 
@@ -612,6 +731,132 @@ impl Host for LinuxHost {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    fn script(dir: &Path, name: &str, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt as _;
+        let p = dir.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p.display().to_string()
+    }
+
+    fn host_in(dir: &Path, tweak: impl FnOnce(&mut serde_json::Value)) -> LinuxHost {
+        let mut v = serde_json::json!({"broker_url": "https://b.example",
+            "broker_public_key": crate::config::tests::key(), "name": "excelsior",
+            "runtime_dir": dir.join("run"), "state_dir": dir.join("state")});
+        tweak(&mut v);
+        LinuxHost::new(Arc::new(Config::from_json(&v.to_string()).unwrap()))
+    }
+
+    /// Review #5 item 1: nothing of sandboxd's environment reaches what it
+    /// runs, and the tmux client runs in a unit of its own.
+    #[tokio::test]
+    async fn children_get_a_clean_environment_and_clients_a_unit() {
+        let d = crate::testdir::TestDir::new("cleanenv");
+        let out = d.path().join("seen");
+        let run = script(
+            d.path(),
+            "systemd-run",
+            &format!(
+                "env > {0}.env; printf '%s\\n' \"$@\" > {0}.args\n",
+                out.display()
+            ),
+        );
+        let host = host_in(d.path(), |v| v["systemd_run"] = serde_json::json!(run));
+        let mut env = BTreeMap::new();
+        env.insert("PATH".to_owned(), "/x".to_owned());
+        let spec = UnitSpec {
+            name: "sbx-tmuxc-0123456789ab".into(),
+            uid: 40001,
+            argv: vec![
+                "tmux".into(),
+                "-S".into(),
+                "/tmp/tmux-a.sock".into(),
+                "has-session".into(),
+            ],
+            workdir: "/w".into(),
+            home: "/h".into(),
+            tmp: "/t".into(),
+            env,
+            read_write: vec![],
+            description: "tmux client".into(),
+        };
+        let (code, _) = host.run_in_unit(&spec).await;
+        assert_eq!(code, 0);
+        let seen_env = std::fs::read_to_string(format!("{}.env", out.display())).unwrap();
+        let mut keys: Vec<&str> = seen_env
+            .lines()
+            .filter_map(|l| l.split('=').next())
+            .filter(|k| !matches!(*k, "PWD" | "SHLVL" | "_"))
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["LANG", "PATH"], "{seen_env}");
+        let args = std::fs::read_to_string(format!("{}.args", out.display())).unwrap();
+        for want in [
+            "--uid=40001",
+            "--pipe",
+            "ProtectProc=invisible",
+            "BindPaths=/t:/tmp",
+            "has-session",
+        ] {
+            assert!(args.contains(want), "{want} in {args}");
+        }
+        // The env file is gone afterwards.
+        assert!(!d.path().join("run/env/sbx-tmuxc-0123456789ab.env").exists());
+    }
+
+    /// Review #5 item 3: a freeze is verified; one that does not take is
+    /// retried, then the unit is stopped and the error says so.
+    #[tokio::test]
+    async fn a_freeze_is_verified_and_an_unfreezable_unit_is_stopped() {
+        let d = crate::testdir::TestDir::new("freeze");
+        let state = d.path().join("state.txt");
+        let calls = d.path().join("calls");
+        let ctl = script(
+            d.path(),
+            "systemctl",
+            &format!(
+                "echo \"$@\" >> {calls}\ncase \"$1\" in show) cat {state};; esac\nexit 0\n",
+                calls = calls.display(),
+                state = state.display()
+            ),
+        );
+        let host = host_in(d.path(), |v| v["systemctl"] = serde_json::json!(ctl));
+        std::fs::write(&state, "frozen\n").unwrap();
+        host.freeze_unit("sbx-conv-a", true).await.unwrap();
+        std::fs::write(&state, "running\n").unwrap();
+        std::fs::write(&calls, "").unwrap();
+        let e = host.freeze_unit("sbx-conv-a", true).await.unwrap_err();
+        assert!(e.0.contains("stopped instead"), "{e}");
+        let log = std::fs::read_to_string(&calls).unwrap();
+        assert_eq!(
+            log.matches("freeze sbx-conv-a.service").count(),
+            usize::try_from(FREEZE_TRIES).unwrap()
+        );
+        assert!(log.contains("stop sbx-conv-a.service"), "{log}");
+        assert!(is_frozen("frozen\n") && !is_frozen("freezing"));
+    }
+
+    #[test]
+    fn interactive_commands_get_a_pty_of_their_own() {
+        let argv = pty_command(
+            "/bin/systemd-run",
+            40001,
+            "/var/lib/sandbox/projects/p",
+            Some("xterm-256color"),
+            &["tmux".into(), "attach".into()],
+        );
+        assert_eq!(&argv[..2], ["/bin/systemd-run", "--pty"]);
+        assert!(
+            argv.contains(&"--uid=40001".to_owned()) && argv.contains(&"--gid=40001".to_owned())
+        );
+        assert!(argv.contains(&"--setenv=TERM=xterm-256color".to_owned()));
+        assert!(!argv.iter().any(|a| a.contains("setpriv")));
+        assert_eq!(&argv[argv.len() - 3..], ["--", "tmux", "attach"]);
+        // A TERM that is not a plain name is not passed.
+        let odd = pty_command("s", 1, "/", Some("x\ny"), &[]);
+        assert!(!odd.iter().any(|a| a.starts_with("--setenv=TERM")));
+    }
 
     #[test]
     fn env_lines_are_systemd_quoted() {

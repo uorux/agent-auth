@@ -51,6 +51,14 @@ pub struct FakeHost {
     pub triage_answer: Mutex<Option<String>>,
     /// Starting a headless process fails with this, while set.
     pub fail_start: Mutex<Option<String>>,
+    /// Reclaims after a write grant: (tree, grantee, owner).
+    pub reclaims: Mutex<Vec<(PathBuf, u32, u32)>>,
+    /// Tree operations fail with this, while set.
+    pub fail_tree: Mutex<Option<String>>,
+    /// Freezing fails (the unit is stopped instead), while set.
+    pub fail_freeze: Mutex<bool>,
+    /// The short commands run in units of their own.
+    pub unit_runs: Mutex<Vec<UnitSpec>>,
     /// The next headless start waits for this before it returns.
     pub start_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     units: Mutex<HashMap<String, Unit>>,
@@ -121,6 +129,10 @@ impl FakeHost {
             triage_answer: Mutex::new(None),
             fail_start: Mutex::new(None),
             start_gate: Mutex::new(None),
+            fail_freeze: Mutex::new(false),
+            reclaims: Mutex::new(Vec::new()),
+            fail_tree: Mutex::new(None),
+            unit_runs: Mutex::new(Vec::new()),
             units: Mutex::new(HashMap::new()),
         }
     }
@@ -294,6 +306,14 @@ impl Host for FakeHost {
         Ok(())
     }
 
+    async fn reclaim_tree(&self, tree: &Tree, grantee: u32, owner: u32) -> Result<(), HostError> {
+        if let Some(why) = lock(&self.fail_tree).clone() {
+            return Err(HostError(why));
+        }
+        lock(&self.reclaims).push((tree.path(), grantee, owner));
+        Ok(())
+    }
+
     fn can_chown(&self) -> bool {
         false
     }
@@ -387,17 +407,30 @@ impl Host for FakeHost {
         matches!(c.try_wait(), Ok(None))
     }
 
-    async fn freeze_unit(&self, name: &str, frozen: bool) {
+    async fn freeze_unit(&self, name: &str, frozen: bool) -> Result<(), HostError> {
         lock(&self.frozen).push((name.to_owned(), frozen));
+        if frozen && *lock(&self.fail_freeze) && self.unit_active(name).await {
+            // As the real host: what cannot be frozen is stopped.
+            self.stop_unit(name).await;
+            return Err(HostError(format!(
+                "{name}.service could not be frozen; it was stopped instead"
+            )));
+        }
+        Ok(())
     }
 
-    async fn run_as(&self, _uid: u32, argv: &[String]) -> (i32, String) {
+    async fn run_in_unit(&self, spec: &UnitSpec) -> (i32, String) {
+        lock(&self.unit_runs).push(spec.clone());
+        let argv: Vec<String> = spec.argv.iter().map(|a| rebase(a, &spec.tmp)).collect();
         let Some((program, args)) = argv.split_first() else {
             return (-1, String::new());
         };
         match tokio::process::Command::new(program)
             .args(args)
+            .env_clear()
+            .envs(spec.env.iter())
             .env("FAKE_LOG", &self.log)
+            .current_dir(&spec.workdir)
             .stdin(std::process::Stdio::null())
             .output()
             .await

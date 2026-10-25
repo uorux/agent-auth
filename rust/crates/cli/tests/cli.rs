@@ -368,6 +368,10 @@ fn every_admin_command_parses() {
         AdminCommand::AgentDisable { .. }
     ));
     assert!(matches!(
+        admin(&["admin", "agent-enable", "a"]),
+        AdminCommand::AgentEnable { .. }
+    ));
+    assert!(matches!(
         admin(&["admin", "rotate-key", "a"]),
         AdminCommand::RotateKey { .. }
     ));
