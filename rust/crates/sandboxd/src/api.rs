@@ -269,7 +269,8 @@ impl<H: Host> OperatorApi<H> {
             OperatorCall::Shell { project } => {
                 let uid = s.project_uid(Some(&project)).map_err(text)?;
                 let (work, _, _) = s.paths(Some(&project));
-                json!({"uid": uid, "workdir": work.display().to_string()})
+                json!({"uid": uid, "workdir": work.display().to_string(),
+                       "systemd_run": s.config.systemd_run})
             }
             OperatorCall::SecretSet { name, value } => {
                 if !SECRETS.contains(&name.as_str()) {

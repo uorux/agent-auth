@@ -443,6 +443,43 @@ async fn set_webhook(
     without_nulls(&agent_out(&row, None, secret))
 }
 
+/// Re-enable an agent (and only it): the reason it was disabled is
+/// cleared. A VM agent gets a new key for its sandbox in the same
+/// transaction, so the key it had when it was disabled never works again.
+async fn enable(
+    State(st): State<AppState>,
+    _admin: AdminCaller,
+    Path(id): Path<String>,
+) -> ApiResult<Json<agent_auth_wire::admin::Enabled>> {
+    let tx = st.store.begin().await?;
+    let a = find_agent(&tx, &id, false)
+        .await?
+        .ok_or_else(|| ApiError::not_found("agent not found"))?;
+    not_operator(&a)?;
+    let sandbox = match (&a.sandbox_id, &st.sandboxes) {
+        (None, _) => None,
+        (Some(_), Some(s)) => s
+            .rekey_enabled(&tx, &a, st.now())
+            .await
+            .map_err(|e| ApiError::conflict(format!("{}: {e}", a.name)))?,
+        (Some(_), None) => {
+            return Err(ApiError::conflict(format!(
+                "{} runs in an agent VM and the daemon channel is off: it can't get a new key",
+                a.name
+            )));
+        }
+    };
+    agent_auth_store::agents::set_disabled(&tx, a.id, false).await?;
+    tx.commit().await?;
+    if let (Some(d), Some(s)) = (sandbox, &st.sandboxes) {
+        s.nudge(d);
+    }
+    Ok(Json(agent_auth_wire::admin::Enabled {
+        enabled: a.name,
+        key_rotated: sandbox.is_some(),
+    }))
+}
+
 async fn disable(
     State(st): State<AppState>,
     _admin: AdminCaller,
@@ -642,6 +679,7 @@ pub fn routes() -> Router<AppState> {
         .route("/admin/agents/{id}/set-kind", post(set_kind))
         .route("/admin/agents/{id}/set-webhook", post(set_webhook))
         .route("/admin/agents/{id}/disable", post(disable))
+        .route("/admin/agents/{id}/enable", post(enable))
         .route("/admin/rules", get(list_rules))
         .route("/admin/rules/{id}", delete(delete_rule))
         .route("/admin/requests", get(list_requests))

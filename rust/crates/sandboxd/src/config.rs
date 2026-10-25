@@ -66,8 +66,6 @@ struct Raw {
     systemctl: String,
     #[serde(default = "d_setfacl")]
     setfacl: String,
-    #[serde(default = "d_setpriv")]
-    setpriv: String,
     #[serde(default = "d_orchestrator_runtime")]
     orchestrator_runtime: String,
     #[serde(default = "d_uid_base")]
@@ -96,6 +94,8 @@ struct Raw {
     unit_tasks_max: u32,
     #[serde(default)]
     codex_auth_owner: Option<String>,
+    #[serde(default = "d_true")]
+    refuse_vm_logins_when_unreachable: bool,
 }
 
 fn d_state_dir() -> PathBuf {
@@ -136,9 +136,6 @@ fn d_systemctl() -> String {
 }
 fn d_setfacl() -> String {
     "setfacl".to_owned()
-}
-fn d_setpriv() -> String {
-    "setpriv".to_owned()
 }
 fn d_orchestrator_runtime() -> String {
     "claude".to_owned()
@@ -198,7 +195,6 @@ pub struct Config {
     pub systemd_run: String,
     pub systemctl: String,
     pub setfacl: String,
-    pub setpriv: String,
     /// Which runtime the orchestrator runs.
     pub orchestrator_runtime: String,
     pub uid_base: u32,
@@ -221,6 +217,10 @@ pub struct Config {
     /// login (`secrets/codex-auth.json`); every other project gets a
     /// read-only copy. None: nobody writes it back.
     pub codex_auth_owner: Option<ProjectName>,
+    /// A broker that cannot be reached (so no word on its model gateway)
+    /// starts no process on the VM's own logins (default true; the Python
+    /// fell back to them).
+    pub refuse_vm_logins_when_unreachable: bool,
 }
 
 fn finite_positive(v: f64, what: &str) -> Result<f64, ConfigError> {
@@ -271,6 +271,12 @@ impl Config {
         let name = DaemonName::parse(&raw.name).ok_or_else(|| {
             ConfigError(format!("name {:?}: [a-z0-9][a-z0-9-]{{0,62}}", raw.name))
         })?;
+        if name.as_str().contains('-') {
+            return Err(ConfigError(format!(
+                "name {:?}: an agent VM's name has no '-' (its agents are <runtime>-<project>-<name>-sandbox)",
+                raw.name
+            )));
+        }
         for rt in raw.runtimes.keys() {
             if !RUNTIMES.contains(&rt.as_str()) {
                 return Err(ConfigError(format!(
@@ -328,7 +334,6 @@ impl Config {
             systemd_run: raw.systemd_run,
             systemctl: raw.systemctl,
             setfacl: raw.setfacl,
-            setpriv: raw.setpriv,
             orchestrator_runtime: raw.orchestrator_runtime,
             uid_base: raw.uid_base,
             uid_max: raw.uid_max,
@@ -346,6 +351,7 @@ impl Config {
             unit_memory_max: raw.unit_memory_max,
             unit_tasks_max: raw.unit_tasks_max,
             codex_auth_owner,
+            refuse_vm_logins_when_unreachable: raw.refuse_vm_logins_when_unreachable,
         })
     }
 
@@ -392,6 +398,7 @@ pub(crate) mod tests {
         let c = Config::from_json(&base().to_string()).unwrap();
         assert_eq!(c.uid_base, 40000);
         assert_eq!(c.max_processes, 16);
+        assert!(c.refuse_vm_logins_when_unreachable);
         assert_eq!(
             c.operator_socket(),
             PathBuf::from("/run/sandboxd/operator.sock")
@@ -416,6 +423,14 @@ pub(crate) mod tests {
         let mut v = base();
         v["broker_url"] = serde_json::json!("http://broker.example");
         assert!(Config::from_json(&v.to_string()).is_err());
+        let mut v = base();
+        v["name"] = serde_json::json!("my-vm");
+        assert!(
+            Config::from_json(&v.to_string())
+                .unwrap_err()
+                .0
+                .contains("no '-'")
+        );
         let mut v = base();
         v["codex_auth_owner"] = serde_json::json!("Bad_Name");
         assert!(Config::from_json(&v.to_string()).is_err());

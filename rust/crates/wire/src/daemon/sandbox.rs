@@ -30,6 +30,10 @@ pub enum BrokerToSandbox {
     /// The complete set of this VM's agents that are held.
     #[serde(rename = "agents.contained")]
     AgentsContained(AgentsContained),
+    /// The broker's active (and provisioning) project grants of this VM,
+    /// on every connect: anything else recorded in the VM is revoked.
+    #[serde(rename = "project.grants")]
+    ProjectGrants(ProjectGrants),
 }
 
 impl ChannelMessage for BrokerToSandbox {
@@ -40,6 +44,7 @@ impl ChannelMessage for BrokerToSandbox {
         "lockdown",
         "unlock",
         "agents.contained",
+        "project.grants",
     ];
 }
 
@@ -53,6 +58,7 @@ impl BrokerToSandbox {
             BrokerToSandbox::Lockdown(m) => m.call_id.as_ref(),
             BrokerToSandbox::Unlock(m) => m.call_id.as_ref(),
             BrokerToSandbox::AgentsContained(m) => m.call_id.as_ref(),
+            BrokerToSandbox::ProjectGrants(m) => m.call_id.as_ref(),
         }
     }
 }
@@ -138,6 +144,15 @@ pub struct SandboxUnlock {
 #[serde(deny_unknown_fields)]
 pub struct AgentsContained {
     pub agents: BoundedVec<Text<1, 128>, 0, 10_000>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<CallId>,
+}
+
+/// `project.grants`: the grant ids the broker still has for this VM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectGrants {
+    pub grants: BoundedVec<GrantId, 0, 100_000>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_id: Option<CallId>,
 }

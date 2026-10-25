@@ -302,7 +302,20 @@ struct Agents(BTreeMap<String, AgentRecord>);
 struct Projects {
     projects: BTreeMap<String, ProjectRecord>,
     grants: BTreeMap<String, GrantRecord>,
+    /// Grant ids revoked (or revoked before they arrived), with when: a
+    /// late `project.grant` for one is refused (B-7).
+    #[serde(default)]
+    revoked: BTreeMap<String, f64>,
 }
+
+/// The most a conversation's inbox holds (messages, bytes): beyond, a new
+/// message is refused (its thread is closed) rather than the document
+/// growing without bound.
+pub const MAX_INBOX_ITEMS: usize = 1000;
+pub const MAX_INBOX_BYTES: usize = 8 * 1024 * 1024;
+
+/// The most revoked grant ids remembered (the oldest go first).
+pub const MAX_TOMBSTONES: usize = 10_000;
 
 /// The hold flags (`kv` `locked` and `contained` in the Python).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -446,6 +459,56 @@ impl Store {
         self.projects.update(|p| {
             p.grants.insert(g.grant_id.clone(), g);
         })
+    }
+
+    #[must_use]
+    pub fn project_grant(&self, grant_id: &str) -> Option<GrantRecord> {
+        self.projects.read(|p| p.grants.get(grant_id).cloned())
+    }
+
+    /// Record a grant that is not revoked; false (nothing recorded) if its
+    /// id was revoked already.
+    pub fn add_project_grant_unless_revoked(&self, g: GrantRecord) -> Result<bool, StoreError> {
+        self.projects.update(|p| {
+            if p.revoked.contains_key(&g.grant_id) {
+                return false;
+            }
+            p.grants.insert(g.grant_id.clone(), g);
+            true
+        })
+    }
+
+    /// Forget a grant and remember its id as revoked.
+    pub fn tombstone_project_grant(&self, grant_id: &str) -> Result<(), StoreError> {
+        let t = now();
+        self.projects.update(|p| {
+            p.grants.remove(grant_id);
+            p.revoked.insert(grant_id.to_owned(), t);
+            while p.revoked.len() > MAX_TOMBSTONES {
+                let oldest = p
+                    .revoked
+                    .iter()
+                    .min_by(|a, b| a.1.total_cmp(b.1))
+                    .map(|(k, _)| k.clone());
+                match oldest {
+                    Some(k) => {
+                        p.revoked.remove(&k);
+                    }
+                    None => break,
+                }
+            }
+        })
+    }
+
+    #[must_use]
+    pub fn is_revoked(&self, grant_id: &str) -> bool {
+        self.projects.read(|p| p.revoked.contains_key(grant_id))
+    }
+
+    /// Every recorded grant.
+    #[must_use]
+    pub fn all_project_grants(&self) -> Vec<GrantRecord> {
+        self.projects.read(|p| p.grants.values().cloned().collect())
     }
 
     pub fn pop_project_grant(&self, grant_id: &str) -> Result<Option<GrantRecord>, StoreError> {
@@ -649,6 +712,14 @@ impl Store {
         )?);
         map.insert(conv.clone(), std::sync::Arc::clone(&doc));
         Ok(doc)
+    }
+
+    /// Whether one more text fits the conversation's inbox.
+    pub fn inbox_room(&self, conv: &ConvId, text: &str) -> Result<bool, StoreError> {
+        Ok(self.inbox(conv)?.read(|i| {
+            let bytes: usize = i.0.iter().map(String::len).sum();
+            i.0.len() < MAX_INBOX_ITEMS && bytes.saturating_add(text.len()) <= MAX_INBOX_BYTES
+        }))
     }
 
     /// Queue a text for a conversation.

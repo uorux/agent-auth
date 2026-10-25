@@ -76,10 +76,58 @@ pub fn identity(config: &Config) -> anyhow::Result<Identity> {
     ))
 }
 
+/// `fs.protected_hardlinks`: without it a project could hard-link files it
+/// cannot write into its tree, and root's ownership and ACL changes there
+/// would reach them.
+pub const PROTECTED_HARDLINKS: &str = "/proc/sys/fs/protected_hardlinks";
+
+/// Whether the sysctl file at `path` says 1.
+#[must_use]
+pub fn protected_hardlinks_on(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|v| v.trim() == "1")
+}
+
+/// The runtime directories, created with their modes set through a handle
+/// on each (never by path after the fact) before any socket is bound:
+/// `runtime_dir` 0711 (root's: the operator socket, the env files under
+/// `env/` 0700), and the agent socket's directory 0755 (every agent unit
+/// reaches the socket, which checks each caller).
+pub fn prepare_runtime_dirs(config: &Config) -> std::io::Result<()> {
+    fn ensure(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let parent = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("no parent directory"))?;
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| std::io::Error::other("not a directory name"))?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(parent)?;
+        let dir = fsops::Dir::open_trusted(parent)?.ensure_child(name, mode)?;
+        dir.set_owner_mode(None, mode)
+    }
+    ensure(&config.runtime_dir, 0o711)?;
+    ensure(&config.runtime_dir.join("env"), 0o700)?;
+    if let Some(agent_dir) = config.agent_socket.parent() {
+        ensure(agent_dir, 0o755)?;
+    }
+    Ok(())
+}
+
 /// Run sandboxd until SIGTERM/SIGINT: the broker channel, the agent socket
 /// (0666; each call checks its caller) and the operator socket (0600,
 /// root only).
 pub async fn run(config: Config) -> anyhow::Result<()> {
+    if !protected_hardlinks_on(std::path::Path::new(PROTECTED_HARDLINKS)) {
+        anyhow::bail!(
+            "fs.protected_hardlinks is not 1: refusing to run (a project could hard-link files \
+             it cannot write into its own tree)"
+        );
+    }
+    prepare_runtime_dirs(&config)?;
     let config = Arc::new(config);
     let tls = Arc::new(agent_auth_tls::default_client_config()?);
     let identity = identity(&config)?;
@@ -115,4 +163,48 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     sbx.shutdown().await;
     tasks.abort_all();
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn runtime_dirs_get_their_modes_and_hardlinks_must_be_protected() {
+        let d = crate::testdir::TestDir::new("rundirs");
+        let key = crate::config::tests::key();
+        let cfg = Config::from_json(
+            &serde_json::json!({"broker_url": "https://b.example", "broker_public_key": key,
+                "name": "excelsior", "runtime_dir": d.path().join("run"),
+                "agent_socket": d.path().join("agent/agent.sock")})
+            .to_string(),
+        )
+        .unwrap();
+        // An existing directory with a wider mode is narrowed.
+        std::fs::create_dir_all(d.path().join("run")).unwrap();
+        std::fs::set_permissions(d.path().join("run"), std::fs::Permissions::from_mode(0o777))
+            .unwrap();
+        prepare_runtime_dirs(&cfg).unwrap();
+        let mode = |p: &str| {
+            std::fs::metadata(d.path().join(p))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode("run"), 0o711);
+        assert_eq!(mode("run/env"), 0o700);
+        assert_eq!(mode("agent"), 0o755);
+        // A symlink in place of the runtime directory is refused.
+        std::fs::remove_dir_all(d.path().join("run")).unwrap();
+        std::os::unix::fs::symlink("/tmp", d.path().join("run")).unwrap();
+        assert!(prepare_runtime_dirs(&cfg).is_err());
+        std::fs::write(d.path().join("on"), "1\n").unwrap();
+        std::fs::write(d.path().join("off"), "0\n").unwrap();
+        assert!(protected_hardlinks_on(&d.path().join("on")));
+        assert!(!protected_hardlinks_on(&d.path().join("off")));
+        assert!(!protected_hardlinks_on(&d.path().join("missing")));
+    }
 }

@@ -45,7 +45,7 @@ use futures::stream::SplitSink;
 use serde_json::{Map, Value, json};
 use tokio::sync::{Semaphore, oneshot, watch};
 
-pub use pairing::{PairingError, PairingRefused};
+pub use pairing::{PairingError, PairingRefused, identity as pairing_identity};
 pub use routes::routes;
 
 /// Connections that haven't authenticated yet are anyone's: at most this
@@ -321,6 +321,13 @@ impl DaemonHub {
     #[must_use]
     pub fn is_online(&self, role: Role, name: &str) -> bool {
         self.registry().live.contains_key(&key_of(role, name))
+    }
+
+    /// The verified peer of (role, name)'s live connection, if connected:
+    /// one value per connection (a reconnect makes another).
+    #[must_use]
+    pub fn current_peer(&self, role: Role, name: &str) -> Option<Arc<DaemonPeer>> {
+        self.live(role, name).map(|l| Arc::clone(&l.peer))
     }
 
     fn live(&self, role: Role, name: &str) -> Option<Arc<Live>> {

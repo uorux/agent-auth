@@ -218,14 +218,10 @@ impl<H: Host> Sandboxd<H> {
         let conv = match conv {
             Some(c) => c,
             None => {
-                let title = format!(
-                    "{}: {}",
-                    py_str(thread.peer.as_deref()),
-                    thread
-                        .topic
-                        .clone()
-                        .filter(|t| !t.is_empty())
-                        .unwrap_or_else(|| tid.chars().take(8).collect())
+                let title = crate::names::thread_title(
+                    thread.peer.as_deref(),
+                    thread.topic.as_deref(),
+                    tid,
                 );
                 self.new_conversation(
                     &rec.name,
@@ -306,18 +302,19 @@ impl<H: Host> Sandboxd<H> {
         rec: &AgentRecord,
         thread: &ThreadView,
     ) -> Vec<(Conversation, crate::store::ThreadRecord)> {
-        let peer = thread.peer.as_deref().filter(|p| !p.is_empty());
-        let topic = thread.topic.as_deref().filter(|t| !t.is_empty());
+        // Only conversations that already talk to this peer: a matching
+        // topic alone would let any agent steer its thread into another
+        // peer's conversation (review #5).
+        let Some(peer) = thread.peer.as_deref().filter(|p| !p.is_empty()) else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
         for conv in self.store.conversations(Some(&rec.name), false) {
             let related: Vec<crate::store::ThreadRecord> = self
                 .store
                 .threads_of(&conv.id)
                 .into_iter()
-                .filter(|t| {
-                    (peer.is_some() && t.peer.as_deref() == peer)
-                        || (topic.is_some() && t.topic.as_deref() == topic)
-                })
+                .filter(|t| t.peer.as_deref() == Some(peer))
                 .collect();
             if let Some(last) = related.last() {
                 out.push((conv.clone(), last.clone()));
@@ -364,8 +361,8 @@ impl<H: Host> Sandboxd<H> {
                 format!(
                     "- id: {} · peer: {} · topic: {} · title: {} · turns: {} · last active {} min ago",
                     conv.id,
-                    py_str(t.peer.as_deref()),
-                    t.topic.as_deref().filter(|s| !s.is_empty()).unwrap_or("-"),
+                    inert(py_str(t.peer.as_deref())),
+                    inert(t.topic.as_deref().filter(|s| !s.is_empty()).unwrap_or("-")),
                     inert(&title),
                     conv.turns,
                     format_minutes(minutes),
@@ -385,7 +382,7 @@ impl<H: Host> Sandboxd<H> {
                 &inert(thread.topic.as_deref().unwrap_or("")).replace('"', "'"),
             )
             .replace("{request}", &inert(&body));
-        let project = self.project_of(rec);
+        let project = self.project_of(rec).ok()?;
         let (_, home, tmp) = self.paths(project.as_deref());
         let mut env = std::collections::BTreeMap::new();
         env.insert("HOME".to_owned(), home.display().to_string());
@@ -408,6 +405,22 @@ impl<H: Host> Sandboxd<H> {
         if let Some(g) = &gateway {
             super::gateway::gateway_env(&mut env, g);
         }
+        let uid = self.project_uid(project.as_deref()).ok()?;
+        // codex triage reads a fresh CODEX_HOME holding only the login: the
+        // project's own codex config (its MCP servers, its instructions)
+        // has no part in reading untrusted text (B-16).
+        let codex_home = if matches!(runtime, crate::runtime::Runtime::Codex(_)) {
+            let name = self.triage_codex_home(project.as_deref(), uid, gateway.is_some());
+            match &name {
+                Some(n) => {
+                    env.insert("CODEX_HOME".to_owned(), format!("/tmp/{n}"));
+                }
+                None => return None,
+            }
+            name
+        } else {
+            None
+        };
         let mut argv = runtime.triage_argv(c.triage_model.as_deref());
         let gw_args = runtime.gateway_argv(gateway.as_ref().map(|g| g.url.as_str()));
         if !gw_args.is_empty() && !argv.is_empty() {
@@ -415,7 +428,6 @@ impl<H: Host> Sandboxd<H> {
             argv.extend(gw_args);
             argv.extend(rest);
         }
-        let uid = self.project_uid(project.as_deref()).ok()?;
         let spec = crate::host::UnitSpec {
             name: triage_unit(),
             uid,
@@ -429,7 +441,15 @@ impl<H: Host> Sandboxd<H> {
             read_write: Vec::new(),
             description: format!("routing triage for {}", rec.name),
         };
-        let answer = self.run_triage(&spec, &prompt, project.as_deref()).await;
+        let answer = self
+            .run_triage(&spec, &prompt, project.as_deref(), &rec.name)
+            .await;
+        if let Some(n) = codex_home {
+            let (_, _, tmp_tree) = self.trees(project.as_deref());
+            if let Err(e) = tmp_tree.open().and_then(|t| t.remove_flat_dir(&n)) {
+                tracing::warn!("removing triage's codex home: {e}");
+            }
+        }
         let answer = match answer {
             Ok(out) => runtime.triage_answer(&out),
             Err(e) => {
@@ -456,11 +476,44 @@ impl<H: Host> Sandboxd<H> {
         self.store.conversation(&one.id)
     }
 
+    /// A fresh directory in the project's tmp (the unit's `/tmp`) with
+    /// only the shared codex login in it (none on the gateway). Its name.
+    pub(crate) fn triage_codex_home(
+        &self,
+        project: Option<&str>,
+        uid: u32,
+        gateway: bool,
+    ) -> Option<String> {
+        let name = format!("codex-triage-{}", ConvId::generate().as_str());
+        let (_, _, tmp) = self.trees(project);
+        let chown = self.host.can_chown().then_some(uid);
+        let made = (|| -> std::io::Result<()> {
+            let dir = tmp.open()?.ensure_child(&name, 0o700)?;
+            dir.set_owner_mode(chown, 0o700)?;
+            if !gateway
+                && let Some((login, _)) =
+                    crate::fsops::Dir::open_trusted(&self.config.secrets_dir())?
+                        .read_file("codex-auth.json", super::projects::MAX_CODEX_AUTH)?
+            {
+                dir.write_file("auth.json", &login, chown, 0o600)?;
+            }
+            Ok(())
+        })();
+        match made {
+            Ok(()) => Some(name),
+            Err(e) => {
+                tracing::warn!("triage's codex home: {e}");
+                None
+            }
+        }
+    }
+
     async fn run_triage(
         &self,
         spec: &crate::host::UnitSpec,
         prompt: &str,
         project: Option<&str>,
+        agent: &str,
     ) -> Result<String, String> {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let _slot = self
@@ -488,9 +541,16 @@ impl<H: Host> Sandboxd<H> {
                     .map_err(|e| e.to_string())?;
                 Ok::<_, String>(String::from_utf8_lossy(&out).into_owned())
             };
-            match tokio::time::timeout(timeout, io).await {
-                Ok(r) => r,
-                Err(_) => Err("timed out".to_owned()),
+            // A hold that comes while it runs ends it: no model runs for a
+            // held agent, even this one.
+            let held = async {
+                while !self.held(agent) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            };
+            tokio::select! {
+                r = tokio::time::timeout(timeout, io) => r.unwrap_or_else(|_| Err("timed out".to_owned())),
+                () = held => Err("held while it ran".to_owned()),
             }
         }
         .await;
@@ -594,40 +654,54 @@ impl<H: Host> Sandboxd<H> {
             let mut locks = locked(&self.thread_locks);
             Arc::clone(locks.entry(tid.clone()).or_default())
         };
-        let (fresh, closing) = {
-            let _g = lock.lock().await;
-            let bound = self.store.thread(tid);
-            let cursor = bound.as_ref().map_or(0, |b| b.cursor);
-            let mut fresh = Vec::new();
-            if thread.last_seq > cursor {
-                let page = self
-                    .client(rec, conv.broker_session_id.as_deref())
-                    .a2a_poll(tid, i64::try_from(cursor).unwrap_or(i64::MAX), 0.0)
-                    .await?;
-                fresh = page
-                    .messages
-                    .into_iter()
-                    .filter(|m| m.seq > cursor)
-                    .collect::<Vec<_>>();
-                if let Some(max) = fresh.iter().map(|m| m.seq).max() {
-                    self.store.set_thread_cursor(tid, max)?;
+        // One reader per thread; each message's cursor moves only once its
+        // text is safely recorded (sent, or queued), so a failure before
+        // that leaves it to be read again.
+        let _g = lock.lock().await;
+        let bound = self.store.thread(tid);
+        let cursor = bound.as_ref().map_or(0, |b| b.cursor);
+        if thread.last_seq > cursor {
+            let page = self
+                .client(rec, conv.broker_session_id.as_deref())
+                .a2a_poll(tid, i64::try_from(cursor).unwrap_or(i64::MAX), 0.0)
+                .await?;
+            for m in page.messages.into_iter().filter(|m| m.seq > cursor) {
+                if m.from != rec.name {
+                    let text = format_a2a(thread, &m.from, m.seq, &m.payload);
+                    match self.deliver_recorded(&conv.id, &text).await {
+                        Ok(None) => {}
+                        Ok(Some(e)) => tracing::warn!(
+                            "conversation {} queued a message it could not start for: {e}",
+                            conv.id
+                        ),
+                        Err(SbxError::Full(why)) => {
+                            // Nothing more fits: the thread ends rather than
+                            // the inbox growing without bound.
+                            tracing::warn!("closing thread {tid}: {why}");
+                            let reason: String =
+                                format!("sandbox: {why}").chars().take(500).collect();
+                            if let Err(e) = self
+                                .client(rec, conv.broker_session_id.as_deref())
+                                .a2a_close(tid, Some(&reason))
+                                .await
+                            {
+                                tracing::warn!("closing thread {tid}: {e}");
+                            }
+                            self.store
+                                .set_thread_cursor(tid, thread.last_seq.max(m.seq))?;
+                            self.store.set_thread_closed(tid)?;
+                            return Ok(());
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
-            }
-            let closing = thread.closed && !bound.as_ref().is_some_and(|b| b.closed);
-            if closing {
-                self.store.set_thread_closed(tid)?;
-            }
-            (fresh, closing)
-        };
-        for m in &fresh {
-            if m.from != rec.name {
-                self.deliver(&conv.id, &format_a2a(thread, &m.from, m.seq, &m.payload))
-                    .await?;
+                self.store.set_thread_cursor(tid, m.seq)?;
             }
         }
+        let closing = thread.closed && !bound.as_ref().is_some_and(|b| b.closed);
         if closing {
             let reason = thread.close_reason.as_deref().unwrap_or("closed");
-            self.deliver(
+            self.deliver_recorded(
                 &conv.id,
                 &format!(
                     "[a2a] thread {tid} with {} is closed ({reason}). Nothing more will arrive on it.",
@@ -635,6 +709,7 @@ impl<H: Host> Sandboxd<H> {
                 ),
             )
             .await?;
+            self.store.set_thread_closed(tid)?;
         }
         Ok(())
     }

@@ -551,14 +551,41 @@ async fn b14_only_the_orchestrator_can_mint(pool: sqlx::PgPool) {
 /// naming `mint`).
 #[sqlx::test(migrations = "../store/migrations")]
 async fn inv7_a_catchall_rule_does_not_clear_a_mint(pool: sqlx::PgPool) {
+    // Only a catch-all matches the orchestrator here (no rule names mint).
+    let policy = r#"
+defaults: {action: surface, max_duration: 24h}
+platforms:
+  agents: {runtimes: [claude, codex], lease: 30d}
+rules:
+  - {match: {agent: "orchestrator-*"}, action: approve}
+"#;
+    let b = Broker::start_with(pool, policy, true).await;
+    let (_sb, orch, _) = vm(&b).await;
+    let r = ask(&b, &orch, mint_body(CHILD)).await;
+    assert_eq!(r.status, RequestStatus::AwaitingHuman);
+}
+
+/// Review #5 item 5: the orchestrator is its name for its VM, its VM and
+/// no parent; an agent that only has the runtime `orchestrator` (renamed,
+/// or minted under the orchestrator) can't mint.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn only_the_named_parentless_orchestrator_of_the_vm_mints(pool: sqlx::PgPool) {
     let b = Broker::start(pool).await;
     let (_sb, orch, _) = vm(&b).await;
     let tx = b.st.store.begin().await.unwrap();
-    agents::rename(&tx, orch.id, "catchall-orch").await.unwrap();
+    agents::rename(&tx, orch.id, "orchestrator-renamed")
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
-    let orch = b.agent("catchall-orch").await;
-    let r = ask(&b, &orch, mint_body(CHILD)).await;
-    assert_eq!(r.status, RequestStatus::AwaitingHuman);
+    let renamed = b.agent("orchestrator-renamed").await;
+    assert_eq!(renamed.runtime.as_deref(), Some("orchestrator"));
+    let r = ask(&b, &renamed, mint_body(CHILD)).await;
+    assert_eq!(r.status, RequestStatus::Denied);
+    assert!(
+        r.decision_reason
+            .unwrap_or_default()
+            .contains("orchestrator can mint")
+    );
 }
 
 /// INV-8: nothing is minted while the broker is locked down for the VM.
@@ -749,13 +776,19 @@ async fn b3_on_connect_while_locked_a_sandbox_gets_lockdown(pool: sqlx::PgPool) 
         .unwrap();
     sb.stop().await;
     let again = FakeSandbox::start(&b, HOST).await;
-    assert!(eventually(|| async { !again.of_type("agents.contained").is_empty() }).await);
+    // Re-pairing rotated the orchestrator's key: wait for it, then check
+    // that the lock state and the held list came first (a key never
+    // reaches a VM before it knows it is locked down).
+    again.wait_key(ORCH).await;
     let types = again.types();
     assert_eq!(
         types.first().map(String::as_str),
         Some("lockdown"),
         "{types:?}"
     );
+    let first_key = types.iter().position(|t| t == "key").unwrap();
+    let held = types.iter().position(|t| t == "agents.contained").unwrap();
+    assert!(held < first_key, "{types:?}");
     assert!(!types.contains(&"unlock".to_owned()));
     assert_eq!(
         again.of_type("agents.contained")[0]["agents"],
@@ -1042,4 +1075,96 @@ async fn inv7_a_mint_into_a_restricted_zone_goes_to_a_human(pool: sqlx::PgPool) 
     );
     let free = ask(&b, &orch, mint_body(CHILD)).await;
     assert_eq!(free.status, RequestStatus::Granted);
+}
+
+/// Review #5: `key.rotate` is rate-limited per agent (a burst of 2, then
+/// one per 5 minutes).
+#[sqlx::test(migrations = "../store/migrations")]
+async fn key_rotate_is_rate_limited(pool: sqlx::PgPool) {
+    let b = Broker::start(pool).await;
+    let (sb, _, _) = vm(&b).await;
+    let keys_of = |sb: &FakeSandbox| {
+        sb.of_type("key")
+            .iter()
+            .filter(|m| m["name"] == json!(ORCH))
+            .count()
+    };
+    let before = keys_of(&sb);
+    for _ in 0..3 {
+        sb.send(json!({"type": "key.rotate", "name": ORCH})).await;
+    }
+    super::testkit::wait_until(|| keys_of(&sb) >= before + 2).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(keys_of(&sb), before + 2);
+}
+
+/// Review #5 follow-up: the operator re-enables an agent; a VM agent gets
+/// a new key at once (the one it had when disabled never works again), a
+/// host agent just comes back.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn the_operator_reenables_an_agent(pool: sqlx::PgPool) {
+    let b = Broker::start(pool).await;
+    let (sb, orch, old) = vm(&b).await;
+    let (status, out) = b
+        .post_as(
+            ADMIN_TOKEN,
+            &format!("/admin/agents/{}/disable", orch.id),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 200, "{out}");
+    sb.forget_key(ORCH);
+    let (status, out) = b
+        .post_as(
+            ADMIN_TOKEN,
+            &format!("/admin/agents/{}/enable", orch.id),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 200, "{out}");
+    assert_eq!(out, json!({"enabled": ORCH, "key_rotated": true}));
+    let row = b.agent(ORCH).await;
+    assert!(!row.disabled && row.disabled_reason.is_none());
+    let new = sb.wait_key(ORCH).await;
+    assert_ne!(new, old);
+    assert_eq!(me_status(&b, &old).await, 401);
+    assert_eq!(me_status(&b, &new).await, 200);
+    let (host_agent, key) = plain_agent(&b, "hermes", |_| {}).await;
+    b.post_as(
+        ADMIN_TOKEN,
+        &format!("/admin/agents/{}/disable", host_agent.id),
+        json!({}),
+    )
+    .await;
+    let (status, out) = b
+        .post_as(
+            ADMIN_TOKEN,
+            &format!("/admin/agents/{}/enable", host_agent.id),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(out["key_rotated"], false);
+    assert_eq!(me_status(&b, &key).await, 200);
+    let (status, _) = b
+        .post_as(
+            &key,
+            &format!("/admin/agents/{}/enable", host_agent.id),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 401, "admin only");
+}
+
+/// Review #5 item 6: an agent VM's name has no '-' (pairing refuses it).
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_vm_name_with_a_hyphen_is_refused_at_pairing(pool: sqlx::PgPool) {
+    use agent_auth_crypto::daemon::{DaemonId as ChannelId, DaemonName, Role};
+    let b = Broker::start(pool).await;
+    let id = ChannelId::new(Role::Sandbox, DaemonName::parse("my-vm").unwrap());
+    let e = b.part.hub.create_pairing_code(&id).await.unwrap_err();
+    assert!(e.to_string().contains("no '-'"), "{e}");
+    let host = ChannelId::new(Role::Host, DaemonName::parse("my-host").unwrap());
+    assert!(b.part.hub.create_pairing_code(&host).await.is_ok());
+    assert!(crate::daemons::pairing_identity("sandbox", "my-vm").is_err());
 }

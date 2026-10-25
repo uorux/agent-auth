@@ -1341,8 +1341,8 @@ sandboxd:
   `\`, `"`, `` ` `` and `$` escaped (the Python's `shlex.quote` single
   quotes were not systemd's syntax for a value with a `'`) (B-18).
 - **Strict config and local API.** Unknown config keys and runtimes other
-  than `claude`/`codex` are refused; new keys `setpriv` and
-  `codex_auth_owner`. Local API parameters must have their JSON types
+  than `claude`/`codex` are refused; new keys `codex_auth_owner` and
+  `refuse_vm_logins_when_unreachable`; an agent VM's `name` has no `-`. Local API parameters must have their JSON types
   (the Python called `str()` on anything), unknown parameters are
   refused, and strings are bounded; a missing one still answers
   `internal error: '<name>'`. Projects list `sealed` as a boolean (the
@@ -1352,6 +1352,100 @@ sandboxd:
 - **The gateway request waits for any undecided status** (up to 20 s;
   the Python waited only for approved/provisioning/pending).
 - **sandboxctl prints log times in UTC** (no local time zone without libc).
+
+Security review #5 (sandboxd), fixed. "Python" marks what the port
+inherited from the Python; "port" what the port introduced.
+- **No environment of sandboxd's reaches its children** (Python): every
+  command sandboxd runs gets PATH and LANG only, and the tmux client
+  commands (`new-session`, `has-session`, `capture-pane`, the idle check)
+  run in a transient unit of their own (the project's uid, the agent
+  units' protections, its tmp at `/tmp`, PATH/LANG/HOME only), never as
+  the project's uid outside a unit, where its processes could read their
+  environment. The `setpriv` config key is gone.
+- **The operator's attach and shell run on a pty of their own** (Python):
+  `sandboxctl attach|new|shell` run `systemd-run --pty --uid=… -p
+  NoNewPrivileges=yes -p ProtectProc=invisible …` with TERM/LANG/PATH/HOME
+  only; root relays the new pty, so no process of the project's uid holds
+  an fd of the operator's root tty (no `/proc/<pid>/fd/0` grab, no
+  TIOCSTI after a detach). The operator API's attach and shell answers
+  carry `workdir` and `systemd_run` (additive).
+- **A revoked write grant leaves the grantee nothing** (port): when the
+  last write grant of a pair ends, everything the grantee owns in the
+  target is reclaimed: directories become the target's, each regular file
+  is replaced by a target-owned copy (a hard link elsewhere keeps its
+  file), symlinks/FIFOs/sockets it owns are removed. Every tree walk
+  (grants, revokes, seals, reclaims) fails with an error at the depth cap
+  (128) instead of skipping what lies below. A revoke that fails keeps the
+  grant recorded (it is retried, never forgotten with its ACL in place).
+- **Freezes are verified** (Python ignored the result): `systemctl show -p
+  FreezerState` must say `frozen`; three tries, then the unit is stopped
+  and the error logged (a held agent's process never keeps running). A run
+  or TUI that started while its agent was being held is frozen the same
+  way, and a triage running when a hold arrives is stopped. The Kani
+  harnesses (`proofs_sandbox.rs`) model freeze and thaw as succeeding;
+  this fallback is what makes that assumption safe.
+- **Keys only for this VM's agents** (Python): a `key` is stored only for
+  `orchestrator-<host>-sandbox` or exactly `<runtime>-<project>-<host>-sandbox`
+  of a project that exists in the VM; an agent without a project has none
+  to run in (it no longer maps to the orchestrator's uid and home).
+- **The orchestrator is its name, VM and lack of a parent** (port; the
+  Python's bootstrap keyed on the runtime): minting and the `agents`
+  catalog entry need `name == orchestrator-<daemon>-sandbox`, `sandbox_id ==
+  the daemon` and no parent. Policy refuses `orchestrator` (and any name
+  with `-` or other than lowercase letters and digits) in
+  `platforms.agents.runtimes`.
+- **Agent VM names have no `-`** (Python): pairing a sandbox daemon whose
+  name has one is refused (and sandboxd's config refuses it), so
+  `<runtime>-<project>-<host>-sandbox` reads one way only.
+- **`/run/sandboxd` is created 0711** (`env/` 0700, the agent socket's
+  directory 0755), modes set through a handle on each before any socket
+  is bound, and a symlink in its place is refused. sandboxd refuses to run
+  unless `fs.protected_hardlinks` is 1 (Python: the module's 0755, no
+  check).
+- **`POST /admin/agents/{id}/enable`** (new, admin only; `agent-auth admin
+  agent-enable <agent>`): re-enables that agent (not what it minted) and
+  clears its disable reason; a VM agent gets a new key for its sandbox in
+  the same transaction (answer `{"enabled", "key_rotated"}`).
+- **`key.rotate` is rate-limited per agent** on the broker (bursts of 2,
+  then one per 5 minutes; Python: none).
+- **A closed conversation's broker session is closed** and forgotten once
+  the broker has it closed; a failure is retried by the reaper.
+- **Keys reach a VM only after its greeting**: lock state, held list and
+  live grants are sent on every connect before any key, and keys pushed
+  by heartbeats, the tick or a mint wait until that connection has been
+  greeted (a heartbeat push could overtake it before).
+- **Project grants under races** (Python, B-7): a grant is recorded
+  before waiting for its pair's lock; a revoke of an unknown id leaves a
+  tombstone and a late grant with that id is refused; on every connect the
+  broker sends `project.grants` (new message: the grant ids active or
+  provisioning for the VM) and the VM revokes any other grant it holds.
+- **Operator output is terminal-safe** (Python): `sandboxctl logs` and
+  `ls` show C0/C1 controls (but newline and tab), DEL and bidi controls as
+  `\u{..}`; a conversation title's peer must be an agent name.
+- **codex logins** (Python): a project's copy of the shared login is
+  deleted when its process uses the gateway and when its agent is
+  contained; the owner's write-back must have codex's shape (`tokens` with
+  a `refresh_token`) and the shared login's `account_id`; codex triage gets
+  a fresh `CODEX_HOME` with only the login. Exposure, stated: a codex
+  project not on the gateway holds a refresh token of the shared account
+  in its `~/.codex/auth.json`, readable by every process of that project's
+  uid, and can use (or leak) it for as long as the account allows.
+- **Triage listing** (Python): only conversations that already talk to the
+  peer are candidates (a matching topic alone no longer is), and peer and
+  topic are inert in the listing.
+- **Bounded inbox** (Python): at most 1000 queued messages and 8 MiB per
+  conversation; a new message beyond is refused, and a thread whose
+  message no longer fits is closed with `sandbox: the inbox of
+  conversation … is full`.
+- **No silent fallback to the VM's logins** (Python): with
+  `refuse_vm_logins_when_unreachable` (default true) a broker that cannot
+  be reached starts no process; a reachable broker without a gateway still
+  means the VM's logins.
+- **A thread's cursor moves past a message only once it is recorded**
+  (Python moved it first: at most once): sent, or queued even if its
+  process then failed to start. A message whose text could not be recorded
+  is read again (at least once; deliveries happen under the thread's
+  lock, so the claim and the watcher don't both deliver it).
 
 ## Open questions
 
@@ -1415,27 +1509,19 @@ sandboxd:
   model provider reads every message and draft. Both by upstream's design;
   flagged there.
 
-- **Re-enabling an agent the operator disabled** (sandboxd B-1): a mint no
-  longer does it, and there is no admin route that does. Agents are never
-  deleted, so such a VM agent's name is unusable for good. Add
-  `POST /admin/agents/{id}/enable` (re-enable, rotate the key through its
-  sandbox)?
-- **`key.rotate` has no rate limit on the broker** (as the Python);
-  sandboxd now asks at most once per 5 minutes per agent.
 - **The shared codex login** (sandboxd B-11b, upstream flag): with
   `codex_auth_owner` unset nobody writes it back, so a refresh in any
   project may invalidate the shared refresh token for the others. Is a
   shared refreshable login still wanted, or one login per project?
-- **codex triage is not tool-less** (B-16): `codex exec -s read-only`
-  keeps its read-only shell tools while reading untrusted text, and uses
-  the runtime's normal model when `triage_model` is unset. Unchanged.
-- **Conversations keep a broker session each, forever** (B-18): an
-  orchestrator with many conversations may reach the broker's
-  `max_sessions_per_agent`. Close idle conversations automatically?
+- **codex triage keeps its read-only tools** (B-16): `codex exec -s
+  read-only` still has its read-only shell tools while reading untrusted
+  text (now with a fresh CODEX_HOME), and uses the runtime's normal model
+  when `triage_model` is unset.
+- **Conversations are never closed automatically** (B-18): a closed one's
+  broker session is now closed (and retried), but open conversations keep
+  theirs. Close idle conversations after some time?
 - **Triage picks the candidate whose id appears in the answer** (B-18):
   kept (exactly one must match).
-- **`/run/sandboxd` is 0755** in the NixOS module (B-18; its files are
-  0600); not changed here.
 
 ## To do (engineering, tracked here until done)
 

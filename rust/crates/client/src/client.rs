@@ -1039,6 +1039,15 @@ impl BrokerClient {
             .await
     }
 
+    /// `POST /admin/agents/{id}/enable`.
+    pub async fn admin_enable_agent(
+        &self,
+        agent: &str,
+    ) -> Result<agent_auth_wire::admin::Enabled, ClientError> {
+        self.call(Call::post(&["admin", "agents", agent, "enable"]).admin())
+            .await
+    }
+
     /// `GET /admin/rules`.
     pub async fn admin_list_rules(
         &self,

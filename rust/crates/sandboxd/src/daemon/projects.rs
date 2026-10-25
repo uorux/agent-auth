@@ -116,14 +116,24 @@ impl<H: Host> Sandboxd<H> {
         };
         let uid = self.project_uid(Some(project))?;
         let owner = self.project_uid(Some(target))?;
-        let lock = self.grant_lock(project, target);
-        let _g = lock.lock().await;
-        self.store.add_project_grant(GrantRecord {
+        // Recorded before waiting for the pair's lock, so a revoke that
+        // comes meanwhile finds it; refused if its id was revoked already
+        // (a revoke that overtook it, B-7).
+        let recorded = self.store.add_project_grant_unless_revoked(GrantRecord {
             grant_id: grant_id.to_owned(),
             project: project.to_owned(),
             target: target.to_owned(),
             access: access.to_owned(),
         })?;
+        let revoked = || SbxError::Value(format!("grant {grant_id} was revoked"));
+        if !recorded {
+            return Err(revoked());
+        }
+        let lock = self.grant_lock(project, target);
+        let _g = lock.lock().await;
+        if self.store.project_grant(grant_id).is_none() {
+            return Err(revoked());
+        }
         // Another grant of the pair may already give write access: a read
         // grant must not take it away (the Python's setfacl did).
         let write = write
@@ -135,7 +145,7 @@ impl<H: Host> Sandboxd<H> {
         let (work, _, _) = self.trees(Some(target));
         if let Err(e) = self.host.grant_acl(&work, uid, write, owner).await {
             let _ = self.store.pop_project_grant(grant_id);
-            if let Err(undo) = self.regrant(&work, project, target, uid).await {
+            if let Err(undo) = self.regrant(&work, project, target, uid, None).await {
                 tracing::error!("undoing a failed grant on {target}: {undo}");
             }
             return Err(e.into());
@@ -148,31 +158,70 @@ impl<H: Host> Sandboxd<H> {
     /// last write grant goes, what the grantee created in the target is
     /// handed back to the target's user (owner rights outlive an ACL).
     pub async fn remove_project_grant(&self, grant_id: &str) -> SbxResult<()> {
-        let Some(grant) = self.store.pop_project_grant(grant_id)? else {
+        let Some(grant) = self.store.project_grant(grant_id) else {
+            // Unknown (or not here yet): remembered, so a late grant with
+            // this id is refused.
+            self.store.tombstone_project_grant(grant_id)?;
             return Ok(());
         };
         let lock = self.grant_lock(&grant.project, &grant.target);
         let _g = lock.lock().await;
         let uid = self.project_uid(Some(&grant.project))?;
         let (work, _, _) = self.trees(Some(&grant.target));
-        self.regrant(&work, &grant.project, &grant.target, uid)
+        // The record goes only once its access is gone: a revoke that fails
+        // (a tree too deep, a setfacl error) is reported and stays to be
+        // retried, never forgotten with the ACL in place.
+        self.regrant(&work, &grant.project, &grant.target, uid, Some(grant_id))
             .await?;
-        let others = self.store.project_grants(&grant.project, &grant.target);
+        let others: Vec<GrantRecord> = self
+            .store
+            .project_grants(&grant.project, &grant.target)
+            .into_iter()
+            .filter(|o| o.grant_id != grant_id)
+            .collect();
         if grant.access == "project.write" && !others.iter().any(|o| o.access == "project.write") {
             let owner = self.project_uid(Some(&grant.target))?;
-            self.host.chown_tree(&work, owner, &[uid]).await?;
+            self.host.reclaim_tree(&work, uid, owner).await?;
         }
+        self.store.tombstone_project_grant(grant_id)?;
         Ok(())
     }
 
+    /// The broker's active grants of this VM (on every connect): what is
+    /// recorded here and not among them is revoked (B-7: a grant applied
+    /// after the broker gave up on it, or a revoke that never arrived).
+    pub async fn reconcile_project_grants(&self, active: &[String]) {
+        for g in self.store.all_project_grants() {
+            if !active.contains(&g.grant_id) {
+                tracing::warn!(
+                    "grant {} ({} on {}) is not active at the broker: revoking it",
+                    g.grant_id,
+                    g.project,
+                    g.target
+                );
+                if let Err(e) = self.remove_project_grant(&g.grant_id).await {
+                    tracing::error!("revoking grant {}: {e}", g.grant_id);
+                }
+            }
+        }
+    }
+
     /// `uid`'s entries go, then come back as far as the remaining grants
-    /// of the pair justify.
-    async fn regrant(&self, work: &Tree, project: &str, target: &str, uid: u32) -> SbxResult<()> {
+    /// of the pair (but `leaving`) justify.
+    async fn regrant(
+        &self,
+        work: &Tree,
+        project: &str,
+        target: &str,
+        uid: u32,
+        leaving: Option<&str>,
+    ) -> SbxResult<()> {
         self.host.revoke_acl(work, uid).await?;
         let owner = self.project_uid(Some(target))?;
         let others = self.store.project_grants(project, target);
         if let Some(write) = others
             .iter()
+            .filter(|o| Some(o.grant_id.as_str()) != leaving)
             .map(|o| o.access == "project.write")
             .reduce(|a, b| a || b)
         {
@@ -281,11 +330,20 @@ impl<H: Host> Sandboxd<H> {
                 return;
             }
         };
-        if serde_json::from_slice::<serde_json::Value>(&local).is_err() {
-            tracing::warn!("codex auth sync: the owner's auth.json is not JSON; not copied back");
+        let shared = self.shared_codex_auth();
+        if shared.as_deref() == Some(local.as_slice()) {
             return;
         }
-        if self.shared_codex_auth().as_deref() == Some(local.as_slice()) {
+        let parsed = |b: &[u8]| serde_json::from_slice::<serde_json::Value>(b).ok();
+        let Some(local_json) = parsed(&local) else {
+            tracing::warn!("codex auth sync: the owner's auth.json is not JSON; not copied back");
+            return;
+        };
+        if !codex_login_ok(&local_json, shared.as_deref().and_then(parsed).as_ref()) {
+            tracing::warn!(
+                "codex auth sync: the owner's auth.json is not a refreshed copy of the same \
+                 login (shape or account); not copied back"
+            );
             return;
         }
         let path = self.config.secrets_dir().join("codex-auth.json");
@@ -297,5 +355,82 @@ impl<H: Host> Sandboxd<H> {
             }
             Err(e) => tracing::warn!("codex auth sync: {e}"),
         }
+    }
+}
+
+/// Whether `local` may replace the shared codex login: a login of codex's
+/// shape (`tokens` with a `refresh_token`), and of the same account as the
+/// shared one when that names one (a project can't swap in its own).
+#[must_use]
+pub fn codex_login_ok(local: &serde_json::Value, shared: Option<&serde_json::Value>) -> bool {
+    use serde_json::Value;
+    let tokens = |v: &Value| v.get("tokens").and_then(Value::as_object).cloned();
+    let Some(lt) = tokens(local) else {
+        return false;
+    };
+    if !lt
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .is_some_and(|t| !t.is_empty())
+    {
+        return false;
+    }
+    let account = |t: &serde_json::Map<String, Value>| {
+        t.get("account_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    match shared.and_then(tokens).and_then(|st| account(&st)) {
+        Some(want) => account(&lt).as_deref() == Some(want.as_str()),
+        None => true,
+    }
+}
+
+impl<H: Host> Sandboxd<H> {
+    /// A project's copy of the shared codex login goes when its processes
+    /// use the gateway or it is contained: the token is not left where the
+    /// project could still use or leak it.
+    pub fn remove_codex_copy(&self, project: Option<&str>) {
+        let (_, home, _) = self.trees(project);
+        let removed = home
+            .open()
+            .and_then(|h| h.child(".codex"))
+            .and_then(|c| c.remove("auth.json"));
+        match removed {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!("removing a codex login copy: {e}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::codex_login_ok;
+    use serde_json::json;
+
+    #[test]
+    fn only_a_refreshed_copy_of_the_same_login_goes_back() {
+        let shared = json!({"tokens": {"refresh_token": "r1", "account_id": "acct"}});
+        assert!(codex_login_ok(
+            &json!({"tokens": {"refresh_token": "r2", "account_id": "acct"}}),
+            Some(&shared)
+        ));
+        assert!(!codex_login_ok(
+            &json!({"tokens": {"refresh_token": "r2", "account_id": "other"}}),
+            Some(&shared)
+        ));
+        assert!(!codex_login_ok(
+            &json!({"tokens": {"account_id": "acct"}}),
+            Some(&shared)
+        ));
+        assert!(!codex_login_ok(
+            &json!({"OPENAI_API_KEY": "sk"}),
+            Some(&shared)
+        ));
+        assert!(codex_login_ok(
+            &json!({"tokens": {"refresh_token": "r"}}),
+            None
+        ));
     }
 }

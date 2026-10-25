@@ -175,6 +175,14 @@ pub struct Disabled {
     pub disabled: Vec<String>,
 }
 
+/// `POST /admin/agents/{id}/enable` → 200.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Enabled {
+    pub enabled: String,
+    /// A VM agent's key was replaced (the new one goes to its sandbox).
+    pub key_rotated: bool,
+}
+
 /// A saved rule's action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
