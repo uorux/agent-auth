@@ -1856,6 +1856,7 @@ fn the_prompt_delimits_the_untrusted_justification() {
         lldap_username: None,
         lldap_password_encrypted: None,
         disabled: false,
+        disabled_reason: None,
         kind: AgentKind::Service,
         last_seen_at: None,
         last_listen_at: None,

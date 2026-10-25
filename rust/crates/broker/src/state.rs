@@ -46,6 +46,9 @@ pub struct AppState {
     pub hostd: Option<Arc<crate::daemons::HostdPart>>,
     /// The mail gateway (`mail`); none: `/v1/mail` answers 501.
     pub mail: Option<Arc<crate::mail::Mail>>,
+    /// Agent VMs: orchestrator bootstrap, key delivery, minting and
+    /// cross-project access (`sandboxes`); on with the daemon channel.
+    pub sandboxes: Option<Arc<crate::sandboxes::Sandboxes>>,
 }
 
 impl AppState {
@@ -76,6 +79,7 @@ impl AppState {
             spine: Arc::default(),
             hostd: None,
             mail: None,
+            sandboxes: None,
         }
     }
 }

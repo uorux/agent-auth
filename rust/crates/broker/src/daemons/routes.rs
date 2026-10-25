@@ -169,9 +169,10 @@ async fn unpair(
     let id: DaemonId = daemon_id
         .parse()
         .map_err(|_| ApiError::not_found("daemon not found"))?;
-    if !hub.unpair(id).await? {
+    let Some(disabled) = hub.unpair_disabling(id).await? else {
         return Err(ApiError::not_found("daemon not found"));
-    }
+    };
+    crate::scheduler::after_disable(&state, &disabled).await;
     Ok(Json(json!({"ok": true})))
 }
 

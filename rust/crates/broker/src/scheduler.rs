@@ -110,7 +110,15 @@ pub async fn sweep_leases(st: &AppState) -> usize {
         let tx = st.store.begin().await?;
         let mut disabled = Vec::new();
         for id in agents::lease_expired(&tx, now).await? {
-            disabled.extend(sandboxes::disable_tree(&tx, id, now).await?);
+            disabled.extend(
+                sandboxes::disable_tree(
+                    &tx,
+                    id,
+                    now,
+                    agent_auth_store::agents::DisableReason::Lease,
+                )
+                .await?,
+            );
         }
         tx.commit().await?;
         Ok::<_, agent_auth_store::StoreError>(disabled)

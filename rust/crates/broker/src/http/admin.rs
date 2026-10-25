@@ -309,6 +309,14 @@ async fn rotate_key(
     let tx = st.store.begin().await?;
     let a = by_id(&tx, &id).await?;
     not_operator(&a)?;
+    // Its key lives in its agent VM: a key handed to the admin would strand
+    // the VM's copy (sandboxd B-10).
+    if a.sandbox_id.is_some() {
+        return Err(ApiError::conflict(format!(
+            "{} was minted in an agent VM; its key is its sandbox's (disable it and mint it again)",
+            a.name
+        )));
+    }
     agents::set_key(&tx, a.id, key.key_id.as_str(), key.hash.as_str()).await?;
     let row = agents::get(&tx, a.id).await?.ok_or_else(unknown_agent)?;
     tx.commit().await?;
@@ -446,7 +454,13 @@ async fn disable(
         .ok_or_else(|| ApiError::not_found("agent not found"))?;
     // The operator's row is the panel's own (http-api §8.13).
     not_operator(&a)?;
-    let names = sandboxes::disable_tree(&tx, a.id, st.now()).await?;
+    let names = sandboxes::disable_tree(
+        &tx,
+        a.id,
+        st.now(),
+        agent_auth_store::agents::DisableReason::Operator,
+    )
+    .await?;
     tx.commit().await?;
     crate::scheduler::after_disable(&st, &names).await;
     Ok(Json(Disabled { disabled: names }))

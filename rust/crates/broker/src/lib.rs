@@ -42,6 +42,7 @@ pub mod oauth;
 pub mod provisioners;
 pub mod random;
 pub mod remote_mcp;
+pub mod sandboxes;
 pub mod scheduler;
 pub mod security_log;
 pub mod server;

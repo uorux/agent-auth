@@ -200,6 +200,10 @@ pub enum AnyProvisioner {
     Pool(pool::PoolProvisioner),
     /// The mail gateway's platform (`crate::mail::provisioner`).
     Mail(crate::mail::provisioner::MailProvisioner),
+    /// Minting identities in an agent VM (`crate::sandboxes::agents`).
+    Agents(crate::sandboxes::agents::AgentsProvisioner),
+    /// Cross-project access in an agent VM (`crate::sandboxes::project`).
+    Sandbox(crate::sandboxes::project::SandboxProvisioner),
 }
 
 macro_rules! dispatch {
@@ -217,6 +221,8 @@ macro_rules! dispatch {
             AnyProvisioner::GoogleStub($p) => $e,
             AnyProvisioner::Pool($p) => $e,
             AnyProvisioner::Mail($p) => $e,
+            AnyProvisioner::Agents($p) => $e,
+            AnyProvisioner::Sandbox($p) => $e,
         }
     };
 }

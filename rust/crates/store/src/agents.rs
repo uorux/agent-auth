@@ -27,6 +27,8 @@ pub struct AgentRow {
     pub lldap_username: Option<String>,
     pub lldap_password_encrypted: Option<String>,
     pub disabled: bool,
+    /// Why it is disabled (`None` while enabled, or unknown).
+    pub disabled_reason: Option<DisableReason>,
     pub kind: AgentKind,
     pub last_seen_at: Option<OffsetDateTime>,
     pub last_listen_at: Option<OffsetDateTime>,
@@ -47,6 +49,7 @@ impl fmt::Debug for AgentRow {
             .field("name", &self.name)
             .field("kind", &self.kind)
             .field("disabled", &self.disabled)
+            .field("disabled_reason", &self.disabled_reason)
             .field("runtime", &self.runtime)
             .field("project", &self.project)
             .field("host", &self.host)
@@ -84,6 +87,38 @@ impl AgentRow {
     }
 }
 
+/// Why an agent is disabled (sandboxd B-1, B-10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DisableReason {
+    /// The operator (admin endpoint or panel). A renewal never undoes it.
+    Operator,
+    /// Its lease, or an ancestor's, ran out. Renewing re-enables it.
+    Lease,
+    /// Its agent VM was unpaired.
+    Unpaired,
+}
+
+impl DisableReason {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DisableReason::Operator => "operator",
+            DisableReason::Lease => "lease",
+            DisableReason::Unpaired => "unpaired",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(text: &str) -> Option<DisableReason> {
+        match text {
+            "operator" => Some(DisableReason::Operator),
+            "lease" => Some(DisableReason::Lease),
+            "unpaired" => Some(DisableReason::Unpaired),
+            _ => None,
+        }
+    }
+}
+
 pub(crate) struct RawAgent {
     pub id: Uuid,
     pub name: String,
@@ -106,6 +141,7 @@ pub(crate) struct RawAgent {
     pub placement: String,
     pub lease_expires_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
+    pub disabled_reason: Option<String>,
 }
 
 impl TryFrom<RawAgent> for AgentRow {
@@ -117,6 +153,13 @@ impl TryFrom<RawAgent> for AgentRow {
                 .ok_or_else(|| StoreError::corrupt(T, format!("kind {:?}", r.kind)))?,
             placement: Placement::parse(&r.placement)
                 .ok_or_else(|| StoreError::corrupt(T, format!("placement {:?}", r.placement)))?,
+            disabled_reason: match r.disabled_reason.as_deref() {
+                None => None,
+                Some(t) => Some(
+                    DisableReason::parse(t)
+                        .ok_or_else(|| StoreError::corrupt(T, format!("disabled_reason {t:?}")))?,
+                ),
+            },
             name: r.name,
             description: r.description,
             key_id: r.key_id,
@@ -606,7 +649,9 @@ pub async fn set_disabled(tx: &Tx<'_>, id: AgentId, disabled: bool) -> Result<bo
     }
     let mut c = tx.conn().await;
     let n = sqlx::query!(
-        "UPDATE agents SET disabled = $2 WHERE id = $1",
+        "UPDATE agents SET disabled = $2,
+             disabled_reason = CASE WHEN $2 THEN disabled_reason END
+         WHERE id = $1",
         Uuid::from(id),
         disabled
     )
@@ -664,11 +709,38 @@ pub async fn adopt_orchestrator(
 ) -> Result<bool, StoreError> {
     let mut c = tx.conn().await;
     let n = sqlx::query!(
-        "UPDATE agents SET sandbox_id = $2, host = $3, placement = 'sandbox', disabled = false
+        "UPDATE agents SET sandbox_id = $2, host = $3, placement = 'sandbox', disabled = false,
+             disabled_reason = NULL
          WHERE id = $1 AND runtime = 'orchestrator' AND (sandbox_id IS NULL OR sandbox_id = $2)",
         Uuid::from(id),
         Uuid::from(sandbox),
         host
+    )
+    .execute(&mut **c)
+    .await?
+    .rows_affected();
+    Ok(n == 1)
+}
+
+/// Re-enable an agent whose lease ran out, with a new key and lease (a
+/// renewal: sandboxd B-1, B-8). Only an agent disabled for `lease`; false
+/// otherwise.
+pub async fn reenable_after_lease(
+    tx: &Tx<'_>,
+    id: AgentId,
+    key_id: &str,
+    api_key_hash: &str,
+    lease_expires_at: OffsetDateTime,
+) -> Result<bool, StoreError> {
+    let mut c = tx.conn().await;
+    let n = sqlx::query!(
+        "UPDATE agents SET disabled = false, disabled_reason = NULL, key_id = $2,
+             api_key_hash = $3, lease_expires_at = $4
+         WHERE id = $1 AND disabled AND disabled_reason = 'lease'",
+        Uuid::from(id),
+        key_id,
+        api_key_hash,
+        lease_expires_at
     )
     .execute(&mut **c)
     .await?

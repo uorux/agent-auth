@@ -312,6 +312,26 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
         registry.register(p);
     }
     hostd.install_hooks(&mut spine.hooks);
+    // Agent VMs: with the daemon channel. Their keys wait encrypted until
+    // their sandbox acknowledges them, so ENCRYPTION_KEY too.
+    let sandboxes = if hostd.hub.enabled() {
+        let secret_box = match &config.encryption_key {
+            Some(k) => Some(Arc::new(
+                SecretBox::from_base64(k.expose())
+                    .map_err(|e| anyhow::anyhow!("ENCRYPTION_KEY: {e}"))?,
+            )),
+            None => None,
+        };
+        let s = crate::sandboxes::Sandboxes::new(Arc::clone(&hostd.hub), store.clone(), secret_box)
+            .map_err(|e| anyhow::anyhow!("sandboxes: {e}"))?;
+        for p in s.provisioners(&policy) {
+            registry.register(p);
+        }
+        s.install_hooks(&mut spine.hooks);
+        Some(s)
+    } else {
+        None
+    };
     // `env` (the process environment over `./.env`), not the process
     // environment alone: the quick start puts DISCORD_TOKEN in `.env`.
     let lookup = |k: &str| env.get(k).map(str::to_owned);
@@ -363,8 +383,12 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
     state.mail = mail.clone();
     let hostd = Arc::new(hostd);
     state.hostd = Some(Arc::clone(&hostd));
+    state.sandboxes = sandboxes.clone();
     let state = crate::webui::install(state, web);
     hostd.bind(&state);
+    if let Some(s) = &sandboxes {
+        s.bind(state.clone());
+    }
     crate::scheduler::boot(&state).await;
 
     let mut tasks = Vec::new();

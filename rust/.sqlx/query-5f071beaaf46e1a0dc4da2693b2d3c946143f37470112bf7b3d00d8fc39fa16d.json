@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE agents SET disabled = $2,\n             disabled_reason = CASE WHEN $2 THEN disabled_reason END\n         WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5f071beaaf46e1a0dc4da2693b2d3c946143f37470112bf7b3d00d8fc39fa16d"
+}

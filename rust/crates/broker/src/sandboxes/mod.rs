@@ -1,0 +1,555 @@
+//! Agent VMs as seen from the broker (sandboxd spec §2): the orchestrator
+//! bootstrap, key custody and delivery, and what an agent VM is told about
+//! lockdowns and containment.
+//!
+//! - Pairing a sandbox daemon (role `sandbox`) bootstraps
+//!   `orchestrator-<host>-sandbox`; re-pairing rotates its key.
+//! - Minting (`agents::AgentsProvisioner`) creates or renews
+//!   `<runtime>-<project>-<host>-sandbox`. Its API key is generated here and
+//!   handed ONLY to its sandbox daemon, over the signed channel, in a `key`
+//!   message (INV-1). Until that daemon acknowledges that very key (the ack
+//!   names its `key_id`: B-6) it waits encrypted in
+//!   `pending_key_deliveries`, the one place it can be recovered (INV-2).
+//! - A sandbox may ask for a fresh key for one of its own enabled agents.
+//! - On every (re)connect a sandbox is told the broker's lock state
+//!   (`lockdown` or `unlock`: a missed unlock is resent, B-3) and its held
+//!   agents, then its pending keys. Whenever containment changes it gets
+//!   its held list again (`tell_sandboxes`).
+//! - Cross-project access (`project::SandboxProvisioner`) is applied by the
+//!   daemon as ACLs.
+
+pub mod agents;
+pub mod project;
+#[cfg(test)]
+pub(crate) mod testkit;
+#[cfg(test)]
+mod tests;
+
+use std::sync::{Arc, OnceLock, Weak};
+use std::time::Duration;
+
+use agent_auth_core::containment::{AgentKind, Placement};
+use agent_auth_core::sandbox::{ORCHESTRATOR_RUNTIME, orchestrator_name};
+use agent_auth_core::{AgentId, DaemonId};
+use agent_auth_crypto::api_key::{self, GeneratedKey};
+use agent_auth_crypto::daemon::Role;
+use agent_auth_crypto::secretbox::{Binding, SecretBox};
+use agent_auth_store::agents::{self as agent_rows, AgentRow, NewAgent};
+use agent_auth_store::daemons::{self, DaemonRole};
+use agent_auth_store::{Store, StoreError, Tx, flags, lockdown, sandboxes as store};
+use agent_auth_wire::daemon::channel::{Incoming, parse};
+use agent_auth_wire::daemon::sandbox::SandboxToBroker;
+use serde_json::{Map, Value, json};
+use time::OffsetDateTime;
+use uuid::Uuid;
+
+use crate::daemons::{DaemonHub, DaemonPeer};
+use crate::state::AppState;
+
+/// Without `ENCRYPTION_KEY` no key can wait for its sandbox (INV-2).
+pub const NO_KEY_BOX: &str = "ENCRYPTION_KEY is required to hand keys to a sandbox";
+/// A key is pushed this long after the transaction that queued it, so it
+/// has committed (heartbeats and the scheduler retry anyway).
+pub const NUDGE_DELAY: Duration = Duration::from_millis(500);
+
+/// Where a pending key's ciphertext lives (its AEAD binding).
+fn binding(delivery: &str) -> Binding<'_> {
+    Binding::new("pending_key_deliveries", "key_encrypted", delivery)
+}
+
+/// Why a key could not be queued.
+#[derive(Debug, thiserror::Error)]
+pub enum QueueError {
+    #[error("{NO_KEY_BOX}")]
+    NoKeyBox,
+    #[error("no randomness for a new key")]
+    Random,
+    #[error("could not encrypt the key")]
+    Seal,
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+/// The agent-VM part of the broker (one `AppState` field).
+pub struct Sandboxes {
+    hub: Arc<DaemonHub>,
+    store: Store,
+    secret_box: Option<Arc<SecretBox>>,
+    me: Weak<Sandboxes>,
+    st: OnceLock<AppState>,
+}
+
+impl std::fmt::Debug for Sandboxes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sandboxes")
+            .field("keys", &self.secret_box.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+fn is_sandbox(peer: &DaemonPeer) -> bool {
+    peer.role() == Role::Sandbox
+}
+
+fn payload(v: Value) -> Map<String, Value> {
+    match v {
+        Value::Object(m) => m,
+        _ => Map::new(),
+    }
+}
+
+impl Sandboxes {
+    /// The service, with its hooks and handlers registered on the hub.
+    pub fn new(
+        hub: Arc<DaemonHub>,
+        store: Store,
+        secret_box: Option<Arc<SecretBox>>,
+    ) -> Result<Arc<Sandboxes>, String> {
+        if secret_box.is_none() {
+            tracing::warn!("ENCRYPTION_KEY unset: agent VMs can pair but receive no agent keys");
+        }
+        let me = Arc::new_cyclic(|weak| Sandboxes {
+            hub: Arc::clone(&hub),
+            store,
+            secret_box,
+            me: weak.clone(),
+            st: OnceLock::new(),
+        });
+        let s = Arc::clone(&me);
+        hub.on_paired(Arc::new(move |role, name, id| {
+            let s = Arc::clone(&s);
+            Box::pin(async move {
+                if role == Role::Sandbox {
+                    s.bootstrap(&name, id).await;
+                }
+            })
+        }));
+        let s = Arc::clone(&me);
+        hub.on_connect(Arc::new(move |peer| {
+            let s = Arc::clone(&s);
+            Box::pin(async move { s.on_connect(&peer).await })
+        }));
+        let s = Arc::clone(&me);
+        hub.on_heartbeat(Arc::new(move |peer| {
+            let s = Arc::clone(&s);
+            Box::pin(async move {
+                if is_sandbox(&peer) {
+                    s.push(peer.name(), peer.row_id()).await;
+                }
+            })
+        }));
+        let s = Arc::clone(&me);
+        hub.handle(
+            "key.ack",
+            Arc::new(move |peer, body| {
+                let s = Arc::clone(&s);
+                Box::pin(async move { s.on_key_ack(&peer, body).await })
+            }),
+        )?;
+        let s = Arc::clone(&me);
+        hub.handle(
+            "key.rotate",
+            Arc::new(move |peer, body| {
+                let s = Arc::clone(&s);
+                Box::pin(async move { s.on_key_rotate(&peer, body).await })
+            }),
+        )?;
+        Ok(me)
+    }
+
+    /// Attach the broker's state (once, after `AppState` is built).
+    pub fn bind(&self, st: AppState) {
+        let _ = self.st.set(st);
+    }
+
+    #[must_use]
+    pub fn hub(&self) -> &Arc<DaemonHub> {
+        &self.hub
+    }
+
+    // ------------------------------------------------------------- keys
+
+    /// Queue `key` for the agent's sandbox, replacing any older pending
+    /// key of the agent. The agent's stored key must already be `key`.
+    async fn queue_delivery(
+        &self,
+        tx: &Tx<'_>,
+        agent: AgentId,
+        sandbox: DaemonId,
+        key: &GeneratedKey,
+        now: OffsetDateTime,
+    ) -> Result<(), QueueError> {
+        let boxed = self.secret_box.as_ref().ok_or(QueueError::NoKeyBox)?;
+        let id = Uuid::new_v4();
+        let row = id.to_string();
+        let sealed = boxed
+            .seal_str(key.full_key.expose(), &binding(&row))
+            .map_err(|_| QueueError::Seal)?;
+        store::queue(tx, id, agent, sandbox, key.key_id.as_str(), &sealed, now).await?;
+        Ok(())
+    }
+
+    /// A new key for an existing agent of `sandbox`, queued for it alone:
+    /// the old key stops authenticating in this transaction (INV-4).
+    async fn rotate_key(
+        &self,
+        tx: &Tx<'_>,
+        agent: AgentId,
+        sandbox: DaemonId,
+        now: OffsetDateTime,
+    ) -> Result<(), QueueError> {
+        if self.secret_box.is_none() {
+            return Err(QueueError::NoKeyBox);
+        }
+        let key = api_key::generate().map_err(|_| QueueError::Random)?;
+        agent_rows::set_key(tx, agent, key.key_id.as_str(), key.hash.as_str()).await?;
+        self.queue_delivery(tx, agent, sandbox, &key, now).await
+    }
+
+    /// Push every pending key of daemon `id` (named `name`) to it, if it is
+    /// connected. The plaintext key exists only in the sealed `key`
+    /// message (INV-1).
+    pub async fn push(&self, name: &str, id: DaemonId) {
+        let Some(boxed) = self.secret_box.as_ref() else {
+            return;
+        };
+        if !self.hub.is_online(Role::Sandbox, name) {
+            return;
+        }
+        let pending = async {
+            let tx = self.store.begin().await?;
+            let rows = store::pending_for(&tx, id).await?;
+            tx.commit().await?;
+            Ok::<_, StoreError>(rows)
+        }
+        .await;
+        let pending = match pending {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(sandbox = %name, error = %e, "listing pending keys failed");
+                return;
+            }
+        };
+        for row in pending {
+            let delivery = row.id.to_string();
+            let Ok(key) = boxed.open_str(&row.key_encrypted, &binding(&delivery)) else {
+                tracing::error!(sandbox = %name, agent = %row.agent_name, "a pending key does not decrypt; skipped");
+                continue;
+            };
+            let msg = payload(json!({
+                "type": "key",
+                "agent_id": row.agent_id.to_string(),
+                "key_id": row.key_id,
+                "name": row.agent_name,
+                "runtime": row.runtime,
+                "project": row.project,
+                "api_key": key.expose(),
+            }));
+            if self.hub.send_default(Role::Sandbox, name, &msg).await {
+                tracing::info!(sandbox = %name, agent = %row.agent_name, "key delivered");
+            }
+        }
+    }
+
+    /// Push daemon `id`'s pending keys shortly (after the caller's
+    /// transaction commits).
+    pub fn nudge(&self, id: DaemonId) {
+        let Some(me) = self.me.upgrade() else {
+            return;
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(NUDGE_DELAY).await;
+            let row = async {
+                let tx = me.store.begin().await?;
+                let row = daemons::get(&tx, id).await?;
+                tx.commit().await?;
+                Ok::<_, StoreError>(row)
+            }
+            .await;
+            match row {
+                Ok(Some(d)) if d.role == DaemonRole::Sandbox => me.push(&d.name, d.id).await,
+                Ok(_) => {}
+                Err(e) => tracing::error!(error = %e, "loading a sandbox to push keys failed"),
+            }
+        });
+    }
+
+    /// `key.ack {agent_id, key_id}`: only the sandbox the key was meant
+    /// for retires its delivery, and only for that key (INV-3, B-6).
+    async fn on_key_ack(&self, peer: &DaemonPeer, body: Map<String, Value>) {
+        if !is_sandbox(peer) {
+            return;
+        }
+        let ack = match parse::<SandboxToBroker>(body) {
+            Incoming::Message(SandboxToBroker::KeyAck(a)) => a,
+            Incoming::Malformed { error, .. } => {
+                tracing::warn!(daemon = %peer.principal(), "malformed key.ack: {error}");
+                return;
+            }
+            _ => return,
+        };
+        let done = async {
+            let tx = self.store.begin().await?;
+            let n = store::ack(&tx, ack.agent_id, peer.row_id(), ack.key_id.as_str()).await?;
+            tx.commit().await?;
+            Ok::<_, StoreError>(n)
+        }
+        .await;
+        match done {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(daemon = %peer.principal(), "key.ack for no pending key (superseded or not its own)")
+            }
+            Err(e) => tracing::error!(daemon = %peer.principal(), error = %e, "key.ack failed"),
+        }
+    }
+
+    /// `key.rotate {name}`: a sandbox lost one of its agents' keys. A new
+    /// one is issued only for its own enabled agent, to it alone (INV-4).
+    async fn on_key_rotate(&self, peer: &DaemonPeer, body: Map<String, Value>) {
+        if !is_sandbox(peer) {
+            return;
+        }
+        let name = match parse::<SandboxToBroker>(body) {
+            Incoming::Message(SandboxToBroker::KeyRotate(r)) => r.name.as_str().to_owned(),
+            Incoming::Malformed { error, .. } => {
+                tracing::warn!(daemon = %peer.principal(), "malformed key.rotate: {error}");
+                return;
+            }
+            _ => return,
+        };
+        let done = async {
+            let now = OffsetDateTime::now_utc();
+            let tx = self.store.begin().await?;
+            let Some(agent) = agent_rows::by_name(&tx, &name).await? else {
+                return Ok(false);
+            };
+            if agent.sandbox_id != Some(peer.row_id()) || agent.disabled {
+                return Ok(false);
+            }
+            self.rotate_key(&tx, agent.id, peer.row_id(), now).await?;
+            tx.commit().await?;
+            Ok::<_, QueueError>(true)
+        }
+        .await;
+        match done {
+            Ok(true) => {
+                tracing::info!(daemon = %peer.principal(), agent = %name, "rotated a key at its sandbox's request");
+                self.push(peer.name(), peer.row_id()).await;
+            }
+            Ok(false) => tracing::warn!(
+                daemon = %peer.principal(),
+                "asked for a key it doesn't own (or a disabled agent's): {name:?}"
+            ),
+            Err(e) => tracing::error!(daemon = %peer.principal(), error = %e, "key.rotate failed"),
+        }
+    }
+
+    // ---------------------------------------------------- orchestrator
+
+    /// After a sandbox (re-)paired: create its orchestrator, or adopt it and
+    /// rotate its key (INV-10). Never takes over a same-named agent of
+    /// another daemon or another runtime.
+    async fn bootstrap(&self, host: &str, daemon: DaemonId) {
+        let done = async {
+            if self.secret_box.is_none() {
+                return Err(QueueError::NoKeyBox);
+            }
+            let name = orchestrator_name(host);
+            let now = OffsetDateTime::now_utc();
+            let tx = self.store.begin().await?;
+            match agent_rows::by_name(&tx, &name).await? {
+                None => {
+                    let key = api_key::generate().map_err(|_| QueueError::Random)?;
+                    let description = format!("orchestrator of the agent VM on {host}");
+                    let row = agent_rows::insert(
+                        &tx,
+                        &NewAgent {
+                            id: AgentId::new(),
+                            name: &name,
+                            description: &description,
+                            key_id: key.key_id.as_str(),
+                            api_key_hash: key.hash.as_str(),
+                            kind: AgentKind::Service,
+                            webhook_url: None,
+                            webhook_secret: None,
+                            lldap_username: None,
+                            parent_agent_id: None,
+                            sandbox_id: Some(daemon),
+                            runtime: Some(ORCHESTRATOR_RUNTIME),
+                            project: None,
+                            host: Some(host),
+                            placement: Placement::Sandbox,
+                            lease_expires_at: None,
+                            last_seen_at: Some(now),
+                            now,
+                        },
+                    )
+                    .await?;
+                    self.queue_delivery(&tx, row.id, daemon, &key, now).await?;
+                    tx.commit().await?;
+                    tracing::info!(sandbox = %host, "orchestrator {name} created, key queued");
+                }
+                Some(a)
+                    if a.sandbox_id.is_some_and(|s| s != daemon)
+                        || a.runtime.as_deref() != Some(ORCHESTRATOR_RUNTIME) =>
+                {
+                    tracing::error!(
+                        sandbox = %host,
+                        "{name} exists and isn't this sandbox's orchestrator; not taking it over"
+                    );
+                }
+                Some(a) => {
+                    if !agent_rows::adopt_orchestrator(&tx, a.id, daemon, host).await? {
+                        tracing::error!(sandbox = %host, "{name} could not be adopted");
+                        return Ok(());
+                    }
+                    self.rotate_key(&tx, a.id, daemon, now).await?;
+                    tx.commit().await?;
+                    tracing::info!(sandbox = %host, "orchestrator {name} adopted, new key queued");
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = done {
+            tracing::error!(sandbox = %host, error = %e, "orchestrator bootstrap failed");
+        }
+    }
+
+    // ------------------------------------------------------- telling
+
+    /// A sandbox (re)connected: its lock state (`lockdown`, or `unlock` so
+    /// a missed unlock is not lost: B-3), its held agents, then its keys.
+    /// One hook, so the order is fixed.
+    async fn on_connect(&self, peer: &DaemonPeer) {
+        if !is_sandbox(peer) {
+            return;
+        }
+        let facts = async {
+            let tx = self.store.begin().await?;
+            let locked = flags::locked(&tx, peer.name()).await?;
+            let held = lockdown::held_in(&tx, peer.row_id()).await?;
+            tx.commit().await?;
+            Ok::<_, StoreError>((locked, held))
+        }
+        .await;
+        let (locked, held) = match facts {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(daemon = %peer.principal(), error = %e, "sandbox on_connect failed");
+                return;
+            }
+        };
+        let lock = if locked {
+            json!({"type": "lockdown", "kill_vm": false})
+        } else {
+            json!({"type": "unlock"})
+        };
+        self.hub
+            .send_default(Role::Sandbox, peer.name(), &payload(lock))
+            .await;
+        self.hub
+            .send_default(
+                Role::Sandbox,
+                peer.name(),
+                &payload(json!({"type": "agents.contained", "agents": held})),
+            )
+            .await;
+        self.push(peer.name(), peer.row_id()).await;
+    }
+
+    /// Every agent VM gets its complete held list. Returns
+    /// `{"sandbox:<name>": "<n> held" | "not connected; told when it reconnects"}`.
+    pub async fn tell(&self) -> Map<String, Value> {
+        let lists = async {
+            let tx = self.store.begin().await?;
+            let mut out = Vec::new();
+            for d in daemons::list_role(&tx, DaemonRole::Sandbox).await? {
+                let held = lockdown::held_in(&tx, d.id).await?;
+                out.push((d.name, held));
+            }
+            tx.commit().await?;
+            Ok::<_, StoreError>(out)
+        }
+        .await;
+        let mut reports = Map::new();
+        match lists {
+            Ok(lists) => {
+                for (name, held) in lists {
+                    let n = held.len();
+                    let sent = self
+                        .hub
+                        .send_default(
+                            Role::Sandbox,
+                            &name,
+                            &payload(json!({"type": "agents.contained", "agents": held})),
+                        )
+                        .await;
+                    reports.insert(
+                        format!("sandbox:{name}"),
+                        json!(if sent {
+                            format!("{n} held")
+                        } else {
+                            "not connected; told when it reconnects".to_owned()
+                        }),
+                    );
+                }
+            }
+            Err(e) => tracing::error!(error = %e, "telling agent VMs their held agents failed"),
+        }
+        reports
+    }
+
+    /// The scheduler's step: pending keys go to every connected sandbox.
+    pub async fn tick(&self) {
+        let rows = async {
+            let tx = self.store.begin().await?;
+            let rows = daemons::list_role(&tx, DaemonRole::Sandbox).await?;
+            tx.commit().await?;
+            Ok::<_, StoreError>(rows)
+        }
+        .await;
+        match rows {
+            Ok(rows) => {
+                for d in rows {
+                    self.push(&d.name, d.id).await;
+                }
+            }
+            Err(e) => tracing::error!(error = %e, "sandboxes tick failed"),
+        }
+    }
+
+    /// The minting and project provisioners, to register.
+    #[must_use]
+    pub fn provisioners(
+        self: &Arc<Self>,
+        policy: &agent_auth_core::Policy,
+    ) -> Vec<crate::provisioners::AnyProvisioner> {
+        let a = &policy.platforms().agents;
+        vec![
+            crate::provisioners::AnyProvisioner::Agents(agents::AgentsProvisioner {
+                sandboxes: Arc::clone(self),
+                runtimes: a.runtimes.clone(),
+                lease: a.lease,
+            }),
+            crate::provisioners::AnyProvisioner::Sandbox(project::SandboxProvisioner::new(
+                Arc::clone(self),
+            )),
+        ]
+    }
+
+    /// Plug into the spine: the scheduler step and `tell_sandboxes`.
+    pub fn install_hooks(self: &Arc<Self>, hooks: &mut crate::service::Hooks) {
+        let s = Arc::clone(self);
+        hooks.sandboxes_tick = Some(Arc::new(move |_st| {
+            let s = Arc::clone(&s);
+            Box::pin(async move { s.tick().await })
+        }));
+        let s = Arc::clone(self);
+        hooks.tell_sandboxes = Some(Arc::new(move |_st, _held: Vec<AgentRow>| {
+            let s = Arc::clone(&s);
+            Box::pin(async move { s.tell().await })
+        }));
+    }
+}

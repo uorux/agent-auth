@@ -100,6 +100,7 @@ mod tests {
             lldap_username: None,
             lldap_password_encrypted: None,
             disabled: false,
+            disabled_reason: None,
             kind,
             last_seen_at: None,
             last_listen_at: listen,

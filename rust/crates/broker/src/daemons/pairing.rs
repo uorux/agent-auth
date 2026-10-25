@@ -172,19 +172,52 @@ impl DaemonHub {
 
     /// Delete a daemon, burn its unused codes, close its connection.
     pub async fn unpair(&self, id: DaemonId) -> Result<bool, PairingError> {
+        Ok(self.unpair_disabling(id).await?.is_some())
+    }
+
+    /// [`DaemonHub::unpair`], also disabling (in the same transaction) every
+    /// agent of an agent VM, with what they minted (sandboxd B-10: their
+    /// keys must not outlive the VM's pairing). `None`: no such daemon;
+    /// else the names disabled (for `scheduler::after_disable`).
+    pub async fn unpair_disabling(
+        &self,
+        id: DaemonId,
+    ) -> Result<Option<Vec<String>>, PairingError> {
+        let now = OffsetDateTime::now_utc();
         let tx = self.store.begin().await?;
-        let row = daemons::unpair(&tx, id, OffsetDateTime::now_utc()).await?;
+        let mut disabled = Vec::new();
+        for agent in agent_auth_store::sandboxes::enabled_in(&tx, id).await? {
+            disabled.extend(
+                agent_auth_store::sandboxes::disable_tree(
+                    &tx,
+                    agent,
+                    now,
+                    agent_auth_store::agents::DisableReason::Unpaired,
+                )
+                .await?,
+            );
+        }
+        let row = daemons::unpair(&tx, id, now).await?;
         tx.commit().await?;
         let Some(row) = row else {
-            return Ok(false);
+            return Ok(None);
         };
+        disabled.sort();
+        disabled.dedup();
         let role = match row.role {
             DaemonRole::Host => Role::Host,
             DaemonRole::Sandbox => Role::Sandbox,
         };
         self.kick(role, &row.name, "unpaired");
         tracing::info!(daemon = %format!("{role}:{}", row.name), "unpaired");
-        Ok(true)
+        if !disabled.is_empty() {
+            tracing::warn!(
+                "unpaired {role}:{}: disabled {}",
+                row.name,
+                disabled.join(", ")
+            );
+        }
+        Ok(Some(disabled))
     }
 
     /// Every paired daemon, by role and name.

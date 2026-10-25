@@ -363,7 +363,13 @@ async fn disabling_a_delegator_waits_for_a_provisioning_instead_of_deadlocking(p
     let delegator = initiator.id;
     let disabler = tokio::spawn(async move {
         let tx2 = s2.begin().await.unwrap();
-        let names = sandboxes::disable_tree(&tx2, delegator, now()).await?;
+        let names = sandboxes::disable_tree(
+            &tx2,
+            delegator,
+            now(),
+            agent_auth_store::agents::DisableReason::Operator,
+        )
+        .await?;
         tx2.commit().await?;
         Ok::<_, StoreError>(names)
     });

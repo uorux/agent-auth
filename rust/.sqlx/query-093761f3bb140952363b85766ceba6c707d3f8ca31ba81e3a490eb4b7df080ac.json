@@ -233,6 +233,17 @@
             "name": "created_at"
           }
         }
+      },
+      {
+        "ordinal": 21,
+        "name": "disabled_reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "disabled_reason"
+          }
+        }
       }
     ],
     "parameters": {
@@ -261,7 +272,8 @@
       true,
       false,
       true,
-      false
+      false,
+      true
     ]
   },
   "hash": "093761f3bb140952363b85766ceba6c707d3f8ca31ba81e3a490eb4b7df080ac"

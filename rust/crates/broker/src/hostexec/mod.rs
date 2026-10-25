@@ -662,43 +662,38 @@ impl HostExec {
 
     // ------------------------------------------------------- connecting
 
-    /// A daemon that was offline when it mattered is told now: the broker's
-    /// lockdown, shells that ended while it was away, held agents.
+    /// A host that was offline when it mattered is told now: the broker's
+    /// lockdown, shells that ended while it was away. (An agent VM is told
+    /// its lock state and held agents by `crate::sandboxes`, in one hook.)
     async fn on_connect(&self, peer: &crate::daemons::DaemonPeer) {
+        if peer.role() != Role::Host {
+            return;
+        }
         let result = async {
             let tx = self.store.begin().await?;
             let locked = flags::locked(&tx, peer.name()).await?;
             let mut stale = Vec::new();
-            let mut held = None;
-            match peer.role() {
-                Role::Host => {
-                    let since =
-                        time::OffsetDateTime::now_utc().saturating_sub(time::Duration::days(1));
-                    for g in agent_auth_store::grants::ended_on(
-                        &tx,
-                        agent_auth_core::Platform::Hostexec,
-                        peer.name(),
-                        since,
-                    )
-                    .await?
-                    {
-                        if matches!(
-                            g.authority,
-                            Authority::Hostexec(HostexecAuthority::Shell { .. })
-                        ) {
-                            stale.push(g.request_id);
-                        }
-                    }
-                }
-                Role::Sandbox => {
-                    held = Some(agent_auth_store::lockdown::held_in(&tx, peer.row_id()).await?);
+            let since = time::OffsetDateTime::now_utc().saturating_sub(time::Duration::days(1));
+            for g in agent_auth_store::grants::ended_on(
+                &tx,
+                agent_auth_core::Platform::Hostexec,
+                peer.name(),
+                since,
+            )
+            .await?
+            {
+                if matches!(
+                    g.authority,
+                    Authority::Hostexec(HostexecAuthority::Shell { .. })
+                ) {
+                    stale.push(g.request_id);
                 }
             }
             tx.commit().await?;
-            Ok::<_, StoreError>((locked, stale, held))
+            Ok::<_, StoreError>((locked, stale))
         }
         .await;
-        let (locked, stale, held) = match result {
+        let (locked, stale) = match result {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!(daemon = %peer.principal(), error = %e, "on_connect failed");
@@ -712,9 +707,6 @@ impl HostExec {
         };
         if locked {
             send(json!({"type": "lockdown", "kill_vm": false})).await;
-        }
-        if let Some(held) = held {
-            send(json!({"type": "agents.contained", "agents": held})).await;
         }
         for shell in stale {
             send(json!({"type": "shell.close", "shell_id": shell.to_string()})).await;

@@ -9,6 +9,7 @@ use agent_auth_core::{AgentId, DaemonId};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::agents::DisableReason;
 use crate::{StoreError, Tx};
 
 /// A key waiting for its sandbox daemon, with the agent it is for.
@@ -126,11 +127,15 @@ pub async fn ack(
 /// Disable an agent and everything minted under it (transitively): each
 /// is disabled, its active grants expire now (the next expiry pass revokes
 /// them through their provisioners), and its pending key is dropped.
+/// `reason` is recorded on every agent of the tree; an agent already
+/// disabled keeps its reason unless the operator disables it now (a lease
+/// running out never turns an operator's disable into a renewable one).
 /// Returns the names, sorted.
 pub async fn disable_tree(
     tx: &Tx<'_>,
     root: AgentId,
     now: OffsetDateTime,
+    reason: DisableReason,
 ) -> Result<Vec<String>, StoreError> {
     // Lock order: the containment lock (exclusive: waits for in-flight
     // checks), then agents in id order, then their grants in id order.
@@ -149,8 +154,13 @@ pub async fn disable_tree(
     .fetch_all(&mut **c)
     .await?;
     let disabled = sqlx::query!(
-        "UPDATE agents SET disabled = true WHERE id = ANY($1) RETURNING name",
-        &tree
+        "UPDATE agents SET disabled = true,
+             disabled_reason = CASE WHEN $2 = 'operator' THEN 'operator'
+                                    WHEN disabled THEN COALESCE(disabled_reason, 'operator')
+                                    ELSE $2 END
+         WHERE id = ANY($1) RETURNING name",
+        &tree,
+        reason.as_str()
     )
     .fetch_all(&mut **c)
     .await?;
@@ -172,4 +182,17 @@ pub async fn disable_tree(
     let mut names: Vec<String> = disabled.into_iter().map(|r| r.name).collect();
     names.sort();
     Ok(names)
+}
+
+/// An agent VM's agents that are not disabled yet (to disable them, with
+/// what they minted, when the VM is unpaired: sandboxd B-10).
+pub async fn enabled_in(tx: &Tx<'_>, sandbox: DaemonId) -> Result<Vec<AgentId>, StoreError> {
+    let mut c = tx.conn().await;
+    let out = sqlx::query_scalar!(
+        "SELECT id FROM agents WHERE sandbox_id = $1 AND NOT disabled ORDER BY id",
+        Uuid::from(sandbox)
+    )
+    .fetch_all(&mut **c)
+    .await?;
+    Ok(out.into_iter().map(AgentId::from_uuid).collect())
 }

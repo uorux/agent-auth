@@ -122,6 +122,8 @@ pub async fn lockdown(
     if let Err(e) = &entry {
         tracing::error!(error = %e, "lockdown: containment entry not recorded");
     }
+    // Agent VMs hold the agents the entry holds (as a containment does).
+    tell_sandboxes(st).await;
 
     // Stop what runs before tidying the records. Sandboxes first, briefly:
     // once its host froze the VM a sandbox can't answer any more.
@@ -261,6 +263,15 @@ pub async fn lockdown(
     Ok(out)
 }
 
+/// Tell every agent VM its held agents (the spine's `tell_sandboxes`
+/// hook; nothing when agent VMs are not served).
+async fn tell_sandboxes(st: &AppState) {
+    if let Some(hook) = &st.spine.hooks.tell_sandboxes {
+        let reports = hook(st.clone(), Vec::new()).await;
+        tracing::info!(?reports, "agent VMs told their held agents");
+    }
+}
+
 async fn record_entry(
     st: &AppState,
     r#match: &Value,
@@ -339,8 +350,12 @@ pub async fn unlock(
     }
     .await
     .map_err(internal)?;
+    // The entries just lifted: the VMs' held lists change too.
+    tell_sandboxes(st).await;
     for d in sandboxes {
-        if host.is_none_or(|h| h == d.name) {
+        // Only a VM the remaining flag no longer locks (`*` or its own name).
+        let still_locked = still.iter().any(|h| h == "*" || *h == d.name);
+        if host.is_none_or(|h| h == d.name) && !still_locked {
             let mut msg = Map::new();
             msg.insert("type".into(), json!("unlock"));
             if hostexec

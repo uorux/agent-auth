@@ -494,7 +494,14 @@ async fn unpairing_cascades_and_disabling_walks_the_tree(pool: PgPool) {
             .unwrap()
     );
     // Disabling the middle agent takes its child with it, not its parent.
-    let names = sandboxes::disable_tree(&tx, ids[1], now()).await.unwrap();
+    let names = sandboxes::disable_tree(
+        &tx,
+        ids[1],
+        now(),
+        agent_auth_store::agents::DisableReason::Operator,
+    )
+    .await
+    .unwrap();
     assert_eq!(names, vec!["claude-p-vm1-sandbox", "codex-q-vm1-sandbox"]);
     assert!(!agents::get(&tx, ids[0]).await.unwrap().unwrap().disabled);
     assert!(sandboxes::pending_for(&tx, vm.id).await.unwrap().is_empty());
