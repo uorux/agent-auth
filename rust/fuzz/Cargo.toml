@@ -1,0 +1,54 @@
+# cargo-fuzz targets: every parser of untrusted input (ARCHITECTURE.md).
+# Run with the nightly shell: `nix develop ..#nightly -c cargo fuzz run <target>`.
+# A workspace of its own, so the main build never links libFuzzer.
+[package]
+name = "agent-auth-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+agent-auth-wire = { path = "../crates/wire" }
+# float_roundtrip: so a re-parsed f64 (`wait`) compares equal in the round trips.
+serde_json = { version = "1.0.152", default-features = false, features = ["std", "float_roundtrip"] }
+
+[profile.release]
+debug = 1
+overflow-checks = true
+
+# --- wire (crates/wire): every request body, every channel message --------
+
+[[bin]]
+name = "wire_request_bodies"
+path = "fuzz_targets/wire_request_bodies.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_channel"
+path = "fuzz_targets/wire_channel.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_oauth_register"
+path = "fuzz_targets/wire_oauth_register.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_scalars"
+path = "fuzz_targets/wire_scalars.rs"
+test = false
+doc = false
+bench = false
