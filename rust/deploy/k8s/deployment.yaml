@@ -70,11 +70,11 @@ spec:
             - name: KUBERNETES_API_URL
               value: in-cluster
             # The API server as agents reach it (credentials name it, with
-            # the cluster CA): not the in-cluster name. A node's tailnet
-            # address (the API certificate has them as SANs); more,
-            # comma-separated, for failover.
+            # the cluster CA): not the in-cluster name. The highly available
+            # Tailscale service in front of the API servers; the API
+            # certificate must have it as a SAN.
             - name: KUBERNETES_AGENT_API_URL
-              value: "https://100.126.30.73:6443"
+              value: "https://100.67.22.237:6443"
             - name: GITHUB_APP_PRIVATE_KEY_FILE
               value: /etc/agent-auth/github/app.pem
             # Traefik sets X-Real-IP: the security log and the per-address
