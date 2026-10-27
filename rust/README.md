@@ -466,6 +466,31 @@ filesystem (mount an emptyDir at `/tmp`), listens on 8400, and reads
 `HEALTHCHECK` (nothing in the image could run one); probe `GET /healthz`
 over HTTP.
 
+### Releasing an image
+
+Built by GitHub Actions from a signed version tag, and pinned only after a
+second, local build agrees (`.github/workflows/image.yml`):
+
+1. Set `workspace.package.version` in `rust/Cargo.toml` (the image's own
+   `agent-auth:<version>`), commit, and tag that commit with a **signed**
+   annotated tag: `git tag -s v<version> -m v<version>`, then
+   `git push origin v<version>`. Anyone who can push could push a tag; only
+   a signature by an operator key gets an image pinned.
+2. The workflow builds `./rust#image` on a GitHub-hosted runner,
+   substituting from cache.nixos.org only, pushes
+   `ghcr.io/uorux/agent-auth:v<version>`, attests its build provenance,
+   and lists the manifest and config digests in the run's summary.
+3. In the deploying repository, `scripts/verify-image.sh` checks the tag's
+   signature against its allowed signers, rebuilds the tagged commit
+   locally (cache.nixos.org only), compares the config digest with the
+   registry's, and prints `ghcr.io/uorux/agent-auth:v<version>@sha256:…`
+   to pin. The image is reproducible: two builds of a commit have the same
+   config digest (the manifest digest can differ by layer compression, so
+   the config is what's compared).
+4. Pin that digest in a signed commit there. The first push leaves the
+   package private on ghcr.io: make it public once (package settings) so
+   nodes pull it without a token.
+
 ### Kubernetes
 
 `rust/deploy/k8s/` is a kustomization laid out like the homelab repo's apps
@@ -492,8 +517,8 @@ first sync:
    `platforms.kubernetes.grant_namespace: agent-auth-grants`, and the
    role lists in step with `rbac.yaml`, `components/cluster-grants` and the
    `clusterRoles` of `admission-policy.yaml`.
-5. **Image**: `nix build ./rust#image`, push it, and set `images:` in
-   `kustomization.yaml` (pin a digest).
+5. **Image**: a released, verified image ("Releasing an image"), its
+   digest pinned in `images:` in `kustomization.yaml`.
 6. Kubernetes 1.30 or later (ValidatingAdmissionPolicy), and Cilium for
    `networkpolicy-cilium.yaml` (the API server's entity; without Cilium
    replace it with an ipBlock rule).
