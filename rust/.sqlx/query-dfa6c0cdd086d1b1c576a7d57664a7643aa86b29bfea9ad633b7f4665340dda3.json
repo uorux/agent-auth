@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE shell_scopes SET closed_at = greatest($3, opened_at)\n         WHERE id = $1 AND grant_id = $2 AND closed_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "dfa6c0cdd086d1b1c576a7d57664a7643aa86b29bfea9ad633b7f4665340dda3"
+}

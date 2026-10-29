@@ -5,7 +5,8 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, Protocol
+from fnmatch import fnmatch
+from typing import Any, Awaitable, Callable, Protocol
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,7 +32,10 @@ from ..provisioners.base import (
     SpecValidationError,
 )
 from ..schemas import RequestCreate
+from . import lockdown as lockdown_mod
 from .events import KeyedEvents
+from .zones import Zones
+from .oauth import WEB_RUNTIME
 from .states import (
     THREAD_CLOSED,
     THREAD_OPEN,
@@ -60,6 +64,26 @@ class Notifier(Protocol):
         self, request: AccessRequest, agent: Agent, rule: Rule | None, grant: Grant | None
     ) -> None: ...
 
+    # hostexec (core/hostexec.py). job_finished: a command's result is in.
+    # shell_command: a shell command is about to be sent to its host — False
+    # means it could not be shown to a human, and it then does not run.
+    async def job_finished(self, request: AccessRequest, job) -> None: ...
+    async def shell_command(self, request: AccessRequest, job) -> bool: ...
+    # The watcher found a running command alarming (advisory; nothing stops).
+    async def watch_alert(self, request: AccessRequest, job, text: str) -> None: ...
+    # An agent wants the operator's attention (core/attention.py); `desks`
+    # are the hosts whose desktops already showed it.
+    async def attention(self, agent: Agent, text: str, urgency: str, desks: list[str]) -> None: ...
+    # Agents were contained or locked down (core/lockdown.py): always a ping.
+    async def contained(self, event: dict) -> None: ...
+
+
+# Runs before a human approval takes effect, outside any transaction, and
+# raises TransitionError to stop it (the request stays pending). hostexec uses
+# it to ask the host whether it would accept the approval, and to hand it a
+# TOTP code, before the request is marked approved.
+ApprovalGate = Callable[["AccessRequest", "Agent", "HumanDecision"], Awaitable[None]]
+
 
 class NullNotifier:
     async def surface(self, request: AccessRequest, agent: Agent) -> None:
@@ -76,9 +100,28 @@ class NullNotifier:
     ) -> None:
         pass
 
+    async def job_finished(self, request: AccessRequest, job) -> None:
+        pass
+
+    async def shell_command(self, request: AccessRequest, job) -> bool:
+        return True  # headless broker: the journal on the host is the record
+
+    async def watch_alert(self, request: AccessRequest, job, text: str) -> None:
+        log.warning("%s: job %s on %s", text, job.id, job.host)
+
+    async def attention(self, agent: Agent, text: str, urgency: str, desks: list[str]) -> None:
+        log.info("attention (%s) from %s: %s", urgency, agent.name, text)
+
+    async def contained(self, event: dict) -> None:
+        log.warning("contained (no notifier): %s", event.get("reason"))
+
 
 class TransitionError(Exception):
     """Illegal or lost-race state transition."""
+
+
+def _held_text(entry: dict[str, Any]) -> str:
+    return f"contained ({entry['id']}): {entry.get('reason') or 'by the operator'}"
 
 
 @dataclass
@@ -96,6 +139,9 @@ class HumanDecision:
     rule_action: RuleAction | None = None
     rule_resource_pattern: str | None = None
     rule_any_authority: bool = False
+    # hostexec: a TOTP code for the host's direct secret, typed by the human.
+    # Passed to the host by the platform's approval gate; never stored.
+    totp: str | None = None
 
 
 class RequestService:
@@ -115,6 +161,10 @@ class RequestService:
         self.llm = llm
         self.notifier: Notifier = notifier or NullNotifier()
         self._llm_tasks: set[asyncio.Task] = set()
+        self.gates: dict[Platform, ApprovalGate] = {}
+        # policy/risk.RiskSummarizer: an advisory line on requests shown to a
+        # human (hostexec). None = no summaries.
+        self.risk = None
 
     def set_notifier(self, notifier: Notifier) -> None:
         self.notifier = notifier
@@ -138,6 +188,17 @@ class RequestService:
                 justification=body.justification,
                 requested_duration_secs=body.duration_secs,
             )
+
+            # Containment (core/lockdown.py): nothing new for a held agent.
+            held = await lockdown_mod.holding(session, agent)
+            if held is not None:
+                request.status = RequestStatus.DENIED
+                request.decision_source = DecisionSource.POLICY
+                request.decision_reason = _held_text(held)
+                request.decided_at = utcnow()
+                session.add(request)
+                await session.flush()
+                return request
 
             if body.on_behalf_of_thread:
                 problem = await self._resolve_delegation(
@@ -172,6 +233,20 @@ class RequestService:
                 await session.flush()
                 return request
 
+            # Restricted zones (core/zones.py), before any rule: to an agent
+            # outside one, its resources are not brokered at all.
+            zoned = await Zones(self.engine.policy).check(
+                session, agent, request.platform, spec.resource, spec.scope
+            )
+            if zoned is not None and zoned[0] == "deny":
+                request.status = RequestStatus.DENIED
+                request.decision_source = DecisionSource.POLICY
+                request.decision_reason = f"validator: {zoned[1]}"
+                request.decided_at = utcnow()
+                session.add(request)
+                await session.flush()
+                return request
+
             request.resource = spec.resource
             request.authority = authority_mod.fold(
                 request.platform, spec.capability, spec.scope
@@ -182,10 +257,36 @@ class RequestService:
             await session.flush()
 
             decision = await self.engine.evaluate(session, agent, request)
+            if zoned is not None and decision.action in (PolicyAction.APPROVE, PolicyAction.LLM):
+                # ("human", note): never without a person.
+                decision.action = PolicyAction.SURFACE
+                decision.pinned_authority = decision.explicit = False
+                request.risk_notes = [*request.risk_notes, zoned[1]]
             source = (
                 DecisionSource.RULE if decision.source == "rule" else DecisionSource.POLICY
             )
             pending_grant_id: str | None = None
+
+            # Some things no rule and no LLM ever decides (a shell on a host).
+            if decision.action in (PolicyAction.APPROVE, PolicyAction.LLM) and authority_mod.human_only(
+                request.platform, request.authority
+            ):
+                decision.action = PolicyAction.SURFACE
+                decision.pinned_authority = decision.explicit = False
+                request.risk_notes = [*request.risk_notes, "always decided by a human"]
+
+            # A web UI's connector (core/oauth.py), or a request made on one's
+            # behalf: always a person, whatever a policy rule, a saved rule or
+            # the LLM reviewer would say. What drives it is a chat on someone
+            # else's service.
+            if decision.action in (PolicyAction.APPROVE, PolicyAction.LLM):
+                delegator = (
+                    await session.get(Agent, request.delegator_agent_id) if request.delegator_agent_id else None
+                )
+                if agent.runtime == WEB_RUNTIME or (delegator is not None and delegator.runtime == WEB_RUNTIME):
+                    decision.action = PolicyAction.SURFACE
+                    decision.pinned_authority = decision.explicit = False
+                    request.risk_notes = [*request.risk_notes, "for a web UI connector: always decided by a human"]
 
             # Sensitive capabilities always reach a human, even if a YAML rule or
             # the LLM path would clear them — unless a human's own rule pinned to
@@ -200,6 +301,21 @@ class RequestService:
                 request.risk_notes = [
                     *request.risk_notes,
                     "sensitive capability — routed to human review",
+                ]
+            # Some privileges (github "create") are a different kind of act from
+            # what catch-all rules were written for, so only a rule that names
+            # them may clear them: a YAML rule with that exact capability, or a
+            # saved rule pinned to the exact authority. An "approve github
+            # org/*" or null-authority rule, or an llm catch-all, surfaces.
+            if (
+                decision.action in (PolicyAction.APPROVE, PolicyAction.LLM)
+                and not decision.explicit
+                and self.engine.needs_explicit_rule(request)
+            ):
+                decision.action = PolicyAction.SURFACE
+                request.risk_notes = [
+                    *request.risk_notes,
+                    f"no rule names {request.capability!r} — routed to human review",
                 ]
 
             # Set after the sensitive gate: a matched rule that got surfaced
@@ -221,7 +337,8 @@ class RequestService:
                 duration = self.engine.cap_duration(
                     request.requested_duration_secs, decision.max_duration_secs
                 )
-                await self._approve(session, request, source, "policy", decision.reason, duration)
+                decided_by = f"window:{decision.rule_id}" if decision.window else "policy"
+                await self._approve(session, request, source, decided_by, decision.reason, duration)
                 pending_grant_id = await self._begin_provision(session, request)
 
             if decision.action == PolicyAction.LLM:
@@ -250,6 +367,8 @@ class RequestService:
             await self._surface(request_id)
         elif applied_rule_id is not None:
             await self._notify_rule_applied(request_id, applied_rule_id)
+        elif source == DecisionSource.POLICY and decision.action == PolicyAction.APPROVE:
+            await self._announce_auto_approval(request)
         return request
 
     async def _resolve_delegation(
@@ -417,6 +536,7 @@ class RequestService:
 
         if pending_grant_id is not None:
             await self._finish_provision(pending_grant_id)
+            await self._announce_auto_approval(await self._reload_request(request_id))
         self.events.notify(request_id)
         if status == RequestStatus.AWAITING_HUMAN:
             await self._surface(request_id)
@@ -427,6 +547,7 @@ class RequestService:
             if request.status != RequestStatus.LLM_DENIED:
                 raise TransitionError(f"cannot retry from status {request.status.value}")
             agent = await session.get(Agent, request.agent_id)
+            await self._refuse_if_held(session, agent)
             decision = await self.engine.evaluate(session, agent, request)
             retry_budget = (
                 decision.retry_budget
@@ -448,6 +569,7 @@ class RequestService:
             request = await self._own_request(session, request_id, agent_id)
             if request.status != RequestStatus.LLM_DENIED:
                 raise TransitionError(f"cannot escalate from status {request.status.value}")
+            await self._refuse_if_held(session, await session.get(Agent, request.agent_id))
             if not await self._guarded_transition(session, request, RequestStatus.AWAITING_HUMAN):
                 raise TransitionError("request was decided concurrently")
             request.risk_notes = [
@@ -471,7 +593,26 @@ class RequestService:
 
     # ----------------------------------------------------------- human path
 
+    async def _run_gate(self, request_id: str, decision: HumanDecision) -> None:
+        async with self.db.session() as session:
+            request = await session.get(AccessRequest, request_id)
+            if request is None:
+                raise TransitionError("unknown request")
+            if request.status not in (
+                RequestStatus.AWAITING_HUMAN,
+                RequestStatus.LLM_DENIED,
+                RequestStatus.LLM_EVALUATING,
+            ):
+                # Before the gate spends anything (a TOTP code) on it.
+                raise TransitionError(f"request already resolved (status {request.status.value})")
+            gate = self.gates.get(request.platform)
+            agent = await session.get(Agent, request.agent_id)
+        if gate is not None:
+            await gate(request, agent, decision)
+
     async def decide(self, request_id: str, decision: HumanDecision) -> AccessRequest:
+        if decision.approve:
+            await self._run_gate(request_id, decision)
         async with self.db.session() as session:
             request = await session.get(AccessRequest, request_id)
             if request is None:
@@ -586,6 +727,82 @@ class RequestService:
         await self.notifier.update_outcome(request, grant)
         return request
 
+    async def apply_rule_to_pending(self, rule_id: str) -> list[str]:
+        """A rule was just saved (an "approve all" window): approve the
+        requests it covers that are already waiting for a human. Returns
+        their ids."""
+        async with self.db.session() as session:
+            rule = await session.get(Rule, rule_id)
+            if rule is None or rule.action != RuleAction.AUTO_APPROVE or not rule.enabled:
+                return []
+            waiting = list(
+                (
+                    await session.execute(
+                        select(AccessRequest).where(
+                            AccessRequest.status == RequestStatus.AWAITING_HUMAN,
+                            AccessRequest.platform == rule.platform,
+                        )
+                    )
+                ).scalars()
+            )
+            matching = []
+            for request in waiting:
+                agent = await session.get(Agent, request.agent_id)
+                delegator = (
+                    await session.get(Agent, request.delegator_agent_id)
+                    if request.delegator_agent_id
+                    else None
+                )
+                if (
+                    agent is not None
+                    and fnmatch(agent.name, rule.agent_pattern)
+                    and fnmatch(request.resource, rule.resource_pattern)
+                    and authority_mod.rule_covers(request.platform, rule.authority, request.authority)
+                    # Same as the engine: a rule that names no delegator never
+                    # approves a delegated request.
+                    and (
+                        (delegator is None and rule.delegator_pattern is None)
+                        or (
+                            delegator is not None
+                            and rule.delegator_pattern is not None
+                            and fnmatch(delegator.name, rule.delegator_pattern)
+                        )
+                    )
+                    and not authority_mod.human_only(request.platform, request.authority)
+                ):
+                    matching.append(request.id)
+            window = (rule.authority or {}).get("action") == "window"
+            max_duration = rule.max_duration_secs
+        approved: list[str] = []
+        for request_id in matching:
+            pending_grant_id = None
+            async with self.db.session() as session:
+                request = await session.get(AccessRequest, request_id)
+                if request is None or request.status != RequestStatus.AWAITING_HUMAN:
+                    continue
+                duration = self.engine.cap_duration(request.requested_duration_secs, max_duration)
+                try:
+                    await self._approve(
+                        session,
+                        request,
+                        DecisionSource.RULE,
+                        f"window:{rule_id}" if window else "rule",
+                        "approve-all window" if window else "matched saved rule",
+                        duration,
+                    )
+                    pending_grant_id = await self._begin_provision(session, request)
+                except TransitionError:
+                    continue
+            if pending_grant_id is not None:
+                await self._finish_provision(pending_grant_id)
+            async with self.db.session() as session:
+                request = await session.get(AccessRequest, request_id)
+                grant = await self._grant_for(session, request_id)
+            self.events.notify(request_id)
+            await self.notifier.update_outcome(request, grant)
+            approved.append(request_id)
+        return approved
+
     # -------------------------------------------------------- provision/revoke
 
     async def _approve(
@@ -620,6 +837,14 @@ class RequestService:
         """
         if not await self._guarded_transition(session, request, RequestStatus.PROVISIONING):
             raise TransitionError("request changed state concurrently")
+
+        # Containment: whatever cleared it (a rule, the LLM, a window, a
+        # human who wasn't told), nothing is provisioned for a held agent.
+        held = await lockdown_mod.holding(session, await session.get(Agent, request.agent_id))
+        if held is not None:
+            await self._guarded_transition(session, request, RequestStatus.PROVISION_FAILED)
+            request.decision_reason = (request.decision_reason or "") + f" | provisioning failed: {_held_text(held)}"
+            return None
 
         expires_at = utcnow() + timedelta(seconds=request.approved_duration_secs)
         if request.delegation_thread_id is not None:
@@ -672,6 +897,13 @@ class RequestService:
                 return
             request = await session.get(AccessRequest, grant.request_id)
             assert request is not None
+            held = await lockdown_mod.holding(session, await session.get(Agent, grant.agent_id))
+            if held is not None:
+                grant.status = GrantStatus.PROVISION_FAILED
+                grant.revoke_reason = _held_text(held)
+                await self._guarded_transition(session, request, RequestStatus.PROVISION_FAILED)
+                request.decision_reason = (request.decision_reason or "") + f" | provisioning failed: {_held_text(held)}"
+                return
             provisioner = self.registry.get(grant.platform)
             try:
                 grant.provisioner_state = await provisioner.provision(session, grant)
@@ -688,6 +920,16 @@ class RequestService:
                 return
             grant.status = GrantStatus.ACTIVE
             await self._guarded_transition(session, request, RequestStatus.GRANTED)
+        # A containment recorded while the provisioner ran found no ACTIVE
+        # grant to revoke: this one is revoked here instead.
+        async with self.db.session() as session:
+            grant = await session.get(Grant, grant_id)
+            held = await lockdown_mod.holding(session, await session.get(Agent, grant.agent_id))
+        if held is not None:
+            try:
+                await self.revoke_grant(grant_id, _held_text(held), "containment")
+            except TransitionError:
+                pass  # revoked meanwhile (by contain() itself)
 
     async def reap_stale_provisioning(self, max_age_secs: float) -> int:
         """Scheduler pass: grants left in PROVISIONING had their provisioner
@@ -734,6 +976,42 @@ class RequestService:
                 # Stays PROVISIONING (never issuable); retried next tick.
                 log.exception("failed to reap stale provisioning grant %s; will retry", grant_id)
         return reaped
+
+    async def _refuse_if_held(self, session: AsyncSession, agent: Agent | None) -> None:
+        held = await lockdown_mod.holding(session, agent) if agent is not None else None
+        if held is not None:
+            raise TransitionError(_held_text(held))
+
+    async def deny_pending(self, agent_ids: list[str], reason: str, by: str) -> int:
+        """Containment: deny every request of these agents still waiting on
+        a rule, the LLM or a human. Returns how many."""
+        if not agent_ids:
+            return 0
+        async with self.db.session() as session:
+            ids = (
+                (
+                    await session.execute(
+                        select(AccessRequest.id).where(
+                            AccessRequest.agent_id.in_(agent_ids),
+                            AccessRequest.status.in_(
+                                [
+                                    RequestStatus.AWAITING_HUMAN,
+                                    RequestStatus.LLM_EVALUATING,
+                                    RequestStatus.LLM_DENIED,
+                                ]
+                            ),
+                        )
+                    )
+                ).scalars().all()
+            )
+        denied = 0
+        for request_id in ids:
+            try:
+                await self.decide(request_id, HumanDecision(approve=False, decided_by=by, reason=reason))
+                denied += 1
+            except TransitionError:
+                pass  # decided meanwhile; _begin_provision refuses it anyway
+        return denied
 
     async def _reload_request(self, request_id: str) -> AccessRequest:
         async with self.db.session() as session:
@@ -825,17 +1103,33 @@ class RequestService:
         async with self.db.session() as session:
             request = await session.get(AccessRequest, request_id)
             agent = await session.get(Agent, request.agent_id)
+        if self.risk is not None and self.risk.wants(request):
+            # Advisory context for the human; it decides nothing, and its
+            # failure only costs the line.
+            line = await self.risk.summarize(request, agent)
+            if line:
+                async with self.db.session() as session:
+                    request = await session.get(AccessRequest, request_id)
+                    request.risk_notes = [*request.risk_notes, line]
         try:
             await self.notifier.surface(request, agent)
         except Exception:
             log.exception("notifier.surface failed for %s", request_id)
 
-    async def _notify_rule_applied(self, request_id: str, rule_id: str) -> None:
+    async def _announce_auto_approval(self, request: AccessRequest) -> None:
+        """notify.auto_approvals: the policy file's and the LLM reviewer's
+        approvals get the same audit line a saved rule's do."""
+        notify = self.engine.policy.notify
+        if notify.auto_approvals and request.platform not in notify.skip_platforms:
+            await self._notify_rule_applied(request.id, None)
+
+    async def _notify_rule_applied(self, request_id: str, rule_id: str | None) -> None:
         async with self.db.session() as session:
             request = await session.get(AccessRequest, request_id)
             agent = await session.get(Agent, request.agent_id)
-            # None if the rule was deleted since matching; notifier copes.
-            rule = await session.get(Rule, rule_id)
+            # None if the rule was deleted since matching (or there is none:
+            # the policy file or the LLM decided); the notifier copes.
+            rule = await session.get(Rule, rule_id) if rule_id else None
             grant = await self._grant_for(session, request_id)
         try:
             await self.notifier.rule_applied(request, agent, rule, grant)

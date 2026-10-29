@@ -5,10 +5,12 @@ import logging
 import secrets
 from datetime import datetime, timezone
 
+from fastapi.responses import JSONResponse
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import select
 
 from ..core.a2a import A2AError, reachability, unreachable_detail
+from ..core.zones import Zones
 from ..models import Agent, AgentSession, utcnow
 from ..provisioners import a2a as a2a_mod
 from ..schemas import (
@@ -175,6 +177,14 @@ async def send_message(
         _raise(exc)
 
 
+def _payloads(result: dict) -> JSONResponse:
+    """Agents' payloads verbatim. FastAPI's default encoder drops any dict
+    key starting with "_sa" (it takes them for SQLAlchemy instance state), so
+    a payload like {"_sandbox": …} or {"_sample": …} would silently lose
+    them; everything in here is already JSON-ready."""
+    return JSONResponse(result)
+
+
 @router.get("/a2a/threads/{thread_id}/messages")
 async def read_messages(
     thread_id: str,
@@ -195,11 +205,11 @@ async def read_messages(
         _raise(exc)
     start_state = first["thread"]["state"]
     if first["messages"] or wait <= 0 or start_state == "closed":
-        return first
+        return _payloads(first)
     while True:
         remaining = deadline - asyncio.get_event_loop().time()
         if remaining <= 0:
-            return first
+            return _payloads(first)
         await state.a2a_events.wait(wake_key, timeout=min(remaining, 2.0))
         await _touch_caller(state, caller)
         await mark_listening(state, caller)
@@ -210,7 +220,7 @@ async def read_messages(
         except A2AError as exc:
             _raise(exc)
         if result["messages"] or result["thread"]["state"] != start_state:
-            return result
+            return _payloads(result)
         first = result
 
 
@@ -269,7 +279,8 @@ async def a2a_check(
         peer_agent = (
             await db.execute(select(Agent).where(Agent.name == peer))
         ).scalar_one_or_none()
-        if peer_agent is None:
+        if peer_agent is None or Zones(request.app.state.service.engine.policy).apart(caller.agent, peer_agent):
+            # A restricted zone's member, to anyone outside it, is no one.
             return A2ACheckOut(allowed=False, reason=f"unknown agent {peer!r}")
         peer_out = PeerEntry(
             description=peer_agent.description or None,

@@ -1,0 +1,107 @@
+# The broker's image, from a version tag, on a GitHub-hosted runner, to
+# ghcr.io. One builder of two: Jacob rebuilds the same tag locally (the
+# deploying repository's scripts/verify-image.sh), checks its signature
+# and that both images agree, and only then pins the digest there in a
+# signed commit. So nothing here is trusted on its own: a tag anyone
+# pushed, or an image anyone overwrote, never matches a pin.
+#
+# - Tags v* only. The tag's signature is checked where it counts, by
+#   verify-image.sh against Jacob's keys, not here.
+# - A clean runner, substituting from cache.nixos.org alone: no
+#   self-hosted cache (agents can reach ours), no Actions cache (shared
+#   with every branch's workflows).
+# - Summary: the manifest digest (what a pin names) and the config digest
+#   (the image's identity: its config and uncompressed layers; the
+#   manifest digest of two pushes of the same image can differ by
+#   compression).
+# - Public repositories also get a build provenance attestation in the
+#   registry (artifact attestations need Enterprise for private ones).
+#
+# The same file works for another repository with a Nix image: change
+# FLAKE_ATTR and IMAGE.
+name: image
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  FLAKE_ATTR: ./rust#image
+  IMAGE: ghcr.io/uorux/agent-auth
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write # push the image (and its attestation)
+      id-token: write # attestation: the workflow's OIDC identity
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+        with:
+          enable_kvm: false
+          extra_nix_config: |
+            substituters = https://cache.nixos.org
+            trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+            accept-flake-config = false
+      - name: Build
+        run: nix build --print-build-logs --out-link image.tar.gz "$FLAKE_ATTR"
+      - name: Push
+        id: push
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # skopeo from the flake's own locked nixpkgs.
+          skopeo() { nix run --inputs-from "${FLAKE_ATTR%%#*}" nixpkgs#skopeo -- "$@"; }
+          export REGISTRY_AUTH_FILE="$RUNNER_TEMP/auth.json"
+          printf '%s' "$GITHUB_TOKEN" | skopeo login --username "$ACTOR" --password-stdin ghcr.io
+          # The source is this job's own build: no signatures to require.
+          echo '{"default":[{"type":"insecureAcceptAnything"}]}' > "$RUNNER_TEMP/policy.json"
+          skopeo copy --policy "$RUNNER_TEMP/policy.json" --digestfile "$RUNNER_TEMP/digest" \
+            docker-archive:image.tar.gz "docker://$IMAGE:$TAG"
+          digest=$(cat "$RUNNER_TEMP/digest")
+          config=$(skopeo inspect --raw "docker://$IMAGE@$digest" | jq -r .config.digest)
+          rm -f "$REGISTRY_AUTH_FILE"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          {
+            echo "### $IMAGE:$TAG"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| commit | \`$GITHUB_SHA\` |"
+            echo "| manifest digest | \`$digest\` |"
+            echo "| config digest | \`$config\` |"
+            echo
+            echo "Pin, once \`scripts/verify-image.sh\` agrees:"
+            echo
+            echo "    $IMAGE:$TAG@$digest"
+          } >> "$GITHUB_STEP_SUMMARY"
+      # The attestation's push reads its registry login from
+      # ~/.docker/config.json and nowhere else (not skopeo's file above, not
+      # $DOCKER_CONFIG), so it gets a login of its own there, removed after.
+      - name: Log in for the attestation
+        if: github.event.repository.visibility == 'public'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
+      - name: Attest
+        if: github.event.repository.visibility == 'public'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      - name: Log out
+        if: always() && github.event.repository.visibility == 'public'
+        run: docker logout ghcr.io

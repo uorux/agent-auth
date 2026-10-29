@@ -25,9 +25,12 @@ class ExpiryScheduler:
         service: RequestService,
         a2a: A2AThreadService | None = None,
         interval_secs: float = 30.0,
+        sandboxes=None,
     ):
         self.service = service
         self.a2a = a2a
+        # core/sandboxes.SandboxService: minted agents' leases.
+        self.sandboxes = sandboxes
         self.interval_secs = interval_secs
         self._stop = asyncio.Event()
 
@@ -66,6 +69,12 @@ class ExpiryScheduler:
                         log.info("revoked %d delegated grant(s) for closed threads", revoked)
                 except Exception:
                     log.exception("delegated-grant cascade failed")
+            if self.sandboxes is not None:
+                # Before the next tick's expiry pass, which ends their grants.
+                try:
+                    await self.sandboxes.sweep_leases()
+                except Exception:
+                    log.exception("lease sweep failed")
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.interval_secs)
             except TimeoutError:

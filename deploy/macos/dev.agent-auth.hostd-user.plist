@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  hostd-user, the desktop helper (approval prompts, presence), as a
+  LaunchAgent in the GUI session. Only needed with "desktop": {"enable": true}.
+  Install: /Library/LaunchAgents/dev.agent-auth.hostd-user.plist, root:wheel 0644.
+  It holds no secrets and decides nothing; hostd listens only to the
+  configured user.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.agent-auth.hostd-user</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/agent-auth/venv/bin/agent-auth-hostd</string>
+    <string>user</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AGENT_AUTH_HOSTD_CONFIG</key>
+    <string>/etc/agent-auth/hostd.json</string>
+  </dict>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+</dict>
+</plist>

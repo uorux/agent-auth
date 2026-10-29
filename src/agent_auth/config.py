@@ -12,6 +12,12 @@ class Settings(BaseSettings):
     # supported: postgresql+asyncpg://user:pw@host:5432/agent_auth
     database_url: str = "sqlite+aiosqlite:///agent-auth.db"
     policy_file: str = "policy.yaml"
+    # More policy merged over it, comma-separated paths (policy/schema.py
+    # load_policy): what must not sit beside the base file, from a secret.
+    policy_overlays: str = ""
+    # Where the remote MCP server's tools reach the broker's own API
+    # (api/remote_mcp.py); default http://127.0.0.1:<listen_port>.
+    remote_mcp_loopback_url: str = ""
     listen_host: str = "0.0.0.0"
     listen_port: int = 8400
 
@@ -22,9 +28,19 @@ class Settings(BaseSettings):
     discord_token: str = ""
     discord_channel_id: int = 0
     discord_owner_id: int = 0
+    # Where shell requests (hostexec "shell") are posted, if not the approvals
+    # channel: somewhere that notifies loudly. 0 = the approvals channel.
+    discord_loud_channel_id: int = 0
+    # Where what needs no one goes, if not the approvals channel: requests
+    # a rule or the LLM reviewer decided (notify.auto_approvals), and the
+    # results of commands nobody approved by hand. 0 = the approvals channel.
+    discord_activity_channel_id: int = 0
 
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    # The LiteLLM gateway's master key (platforms.models): the broker mints
+    # each agent's key with it.
+    litellm_master_key: str = ""
 
     github_app_id: str = ""
     github_installation_id: str = ""
@@ -64,6 +80,16 @@ class Settings(BaseSettings):
     # coarser than liveness: a dispatcher polling on a cycle (rather than
     # holding a long-poll open) is still reachable between polls.
     a2a_listen_threshold_secs: int = 300
+
+    # Paired daemons (hostd on hosts, sandboxd in agent VMs). The broker signs
+    # everything it sends them with this ed25519 seed (agent-auth admin
+    # gen-signing-key); daemons pin its public key from their own config.
+    # Empty = the daemon endpoints are disabled.
+    broker_signing_key: str = ""
+    daemon_heartbeat_secs: int = 30
+    daemon_pairing_code_ttl_secs: int = 600
+    # Wrong proofs a pairing code tolerates before it is burned.
+    daemon_pairing_max_attempts: int = 5
 
     log_level: str = "INFO"
 

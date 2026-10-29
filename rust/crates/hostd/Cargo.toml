@@ -1,0 +1,40 @@
+[package]
+name = "agent-auth-hostd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "agent-auth-hostd"
+path = "src/bin/agent-auth-hostd.rs"
+
+[[bin]]
+name = "agent-auth-hostctl"
+path = "src/bin/agent-auth-hostctl.rs"
+
+[dependencies]
+agent-auth-daemon.workspace = true
+agent-auth-crypto.workspace = true
+agent-auth-wire.workspace = true
+agent-auth-core.workspace = true
+agent-auth-tls.workspace = true
+tokio = { workspace = true, features = ["net", "time", "sync", "rt", "rt-multi-thread", "io-util", "macros", "fs", "process", "signal"] }
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+base64.workspace = true
+futures.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+proptest.workspace = true

@@ -105,6 +105,8 @@ class CredentialOut(BaseModel):
     value: str | None = None
     # Login name when the credential is an account (kind="lldap_account").
     username: str | None = None
+    # Where to use it, when that is part of the credential (a model gateway).
+    url: str | None = None
     expires_at: datetime | None = None
     note: str | None = None
 
@@ -204,14 +206,43 @@ def validate_webhook_url(v: str | None) -> str | None:
     return v
 
 
+ATTR_PATTERN = r"^[a-z0-9][a-z0-9._-]*$"
+ATTR_OR_EMPTY = r"^([a-z0-9][a-z0-9._-]*)?$"
+
+
 class AgentCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128, pattern=r"^[a-zA-Z0-9._-]+$")
     description: str = Field(default="", max_length=2000)
     kind: str = Field(default="service", pattern=r"^(service|ephemeral)$")
     webhook_url: str | None = Field(default=None, max_length=512)
     lldap_username: str | None = Field(default=None, max_length=128)
+    # What the agent is (agent_auth.policy.agents); policy matches on these.
+    runtime: str | None = Field(default=None, max_length=16, pattern=ATTR_PATTERN)
+    project: str | None = Field(default=None, max_length=64, pattern=ATTR_PATTERN)
+    host: str | None = Field(default=None, max_length=64, pattern=ATTR_PATTERN)
 
     _valid_webhook = field_validator("webhook_url")(validate_webhook_url)
+
+
+class AgentAttributesBody(BaseModel):
+    """The fields to change; one left out stays, an empty string clears it."""
+
+    runtime: str | None = Field(default=None, max_length=16, pattern=ATTR_OR_EMPTY)
+    project: str | None = Field(default=None, max_length=64, pattern=ATTR_OR_EMPTY)
+    host: str | None = Field(default=None, max_length=64, pattern=ATTR_OR_EMPTY)
+
+
+class AgentRenameBody(BaseModel):
+    name: str = Field(min_length=1, max_length=128, pattern=r"^[a-zA-Z0-9._-]+$")
+
+
+class AgentRenamed(BaseModel):
+    agent: "AgentOut"
+    previous_name: str
+    # Saved rules and active a2a grants that named the agent and now carry
+    # the new name.
+    rules: int
+    grants: int
 
 
 class SetKindBody(BaseModel):
@@ -239,6 +270,14 @@ class AgentOut(BaseModel):
     # always a mis-registered ephemeral one — it will be advertised as a peer
     # and never answer.
     last_seen_at: datetime | None = None
+    # Agents minted in an agent VM (null otherwise).
+    parent: str | None = None
+    sandbox: str | None = None
+    runtime: str | None = None
+    project: str | None = None
+    host: str | None = None
+    placement: str = "host"
+    lease_expires_at: datetime | None = None
     api_key: str | None = None  # only set on create/rotate
     webhook_secret: str | None = None  # only set on create/rotate-webhook-secret
 
@@ -262,9 +301,22 @@ class PlatformCatalog(BaseModel):
     namespace_allowlist: list[str] | None = None
     repo_allowlist: list[str] | None = None
     permission_ceiling: dict[str, str] | None = None
+    # github: orgs where capability "create" makes a new repo ("org/name",
+    # scope {"visibility": "private"|"public"}; public always human-reviewed).
+    create_owners: list[str] | None = None
+    create_disposition: str | None = None
     groups: list[CatalogEntry] | None = None
     capabilities: list[str] | None = None
     peers: list[PeerEntry] | None = None
+    # hostexec: hosts with a hostd, whether each is online, and per tier
+    # whether it is enabled and armed (a human's approval only counts on an
+    # armed tier, or with a TOTP code).
+    hosts: list[dict[str, Any]] | None = None
+    # mcp: the servers that take this broker's tokens (name, url, what it is
+    # for, its tools if listed).
+    servers: list[dict[str, Any]] | None = None
+    # models: the gateway (name, url).
+    gateway: dict[str, Any] | None = None
 
 
 class CatalogOut(BaseModel):

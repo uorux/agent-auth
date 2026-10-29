@@ -1,0 +1,31 @@
+[package]
+name = "agent-auth-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+agent-auth-core.workspace = true
+agent-auth-wire.workspace = true
+agent-auth-tls = { workspace = true, features = ["reqwest"] }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["time"] }
+url.workspace = true
+# The fake broker for tests (feature `testing`).
+axum = { workspace = true, optional = true }
+
+[features]
+testing = ["dep:axum", "tokio/net", "tokio/rt", "tokio/macros"]
+
+[dev-dependencies]
+agent-auth-client = { path = ".", features = ["testing"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "test-util"] }

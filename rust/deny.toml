@@ -1,0 +1,60 @@
+# cargo deny check — run by scripts/check.sh.
+
+[graph]
+all-features = false
+
+[advisories]
+# Any RustSec advisory (vulnerability, unsound, unmaintained, yanked) fails
+# the check; an accepted one is listed here with the reason.
+version = 2
+yanked = "deny"
+unmaintained = "all"
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+    "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause",
+    "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "CDLA-Permissive-2.0",
+    "MPL-2.0", "CC0-1.0",
+]
+confidence-threshold = 0.9
+
+[[licenses.clarify]]
+crate = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Features we deliberately do without: no compression codecs (decompression
+# bombs, and a long CVE history: brotli, zlib, zstd), no OpenSSL or the
+# platform TLS stacks (rustls + ring only), no second crypto provider.
+deny = [
+    { crate = "brotli", reason = "no compressed HTTP" },
+    { crate = "brotli-decompressor", reason = "no compressed HTTP" },
+    { crate = "flate2", reason = "no compressed HTTP / gateway compression" },
+    { crate = "libz-sys", reason = "no zlib" },
+    { crate = "libz-rs-sys", reason = "no zlib" },
+    { crate = "miniz_oxide", reason = "no deflate" },
+    { crate = "zstd", reason = "no zstd" },
+    { crate = "zstd-sys", reason = "no zstd" },
+    { crate = "async-compression", reason = "no compressed HTTP" },
+    { crate = "openssl", reason = "rustls only" },
+    { crate = "openssl-sys", reason = "rustls only" },
+    { crate = "native-tls", reason = "rustls only" },
+    { crate = "aws-lc-rs", reason = "one crypto provider: ring" },
+    { crate = "aws-lc-sys", reason = "one crypto provider: ring" },
+    { crate = "h2", reason = "HTTP/1.1 only" },
+    { crate = "h3", reason = "HTTP/1.1 only" },
+    { crate = "libsqlite3-sys", reason = "Postgres only" },
+    { crate = "serde_yaml", reason = "deprecated; unsafe-libyaml" },
+    { crate = "unsafe-libyaml", reason = "C translated to unsafe Rust" },
+    { crate = "serde_yml", reason = "unsound (RUSTSEC-2025-0068)" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -25,6 +25,11 @@ def fold(platform: Platform, capability: str, scope: dict[str, Any] | None) -> d
     """Collapse a request's (capability, scope) into its canonical authority."""
     scope = scope or {}
     if platform == Platform.GITHUB:
+        # Creating a repo is a different privilege from any access to one, so
+        # it folds into a distinct authority: no rule pinned to repo access
+        # can ever approve a create, and vice versa.
+        if capability == "create":
+            return {"action": "create", "visibility": scope.get("visibility", "private")}
         return {"permissions": dict(scope.get("permissions", {}))}
     if platform == Platform.KUBERNETES:
         # Cluster-wide is a distinct privilege from the same role in a namespace,
@@ -38,6 +43,41 @@ def fold(platform: Platform, capability: str, scope: dict[str, Any] | None) -> d
         return dict(scope)
     if platform == Platform.GOOGLE:
         return {"action": capability}
+    if platform == Platform.AGENTS:
+        # The runtime is the privilege's kind; the name (resource) carries the
+        # project and host.
+        return {"action": capability, "runtime": scope.get("runtime")}
+    if platform == Platform.SANDBOX:
+        # capability "project.read" / "project.write" on another project
+        return {"access": capability}
+    if platform == Platform.HOSTEXEC:
+        # The whole command is the privilege: a rule pinned to one argv never
+        # approves another. The host is the resource.
+        tier = scope.get("tier")
+        if capability == "shell":
+            return {"action": "shell", "tier": tier}
+        common = {
+            "tier": tier,
+            "cwd": scope.get("cwd"),
+            "env": dict(scope.get("env") or {}),
+            "timeout": scope.get("timeout"),
+            "stdin": scope.get("stdin"),
+        }
+        if capability.startswith("tpl."):
+            return {
+                "action": "tpl",
+                "template": capability[len("tpl."):],
+                "params": dict(scope.get("params") or {}),
+                **common,
+            }
+        return {"action": "run", "argv": list(scope.get("argv") or []), **common}
+    if platform == Platform.MCP:
+        # Which of the server's tools: the server is the resource. Sorted, so
+        # the same set is the same authority; "*" alone means all of them.
+        tools = sorted({str(t) for t in scope.get("tools") or ["*"]})
+        return {"tools": ["*"] if "*" in tools else tools}
+    if platform == Platform.MODELS:
+        return {"action": "use"}
     return {}  # HOMELAB: membership only; the group is the resource
 
 
@@ -45,32 +85,125 @@ def split(platform: Platform, authority: dict[str, Any] | None) -> tuple[str, di
     """Reconstruct (capability, scope) from authority — the inverse of fold."""
     authority = authority or {}
     if platform == Platform.GITHUB:
+        if authority.get("action") == "create":
+            return "create", {"visibility": authority.get("visibility", "private")}
         return "repo", {"permissions": dict(authority.get("permissions", {}))}
     if platform == Platform.KUBERNETES:
         scope = {"cluster": True} if authority.get("cluster") else {}
         return authority.get("role", ""), scope
     if platform == Platform.A2A:
         return "talk", dict(authority)
+    if platform == Platform.AGENTS:
+        return authority.get("action", "mint"), {"runtime": authority.get("runtime")}
+    if platform == Platform.SANDBOX:
+        return authority.get("access", ""), {}
     if platform == Platform.GOOGLE:
         return authority.get("action", ""), {}
+    if platform == Platform.HOSTEXEC:
+        action = authority.get("action")
+        if action in ("shell", "window"):
+            return ("shell" if action == "shell" else "run"), {"tier": authority.get("tier")}
+        scope = {
+            key: authority[key]
+            for key in ("tier", "cwd", "env", "timeout", "stdin")
+            if authority.get(key) not in (None, {}, "")
+        }
+        if action == "tpl":
+            return f"tpl.{authority.get('template')}", {**scope, "params": dict(authority.get("params") or {})}
+        return "run", {**scope, "argv": list(authority.get("argv") or [])}
+    if platform == Platform.MCP:
+        return "use", {"tools": list(authority.get("tools") or ["*"])}
+    if platform == Platform.MODELS:
+        return "use", {}
     return "group", {}  # HOMELAB
 
 
 def label(platform: Platform, authority: dict[str, Any] | None) -> str:
     """Short human/policy-facing name for an authority (used in admin listings)."""
     if platform == Platform.GITHUB:
+        if (authority or {}).get("action") == "create":
+            return f"create:{authority.get('visibility', 'private')}"
         perms = (authority or {}).get("permissions", {})
         return "+".join(f"{k}:{v}" for k, v in sorted(perms.items())) or "repo"
     if platform == Platform.KUBERNETES:
         role = (authority or {}).get("role") or "*"
         return f"{role} (cluster-wide)" if (authority or {}).get("cluster") else role
+    if platform == Platform.AGENTS:
+        return f"mint:{(authority or {}).get('runtime') or '?'}"
+    if platform == Platform.MCP:
+        tools = (authority or {}).get("tools") or ["*"]
+        return "all tools" if "*" in tools else ",".join(tools)
+    if platform == Platform.HOSTEXEC:
+        a = authority or {}
+        if a.get("action") == "window":
+            return f"approve-all:{a.get('tier')}"
+        if a.get("action") == "tpl":
+            return f"tpl.{a.get('template')}:{a.get('tier')}"
+        return f"{a.get('action') or '*'}:{a.get('tier')}"
     return split(platform, authority)[0] or "*"
 
 
-def is_sensitive(platform: Platform, authority: dict[str, Any] | None, platforms_cfg) -> bool:
-    """Does this authority always require a human, regardless of policy routing?"""
+def needs_explicit_rule(platform: Platform, authority: dict[str, Any] | None) -> bool:
+    """May only a rule that names this authority clear it (approve / route to
+    the LLM)? Stricter than "anything goes" and looser than `is_sensitive`: a
+    YAML rule whose `match.capability` is exactly this capability, or a saved
+    rule pinned to this exact authority, still counts. Catch-alls written for
+    repo access ({platform: github, resource: "org/*"}, a null-authority
+    "approve:platform" rule, the default) never do."""
+    if platform == Platform.GITHUB:
+        # Creating a repo is a different act from accessing one; a rule
+        # written to hand out access must not start minting repos.
+        return (authority or {}).get("action") == "create"
+    if platform == Platform.AGENTS:
+        # Minting an identity: never cleared by a rule written for something
+        # else (a null-authority catch-all, the default).
+        return True
+    if platform == Platform.HOSTEXEC:
+        # Running a command on a host: only a rule about hostexec itself.
+        return True
+    if platform == Platform.MCP:
+        # Tools on a server: only a rule about mcp itself.
+        return True
+    if platform == Platform.MODELS:
+        # Spending on models: only a rule about models itself.
+        return True
+    return False
+
+
+def human_only(platform: Platform, authority: dict[str, Any] | None) -> bool:
+    """Is this never decided by a rule or the LLM, whoever wrote the rule?
+    A shell on a host: every one is opened by a human, with a TOTP code."""
+    return platform == Platform.HOSTEXEC and (authority or {}).get("action") == "shell"
+
+
+def rule_covers(
+    platform: Platform, rule_authority: dict[str, Any] | None, authority: dict[str, Any] | None
+) -> bool:
+    """Does a saved rule's pinned authority cover this request's? Equality,
+    with one exception: a hostexec "approve all" window ({"action": "window",
+    "tier": t}) covers any command or template of its tier — never a shell."""
+    if rule_authority is None or rule_authority == authority:
+        return True
+    if platform == Platform.HOSTEXEC and rule_authority.get("action") == "window":
+        a = authority or {}
+        return a.get("action") in ("run", "tpl") and a.get("tier") == rule_authority.get("tier")
+    if platform == Platform.MCP:
+        # A rule for some of a server's tools covers a request for fewer.
+        allowed, wanted = set(rule_authority.get("tools") or []), set((authority or {}).get("tools") or ["*"])
+        return "*" in allowed or ("*" not in wanted and wanted <= allowed)
+    return False
+
+
+def is_sensitive(
+    platform: Platform, authority: dict[str, Any] | None, platforms_cfg, resource: str | None = None
+) -> bool:
+    """Does this authority (over that resource) always require a human,
+    regardless of policy routing?"""
     authority = authority or {}
     if platform == Platform.GITHUB:
+        # A public repo publishes whatever is pushed to it: a human's call.
+        if authority.get("action") == "create":
+            return authority.get("visibility") != "private"
         sensitive = set(platforms_cfg.github.sensitive_permissions)
         return any(p in sensitive for p in authority.get("permissions", {}))
     if platform == Platform.KUBERNETES:
@@ -78,5 +211,13 @@ def is_sensitive(platform: Platform, authority: dict[str, Any] | None, platforms
         # human's call, whatever the role or how routing would otherwise clear it.
         if authority.get("cluster"):
             return True
+        if resource is not None and platforms_cfg.kubernetes.namespace_is_sensitive(resource):
+            return True
         return authority.get("role") in set(platforms_cfg.kubernetes.sensitive_roles)
+    if platform == Platform.SANDBOX:
+        # Writing into another project's files: a human's call.
+        return authority.get("access") == "project.write"
+    if platform == Platform.HOSTEXEC:
+        # Anything as root, and every shell.
+        return authority.get("tier") == "root" or authority.get("action") == "shell"
     return False

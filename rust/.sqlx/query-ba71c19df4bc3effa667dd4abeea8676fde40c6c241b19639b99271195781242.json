@@ -1,0 +1,132 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO llm_evaluations (id, request_id, attempt, model, verdict, reasoning,\n             suggested_duration_secs, raw_response, created_at)\n         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n         RETURNING *",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "llm_evaluations",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "request_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "llm_evaluations",
+            "name": "request_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "attempt",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "llm_evaluations",
+            "name": "attempt"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "llm_evaluations",
+            "name": "model"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "verdict",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "llm_evaluations",
+            "name": "verdict"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "reasoning",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "llm_evaluations",
+            "name": "reasoning"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "suggested_duration_secs",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "llm_evaluations",
+            "name": "suggested_duration_secs"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "raw_response",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "llm_evaluations",
+            "name": "raw_response"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "llm_evaluations",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int4",
+        "Text",
+        "Text",
+        "Text",
+        "Int4",
+        "Jsonb",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "ba71c19df4bc3effa667dd4abeea8676fde40c6c241b19639b99271195781242"
+}

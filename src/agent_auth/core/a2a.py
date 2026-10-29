@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 from datetime import datetime, timedelta
 
 import httpx
@@ -30,6 +31,14 @@ from .states import (
 log = logging.getLogger(__name__)
 
 _WEBHOOK_TIMEOUT_SECS = 5
+
+# The human, writing from the admin panel. One agent row of this kind holds
+# the operator's side of those threads; it has no usable key (get_caller
+# refuses the kind) and cannot receive threads. Its threads carry no grant:
+# the panel's sign-in is the authority, and they end like any other thread
+# (closed by either side, idle or open timeout).
+OPERATOR_KIND = "operator"
+OPERATOR_NAME = "operator"
 
 
 # ------------------------------------------------------------- reachability
@@ -139,13 +148,15 @@ class A2AThreadService:
             ).scalar_one_or_none()
             if responder is None or responder.disabled:
                 raise A2AError(404, f"unknown agent {to!r}")
+            await self._refuse_if_held(db, agent, responder)
             reach = reachability(responder, self.settings.a2a_listen_threshold_secs)
             if not reach["addressable"]:
                 # Initiate-only: ephemeral agents can never receive threads.
                 raise A2AError(403, unreachable_detail(reach))
             self._require_session(agent, agent_session)
-            grant = await check_grant(db, agent.id, responder.name, topic)
-            if grant is None:
+            operator = agent.kind == OPERATOR_KIND
+            grant = None if operator else await check_grant(db, agent.id, responder.name, topic)
+            if grant is None and not operator:
                 raise A2AError(
                     403,
                     f"no active a2a grant to talk to {to!r}; request one via "
@@ -167,7 +178,7 @@ class A2AThreadService:
                 initiator_session_id=agent_session.id if agent_session else None,
                 responder_agent_id=responder.id,
                 topic=topic,
-                grant_id=grant.id,
+                grant_id=grant.id if grant else None,
                 state=THREAD_PENDING_OPEN,
                 last_activity_at=now,
                 last_seq=1,
@@ -183,7 +194,7 @@ class A2AThreadService:
                     sender_agent_id=agent.id,
                     sender_session_id=agent_session.id if agent_session else None,
                     recipient_agent_id=responder.id,
-                    grant_id=grant.id,
+                    grant_id=grant.id if grant else None,
                     payload=payload,
                 )
             )
@@ -215,9 +226,17 @@ class A2AThreadService:
             thread = await self._own_thread(db, thread_id, agent, agent_session)
             self._require_not_closed(thread)
             is_initiator = thread.initiator_agent_id == agent.id
+            await self._refuse_if_held(
+                db,
+                agent,
+                await db.get(Agent, thread.responder_agent_id if is_initiator else thread.initiator_agent_id),
+            )
 
-            grant = await db.get(Grant, thread.grant_id)
-            if grant is None or grant.status != GrantStatus.ACTIVE or grant.expires_at <= utcnow():
+            grant = await db.get(Grant, thread.grant_id) if thread.grant_id else None
+            # An operator thread has no grant (OPERATOR_KIND).
+            if thread.grant_id is not None and (
+                grant is None or grant.status != GrantStatus.ACTIVE or grant.expires_at <= utcnow()
+            ):
                 # Close inside this transaction, but raise only after it
                 # commits — raising here would roll the closure back.
                 await self._close(db, thread, CLOSE_GRANT_REVOKED, closed_by=None)
@@ -285,6 +304,7 @@ class A2AThreadService:
             thread = await self._own_thread(db, thread_id, agent, agent_session)
             self._require_responder(thread, agent.id)
             self._require_pending(thread)
+            await self._refuse_if_held(db, agent, await db.get(Agent, thread.initiator_agent_id))
             thread.state = THREAD_OPEN
             thread.accepted_at = utcnow()
             thread.last_activity_at = utcnow()
@@ -333,6 +353,28 @@ class A2AThreadService:
         self._fire_notices(notices)
         await self._deliver_pings(pings)
         return out
+
+    async def operator(self) -> Agent:
+        """The operator's agent row, made on first use."""
+        async with self.db.session() as db:
+            found = (
+                await db.execute(select(Agent).where(Agent.kind == OPERATOR_KIND))
+            ).scalar_one_or_none()
+            if found is not None:
+                return found
+            if (await db.execute(select(Agent).where(Agent.name == OPERATOR_NAME))).scalar_one_or_none():
+                raise A2AError(409, f"an agent is already named {OPERATOR_NAME!r}; rename it to chat from the panel")
+            row = Agent(
+                name=OPERATOR_NAME,
+                description="the operator, writing from the admin panel",
+                key_id=secrets.token_hex(8),
+                # Not the hash of anything: no key opens it, and get_caller
+                # refuses the kind besides.
+                api_key_hash="!" * 64,
+                kind=OPERATOR_KIND,
+            )
+            db.add(row)
+        return row
 
     async def end_session(self, agent: Agent, session_id: str) -> int:
         """Explicit session close (clean CLI exit): threads end peer_gone."""
@@ -525,6 +567,29 @@ class A2AThreadService:
         await self._deliver_pings(pings)
         return len(threads)
 
+    async def close_all_for(self, agent_id: str, note: str) -> int:
+        """Close every open thread this agent is on, either side (containment)."""
+        notices: list[str] = []
+        pings: list = []
+        async with self.db.session() as db:
+            threads = list(
+                (
+                    await db.execute(
+                        select(A2AThread).where(
+                            (A2AThread.initiator_agent_id == agent_id) | (A2AThread.responder_agent_id == agent_id),
+                            A2AThread.state != THREAD_CLOSED,
+                        )
+                    )
+                ).scalars()
+            )
+            for thread in threads:
+                await self._close(db, thread, CLOSE_CLOSED, closed_by=None, note=note)
+                notices.extend(self._closure_notices(thread))
+                pings.extend(await self._closure_pings(db, thread))
+        self._fire_notices(notices)
+        await self._deliver_pings(pings)
+        return len(threads)
+
     # --------------------------------------------------------------- sweep
 
     async def sweep(self) -> dict[str, int]:
@@ -635,6 +700,18 @@ class A2AThreadService:
                 "ephemeral agents must open a session before using a2a "
                 "(POST /v1/sessions, then send X-Agent-Session)",
             )
+
+    async def _refuse_if_held(self, db, agent: Agent, peer: Agent | None) -> None:
+        """Containment (core/lockdown.py): a held agent neither talks nor is
+        talked to — except with the operator, who may still ask it what it
+        was doing."""
+        from .lockdown import holding
+
+        if peer is None or OPERATOR_KIND in (agent.kind, peer.kind):
+            return
+        for who in (agent, peer):
+            if (held := await holding(db, who)) is not None:
+                raise A2AError(403, f"{who.name} is contained ({held['id']}): no a2a while it is held")
 
     async def _own_thread(
         self, db, thread_id: str, agent: Agent, agent_session: AgentSession | None

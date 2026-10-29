@@ -1,0 +1,62 @@
+[package]
+name = "agent-auth-broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "agent-auth-server"
+path = "src/main.rs"
+
+[dependencies]
+agent-auth-core.workspace = true
+agent-auth-crypto.workspace = true
+agent-auth-wire.workspace = true
+agent-auth-store.workspace = true
+agent-auth-mail.workspace = true
+agent-auth-tls = { workspace = true, features = ["reqwest"] }
+ring.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "sync", "macros", "net", "signal"] }
+axum = { workspace = true, features = ["ws"] }
+tower = { workspace = true, features = ["util"] }
+tower-http.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
+sqlx.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde-saphyr.workspace = true
+time.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+clap.workspace = true
+futures.workspace = true
+base64.workspace = true
+# The remote MCP endpoint (/mcp): the server side and streamable HTTP only.
+rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
+twilight-model.workspace = true
+tokio-tungstenite.workspace = true
+hex.workspace = true
+regex.workspace = true
+
+[dev-dependencies]
+agent-auth-mail = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "sync", "io-util"] }
+tower = { workspace = true, features = ["util"] }
+http-body-util.workspace = true
+ring.workspace = true
+proptest.workspace = true
+agent-auth-daemon.workspace = true
+agent-auth-hostd.workspace = true
+agent-auth-sandboxd = { workspace = true, features = ["testing"] }
+tokio-tungstenite.workspace = true

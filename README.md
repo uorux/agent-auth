@@ -10,19 +10,29 @@ membership, a2a permissions) and revoked when they expire.
 ```
 agent ──HTTP/MCP/CLI──▶ broker ──policy──▶ deny | approve | llm | surface ──▶ Discord ping
                           │                                                    Approve/Deny/Edit
-                          └─▶ provisioners: GitHub App tokens · LLDAP groups · a2a grants · google (stub)
+                          └─▶ provisioners: GitHub App tokens · LLDAP groups · a2a grants · Google tokens
                               └─ expiry scheduler revokes at expires_at
 ```
+
+**Rust port.** `rust/` holds a Rust implementation of everything here
+(broker, CLI, MCP, hostd, sandboxd) with its own flake (`./rust#broker`,
+`nixosModules`, an OCI image, Kubernetes manifests in `rust/deploy/k8s`).
+How to build, configure, deploy and migrate to it: [rust/README.md](rust/README.md);
+what behaves differently: [rust/DEVIATIONS.md](rust/DEVIATIONS.md).
 
 ## Platforms
 
 | platform  | capability    | resource            | grant means                                                                 |
 |-----------|---------------|---------------------|-----------------------------------------------------------------------------|
 | `github`  | `repo`        | `owner/repo`        | broker mints GitHub App installation tokens (≤1h, re-minted on demand) scoped to the repo + `scope.permissions` |
+| `github`  | `create`      | `org/name`          | broker **creates** the repo in an org listed in `create_owners` (`scope.visibility`: `private`, or `public` = always human-reviewed), using an Administration token it mints, uses once and revokes — the agent never sees it. Already exists → fails, unless the broker itself created it earlier (a retried create is adopted). Access afterwards is a normal `repo` grant; nothing is deleted at expiry |
 | `homelab` | `group`       | LLDAP group name    | agent's LLDAP service account is added to the group (Authelia rules are per-group); removed at expiry. Agents without a hand-registered account get a broker-managed one (`svc-<name>`, generated password) at their first grant; the credential fetch returns username + password |
 | `kubernetes` | role name (`view`, `edit`, `traefik-patcher`, …) | namespace name (or `*` for cluster-wide) | per-grant ServiceAccount + RoleBinding to the named (Cluster)Role — a ClusterRoleBinding when the namespace is `*`; tokens minted on demand via TokenRequest; SA deleted at expiry → all tokens die instantly. The capability *is* the role, so policy rules auto-approve narrow roles and surface broad ones |
 | `a2a`     | `talk`        | target agent name   | authorizes OPENING conversation threads to that (service) agent — see [a2a threads](#a2a-threads); no credential is minted |
-| `google`  | `calendar.*`… | calendar id / label | stub: decisions recorded, no credential minted (501)                        |
+| `hostexec` | `run`, `tpl.<name>`, `shell` | host name | one command (or a time-boxed shell) **on a host**, run by that host's daemon — see [Commands on hosts](#commands-on-hosts-hostexec). The host decides, with its own TOTP secrets and policy; root and shells always reach a human |
+| `models`  | `use`         | gateway name (`litellm`) | a LiteLLM virtual key of the agent's own, under a LiteLLM user named after it — see [Model gateway](#model-gateway-litellm). Deleted at revoke (LiteLLM keeps it, with its spend, among its deleted keys); the gateway also ends it at the grant's end |
+| `pool`    | `lease`       | pool name (`minecraft`) | one item of a pool of scarce things (accounts, licences), held by this grant alone: any, one with given properties, the one held last time, or one by name — see [Pools](#pools-scarce-things) |
+| `google`  | `calendar.read`, `calendar.write`, `drive.read` | account name or address | a short-lived Google API token with just that scope (account-wide, by Google's design); a stub when no account is configured. Gmail is never a token — see [Google](#google) |
 
 Note the Gitea flow: the broker grants the homelab agent the `svc-gitea` LLDAP
 group; the agent then authenticates to Gitea itself and mints its own tokens.
@@ -42,6 +52,7 @@ ADMIN_TOKEN=$(openssl rand -hex 24)
 ENCRYPTION_KEY=$(uv run agent-auth admin gen-key)
 DISCORD_TOKEN=...            # bot token; needs no privileged intents
 DISCORD_CHANNEL_ID=...       # channel for approval requests
+#DISCORD_ACTIVITY_CHANNEL_ID=...  # what needs no one (auto-decisions, rule-run results); default: the one above
 DISCORD_OWNER_ID=...         # your discord user id (gets pinged, may click buttons)
 OPENROUTER_API_KEY=...       # optional; without it, 'llm' rules escalate to human
 EOF
@@ -74,8 +85,10 @@ interfaces, all wrapping the same HTTP API:
       "command": "agent-auth-mcp",
       "env": {"AGENT_AUTH_URL": "https://agent-auth.rooty.dev", "AGENT_AUTH_API_KEY": "aa_..."}}}}
   ```
-  Tools: `list_capabilities`, `request_access`, `wait_for_decision`,
-  `retry_request`, `escalate_request`, `get_credential`, `list_grants`,
+  The server sends orientation instructions on connect (clients that defer
+  MCP tools show agents only tool names until loaded, so the workflow lives
+  there). Tools: `whoami`, `list_capabilities`, `request_access`, `wait_for_decision`,
+  `retry_request`, `escalate_request`, `get_credential`, `list_grants`, `release_grant`,
   `create_session`, `close_session`, `check_a2a`, `a2a_open`, `a2a_send`,
   `a2a_poll`, `a2a_threads`, `a2a_accept`, `a2a_reject`, `a2a_close`,
   `a2a_events`. Runtimes that share ONE MCP process across conversations
@@ -99,6 +112,12 @@ interfaces, all wrapping the same HTTP API:
    justification (limited attempts), or `escalate_request` to a human.
 4. On `granted`: `get_credential(grant_id)` when a token is needed (GitHub);
    re-fetch rather than caching — minting stops the moment the grant ends.
+   `get_credential(grant_id, to_file=True)` writes the token to a file only
+   the agent's user can read and returns its path (and, for GitHub, a git
+   `credential.helper` that reads it), so the token is neither in the
+   conversation nor on a command line.
+5. Done early? `release_grant(grant_id)` (`POST /v1/grants/{id}/release`)
+   ends it now: a pool item goes back for the next agent.
 
 ## a2a threads
 
@@ -179,11 +198,12 @@ open (carries first message) ─▶ pending_open ─▶ accept / first reply ─
   reverse grant needed.
 - **Webhook pings** (service agents only): notify-only —
   `{type: a2a_thread_open|a2a_message|a2a_thread_closed, thread_id, seq, from,
-  topic}` with **no payload**; fetch via the cursor read. Signed
-  `X-Agent-Auth-Signature: sha256=<hmac>` with the agent's `webhook_secret`
-  (shown ONCE at admin create / `rotate-webhook-secret` — record it then; it
-  is not readable afterwards, by design), falling back to the global
-  `WEBHOOK_SIGNING_SECRET`. Delivery is best-effort; the poll is authoritative.
+  topic}` with **no payload**; fetch via the cursor read. Signed with the
+  agent's own `webhook_secret` (shown ONCE at admin create / `set-webhook` /
+  `rotate-webhook-secret` — record it then; it is not readable afterwards, by
+  design) and the time of sending; see "Verifying webhook pings" below. An
+  agent without a secret of its own gets no pings (there is no broker-wide
+  fallback key). Delivery is best-effort; the poll is authoritative.
 
 Retrofit: `agent-auth admin agents` lists `kind` and `last_seen_at`; anything
 `service` that has never been seen (or is never seen polling) is the shape to
@@ -249,12 +269,111 @@ ceiling, or namespace/role allowlist. Auto-approve rules are **scope-pinned**: a
 rule created for `contents:write` won't rubber-stamp a later `secrets:write` on the
 same repo. Manage saved rules with `agent-auth admin rules` / `rule-delete`.
 
+### Restricted zones
+
+Some work shouldn't be reachable from every agent, including the broad ones
+(a homelab operator agent that reads any namespace). A zone names its
+members and what is theirs:
+
+```yaml
+restricted:
+  private-thing:
+    members: [{project: private-thing}]
+    kubernetes: [private-thing]        # namespace globs
+    github: [owner/private-thing]      # repo globs
+    wiki: false                        # members don't write the shared wiki
+```
+
+To an agent outside it, the zone's namespaces and repos aren't brokered: the
+request is refused with the same words as a resource the broker doesn't
+broker, **before any rule is read**, so neither a saved rule nor a policy
+rule opens it. A cluster-wide Kubernetes grant to an outsider becomes a
+RoleBinding in each namespace outside the zone (the broker needs `list
+namespaces`; a namespace created later isn't covered) instead of a
+ClusterRoleBinding. Members and outsiders aren't a2a peers either way, and
+members don't appear in an outsider's catalog or `a2a/check`. An outsider in
+an agent VM can't read a member project's files, and minting a member is
+always a human's call.
+
+It doesn't hide that a namespace exists (anyone who can list namespaces sees
+the name), and it can't stop a change that reaches the cluster some other way:
+Flux applying a merged gitops PR, or credentials held outside the broker.
+
+**Overlays** keep a zone's policy out of the repo the policy file lives in:
+`POLICY_OVERLAYS` (the NixOS module's `policyOverlays`, from sops) lists more
+YAML merged over the file. Mappings merge key by key, and lists put the
+overlay's items first, so its rules are matched first. A missing overlay stops
+the broker from starting.
+
+**The audit feed** (`GET /v1/audit/events?since=`) is the broker's record for
+the agents under `audit.readers`: requests as they change, grants issued and
+ended, host commands, a2a threads opened and closed (never the messages),
+new agents, containments, and refused keys and credentials. It is a 404 to
+everyone else.
+
+### What an agent is
+
+Rules say which agents they are about by what the broker has on record for
+each one, not by how it is named:
+
+| Field | Meaning | Set by |
+|---|---|---|
+| `runtime` | what runs it: `claude`, `codex`, `hermes`, `orchestrator` | the operator at registration; the broker for an agent minted in a VM |
+| `project` | what it works on | same |
+| `host` | the machine it runs on | same; a minted agent gets its sandbox's host |
+| `placement` | `host`, or `sandbox` for an agent in a VM | only the broker, when it mints one |
+| `kind` | `service` or `ephemeral` | the operator |
+
+```yaml
+projects:
+  agent-auth: {repos: [uorux/agent-auth]}
+  homelab: {repos: [uorux/homelab]}
+
+rules:
+  # an agent in a VM may use the browser
+  - match: {agent: {placement: sandbox}, platform: mcp, capability: use, resource: playwright}
+    action: approve
+  # a claude agent on its own project's repos
+  - match: {agent: {runtime: claude}, platform: github, resource: "{agent.repos}"}
+    action: llm
+```
+
+Every field given must hold; a field takes one value or a list, compared
+exactly. A `resource` may use the agent's own `{agent.project}`,
+`{agent.host}`, `{agent.runtime}` and `{agent.repos}` (each repo of its
+project). An agent without the field is not matched: "your project's repo"
+says nothing to an agent with no project. `{agent.project}` and
+`{agent.repos}` only stand for a project listed under `projects`: an agent
+VM's orchestrator names the project of each agent it mints, so an
+undeclared one (`flux-system`, say) matches nothing.
+
+A mistake is an error when the policy loads: an unknown field, a project
+not listed under `projects`, a placeholder that doesn't exist. `agent` may
+still be a glob on the name (`agent: "deploy-*"`), for the agents no field
+tells apart; saved rules from Discord stay pinned to the one agent's name.
+
+Set the fields with `agent-auth admin agent-create … --runtime --project
+--host`, correct them with `agent-auth admin agent-set <agent> …`, and see
+them with `agent-auth admin agents` (the agent sees its own in `whoami`).
+An agent cannot change them. Agents that existed before the fields did got
+theirs from their names (`<runtime>-<project>-<host>`), which is a guess:
+check the listing once.
+
+A name can be changed too: `agent-auth admin agent-rename <agent> <new-name>`.
+The agent's key, requests and grants are unaffected. Saved rules written for
+exactly that agent, and active a2a grants to it, are carried over to the new
+name; rules that reach it by a glob and the policy file are not touched.
+Agents minted in a VM keep the name the broker gave them.
+
 LLM review calls OpenRouter with a structured verdict schema; the model is set
 per-rule (`constraints.llm_model`) or globally (`llm.model`). Evaluator errors
 always escalate to a human — never auto-approve. **Sensitive scopes always reach a
 human**: `platforms.github.sensitive_permissions` (default `secrets`,
-`administration`) and `platforms.kubernetes.sensitive_roles` (default `edit`,
-`admin`) force a request to `surface` even if a YAML rule or the LLM would clear it,
+`administration`), `platforms.kubernetes.sensitive_roles` (default `edit`,
+`admin`) and `platforms.kubernetes.sensitive_namespaces` (default the `kube-*`
+namespaces and `flux-system`, plus `cluster_grant_namespace` always: any role
+that patches a workload or starts a Job there runs as the cluster's own
+controllers) force a request to `surface` even if a YAML rule or the LLM would clear it,
 so attacker-controlled justification text can't talk the model into a broad grant.
 A human's own scope-pinned auto-approve rule still applies.
 
@@ -272,7 +391,15 @@ A human's own scope-pinned auto-approve rule still applies.
    broker refuses any other owner rather than silently re-targeting).
 4. Set `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY_FILE`, and mirror the
    ceiling in `platforms.github.permission_ceiling`.
-5. Note the app is its own principal: installation tokens carry the *app's*
+5. **Repo creation** (optional): give the app the **Administration: write**
+   repository permission, accept it on each org installation you list in
+   `platforms.github.create_owners`, and keep those orgs inside
+   `repo_allowlist`. Organizations only — an installation token can't create
+   repos under a personal account. Check whether a newly created repo joins
+   a *selected-repositories* installation; if it doesn't, the create grant's
+   credential says so, and `repo` grants on it fail until you add it (or
+   install the app on all repositories of that org).
+6. Note the app is its own principal: installation tokens carry the *app's*
    permissions as approved at install time — they never inherit or act with
    any user's org role.
 
@@ -280,6 +407,27 @@ Uploading Actions secrets (libsodium sealed box) is the *agent's* job with its
 minted token; the broker only grants `secrets: write`. A minted token can outlive
 revocation by up to ~55 min (GitHub tokens are not remotely revocable by the
 broker beyond best effort); enforcement is refusal to re-mint.
+
+**Known issue: write access to a repo can reach past the repo.** The broker
+can't tell what a permission leads to once it is granted. Two cases:
+
+- **`workflows: write` (or `contents: write` on a repo whose workflows run on
+  push).** The agent can push a workflow that runs on whatever runners the repo
+  may use. A self-hosted runner, in particular a privileged one
+  (`containerMode: dind`) on a cluster node, then hands the agent that node,
+  plus the Actions secrets the repo can see.
+- **`contents: write` on a repo that something deploys from.** A GitOps repo
+  that Flux applies from its default branch is the obvious one: a push to it is
+  a change to the cluster.
+
+The guards for both are outside the broker:
+- runner groups that admit only the repos that need them;
+- branch protection that the App can't bypass (required reviews or status
+  checks on the deployed branch);
+- keeping such repos out of auto-approve rules.
+
+None of it is checked here, so whether an "own repo" rule is narrow depends on
+those GitHub settings.
 
 ## LLDAP setup
 
@@ -321,7 +469,10 @@ you enable cluster-wide grants (below), it also needs create/delete on
 
 Ceilings: `namespace_allowlist: ["*"]` is fine — containment comes from narrow
 roles and human review, not from walling namespaces off (an agent with gitops
-access reaches them anyway). Keep `role_allowlist` enumerated and prefer
+access reaches them anyway). The exception is `sensitive_namespaces`. List
+there every namespace whose ServiceAccounts are worth more than the roles
+granted in it: the cluster's controllers, and the namespace holding the
+broker's own token Secret. A grant in one of them always reaches a human. Keep `role_allowlist` enumerated and prefer
 purpose-built roles over `edit`/`admin`: it must match the ClusterRoles/Roles
 the broker holds `bind` on, so a tight role means a tight grant *and* a tight
 broker credential.
@@ -360,6 +511,595 @@ Agents use the credential as a bearer token:
 Tokens are short-lived (≤1h, capped at the grant's remaining life) and every
 token dies the moment the grant expires or is revoked, because the
 ServiceAccount itself is deleted.
+
+## Paired daemons (hostd)
+
+Hosts run `agent-auth-hostd`, a daemon that dials out to the broker over a
+signed WebSocket (`/v1/daemons/connect`); see
+[docs/sandbox-design.md](docs/sandbox-design.md). With no tier enabled it only
+pairs, connects and reports heartbeats, as the unprivileged `agent-auth-hostd`
+user. Enabling a tier makes it run approved commands
+([Commands on hosts](#commands-on-hosts-hostexec)), as root.
+
+- **macOS hosts:** hostd on a Mac (LaunchDaemon, nix-darwin module or install
+  script) — see [docs/hostd-macos.md](docs/hostd-macos.md).
+
+- **Broker key**: `agent-auth admin gen-signing-key --out FILE` writes
+  `BROKER_SIGNING_KEY` to a new 0600 file (move it into the broker's env
+  secret, never into `settings`) and prints the public key. Without `--out`
+  it prints the seed only to a terminal (or with `--stdout`). Every daemon
+  **pins** that public key in its own config, so the broker is verified
+  against the host's config, not against whatever answers on the network.
+  Without `BROKER_SIGNING_KEY`, the daemon endpoints are disabled (503).
+- **Pairing**: `agent-auth admin daemon-pair <hostname>` issues a one-time
+  code (10 min, single use, burned after 5 wrong proofs). On the host, run
+  `sudo agent-auth-hostd pair` and enter the code at the (hidden) prompt, or
+  pipe it to `agent-auth-hostd pair -`, or set
+  `AGENT_AUTH_HOSTD_PAIRING_CODE`. It is never taken as an argument, where it
+  would land in shell history and process listings. Both sides prove
+  knowledge of the code over the exact keys exchanged, and both print key
+  fingerprints to compare.
+  Re-pairing replaces the key and drops the old connection.
+- **Connections**: mutual challenge–response on every connect, then every
+  message is an ed25519-signed envelope naming its sender and recipient, with
+  a short expiry and replay protection.
+- **Fleet health**: `agent-auth admin daemons` / Discord `/hosts` list paired
+  daemons with online state, version and last heartbeat;
+  `agent-auth admin daemon-unpair <id>` forgets one.
+
+```nix
+imports = [ inputs.agent-auth.nixosModules.hostd ];
+services.agent-auth-hostd = {
+  enable = true;
+  brokerUrl = "https://agent-auth.recusant.rooty.dev";
+  brokerPublicKey = "ed25519:…";   # agent-auth admin broker-key
+};
+# impermanence: persist /var/lib/agent-auth-hostd (the host's identity key,
+# its TOTP secrets and lockdown flag), mode 0700. Owner: agent-auth-hostd while
+# no tier is enabled, root once one is (the module's tmpfiles rule moves it).
+```
+
+## Commands on hosts (hostexec)
+
+An agent can ask to run one exact command on a host, as your user or as root:
+platform `hostexec`, capability `run`, resource = the host,
+`scope {"tier": "user"|"root", "argv": [...], "cwd"?, "env"?, "timeout"?, "stdin"?}`
+(MCP tool `host_run`). The request goes through policy and Discord like any
+other. **Whether it runs is decided on the host**, by hostd, in this order:
+
+1. locked down → no;
+2. tier disabled, a `denyCommands` match, an env var outside `envAllow` → no;
+3. a valid **direct TOTP code** came with the approval → run, armed or not;
+4. an `autoCommands` match (user tier) → run;
+5. the tier is **armed** → run if a human approved it; a rule's, the LLM's or
+   policy's approval only with `acceptMachineApprovals`; an "approve all"
+   window only with `acceptApproveAll`;
+6. otherwise → refused (`not_armed`), and the approval is not accepted: the
+   request stays open on Discord.
+
+```nix
+services.agent-auth-hostd = {
+  enable = true; brokerUrl = "…"; brokerPublicKey = "ed25519:…";
+  user = "jrt";                       # the user tier runs as this account
+  tiers.user = { enable = true; maxArm = "8h"; shell.enable = true; };
+  tiers.root = { enable = true; maxArm = "1h"; };   # no windows, no machine approvals
+  autoCommands = [ [ "systemctl" "--user" "status" "*" ] ];
+  denyCommands = [ ];
+  templates.nixos-rebuild = {
+    tier = "root";
+    argv = [ "nixos-rebuild" "switch" "--flake" "{flake}" ];
+    params.flake = "git\\+https://git\\.example/me/[a-z0-9-]+#[a-z0-9-]+";
+  };
+  vm.unit = "agent-vm.service";       # frozen on lockdown; null without a VM
+};
+```
+
+- **TOTP.** `sudo agent-auth-hostd totp-enroll` on each host creates four
+  secrets and shows each once as a QR code: `<tier>-arm` and `<tier>-direct`
+  for `user` and `root`. They are generated on the host and never leave it.
+  Codes are single use; five wrong ones lock a secret for five minutes.
+- **Arming.** `/arm host tier duration code` (an arm code), or on the host
+  `agent-auth-hostctl arm 2h` (your user for the user tier; `sudo … --tier
+  root`). Held in memory: a restart disarms. `/disarm` needs no code.
+- **Discord.** Approve (needs the tier armed) · Approve all… (a time-boxed
+  rule for that agent, host and tier; armed, and the host must accept
+  windows) · Approve with TOTP (a direct code, works disarmed) · Deny · Edit.
+  The message gets the exit code, duration and the end of the output; the
+  agent gets all of it (the last 1 MiB) from `host_job`. With
+  `OPENROUTER_API_KEY`, each request carries an advisory risk line from a
+  model (`platforms.hostexec.risk_model`); it decides nothing.
+- **Templates** (`tpl.<name>`): the host expands its own copy, with each
+  parameter checked against its regex and substituted as one whole argument.
+  `platforms.hostexec.templates` in the broker's policy mirrors them so the
+  Discord message can show the expanded command.
+- **Shells** (`shell`, `scope {"tier"}`): a time-boxed window in which the
+  agent runs commands one at a time (`host_shell_exec`; no terminal). Opened
+  with a TOTP code only — arming, windows and rules never open one. The
+  request is loud (optionally in `DISCORD_LOUD_CHANNEL_ID`), every command is
+  posted to a thread on it **before** it is sent to the host (if it can't be
+  posted, it doesn't run), and **End shell** kills it. The host keeps the
+  expiry itself.
+- **Kill switch.** `/lockdown [sandboxes|all|host]` or `agent-auth admin
+  lockdown`: revokes the grants of agent-VM agents (of every agent with
+  `all`), refuses new identities and host commands, and each host disarms,
+  kills its jobs and shells, and freezes its agent VM from outside (`kill_vm`
+  stops it). `/unlock` lifts the broker's side; **each host stays locked**
+  until `/unlock host:<h> code:<root-arm code>` or `sudo agent-auth-hostctl
+  unlock` there. The agents it covers are also contained (below) until then.
+- **Containment.** Holding some agents wherever they run, by the fields a
+  rule matches on: `agent-auth admin contain --project x --reason "..."`
+  (or `--name`, `--host`, `--runtime`, `--all`). Their grants are revoked
+  (their host commands killed, shells closed, model-gateway keys deleted, so
+  an agent whose model calls go through the gateway cannot take another
+  step), their pending requests are denied, every new request, retry,
+  escalation and credential fetch of theirs is refused, and nothing is
+  provisioned for them whatever approves it. Their a2a conversations close,
+  and no thread is opened, accepted or written to by or to them (except
+  with the operator). They can't write the wiki. The agent VMs freeze their
+  conversations where they stand and queue what arrives. You are pinged on Discord each time.
+  `agent-auth admin contain-list`, and `contain-lift [id]` to lift one (or
+  all); their grants do not come back, they ask again. On Discord:
+  `/contain`, `/contained`, `/release`. It does not stop a
+  process that needs nothing more from the broker or the gateway on a host
+  outside an agent VM (a lockdown freezes the VMs), nor reach credentials an
+  agent got some other way.
+- **Audit.** Every decision hostd makes is in its journal
+  (`journalctl -u agent-auth-hostd`), with the evidence it was made on.
+
+What this does **not** protect against: codes pass through Discord and the
+broker, so a compromised broker can attach a direct code you typed to a
+different command (once per code); and while a tier is armed it can run
+anything in that tier. Disarmed and without codes it can run only the
+`autoCommands`. `denyCommands` guards against mistakes, not against `sh -c`.
+
+Not yet run on a real host: the systemd-run paths (the user tier's in
+particular). The tests drive the real daemon with a fake executor.
+
+## Pools (scarce things)
+
+Things only one agent should hold at a time (game accounts, licences, a
+test device): platform `pool`, capability `lease`, resource the pool.
+
+```yaml
+platforms:
+  pools:
+    minecraft:
+      description: Minecraft Java accounts for the bots
+      agents: [{project: mc-bots}]      # who may lease at all (empty: anyone)
+      max_per_agent: 1
+      # capacity: 1                     # holders of one item at once
+      items:
+        alt-1:
+          properties: {edition: java, username: AltOne, tags: [survival]}
+          secret_file: /run/credentials/agent-auth.service/mc-alt-1
+        main:
+          properties: {edition: java, username: TheMain}
+          secret_file: /run/credentials/agent-auth.service/mc-main
+          sensitive: true                # only by name, always a human
+rules:
+  - match: {agent: {project: mc-bots}, platform: pool, capability: lease, resource: minecraft}
+    action: approve
+    constraints: {max_duration: 8h}
+```
+
+- **Which one.** Scope `{}` takes any free item (the one the agent held last
+  first), `{"match": {"edition": "java", "tags": "survival"}}` one with those
+  properties (a list property matches a value it contains), `{"previous":
+  true}` the one it held last time, `{"item": "alt-1"}` that one. Sensitive
+  items are never picked unless named. The catalog lists each pool's items,
+  their properties, whether each is free, when a held one frees up, and
+  which one the agent held last.
+- **Holding.** The item is chosen when the grant is provisioned, and a unique
+  (pool, item, slot) lease row keeps two grants from one slot whatever
+  races. Everything taken: provisioning fails with when the first one frees.
+  The credential is the item's `secret_file`, verbatim, with its
+  properties. `release_grant` gives it back early.
+
+What it does not protect against: a credential once handed out can be kept.
+Exclusivity holds for agents that use what the broker hands them; changing
+an account's password after each lease is not done for you.
+
+## Google
+
+`platforms.google.accounts` are the Google logins the broker holds: an OAuth
+client and a refresh token per account (any Gmail or Workspace account), or
+on Workspace a service account with domain-wide delegation (`subject`).
+
+```yaml
+platforms:
+  google:
+    accounts:
+      main:
+        address: me@example.com
+        client_secret_file: /run/credentials/agent-auth.service/google-client.json
+        refresh_token_file: /run/credentials/agent-auth.service/google-refresh
+      work:                                     # Workspace: domain-wide delegation
+        address: jacob@corp.example
+        service_account_file: /run/credentials/agent-auth.service/google-sa.json
+        # subject: someone@corp.example         # whom it acts as (default: address)
+```
+
+`calendar.read` (`calendar.readonly`), `calendar.write` (`calendar.events`)
+and `drive.read` (`drive.readonly`) are access tokens the broker mints with
+exactly that scope, and it checks the scopes Google says the token carries:
+a token wider than the grant is refused, so give such an account a login
+consented for only what agents may hold (or use delegation). Writing a
+calendar and reading a Drive always reach a human, and only a rule naming
+the platform and capability clears any of them. Gmail is never a token.
+
+The refresh token comes from `agent-auth admin google-consent
+--client-secret-file client.json --scopes calendar.readonly --out refresh`,
+run on your own machine (a *Desktop app* OAuth client; loopback redirect with
+PKCE; the token goes to a new 0600 file and is never printed). An OAuth app
+in "Testing" status issues refresh tokens that last 7 days: set it to "In
+production" (or Internal on Workspace). The consent screen lets you untick
+scopes; the command says what was not granted. `--out` must not exist yet
+(it is created 0600, never written through a link). A login file's
+`token_uri`, if it names one, must be Google's token endpoint.
+
+At startup, if accounts are configured and saved rules for `google` exist,
+the broker logs a loud warning: rules saved while google was a stub would
+now approve real, account-wide tokens. Review them with `agent-auth admin
+rules`. Grants approved while it was a stub are revoked at startup (they
+recorded a decision; they never become tokens): agents ask again.
+
+What it does not protect against: those scopes reach the whole account
+(every calendar, every file); Google has nothing per calendar or folder. A
+token is not revoked at the grant's end: revoking a google grant stops new
+tokens; one already fetched lives up to 1 h. Tokens are shared per (account,
+scope) between grants, and Google offers no per-token revocation that leaves
+the login in place: revoking a token Google issued from a refresh token
+revokes the refresh token too.
+Without accounts the platform is the old stub (decisions recorded, 501 on
+the credential).
+
+## MCP servers
+
+agent-auth can hand out access to MCP servers (and other HTTP tools) without
+being in their data path. A grant's credential is a short-lived token the
+broker signs; the server's own proxy verifies it against the broker's public
+keys. Designed for [ToolHive](https://github.com/stacklok/toolhive): one pod
+per server, a token-validating proxy in front.
+
+```yaml
+platforms:
+  mcp:
+    issuer: https://agent-auth.example.org      # this broker's public URL
+    token_ttl: 1h
+    servers:
+      playwright:
+        url: https://mcp-playwright.example.org/mcp
+        description: "A browser"
+        tools: [browser_navigate, browser_snapshot]   # optional: checked, and listed for agents
+rules:
+  - match: {agent: "hermes-*", platform: mcp, capability: use, resource: playwright}
+    action: approve
+```
+
+- **Agents** ask for `platform: mcp, capability: use, resource: <server>`,
+  with `scope: {tools: [...]}` for some of its tools. `get_credential` returns
+  a bearer token for the server's URL.
+- **The token** is an ES256 JWT: `iss` the issuer, `aud` the server's
+  `audience` (its URL by default), `tools` the granted tool names (`["*"]`
+  for all), plus `agent`, `server`, `grant`. Keys: `/.well-known/jwks.json`.
+  They derive from `BROKER_SIGNING_KEY`, which must be set.
+- **ToolHive**: an `MCPOIDCConfig` of type `inline` (`issuer`, `jwksUrl`), the
+  audience on the `MCPServer`, and a Cedar policy such as
+  `permit(principal, action == Action::"call_tool", resource) when { principal.claim_tools.contains("*") || principal.claim_tools.contains(resource.name) };`
+- **Any reverse proxy**: `GET /v1/tokens/verify?server=<name>` with the
+  request's `Authorization` header answers 200 or 401, and also checks that
+  the grant is still active (Traefik `forwardAuth`, nginx `auth_request`).
+- **Clients that can't refresh a header**: `agent-auth-mcp-bridge <server>`
+  is a stdio MCP server that relays to the real one with a current token
+  (`claude mcp add playwright -- agent-auth-mcp-bridge playwright`). Agents in
+  an agent VM get one per granted server automatically.
+
+Ending a grant stops new tokens. A proxy that only checks signatures accepts
+an already issued token until it expires (`token_ttl`); one that calls
+`verify` stops at once.
+
+## Model gateway (LiteLLM)
+
+The agent VMs' model calls can go through one LiteLLM proxy instead of a
+login in every VM. The gateway holds the providers' logins; each agent gets a
+key of its own from the broker, so the gateway counts spend per agent.
+
+```yaml
+platforms:
+  models:
+    name: litellm                          # the resource agents ask for
+    url: https://litellm.example.org       # Anthropic-native here, OpenAI at /v1
+    # admin_url: http://litellm.litellm.svc:4000   # if the broker reaches it elsewhere
+    models: ["claude-*"]                   # what a key may call; empty = all
+    by_runtime:                            # or per runtime (takes precedence):
+      claude: ["claude-*"]                 #   an agent whose runtime is not
+      codex: ["gpt-*"]                     #   listed gets no key
+    # max_budget: 50                       # per key, per budget_duration (30d)
+rules:
+  - match: {agent: {placement: sandbox}, platform: models, capability: use}
+    action: approve
+    max_duration: 24h
+```
+
+The broker needs the gateway's master key as `LITELLM_MASTER_KEY` (and
+`ENCRYPTION_KEY`: it keeps each key encrypted to hand it out again).
+
+- **A grant.** The broker makes (once) a LiteLLM user named after the agent
+  with its fields as metadata, then a key under it: alias
+  `<agent>/<grant id>`, the agent's fields and the grant id as metadata,
+  `duration` = the grant's remaining life, `models` and `max_budget` from
+  the policy. Revoking deletes the key; LiteLLM moves it, with its spend, to
+  its deleted-keys table, so the live table holds only current keys. Only a rule that names `models` (with `capability: use`)
+  approves one; a catch-all for an agent does not.
+- **In an agent VM.** sandboxd asks for a 24h grant per agent the first time
+  one of its conversations starts, reuses it until two hours before its end,
+  and starts claude with `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` (no
+  `CLAUDE_CODE_OAUTH_TOKEN`) and codex with a `model_providers` entry for the
+  gateway's `/v1` (Responses API). When there is no gateway, or the request
+  is not granted at once, or anything fails, the VM's own logins are used as
+  before: the gateway is never a reason a conversation does not start. A
+  running process keeps the key it started with.
+- **One tool per subscription.** With `by_runtime`, a claude agent's key
+  can call only the Claude models and a codex agent's only OpenAI's, and an
+  agent of any other runtime (Hermes) gets no key: a subscription meant for
+  Claude Code is not handed to something else. The gateway can check the
+  caller too (a pre-call hook on the client's User-Agent), but both checks
+  stop mistakes, not an agent set on misuse: the key is in its environment
+  and a header is whatever it sends.
+- **Usage.** `GET /admin/models/usage` (the panel's Model usage tab): each
+  agent's spend as the gateway counts it, by agent and by project.
+
+What it does not protect against. An agent's key is a bearer credential for
+the gateway until its grant ends: whatever runs as that project's user in the
+VM can read it from the process environment and spend on it. With
+subscriptions behind the gateway, every agent draws on the same subscription
+and its limits; the dollars shown are list prices, not a bill. Not verified:
+claude and codex against a live LiteLLM (the codex provider settings in
+particular), and which of Claude Code's beta headers the gateway forwards.
+
+## Wiki
+
+What agents know about the homelab ends up in each one's own memory and
+notes, where no other agent can read it. The wiki is one place they all read
+and each writes its part of: markdown pages in a GitHub repo that only the
+broker touches, as its GitHub App (Contents: write on that repo).
+
+```yaml
+wiki:
+  repo: example-org/agent-wiki     # the App installed on it; empty = no wiki
+  branch: main
+  editors: [{project: homelab}]    # may write every page, as in a rule's `agent`
+platforms:
+  github:
+    repo_denylist: ["example-org/agent-wiki"]   # no agent gets a token for it
+```
+
+- **Reading** needs no grant: `wiki_search`, `wiki_read`, `wiki_list` on the
+  MCP server (`GET /v1/wiki`, `/v1/wiki/page`, `/v1/wiki/search`). The MCP
+  server's instructions tell every agent the wiki exists and to look there
+  before asking another agent.
+- **Writing** (`wiki_write`, `wiki_delete`): an agent writes under
+  `projects/<its project>/` and nowhere else; the project is the one on its
+  record, which it cannot change. `editors` write anywhere, the shared pages
+  included. An agent with no project writes nothing.
+- **Each write is a commit** in the repo, authored as the agent, with its
+  one-line summary. A page that exists is replaced only from the version the
+  writer read (`base_sha`), so a concurrent edit is refused and not lost.
+- **Pages** are `.md` files, at most 64 KiB, under paths of plain segments.
+  A page that looks like it contains a credential (an agent-auth key, a
+  GitHub token, a private key, a JWT) is refused.
+- **By hand**: edit the repo on GitHub like any other; the broker sees it
+  within `refresh_secs` (30 by default). History and revert are git's.
+
+What it does not do. The boundary keeps one project from changing another's
+pages; it does not make a page true. Every agent reads what any agent wrote
+in its own section, so a page comes with its project and last author, and
+the tools say it is information to weigh, not instructions. The credential
+check catches common token shapes pasted by mistake and nothing else. Keep
+the repo on the denylist: a GitHub grant for it would write past the
+per-project rule.
+
+## Web UIs (remote MCP)
+
+claude.ai and ChatGPT can use the broker as a remote MCP server: add a custom
+connector with the URL `https://<public name>/mcp` and sign in when asked.
+
+```yaml
+remote_mcp:
+  enabled: true
+  base_url: https://agent-auth.example   # what the UIs reach
+  # redirect_hosts: [claude.ai, claude.com, chatgpt.com, chat.openai.com]
+  # tools: [...]                         # default: no credentials, no host commands
+```
+
+- **Sign-in.** OAuth 2.1 with PKCE, dynamic client registration (the UIs
+  register themselves), at `/oauth/*`; discovery at
+  `/.well-known/oauth-authorization-server` and
+  `/.well-known/oauth-protected-resource`. Authorizing signs you in at the
+  admin panel's provider (`ui.issuer`, `ui.client_id`; the client must also
+  list `<base_url>/oauth/callback` as a redirect URI) and requires
+  `ui.admin_group`. The consent page names where the browser goes back to
+  and the agent the connector will be. A client may only register redirects
+  to `redirect_hosts`, so a link someone else registered can't send your
+  sign-in elsewhere.
+- **Identity.** Each connector acts as an agent of its own, `web-<name>`,
+  runtime `web`, kind ephemeral, with no API key of its own. **Every request
+  it makes, and every request another agent makes on its behalf, goes to a
+  person**: no policy rule, saved rule or LLM reviewer approves one.
+  Containment, zones and the audit apply as to any agent.
+- **Tokens.** Access tokens last `access_ttl` (1h); refresh tokens
+  (`refresh_ttl`, 30d) rotate, and one used twice ends that authorization.
+  The panel's **Web connectors** tab (or `agent-auth admin connectors`,
+  `connector-revoke`) lists them and revokes a connector at once.
+- **Tools.** By default: whoami, the catalog, requesting access and following
+  decisions, release_grant, a2a threads, reading the wiki, notify_operator. Not
+  get_credential: a token would land in a third party's chat history. Not
+  host commands or wiki writes. Waiting tools return after 50 s at most here
+  (Cloudflare ends longer requests) and tell the model to call again.
+- **Exposure.** Only `/healthz`, `/.well-known/*`, `/mcp` and `/oauth/*`
+  need to be public; the agent API, admin API, panel and daemon channel
+  don't.
+
+What it doesn't protect against: whatever the UI's operator sees of your
+chat (tool results included), and a connector you authorized acting within
+what you then approve for it.
+
+## Admin panel
+
+A page the broker serves at `/ui` for setting agents and hosts up without
+the CLI: the agents and their fields (create, set fields, rename, new key,
+disable), the projects policy names and who is on them, hosts and paired
+daemons (pairing codes, unpair), saved rules (delete). And what happened,
+read-only: every request and who decided it (you, a saved rule, the policy
+file, the LLM), the commands hosts ran with their output, and a diagram of
+which agents talk to which, with the conversations behind each arrow. And a
+chat: you write to agents from it.
+
+```yaml
+ui:
+  enabled: true
+  base_url: https://agent-auth.internal.example.org   # where your browser reaches the broker
+  issuer: https://auth.example.org                    # the OpenID provider (Authelia)
+  client_id: agent-auth-admin
+  admin_group: agent-auth-admins
+```
+
+The provider needs a public client `agent-auth-admin` (PKCE S256, no secret)
+with redirect URI `<base_url>/ui/callback` and the scopes `openid profile
+groups`; give it your strictest authorization policy (two factors). Needs
+`ENCRYPTION_KEY`.
+
+- **Sign-in.** The browser goes to the provider; the broker exchanges the
+  code itself, checks the ID token's signature against the provider's keys,
+  its issuer, audience, expiry and nonce, and that the user is in
+  `admin_group`. No header a proxy adds is believed: whoever can reach the
+  broker's port could send one.
+- **Session.** An encrypted cookie (HttpOnly, Secure), eight hours by
+  default. Every change carries a CSRF token the page reads from the broker,
+  and the page loads nothing from anywhere else (CSP), so another site on the
+  same domain cannot act through it.
+- **Not the admin token.** A session may call a fixed list of admin routes
+  (`core/webui.ALLOWED`). Deciding requests, arming hosts, lifting a lockdown
+  and an agent's webhook or LLDAP password are not on it: those stay on
+  Discord, the CLI and the hosts' TOTP codes.
+- **What it lets you read.** The log shows command output and what agents
+  wrote to each other (`/admin/log/...`, `/admin/a2a/...`). Either can
+  contain whatever a command printed or an agent said, so the panel is as
+  sensitive as the hosts' journals.
+- **One address.** The panel answers only at `base_url`'s host; under the
+  broker's other names (the public one agents use) `/ui` is a 404 and a
+  session cookie is ignored. That narrows where it shows up; the sign-in is
+  what keeps people out.
+
+- **Chat.** A conversation is an a2a thread like any other, opened by the
+  agent row `operator` (made on first use; it has no usable key, cannot be
+  given one, renamed or reclassified, and no other agent may take the name).
+  It goes to service agents only: Hermes, the VMs' orchestrators, not a
+  Claude Code session in a terminal. No grant backs it; the panel's sign-in
+  does, and the panel user is written into each message (`operator` field)
+  and the broker's log. It ends as threads do: either side closes it, or it
+  idles out (`a2a_thread_idle_timeout_secs`, an hour). What the agent asks
+  for on its behalf is a delegated request with `operator` as delegator:
+  rules naming a delegator by runtime (`{runtime: [claude, codex]}`) do not
+  match it, so it goes to the reviewer or to you on Discord as policy says.
+
+What it does not protect against. Whoever can sign in as you at the provider
+(your password, and your second factor if the client asks for one) can create
+agents and read their new keys, re-point a host's pairing and delete saved
+rules. They can write to agents as you, and an agent that trusts `operator`
+more than another agent will act on it with whatever grants it already holds.
+They cannot approve a request with it. Everything shown is text agents
+chose (names, justifications): the page never parses it as HTML, and that is
+the only thing between an agent's justification and your session.
+
+A project in an agent VM is still made on its host (`avm project-create`);
+the broker cannot do that from the panel yet.
+
+## Desktop prompts
+
+With `desktop.enabled` in the policy and `services.agent-auth-hostd.desktop.enable`
+on a host, a request that needs you is also shown as a dialog at the desks
+you are at, next to the Discord message; the first answer decides and the
+others are taken down. No answer in 90 s leaves it to Discord.
+
+```yaml
+desktop:
+  enabled: true
+  agents: ["claude-*", "codex-*", "*-sandbox"]   # who may be asked at a desk
+  # platforms: [github, a2a]    # empty = any
+  # sensitive: false            # sensitive requests stay on Discord
+```
+
+- **Present** means: hostd's helper in your session (`agent-auth-hostd user`,
+  a user service) is connected, the session is unlocked and was used within
+  `desktop.maxIdle`, nothing is fullscreen (or `desktop.busyCommand` says not
+  now), and do-not-disturb is off. Unknown counts as away, and
+  `agent-auth-hostctl status` says why. Hyprland keeps no idle or lock hints,
+  so report them:
+
+  ```
+  # hypridle.conf
+  listener { timeout = 60; on-timeout = agent-auth-hostctl presence idle; on-resume = agent-auth-hostctl presence active }
+  # around your lock screen
+  agent-auth-hostctl presence locked; hyprlock; agent-auth-hostctl presence unlocked
+  ```
+- **A command on the host you are sitting at** is asked at that desk only.
+  hostd builds the dialog from what it would actually run, and with
+  `desktop.approve.user` Allow is that host's own approval of exactly that
+  command: no arming, no TOTP code. With `desktop.approve.root`, a root
+  command then also takes your password (polkit, whose dialog shows the
+  command). Without those, and for commands on other hosts, an answer at a
+  desk is a click like on Discord and the host must be armed. Shells are
+  never asked at a desk.
+- **The dialog** is `desktop.promptCommand`: zenity by default (Allow once ·
+  Deny · Mute agent 1h · Send to Discord; Deny is the default, so a stray
+  Enter denies), or `sbx-prompt` (`{who}` `{what}` `{detail}`).
+- **Limits**: one dialog per desk at a time, 2 in a burst and 6 an hour per
+  agent, 20 an hour overall, a 10-minute pause after a Deny (an hour after
+  three), `agent-auth-hostctl dnd 2h` / `/dnd`.
+- **Attention**: agents can call `notify_operator` when they are blocked on
+  you: a Discord message (a ping if urgent or you are at no desk) and a
+  notification on your desks, with `desktop.attentionCommand` as its sound
+  (also played for prompts). Six an hour per agent.
+
+What this does **not** protect against: anything running as you on one of
+those desktops, or a compromised host, can answer its prompts (not type your
+password). `desktop.agents` and `desktop.platforms` are the limit on what a
+click there can approve; `desktop.approve.user` adds only what such a process
+could do itself.
+
+Not yet run on a desktop: approval at the host's own desk (`pkcheck` in
+particular), sbx-prompt as the dialog, and notifications.
+
+## Agent VMs (sandboxd)
+
+An agent VM is one per host. It runs orchestrated, headless Claude/Codex
+agents, each project under its own unix user. See
+[docs/sandbox-design.md](docs/sandbox-design.md); nixos-dots'
+`modules.agentVm` builds the VM, and `nixosModules.sandboxd` goes into its
+guest.
+
+- **Identities.** Pairing the VM's daemon (`agent-auth admin daemon-pair
+  --role sandbox <host>`, then `avm pair` on the host) bootstraps
+  `orchestrator-<host>-sandbox`. Its policy may mint
+  `<runtime>-<project>-<host>-sandbox` (platform `agents`, capability `mint`;
+  only a rule naming `mint` clears it). A minted agent's key goes to the
+  VM's daemon alone, never to the agent that asked. Each minted agent has a
+  lease (`platforms.agents.lease`, 30d; minting again renews it), and
+  `admin agent-disable` disables an agent and everything it minted.
+- **Conversations.** An a2a open to a VM agent becomes a conversation: a
+  claude (`-p` stream-json) or codex (app-server) process in a sandboxed
+  systemd unit. It parks when idle and resumes on the next message, with the
+  same transcript and scratchpad. `{"_sandbox": {"conversation": id}}` in an
+  opening payload continues an existing conversation.
+- **Projects.** Each project gets `/var/lib/sandbox/projects/<p>`, a home
+  and a `/tmp` of its own, and a userdb user. Another project's files are a
+  grant (platform `sandbox`, `project.read`, or `project.write`, which is
+  always a human's call), applied by the daemon as ACLs.
+- **Operators.** On the host, `avm`: `avm claude <project>` opens a
+  conversation in the Claude TUI, minting the agent if needed. Other commands
+  are `avm ls`, `attach`, `logs -f`, `send`, `stop`, `close`, `shell`,
+  `project-create`, and `secret-set claude-oauth-token < file`.
 
 ## Deploy (recommended: native NixOS service)
 
@@ -430,7 +1170,6 @@ LLDAP_URL=http://lldap:17170
 LLDAP_ADMIN_USER=agent-auth-svc
 LLDAP_ADMIN_PASSWORD=...
 #LLDAP_SET_PASSWORD_BIN=lldap_set_password   # for managed accounts; needs ENCRYPTION_KEY
-WEBHOOK_SIGNING_SECRET=...    # optional; fallback HMAC key for a2a webhook pings
 # a2a thread lifecycle knobs (defaults shown)
 #A2A_OPEN_TIMEOUT_SECS=600
 #A2A_THREAD_IDLE_TIMEOUT_SECS=3600
@@ -441,10 +1180,34 @@ WEBHOOK_SIGNING_SECRET=...    # optional; fallback HMAC key for a2a webhook ping
 `webhook_url` on a registered agent must be an `http(s)` URL (admin-set; the
 broker POSTs to it verbatim, so keep it that way — self-service URLs would be
 an SSRF vector). Webhook POSTs are notify-only pings (no message payload — pull
-via the cursor read) signed with the agent's own `webhook_secret` when set,
-else `WEBHOOK_SIGNING_SECRET`: `X-Agent-Auth-Signature: sha256=<hmac>` over the
-raw body. If neither secret exists the ping is skipped entirely — unsigned
-pings are never sent, and polling remains authoritative.
+via the cursor read) signed with the agent's own `webhook_secret`. An agent
+without one gets no pings — unsigned pings are never sent, and polling remains
+authoritative. (`WEBHOOK_SIGNING_SECRET`, the old broker-wide fallback key, is
+ignored with a warning: every receiver holding it could forge pings to the
+others. `rotate-webhook-secret` gives an agent its own.)
+
+**Verifying webhook pings.** Each ping carries two headers:
+
+- `X-Agent-Auth-Timestamp: <unix seconds when it was sent>`
+- `X-Agent-Auth-Signature: sha256=<lowercase hex HMAC-SHA256>`, keyed with
+  the agent's `webhook_secret` (its UTF-8 bytes), over the timestamp, a
+  `.`, and the raw request body: `"<timestamp>." + body`.
+
+A receiver recomputes the HMAC over exactly those bytes (the body as
+received, before any JSON parsing), compares it in constant time, and
+refuses a timestamp more than about 5 minutes from its own clock, so a
+captured ping cannot be replayed later:
+
+```python
+t = request.headers["X-Agent-Auth-Timestamp"]
+want = "sha256=" + hmac.new(secret.encode(), t.encode() + b"." + raw_body, "sha256").hexdigest()
+ok = t.isdigit() and abs(time.time() - int(t)) <= 300 and hmac.compare_digest(
+    want, request.headers.get("X-Agent-Auth-Signature", ""))
+```
+
+Pings are a doorbell either way: act on what the cursor read returns, never
+on a ping's contents. (`agent-auth a2a serve` signs its own POSTs to a local
+runtime over the body alone, the GitHub-style form such runtimes check.)
 
 The unit runs as a `DynamicUser` with systemd hardening, stores SQLite state in
 `/var/lib/agent-auth/`, and self-migrates on start. Secret files may stay

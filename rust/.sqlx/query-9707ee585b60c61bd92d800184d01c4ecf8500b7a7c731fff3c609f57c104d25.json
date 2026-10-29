@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE access_requests SET approved_resource = $2, approved_authority = $3, updated_at = now()\n         WHERE id = $1 AND status = 'approved'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9707ee585b60c61bd92d800184d01c4ecf8500b7a7c731fff3c609f57c104d25"
+}

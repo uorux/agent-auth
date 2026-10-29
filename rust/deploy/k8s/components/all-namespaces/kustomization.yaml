@@ -1,0 +1,9 @@
+# The provisioner in every namespace: for namespace_allowlist ["*"], and
+# for restricted zones (a cluster-wide grant to an agent outside a zone is a
+# RoleBinding in each namespace outside it, after listing them; it fails
+# closed without the list). admission-policy.yaml still holds every binding
+# to an aa-* grant ServiceAccount in agent-auth-grants.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - rbac.yaml

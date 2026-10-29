@@ -4,7 +4,10 @@ import asyncio
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
 
+from ..policy.agents import attributes
+from ..core import security_log
 from ..core.service import TransitionError
 from ..core.states import GrantStatus, RequestStatus, WAITING_STATUSES
 from ..models import AccessRequest, Agent, Grant
@@ -38,10 +41,34 @@ async def me(caller: Caller = Depends(get_caller)):
         "kind": agent.kind,
         "webhook_url": agent.webhook_url,
         "lldap_username": agent.lldap_username,
+        # What policy knows this agent as.
+        **attributes(agent),
     }
     if caller.session is not None:
         out["session"] = {"id": caller.session.id, "name": caller.session.name}
     return out
+
+
+class AttentionBody(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)
+    urgency: str = "normal"
+
+
+@router.post("/attention")
+async def attention(body: AttentionBody, request: Request, agent: Agent = Depends(get_agent)):
+    """Ask the operator for their attention: Discord, and a notification on
+    the desks they are at. Grants nothing; rate-limited per agent."""
+    from ..core.attention import AttentionLimit
+
+    service = getattr(request.app.state, "attention", None)
+    if service is None:
+        raise HTTPException(501, "not available on this broker")
+    try:
+        return await service.notify(agent, body.text, body.urgency)
+    except AttentionLimit as exc:
+        raise HTTPException(429, str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
 
 
 @router.get("/catalog", response_model=CatalogOut, response_model_exclude_none=True)
@@ -49,6 +76,22 @@ async def catalog(request: Request, agent: Agent = Depends(get_agent)):
     """What this agent may request: enabled platforms and the roles/groups/repos
     (with descriptions and typical routing) available to it."""
     state = request.app.state
+    hosts = None
+    if getattr(state, "hostexec", None) is not None:
+        hosts = [
+            {
+                "name": h["name"],
+                "online": h["online"],
+                "lockdown": h["lockdown"],
+                "tiers": {
+                    name: {"armed": bool(t.get("armed_until")), "shell": bool(t.get("shell"))}
+                    for name, t in h["tiers"].items()
+                    if t.get("enabled")
+                },
+                "templates": h["templates"],
+            }
+            for h in await state.hostexec.hosts()
+        ]
     async with state.db.session() as session:
         return await build_catalog(
             session,
@@ -56,6 +99,7 @@ async def catalog(request: Request, agent: Agent = Depends(get_agent)):
             state.registry,
             state.service.engine,
             state.settings.a2a_listen_threshold_secs,
+            hosts,
         )
 
 
@@ -177,6 +221,13 @@ async def get_credential(grant_id: str, request: Request, agent: Agent = Depends
         grant = await session.get(Grant, grant_id)
         if grant is None or grant.agent_id != agent.id:
             raise HTTPException(404, "unknown grant")
+        # Containment: its grants are being revoked; none is issued meanwhile.
+        from ..core import lockdown
+
+        held = await lockdown.holding(session, agent)
+        if held is not None:
+            security_log.record(request, "credential_refused", agent=agent.name, grant=grant_id, containment=held["id"])
+            raise HTTPException(403, f"contained ({held['id']}): credentials are not issued")
         # Delegated grants stop minting the moment their thread closes — the
         # scheduler revokes them within a tick, but credentials must not be
         # issuable in the gap.

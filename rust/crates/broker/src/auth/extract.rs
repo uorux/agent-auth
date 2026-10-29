@@ -1,0 +1,296 @@
+//! The extractors: the only code that turns an HTTP request into a
+//! principal (rust/spec/http-api.md §3).
+
+use std::net::SocketAddr;
+
+use agent_auth_core::SessionId;
+use agent_auth_core::containment::AgentKind;
+use agent_auth_crypto::Secret;
+use agent_auth_crypto::api_key;
+use agent_auth_store::{Tx, agents, oauth, sessions};
+use axum::extract::{ConnectInfo, FromRequestParts};
+use axum::http::header::AUTHORIZATION;
+use axum::http::request::Parts;
+use time::{Duration, OffsetDateTime};
+
+use super::{AdminCaller, AdminIdentity, AgentCaller, AgentCredentialKind};
+use crate::error::ApiError;
+use crate::state::AppState;
+
+/// Liveness bookkeeping: skip the write when last_seen is this fresh.
+const TOUCH_INTERVAL: Duration = Duration::seconds(20);
+
+/// A web UI connector's OAuth access token (core/oauth.py ACCESS_PREFIX).
+pub const OAUTH_ACCESS_PREFIX: &str = "aat_";
+
+/// How callers authenticate: the admin token, and whether OAuth access
+/// tokens are accepted (the remote MCP is enabled).
+#[derive(Debug, Default)]
+pub struct AuthConfig {
+    /// `ADMIN_TOKEN`; none: the admin API answers 503.
+    pub admin_token: Option<Secret<String>>,
+    /// Accept `aat_` tokens as agent credentials.
+    pub oauth_enabled: bool,
+    /// Take the client address from `X-Real-IP` (set only when a reverse
+    /// proxy that overwrites the header is in front: `TRUST_PROXY_HEADERS`).
+    pub trust_x_real_ip: bool,
+}
+
+/// The bearer token, if the request carries `Authorization: Bearer <t>`
+/// (scheme case-insensitive). Anything else, including a header that is
+/// not visible ASCII, is treated as no token.
+#[must_use]
+pub fn bearer_token(parts: &Parts) -> Option<&str> {
+    let value = parts.headers.get(AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    let token = token.trim();
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
+}
+
+/// Who called, as the reverse proxy saw them (`X-Real-IP`), else the peer.
+#[must_use]
+pub fn client_address(parts: &Parts, trust_x_real_ip: bool) -> Option<String> {
+    if trust_x_real_ip
+        && let Some(ip) = parts.headers.get("x-real-ip").and_then(|v| v.to_str().ok())
+    {
+        return Some(ip.chars().take(64).collect());
+    }
+    parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip().to_string())
+}
+
+fn record(
+    state: &AppState,
+    parts: &Parts,
+    kind: &str,
+    now: OffsetDateTime,
+    fields: &[(&str, Option<&str>)],
+) {
+    let client = client_address(parts, state.auth.trust_x_real_ip);
+    let mut all: Vec<(&str, Option<&str>)> = vec![
+        ("client", client.as_deref()),
+        ("path", Some(parts.uri.path())),
+    ];
+    all.extend_from_slice(fields);
+    state.security_log.record(kind, now, &all);
+}
+
+/// A minted agent past its lease (the scheduler disables it on its next
+/// tick; until then it is refused as if it were).
+fn lapsed(agent: &agents::AgentRow, now: OffsetDateTime) -> bool {
+    agent.lease_expires_at.is_some_and(|l| l <= now)
+}
+
+fn sha256_hex(text: &str) -> String {
+    api_key::hash_secret(text).as_str().to_owned()
+}
+
+impl FromRequestParts<AppState> for AgentCaller {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
+        let Some(token) = bearer_token(parts) else {
+            return Err(ApiError::unauthorized("missing bearer token"));
+        };
+        let now = state.now();
+        let tx = state.store.begin().await?;
+
+        let (agent, via) = if state.auth.oauth_enabled && token.starts_with(OAUTH_ACCESS_PREFIX) {
+            let id = oauth::agent_for_access(&tx, &sha256_hex(token), now).await?;
+            let agent = match id {
+                Some(id) => agents::get(&tx, id).await?,
+                None => None,
+            };
+            match agent {
+                Some(a) if !a.disabled && !lapsed(&a, now) && a.kind != AgentKind::Operator => {
+                    // A connector's token reaches only the routes its remote
+                    // tools call (surfaces Bug-C1): new routes stay closed.
+                    let path = parts.uri.path();
+                    let permitted = state
+                        .web
+                        .remote_mcp
+                        .as_ref()
+                        .is_some_and(|m| m.allows(parts.method.as_str(), path));
+                    if !permitted {
+                        record(
+                            state,
+                            parts,
+                            "connector_route",
+                            now,
+                            &[
+                                ("agent", Some(a.name.as_str())),
+                                ("method", Some(parts.method.as_str())),
+                            ],
+                        );
+                        return Err(ApiError::forbidden("not available to a web UI connector"));
+                    }
+                    (a, AgentCredentialKind::OAuthConnector)
+                }
+                other => {
+                    let name = other.as_ref().map(|a| a.name.clone());
+                    record(
+                        state,
+                        parts,
+                        "bad_key",
+                        now,
+                        &[("agent", name.as_deref()), ("reason", Some("oauth token"))],
+                    );
+                    return Err(ApiError::unauthorized("invalid or expired access token"));
+                }
+            }
+        } else {
+            let Some(parsed) = api_key::parse(token) else {
+                record(
+                    state,
+                    parts,
+                    "bad_key",
+                    now,
+                    &[("reason", Some("malformed"))],
+                );
+                return Err(ApiError::unauthorized("malformed API key"));
+            };
+            let found = agents::by_key_id(&tx, parsed.key_id.as_str()).await?;
+            let refusal = match &found {
+                None => Some("unknown key"),
+                Some(a) if a.disabled => Some("disabled"),
+                // A minted agent whose lease ran out is disabled in all
+                // but the sweep's timing.
+                Some(a) if lapsed(a, now) => Some("lease expired"),
+                // The operator's row speaks only through the admin panel.
+                Some(a) if a.kind == AgentKind::Operator => Some("operator"),
+                Some(a) => match api_key::SecretHash::parse(&a.api_key_hash) {
+                    Some(stored) if api_key::verify(&parsed.secret, &stored) => None,
+                    _ => Some("wrong secret"),
+                },
+            };
+            match (found, refusal) {
+                (Some(a), None) => (a, AgentCredentialKind::ApiKey),
+                (found, Some(reason)) => {
+                    let name = found.as_ref().map(|a| a.name.clone());
+                    record(
+                        state,
+                        parts,
+                        "bad_key",
+                        now,
+                        &[
+                            ("key_id", Some(parsed.key_id.as_str())),
+                            ("agent", name.as_deref()),
+                            ("reason", Some(reason)),
+                        ],
+                    );
+                    return Err(ApiError::unauthorized("invalid API key"));
+                }
+                (None, None) => return Err(ApiError::unauthorized("invalid API key")),
+            }
+        };
+
+        let session = with_session(&tx, parts, &agent, now).await?;
+        agents::touch_seen(&tx, agent.id, now, now.saturating_sub(TOUCH_INTERVAL)).await?;
+        tx.commit().await?;
+        let mut caller = AgentCaller::new(agent, session, via);
+        if via == AgentCredentialKind::OAuthConnector {
+            caller.oauth_token_hash = Some(sha256_hex(token));
+        }
+        Ok(caller)
+    }
+}
+
+impl AgentCaller {
+    /// Is this caller still who it authenticated as? For a request that
+    /// lives on (a long-poll), checked at each re-read: the agent still
+    /// exists, is enabled and not the operator row; its API key is the one
+    /// it presented (not rotated since), or its OAuth access token is still
+    /// live; and its session, if it named one, is still open. Otherwise the
+    /// 401 the extractor would give now.
+    pub(crate) async fn revalidate(&self, state: &AppState) -> Result<(), ApiError> {
+        let now = state.now();
+        let tx = state.store.begin().await?;
+        let row = agents::get(&tx, self.agent.id).await?;
+        let agent_ok = row.as_ref().is_some_and(|a| {
+            !a.disabled
+                && !lapsed(a, now)
+                && a.kind != AgentKind::Operator
+                && (self.via == AgentCredentialKind::OAuthConnector
+                    || (a.key_id == self.agent.key_id && a.api_key_hash == self.agent.api_key_hash))
+        });
+        let token_ok = match &self.oauth_token_hash {
+            None => true,
+            Some(hash) => oauth::agent_for_access(&tx, hash, now).await? == Some(self.agent.id),
+        };
+        if !agent_ok || !token_ok {
+            return Err(ApiError::unauthorized(match self.via {
+                AgentCredentialKind::ApiKey => "invalid API key",
+                AgentCredentialKind::OAuthConnector => "invalid or expired access token",
+            }));
+        }
+        if let Some(s) = &self.session
+            && sessions::get_open(&tx, self.agent.id, s.id)
+                .await?
+                .is_none()
+        {
+            return Err(ApiError::unauthorized("unknown or closed session"));
+        }
+        Ok(())
+    }
+}
+
+async fn with_session(
+    tx: &Tx<'_>,
+    parts: &Parts,
+    agent: &agents::AgentRow,
+    now: OffsetDateTime,
+) -> Result<Option<sessions::SessionRow>, ApiError> {
+    // An empty header is no header (spec http-api §3.1).
+    let Some(header) = parts
+        .headers
+        .get("x-agent-session")
+        .filter(|h| !h.is_empty())
+    else {
+        return Ok(None);
+    };
+    // 401 (not 404): the auth context is stale — mint a new session.
+    let stale = || ApiError::unauthorized("unknown or closed session");
+    let id: SessionId = header
+        .to_str()
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(stale)?;
+    let session = sessions::get_open(tx, agent.id, id)
+        .await?
+        .ok_or_else(stale)?;
+    sessions::touch(tx, id, now, now.saturating_sub(TOUCH_INTERVAL)).await?;
+    Ok(Some(session))
+}
+
+impl FromRequestParts<AppState> for AdminCaller {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
+        // The admin panel's signed-in session (cookie + CSRF on writes),
+        // first, when the panel is on and no Authorization header was sent.
+        if let Some(outcome) = crate::webui::panel::admin_session(state, parts) {
+            return outcome.map(|user| AdminCaller::new(AdminIdentity::Panel { user }));
+        }
+        let Some(expected) = &state.auth.admin_token else {
+            return Err(ApiError::unavailable(
+                "admin API disabled: ADMIN_TOKEN not configured",
+            ));
+        };
+        let presented = bearer_token(parts);
+        // Digests of both, compared in constant time: the time depends on
+        // neither the token's contents nor its length (the operator picks
+        // the length; plain `ct_eq` returns early when lengths differ).
+        let ok = presented.is_some_and(|t| {
+            agent_auth_crypto::ct_eq_hashed(t.as_bytes(), expected.expose().as_bytes())
+        });
+        if !ok {
+            if presented.is_some() || parts.headers.contains_key(AUTHORIZATION) {
+                record(state, parts, "bad_admin_token", state.now(), &[]);
+            }
+            return Err(ApiError::unauthorized("invalid admin token"));
+        }
+        Ok(AdminCaller::new(AdminIdentity::Token))
+    }
+}

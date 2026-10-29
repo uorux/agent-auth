@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM oauth_clients c\n         WHERE c.agent_id IS NULL AND c.revoked_at IS NULL AND c.created_at < $1\n           AND NOT EXISTS (SELECT 1 FROM oauth_tokens t WHERE t.client_id = c.id)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b456f4e2a61924488340140289f2a571c83b46ff1ab3a07a205ac5643609e781"
+}

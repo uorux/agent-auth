@@ -1,0 +1,340 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT * FROM access_requests WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "agent_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "session_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "session_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "delegation_thread_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "delegation_thread_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "delegator_agent_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "delegator_agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "platform",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "platform"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "resource",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "resource"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "requested_capability",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "requested_capability"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "requested_scope",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "requested_scope"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "authority",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "authority"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "justification",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "justification"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "requested_duration_secs",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "requested_duration_secs"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "risk_notes",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "risk_notes"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "status",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "attempt",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "attempt"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "decision_source",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "decision_source"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "decided_by",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "decided_by"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "decision_reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "decision_reason"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "approved_duration_secs",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "approved_duration_secs"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "approved_authority",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "approved_authority"
+          }
+        }
+      },
+      {
+        "ordinal": 20,
+        "name": "approved_resource",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "approved_resource"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "decided_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "decided_at"
+          }
+        }
+      },
+      {
+        "ordinal": 22,
+        "name": "discord_channel_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "discord_channel_id"
+          }
+        }
+      },
+      {
+        "ordinal": 23,
+        "name": "discord_message_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "discord_message_id"
+          }
+        }
+      },
+      {
+        "ordinal": 24,
+        "name": "discord_thread_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "discord_thread_id"
+          }
+        }
+      },
+      {
+        "ordinal": 25,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 26,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "access_requests",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "37a2da857c5bd17d158fff67e6c2dc78eed59c3afd7778f232e825210202747f"
+}

@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE mail_items SET status = $2, decided_by = $3, decided_at = $4,\n                payload_encrypted = CASE WHEN $2 = 'sending' THEN payload_encrypted END\n         WHERE id = $1 AND status = 'held'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "dc8e19509d6dbfb5f583b711fef63f48f1ae48ad38eff2e8b3861961e239e545"
+}

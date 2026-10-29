@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO mail_created_aliases (address, agent_id, grant_id) VALUES ($1, $2, $3)\n         ON CONFLICT (address) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "39a8075887cb14d8b530b5257014294f690a595328298c1fe5d6b43084b5c1a3"
+}

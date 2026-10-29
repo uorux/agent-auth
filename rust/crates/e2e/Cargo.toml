@@ -1,0 +1,32 @@
+[package]
+name = "agent-auth-e2e"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "End-to-end tests: the real binaries against a real database and fake upstreams."
+
+[lints]
+workspace = true
+
+# Nothing to use here: the crate is its tests (tests/e2e). They run the
+# binaries `cargo build --workspace --bins` put in the target directory
+# (scripts/check.sh e2e does that first).
+[lib]
+path = "src/lib.rs"
+test = false
+doctest = false
+
+[dev-dependencies]
+agent-auth-mail = { workspace = true, features = ["testing"] }
+agent-auth-tls = { workspace = true, features = ["reqwest"] }
+axum.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "process", "io-util"] }
+tokio-tungstenite.workspace = true
+url.workspace = true
+uuid.workspace = true

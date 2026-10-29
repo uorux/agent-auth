@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE agents SET kind = $2,\n             webhook_url = CASE WHEN $2 = 'service' THEN webhook_url END,\n             webhook_secret = CASE WHEN $2 = 'service' THEN webhook_secret END,\n             last_listen_at = CASE WHEN $2 = 'service' THEN last_listen_at END\n         WHERE id = $1 AND kind <> 'operator'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "05ccf8b74ccc5dcd000f6c3d35573977fadea68c136aa6fb7d5930027d139c4e"
+}

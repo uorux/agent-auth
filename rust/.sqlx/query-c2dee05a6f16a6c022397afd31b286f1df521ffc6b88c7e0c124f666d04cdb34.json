@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE host_jobs SET via = $3, updated_at = now()\n             WHERE id = $1 AND host = $2 AND status IN ('starting', 'running')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c2dee05a6f16a6c022397afd31b286f1df521ffc6b88c7e0c124f666d04cdb34"
+}

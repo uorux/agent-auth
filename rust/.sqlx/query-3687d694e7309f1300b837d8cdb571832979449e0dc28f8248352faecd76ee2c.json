@@ -1,0 +1,208 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT * FROM a2a_threads WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "a2a_threads",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "initiator_agent_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "a2a_threads",
+            "name": "initiator_agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "initiator_session_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "a2a_threads",
+            "name": "initiator_session_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "responder_agent_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "a2a_threads",
+            "name": "responder_agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "responder_session_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "a2a_threads",
+            "name": "responder_session_id"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "topic",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "a2a_threads",
+            "name": "topic"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "grant_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "a2a_threads",
+            "name": "grant_id"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "state",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "a2a_threads",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "accepted_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "a2a_threads",
+            "name": "accepted_at"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "closed_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "a2a_threads",
+            "name": "closed_at"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "last_activity_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "a2a_threads",
+            "name": "last_activity_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "last_seq",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "a2a_threads",
+            "name": "last_seq"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "closed_by",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "a2a_threads",
+            "name": "closed_by"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "close_reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "a2a_threads",
+            "name": "close_reason"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "close_note",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "a2a_threads",
+            "name": "close_note"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "a2a_threads",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "3687d694e7309f1300b837d8cdb571832979449e0dc28f8248352faecd76ee2c"
+}

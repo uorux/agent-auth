@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO model_call_labels (call_id, expected, note, source, labeled_by, labeled_at)\n         SELECT id, $2, $3, $4, $5, $6 FROM model_calls WHERE id = $1\n         ON CONFLICT (call_id) DO UPDATE\n           SET expected = EXCLUDED.expected, note = EXCLUDED.note, source = EXCLUDED.source,\n               labeled_by = EXCLUDED.labeled_by, labeled_at = EXCLUDED.labeled_at\n           WHERE model_call_labels.source = 'outcome' OR EXCLUDED.source = 'operator'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "49e8f6c038c8d2400af9758e20ef8a1ac5d9bc128c0b1bfa81b56fec3d63d0f9"
+}

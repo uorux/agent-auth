@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import logging
 import math
 from dataclasses import dataclass
 from datetime import timedelta
@@ -9,10 +10,14 @@ from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 
+from ..core import security_log
+from ..core.a2a import OPERATOR_KIND
+from ..core.oauth import ACCESS_PREFIX as OAUTH_ACCESS_PREFIX
 from ..crypto import parse_api_key, verify_secret
 from ..models import Agent, AgentSession, utcnow
 
 _bearer = HTTPBearer(auto_error=False)
+log = logging.getLogger(__name__)
 
 # Liveness bookkeeping: skip the UPDATE when last_seen is this fresh. Keeps hot
 # paths read-only; the skew is invisible against the 120s liveness threshold.
@@ -56,30 +61,57 @@ async def get_caller(
 ) -> Caller:
     if creds is None:
         raise HTTPException(401, "missing bearer token")
-    parsed = parse_api_key(creds.credentials)
-    if parsed is None:
-        raise HTTPException(401, "malformed API key")
-    key_id, secret = parsed
     session_header = request.headers.get("X-Agent-Session")
     now = utcnow()
+    oauth = getattr(request.app.state, "oauth", None)
+    if oauth is not None and creds.credentials.startswith(OAUTH_ACCESS_PREFIX):
+        # A web UI's connector (core/oauth.py): its access token is its agent.
+        async with request.app.state.db.session() as db:
+            agent = await oauth.agent_for_access(db, creds.credentials)
+            if agent is None or agent.disabled:
+                security_log.record(request, "bad_key", agent=agent.name if agent else None, reason="oauth token")
+                raise HTTPException(401, "invalid or expired access token")
+            return await _with_session(db, agent, session_header, now)
+    parsed = parse_api_key(creds.credentials)
+    if parsed is None:
+        security_log.record(request, "bad_key", reason="malformed")
+        raise HTTPException(401, "malformed API key")
+    key_id, secret = parsed
     async with request.app.state.db.session() as db:
         agent = (
             await db.execute(select(Agent).where(Agent.key_id == key_id))
         ).scalar_one_or_none()
-        if agent is None or agent.disabled or not verify_secret(secret, agent.api_key_hash):
+        if (
+            agent is None
+            or agent.disabled
+            or agent.kind == OPERATOR_KIND
+            or not verify_secret(secret, agent.api_key_hash)
+        ):
+            # The operator's row speaks only through the admin panel.
+            security_log.record(
+                request,
+                "bad_key",
+                key_id=key_id,
+                agent=agent.name if agent is not None else None,
+                reason="unknown key" if agent is None else "disabled" if agent.disabled else "operator" if agent.kind == OPERATOR_KIND else "wrong secret",
+            )
             raise HTTPException(401, "invalid API key")
-        agent_session = None
-        if session_header:
-            agent_session = await db.get(AgentSession, session_header)
-            if (
-                agent_session is None
-                or agent_session.agent_id != agent.id
-                or agent_session.closed_at is not None
-            ):
-                # 401 (not 404): the auth context is stale — mint a new session.
-                raise HTTPException(401, "unknown or closed session")
-            _touch(agent_session, now)
-        _touch(agent, now)
+        return await _with_session(db, agent, session_header, now)
+
+
+async def _with_session(db, agent: Agent, session_header: str | None, now) -> Caller:
+    agent_session = None
+    if session_header:
+        agent_session = await db.get(AgentSession, session_header)
+        if (
+            agent_session is None
+            or agent_session.agent_id != agent.id
+            or agent_session.closed_at is not None
+        ):
+            # 401 (not 404): the auth context is stale — mint a new session.
+            raise HTTPException(401, "unknown or closed session")
+        _touch(agent_session, now)
+    _touch(agent, now)
     return Caller(agent=agent, session=agent_session)
 
 
@@ -115,8 +147,29 @@ async def require_admin(
     request: Request,
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> None:
+    # The admin panel: a signed-in session, on the routes it may call, with
+    # the CSRF token for anything that changes something.
+    ui = getattr(request.app.state, "ui_auth", None)
+    if ui is not None and creds is None and ui.serves(request.headers):
+        from ..core import webui
+
+        session = ui.session(request.cookies.get(webui.SESSION_COOKIE))
+        if session is not None:
+            if not webui.allowed(request.method, request.url.path):
+                raise HTTPException(403, "not available from the admin panel")
+            if request.method != "GET" and not hmac.compare_digest(
+                request.headers.get(webui.CSRF_HEADER, ""), session.csrf
+            ):
+                raise HTTPException(403, "missing or wrong CSRF token")
+            if request.method != "GET":
+                log.info("admin panel: %s %s %s", session.user, request.method, request.url.path)
+            request.state.admin_user = session.user
+            return
     admin_token = request.app.state.settings.admin_token
     if not admin_token:
         raise HTTPException(503, "admin API disabled: ADMIN_TOKEN not configured")
     if creds is None or not hmac.compare_digest(creds.credentials, admin_token):
+        if creds is not None:
+            security_log.record(request, "bad_admin_token")
         raise HTTPException(401, "invalid admin token")
+    request.state.admin_user = "admin token"

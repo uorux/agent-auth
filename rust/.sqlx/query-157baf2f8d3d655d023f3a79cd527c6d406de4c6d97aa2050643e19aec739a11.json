@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE agents SET disabled = false, disabled_reason = NULL, key_id = $2,\n             api_key_hash = $3, lease_expires_at = $4\n         WHERE id = $1 AND disabled AND disabled_reason = 'lease'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "157baf2f8d3d655d023f3a79cd527c6d406de4c6d97aa2050643e19aec739a11"
+}

@@ -7,26 +7,47 @@ import discord
 from discord import app_commands
 
 from ..config import Settings
+from ..core.daemons import DaemonHub
 from ..core.service import RequestService
 from ..db import Database
+from ..core.states import GrantStatus
 from ..models import AccessRequest, Agent, A2AThread, Grant, Rule
-from . import embeds, rules, views
+from . import containment as containment_cmds, embeds, hostexec as hx_views, hosts, rules, views
 
 log = logging.getLogger(__name__)
 
 
 class AgentAuthBot(discord.Client):
-    def __init__(self, settings: Settings, db: Database, service: RequestService):
+    def __init__(
+        self,
+        settings: Settings,
+        db: Database,
+        service: RequestService,
+        daemons: DaemonHub | None = None,
+        hostexec=None,
+        desktop=None,
+    ):
         super().__init__(intents=discord.Intents.default())
         self.settings = settings
         self.db = db
         self.service = service
+        self.daemons = daemons
+        # core/hostexec.HostExecService and core/desktop.DesktopService (or None).
+        self.hostexec = hostexec
+        self.desktop = desktop
+        # core/lockdown.ContainmentService, set by main once the app exists.
+        self.containment = None
         self.tree = app_commands.CommandTree(self)
         self._commands_synced = False
         rules.register(self)
+        hosts.register(self)
+        hx_views.register(self)
+        containment_cmds.register(self)
 
     async def setup_hook(self) -> None:
-        self.add_dynamic_items(views.ApproveButton, views.DenyButton, views.EditButton)
+        self.add_dynamic_items(
+            views.ApproveButton, views.DenyButton, views.EditButton, *hx_views.DYNAMIC_ITEMS
+        )
 
     async def on_ready(self) -> None:
         log.info("discord bot ready as %s", self.user)
@@ -70,19 +91,30 @@ class DiscordNotifier:
                     delegator = await session.get(Agent, request.delegator_agent_id)
                     if request.delegation_thread_id is not None:
                         thread = await session.get(A2AThread, request.delegation_thread_id)
-            channel = self.bot.get_channel(
-                self.settings.discord_channel_id
-            ) or await self.bot.fetch_channel(self.settings.discord_channel_id)
-            mention = (
-                f"<@{self.settings.discord_owner_id}> access request from **{agent.name}**"
-            )
+            channel_id = self.settings.discord_channel_id
+            if hx_views.is_hostexec(request):
+                host = None
+                if self.bot.hostexec is not None:
+                    host = next(
+                        (h for h in await self.bot.hostexec.hosts() if h["name"] == request.resource), None
+                    )
+                embed = hx_views.build_embed(request, agent, delegator, thread, host)
+                view = hx_views.pending_view(request)
+                if request.capability == "shell":
+                    # Loud: its own channel if there is one.
+                    channel_id = self.settings.discord_loud_channel_id or channel_id
+                    what = f"🚨 **SHELL request** ({request.scope.get('tier')} on {request.resource})"
+                else:
+                    what = "host command request"
+            else:
+                embed = embeds.build_request_embed(request, agent, delegator, thread)
+                view = views.pending_view(request.id)
+                what = "access request"
+            channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
+            mention = f"<@{self.settings.discord_owner_id}> {what} from **{agent.name}**"
             if delegator is not None:
                 mention += f" on behalf of **{delegator.name}**"
-            message = await channel.send(
-                content=mention,
-                embed=embeds.build_request_embed(request, agent, delegator, thread),
-                view=views.pending_view(request.id),
-            )
+            message = await channel.send(content=mention, embed=embed, view=view)
             async with self.db.session() as session:
                 fresh = await session.get(AccessRequest, request.id)
                 if fresh is not None:
@@ -97,20 +129,163 @@ class DiscordNotifier:
             if message is None:
                 return
             embed = message.embeds[0] if message.embeds else discord.Embed()
-            await message.edit(
-                embed=embeds.apply_outcome(embed, request, grant), view=views.disabled_view()
-            )
+            view = views.disabled_view()
+            if (
+                hx_views.is_hostexec(request)
+                and request.capability == "shell"
+                and grant is not None
+                and grant.status == GrantStatus.ACTIVE
+            ):
+                view = hx_views.shell_view(request.id)  # End shell
+            await message.edit(embed=embeds.apply_outcome(embed, request, grant), view=view)
         except Exception:
             log.exception("failed to update outcome for request %s", request.id)
+
+    async def watch_alert(self, request: AccessRequest, job, text: str) -> None:
+        """The watcher found a running command alarming: a ping, in the
+        shell's thread if it has one. The model's text is escaped."""
+        try:
+            import shlex
+
+            owner = self.settings.discord_owner_id
+            where = await self._shell_thread(request, create=False) if job.shell_id else None
+            if where is None:
+                where = self.bot.get_channel(
+                    self.settings.discord_channel_id
+                ) or await self.bot.fetch_channel(self.settings.discord_channel_id)
+            command = hx_views._code(shlex.join(job.spec.get("argv") or []))
+            said = discord.utils.escape_mentions(discord.utils.escape_markdown(text))
+            await where.send(
+                f"{f'<@{owner}> ' if owner else ''}🚨 **Look at this** — `{job.host}` ({job.tier}), "
+                f"request `{request.id[:8]}`: {command}\n> {said}\nNothing was stopped."[:2000],
+                allowed_mentions=discord.AllowedMentions(users=[discord.Object(owner)] if owner else False,
+                                                         everyone=False, roles=False),
+            )
+        except Exception:
+            log.exception("could not post a watch alert")
+
+    async def attention(self, agent: Agent, text: str, urgency: str, desks: list[str]) -> None:
+        """An agent asks for the operator's attention. A ping when it is
+        urgent or no desk showed it; the text is the agent's, escaped."""
+        try:
+            channel = self.bot.get_channel(
+                self.settings.discord_channel_id
+            ) or await self.bot.fetch_channel(self.settings.discord_channel_id)
+            owner = self.settings.discord_owner_id
+            ping = bool(owner) and (urgency == "high" or not desks)
+            said = discord.utils.escape_mentions(discord.utils.escape_markdown(text))
+            where = f" (shown on {', '.join(desks)})" if desks else ""
+            await channel.send(
+                f"{f'<@{owner}> ' if ping else ''}🔔 **{agent.name}** wants your attention{where}:\n> {said}"[:2000],
+                allowed_mentions=discord.AllowedMentions(users=[discord.Object(owner)] if ping else False,
+                                                         everyone=False, roles=False),
+            )
+        except Exception:
+            log.exception("could not post an attention message")
+
+    async def contained(self, event: dict) -> None:
+        """Agents were contained or locked down: always a ping, with who did
+        it, why, and what was done. The reason and evidence may be a
+        containing agent's words: escaped."""
+        try:
+            channel = self.bot.get_channel(
+                self.settings.discord_channel_id
+            ) or await self.bot.fetch_channel(self.settings.discord_channel_id)
+            owner = self.settings.discord_owner_id
+
+            def said(text: str, limit: int) -> str:
+                text = discord.utils.escape_mentions(discord.utils.escape_markdown(text or ""))
+                return text if len(text) <= limit else text[: limit - 1] + "…"
+
+            agents = event.get("agents") or []
+            lines = [
+                f"{f'<@{owner}> ' if owner else ''}🛑 **Containment `{event.get('id')}`** by {said(event.get('by', ''), 80)}",
+                f"> {said(event.get('reason', ''), 400)}",
+                f"Agents ({len(agents)}): {said(', '.join(agents), 500) or 'none right now (new ones matching are held too)'}",
+                f"Grants revoked: {event.get('grants_revoked', 0)} · conversations closed: {event.get('threads_closed', 0)}",
+            ]
+            if event.get("daemons"):
+                lines.append("Hosts/VMs: " + said(", ".join(f"{k} {v}" for k, v in event["daemons"].items()), 500))
+            if event.get("evidence"):
+                lines.append(f"Evidence:\n> {said(event['evidence'], 700)}")
+            lines.append(f"Lift: `agent-auth admin contain-lift {event.get('id')}` (or /unlock for a lockdown)")
+            await channel.send(
+                "\n".join(lines)[:2000],
+                allowed_mentions=discord.AllowedMentions(users=[discord.Object(owner)] if owner else False,
+                                                         everyone=False, roles=False),
+            )
+        except Exception:
+            log.exception("could not post a containment message")
+
+    async def job_finished(self, request: AccessRequest, job) -> None:
+        """A host command's result: on the approval message for a run, in the
+        shell's thread for a shell command."""
+        try:
+            file = hx_views.output_file(job)
+            files = [file] if file else []
+            if job.shell_id is not None:
+                thread = await self._shell_thread(request, create=False)
+                if thread is not None:
+                    await thread.send(hx_views.result_field(job)[:2000], files=files)
+                return
+            message = await self._message(request)
+            if message is None:
+                # Decided by a rule: there is no approval message to edit.
+                channel = await self._activity_channel()
+                await channel.send(
+                    f"🖥️ `{job.host}` ({job.tier}) for request `{request.id[:8]}`: {hx_views.result_field(job)}"[:2000],
+                    files=files,
+                )
+                return
+            embed = message.embeds[0] if message.embeds else discord.Embed()
+            embed.add_field(name="Result", value=hx_views.result_field(job), inline=False)
+            await message.edit(embed=embed)
+            if files:
+                await message.reply("Full output:", files=files)
+        except Exception:
+            log.exception("failed to post the result of job %s", job.id)
+
+    async def shell_command(self, request: AccessRequest, job) -> bool:
+        """Post a shell command to the shell's thread BEFORE it is sent to the
+        host. False (it could not be shown) stops the command."""
+        try:
+            thread = await self._shell_thread(request, create=True)
+            if thread is None:
+                return False
+            import shlex
+
+            where = f" (cwd `{job.spec['cwd']}`)" if job.spec.get("cwd") else ""
+            await thread.send(f"`$` {hx_views._code(shlex.join(job.spec['argv']))}{where}"[:2000])
+            return True
+        except Exception:
+            log.exception("failed to mirror shell command %s", job.id)
+            return False
+
+    async def _shell_thread(self, request: AccessRequest, create: bool):
+        async with self.db.session() as session:
+            fresh = await session.get(AccessRequest, request.id)
+            thread_id = fresh.discord_thread_id if fresh else None
+        await self.bot.wait_until_ready()
+        if thread_id:
+            return self.bot.get_channel(thread_id) or await self.bot.fetch_channel(thread_id)
+        message = await self._message(request)
+        if message is None or not create:
+            return None
+        thread = await message.create_thread(
+            name=f"shell · {request.scope.get('tier')} on {request.resource}"[:100], auto_archive_duration=1440
+        )
+        async with self.db.session() as session:
+            fresh = await session.get(AccessRequest, request.id)
+            if fresh is not None:
+                fresh.discord_thread_id = thread.id
+        return thread
 
     async def rule_applied(
         self, request: AccessRequest, agent: Agent, rule: Rule | None, grant: Grant | None
     ) -> None:
         try:
             await self.bot.wait_until_ready()
-            channel = self.bot.get_channel(
-                self.settings.discord_channel_id
-            ) or await self.bot.fetch_channel(self.settings.discord_channel_id)
+            channel = await self._activity_channel()
             await channel.send(embed=embeds.build_rule_applied_embed(request, agent, rule, grant))
         except Exception:
             log.exception("failed to log rule application for request %s", request.id)
@@ -124,6 +299,11 @@ class DiscordNotifier:
             await message.edit(embed=embeds.apply_grant_ended(embed, grant))
         except Exception:
             log.exception("failed to mark grant ended for request %s", request.id)
+
+    async def _activity_channel(self):
+        """What needs no one: the activity channel, else the approvals one."""
+        channel_id = self.settings.discord_activity_channel_id or self.settings.discord_channel_id
+        return self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
 
     async def _message(self, request: AccessRequest) -> discord.Message | None:
         if not request.discord_message_id or not request.discord_channel_id:

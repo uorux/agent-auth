@@ -1,0 +1,7 @@
+# The provisioner in the namespaces listed here only: one RoleBinding of
+# agent-auth-provisioner per entry of the policy's
+# platforms.kubernetes.namespace_allowlist (globs expanded by hand).
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - rolebindings.yaml

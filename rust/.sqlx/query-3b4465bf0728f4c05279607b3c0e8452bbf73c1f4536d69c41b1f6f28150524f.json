@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE agents SET disabled = true,\n             disabled_reason = CASE WHEN $2 = 'operator' THEN 'operator'\n                                    WHEN disabled THEN COALESCE(disabled_reason, 'operator')\n                                    ELSE $2 END\n         WHERE id = ANY($1) RETURNING name",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agents",
+            "name": "name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "3b4465bf0728f4c05279607b3c0e8452bbf73c1f4536d69c41b1f6f28150524f"
+}

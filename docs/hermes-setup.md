@@ -51,8 +51,10 @@ Matches Hermes's existing webhook+cron trigger pattern:
 1. Broker side: `agent-auth admin set-webhook <agent-id> --url http://hermes-host:9000/a2a-hook`
    — record the `webhook_secret` it prints ONCE into the Hermes host's secrets.
 2. Hermes side: the endpoint verifies
-   `X-Agent-Auth-Signature == "sha256=" + HMAC_SHA256(secret, raw_body)`
-   (constant-time compare), then schedules **one dispatcher iteration** and
+   `X-Agent-Auth-Signature == "sha256=" + HMAC_SHA256(secret, timestamp + "." + raw_body)`
+   with `timestamp` the `X-Agent-Auth-Timestamp` header (constant-time
+   compare; refuse a timestamp more than ~5 minutes off, see the README's
+   "Verifying webhook pings"), then schedules **one dispatcher iteration** and
    returns 200 immediately. Pings are payload-free
    (`{type, thread_id, from, topic, seq?}`) — treat them purely as a doorbell;
    never act on their contents.
@@ -130,9 +132,11 @@ grant (from then on, opens under it must carry a matching topic). Tighten
 incrementally later via Edit→rule pinning if you want per-subject scoping.
 
 **Broker-side thread privacy**: only the two participant agents can read an
-a2a thread (session-bound on both sides once claimed); there is no admin API
-that reads transcripts — message payloads are, however, stored unencrypted in
-the broker's SQLite, so treat DB access as transcript access.
+a2a thread (session-bound on both sides once claimed). The operator can read
+them too: the admin API's `GET /admin/a2a/threads/{id}` (the panel's log) shows
+a thread's messages, and `/admin/chat` the operator's own threads. Message
+payloads are stored unencrypted in the broker's database, so treat DB access as
+transcript access.
 
 During the conversation, the worker drives everything through its MCP tools:
 
@@ -194,7 +198,9 @@ dead worker's thread.
 You don't need the full dispatcher/worker architecture on day one:
 
 - **v0 — no code, no new nix units**: use Hermes's existing **cron trigger**.
-  A cron-fired conversation every few minutes, with the agent-auth MCP server
+  A cron-fired conversation more often than every 5 minutes (peers count you
+  reachable only if you polled `a2a_events` within `a2a_listen_threshold_secs`,
+  300 s; a slower cron makes opens to you fail with 409 between runs), with the agent-auth MCP server
   attached and a skill/prompt that says: call `a2a_events()`; for each pending
   open — `create_session`, `a2a_accept`, do the work, `a2a_send` the result,
   `a2a_close`, close the session. Pure Hermes configuration. Costs: latency =
@@ -211,9 +217,9 @@ You don't need the full dispatcher/worker architecture on day one:
   conversation-start webhook as flat JSON
   (`{event, thread_id, peer, topic, seq, payload}` — the Hermes route's
   `prompt` template references these fields; the dispatcher itself carries
-  no prompts or instructions). POSTs are signed with the SAME
-  `X-Agent-Auth-Signature` contract as the broker's `set-webhook` pings
-  (HMAC-SHA256 over the raw body); for a Hermes webhook route (GitHub-style
+  no prompts or instructions). POSTs are signed `X-Agent-Auth-Signature:
+  sha256=<HMAC-SHA256 over the raw body>` (unlike the broker's own pings,
+  no timestamp: the GitHub-style form webhook routes check); for a Hermes webhook route (GitHub-style
   verification) add `--sig-header X-Hub-Signature-256` and set the route's
   `secret` to serve's `--hmac-env` secret — the `sha256=<hex>` format already
   matches. It is **level-triggered**: a still-pending

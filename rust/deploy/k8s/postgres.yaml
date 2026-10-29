@@ -1,0 +1,46 @@
+# The broker's database on the shared CNPG cluster (cnpg/postgres), as
+# apps/life/food-tracker does it. The role itself is declared in the
+# Cluster's spec.managed.roles (apps/infra/postgres/cluster.yaml), which
+# this directory cannot add to:
+#
+#   - name: agent-auth
+#     ensure: present
+#     comment: agent-auth broker
+#     login: true
+#     superuser: false
+#     passwordSecret:
+#       name: agent-auth-postgres
+#
+# The broker owns its database and runs its migrations at start; it needs
+# no extension and no superuser. A fresh database: nothing carries over from
+# the Python broker's (rust/README.md, "Migrating").
+apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: agent-auth
+  namespace: cnpg
+spec:
+  name: agent-auth
+  owner: agent-auth
+  cluster:
+    name: postgres
+---
+# CNPG reads `username` and `password` from this secret to manage the role.
+# Use a password without URL-reserved characters (it goes into
+# DATABASE_URL as is).
+apiVersion: onepassword.com/v1
+kind: OnePasswordItem
+metadata:
+  name: agent-auth-postgres
+  namespace: cnpg
+spec:
+  itemPath: "vaults/k8s/items/agent-auth-postgres"
+---
+# The same item in the broker's namespace, for DATABASE_URL.
+apiVersion: onepassword.com/v1
+kind: OnePasswordItem
+metadata:
+  name: agent-auth-postgres
+  namespace: agent-auth
+spec:
+  itemPath: "vaults/k8s/items/agent-auth-postgres"

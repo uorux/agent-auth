@@ -1,0 +1,14 @@
+# One per brokered namespace (copy the document, change the namespace).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agent-auth-provisioner
+  namespace: personal-site
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: agent-auth-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: agent-auth
+    namespace: agent-auth

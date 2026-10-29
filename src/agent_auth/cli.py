@@ -1,18 +1,32 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+from pathlib import Path
 
+import httpx
 import typer
 
 from .client import BrokerClient, BrokerError
 
-app = typer.Typer(help="agent-auth broker CLI", no_args_is_help=True)
-admin = typer.Typer(help="Admin operations (AGENT_AUTH_ADMIN_TOKEN)", no_args_is_help=True)
-a2a = typer.Typer(help="Agent-to-agent threads", no_args_is_help=True)
+# pretty_exceptions_show_locals=False: a traceback must never print the
+# tokens and keys held in local variables (older typer showed them by default).
+app = typer.Typer(
+    help="agent-auth broker CLI", no_args_is_help=True, pretty_exceptions_show_locals=False
+)
+admin = typer.Typer(
+    help="Admin operations (AGENT_AUTH_ADMIN_TOKEN)",
+    no_args_is_help=True,
+    pretty_exceptions_show_locals=False,
+)
+a2a = typer.Typer(
+    help="Agent-to-agent threads", no_args_is_help=True, pretty_exceptions_show_locals=False
+)
 session = typer.Typer(
     help="Agent sessions (ephemeral agents need one for a2a; AGENT_AUTH_SESSION)",
     no_args_is_help=True,
+    pretty_exceptions_show_locals=False,
 )
 app.add_typer(admin, name="admin")
 app.add_typer(a2a, name="a2a")
@@ -27,12 +41,19 @@ def _out(data) -> None:
     typer.echo(json.dumps(data, indent=2, default=str))
 
 
-def _run(fn):
+def _call(fn):
     try:
-        _out(fn())
+        return fn()
     except BrokerError as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         sys.exit(1)
+    except httpx.HTTPError as exc:
+        typer.secho(f"could not reach the broker: {exc}", fg=typer.colors.RED, err=True)
+        sys.exit(1)
+
+
+def _run(fn):
+    _out(_call(fn))
 
 
 @app.command()
@@ -50,7 +71,7 @@ def catalog():
 @app.command()
 def request(
     platform: str = typer.Argument(help="github | homelab | kubernetes | a2a | google"),
-    capability: str = typer.Argument(help="e.g. repo, group, view/edit (k8s role), talk, calendar.read"),
+    capability: str = typer.Argument(help="e.g. repo, create (new github repo), group, view/edit (k8s role), talk, calendar.read"),
     resource: str = typer.Argument(help="e.g. jrt/myrepo, svc-gitea, media (k8s namespace), homelab-agent"),
     justification: str = typer.Option(..., "--why", "-j", help="Why you need this"),
     duration: str = typer.Option("1h", "--duration", "-d", help="e.g. 30m, 8h, 2d"),
@@ -130,8 +151,6 @@ def session_create(
     label: str = typer.Option(None, "--label", "-l", help="Defaults to cwd basename"),
 ):
     """Mint a session; export AGENT_AUTH_SESSION=<session_id> to use it."""
-    import os
-
     if label is None:
         label = os.path.basename(os.getcwd()) or "session"
         label = "".join(c for c in label if c.isalnum() or c in "._-")[:64] or "session"
@@ -339,8 +358,15 @@ def agent_create(
         help="Pre-existing LLDAP account to use as-is. Omit to let the broker "
         "create a managed account (svc-<name>) at the agent's first homelab grant.",
     ),
+    runtime: str = typer.Option(None, "--runtime", help="What runs it: claude, codex, hermes, …"),
+    project: str = typer.Option(None, "--project", help="What it works on (a project of the policy)"),
+    host: str = typer.Option(None, "--host", help="The machine it runs on"),
 ):
-    """Register an agent; prints its API key (and webhook secret) ONCE."""
+    """Register an agent; prints its API key (and webhook secret) ONCE.
+
+    --runtime, --project and --host are what policy rules match on (the name
+    is a label). An agent registered without them is matched only by rules
+    about every agent, or about its name."""
     if kind == "service" and not webhook_url:
         # The common misregistration: a CLI agent left on the default kind gets
         # advertised as a peer and other agents open threads it never reads.
@@ -353,9 +379,38 @@ def agent_create(
         )
     _run(
         lambda: _client().admin_create_agent(
-            name, description, webhook_url, lldap_username, kind=kind
+            name, description, webhook_url, lldap_username, kind=kind,
+            runtime=runtime, project=project, host=host,
         )
     )
+
+
+@admin.command("agent-set")
+def agent_set(
+    agent: str = typer.Argument(..., help="Agent name or id"),
+    runtime: str = typer.Option(None, "--runtime"),
+    project: str = typer.Option(None, "--project"),
+    host: str = typer.Option(None, "--host"),
+):
+    """Correct what an agent is (the fields policy matches on). An option left
+    out keeps its value; "" clears it. Agents minted in a VM are the broker's
+    own record and cannot be changed here."""
+    fields = {k: v for k, v in (("runtime", runtime), ("project", project), ("host", host)) if v is not None}
+    if not fields:
+        raise typer.BadParameter("nothing to set: pass --runtime, --project or --host")
+    _run(lambda: _client().admin_set_attributes(agent, **fields))
+
+
+@admin.command("agent-rename")
+def agent_rename(
+    agent: str = typer.Argument(..., help="Agent name or id"),
+    name: str = typer.Argument(..., help="The new name"),
+):
+    """Rename an agent. Its key, requests and grants are unaffected; saved
+    rules written for exactly this agent and active a2a grants to it are
+    carried over (the counts are reported). Rules that match it by a glob and
+    the policy file are not touched. Agents minted in a VM cannot be renamed."""
+    _run(lambda: _client().admin_rename_agent(agent, name))
 
 
 @admin.command("rotate-lldap-password")
@@ -406,6 +461,12 @@ def agents_list():
     _run(lambda: _client().admin_list_agents())
 
 
+@admin.command("agent-disable")
+def agent_disable(agent_id: str):
+    """Disable an agent and everything it minted; their grants end within a tick."""
+    _run(lambda: _client().admin_disable_agent(agent_id))
+
+
 @admin.command("rotate-key")
 def rotate_key(agent_id: str):
     _run(lambda: _client().admin_rotate_key(agent_id))
@@ -432,14 +493,189 @@ def decide(
     approve: bool = typer.Option(..., "--approve/--deny"),
     reason: str = typer.Option("", "--reason"),
     duration: str = typer.Option(None, "--duration", "-d"),
+    totp: bool = typer.Option(
+        False, "--totp", help="hostexec: prompt for the host's direct TOTP code (required for shells)"
+    ),
 ):
     """Decide a surfaced request via API (fallback when Discord is unavailable)."""
-    _run(lambda: _client().admin_decide(request_id, approve, reason, duration))
+    code = typer.prompt("TOTP code", hide_input=True) if totp and approve else None
+    _run(lambda: _client().admin_decide(request_id, approve, reason, duration, code))
 
 
 @admin.command("revoke")
 def revoke(grant_id: str, reason: str = typer.Option("revoked by admin", "--reason")):
     _run(lambda: _client().admin_revoke_grant(grant_id, reason))
+
+
+@admin.command("gen-signing-key")
+def gen_signing_key(
+    out: Path = typer.Option(
+        None,
+        "--out",
+        help="write BROKER_SIGNING_KEY=<seed> to this new file (0600, never overwritten)",
+    ),
+    to_stdout: bool = typer.Option(
+        False, "--stdout", help="print the private seed even when stdout is not a terminal"
+    ),
+):
+    """Generate BROKER_SIGNING_KEY (ed25519 seed) and print its public key,
+    which every daemon pins as brokerPublicKey. The seed is a secret: prefer
+    --out and move the file into the broker's env secret."""
+    from .daemon_common.crypto import (
+        fingerprint,
+        generate_private_key,
+        private_key_to_text,
+        public_key_text,
+    )
+
+    if out is None and not to_stdout and not sys.stdout.isatty():
+        # Piped or captured output (agent transcripts, logs) would keep the seed.
+        typer.secho(
+            "refusing to print the private signing key to a non-terminal stdout. "
+            "Use --out FILE to write it to a new 0600 file, or --stdout to print anyway.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        sys.exit(2)
+    key = generate_private_key()
+    public = public_key_text(key)
+    line = f"BROKER_SIGNING_KEY={private_key_to_text(key)}"
+    if out is not None:
+        try:
+            fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        except OSError as exc:
+            typer.secho(f"cannot create {out}: {exc.strerror}", fg=typer.colors.RED, err=True)
+            sys.exit(1)
+        with os.fdopen(fd, "w") as f:
+            f.write(line + "\n")
+        typer.echo(f"# wrote BROKER_SIGNING_KEY to {out}")
+    else:
+        typer.echo(line)
+    typer.echo(f"# public key (pin in daemons): {public}")
+    typer.echo(f"# fingerprint: {fingerprint(public)}")
+
+
+@admin.command("daemon-pair")
+def daemon_pair(
+    name: str = typer.Argument(help="the host's name, e.g. excelsior"),
+    role: str = typer.Option("host", "--role", help="host (hostd) | sandbox (sandboxd)"),
+):
+    """Issue a one-time pairing code; on the host, run `sudo agent-auth-hostd
+    pair` and enter it at the prompt (never as an argument)."""
+    res = _call(lambda: _client().admin_create_pairing_code(role, name))
+    from .daemon_common.crypto import fingerprint
+
+    typer.echo(f"pairing code for {role}:{name}: {res['code']}")
+    typer.echo(f"expires: {res['expires_at']}")
+    typer.echo(f"broker key fingerprint (the daemon prints it too): {fingerprint(res['broker_public_key'])}")
+    typer.echo(
+        "on the host: `sudo agent-auth-hostd pair`, then enter the code at the prompt "
+        "(not as an argument — it would land in shell history)"
+    )
+
+
+@admin.command("daemons")
+def daemons_list():
+    """Paired daemons with online state, last heartbeat and key fingerprint."""
+    _run(lambda: _client().admin_list_daemons())
+
+
+@admin.command("daemon-unpair")
+def daemon_unpair(daemon_id: str):
+    """Forget a daemon's key and drop its connection; it must pair again."""
+    _run(lambda: _client().admin_unpair_daemon(daemon_id))
+
+
+@admin.command("broker-key")
+def broker_key():
+    """The broker's public signing key (what daemons pin)."""
+    _run(lambda: _client().admin_broker_key())
+
+
+@admin.command("hosts")
+def hosts_list():
+    """Hosts with a hostd: tiers, arm state, lockdown, VM, desktop presence."""
+    _run(lambda: _client().admin_hosts())
+
+
+@admin.command("arm")
+def arm(
+    host: str,
+    tier: str = typer.Option("user", "--tier", help="user | root"),
+    duration: str = typer.Option("1h", "--duration", "-d", help="capped by the host's own policy"),
+):
+    """Arm a tier on a host: approvals made on Discord then count there.
+    Prompts for a code from that host's <tier>-arm TOTP secret."""
+    code = typer.prompt(f"{host} {tier}-arm code", hide_input=True)
+    _run(lambda: _client().admin_arm(host, tier, duration, code))
+
+
+@admin.command("disarm")
+def disarm(host: str, tier: str = typer.Option(None, "--tier", help="default: both")):
+    _run(lambda: _client().admin_disarm(host, tier))
+
+
+@admin.command("lockdown")
+def lockdown(
+    scope: str = typer.Option("sandboxes", "--scope", help="sandboxes | all | host"),
+    host: str = typer.Option(None, "--host", help="with --scope host"),
+    kill_vm: bool = typer.Option(False, "--kill-vm", help="stop agent VMs instead of freezing them"),
+):
+    """The kill switch: revoke the grants of agent-VM agents (every agent with
+    --scope all), refuse new identities and host commands, disarm hosts, kill
+    their jobs and shells, and freeze their agent VMs from outside."""
+    if host and scope == "sandboxes":
+        scope = "host"
+    _run(lambda: _client().admin_lockdown(scope, host, kill_vm))
+
+
+@admin.command("unlock")
+def unlock(host: str = typer.Option(None, "--host", help="also unlock this host's hostd (asks for its root arm code)")):
+    """Lift a lockdown on the broker. Each host stays locked until it gets its
+    own root arm code (--host), or `sudo agent-auth-hostctl unlock` there."""
+    code = typer.prompt(f"{host} root-arm code", hide_input=True) if host else None
+    _run(lambda: _client().admin_unlock(host, code))
+
+
+@admin.command("contain")
+def contain(
+    reason: str = typer.Option(..., "--reason"),
+    name: str = typer.Option(None, "--name", help="agent name glob"),
+    project: str = typer.Option(None, "--project"),
+    host: str = typer.Option(None, "--host"),
+    runtime: str = typer.Option(None, "--runtime"),
+    everyone: bool = typer.Option(False, "--all", help="every agent"),
+):
+    """Hold agents wherever they run: revoke their grants (model keys too),
+    refuse their requests and credentials, close their conversations, freeze
+    their processes in agent VMs, kill their host commands."""
+    match = {k: v for k, v in {"name": name, "project": project, "host": host, "runtime": runtime}.items() if v}
+    if not match and not everyone:
+        raise typer.BadParameter("say which agents (--name/--project/--host/--runtime) or --all")
+    _run(lambda: _client().admin_contain(match, reason))
+
+
+@admin.command("contain-list")
+def contain_list():
+    _run(lambda: _client().admin_containment())
+
+
+@admin.command("contain-lift")
+def contain_lift(entry: str = typer.Argument(None, help="its id; none: every containment")):
+    """Lift a containment (the agents' grants do not come back: they ask again)."""
+    _run(lambda: _client().admin_contain_lift(entry))
+
+
+@admin.command("connectors")
+def connectors():
+    """Web UI connectors (remote MCP): who registered, which agent each acts as."""
+    _run(lambda: _client().admin_connectors())
+
+
+@admin.command("connector-revoke")
+def connector_revoke(client_id: str):
+    """Revoke a connector: its tokens stop now; it must register and be authorized again."""
+    _run(lambda: _client().admin_connector_revoke(client_id))
 
 
 if __name__ == "__main__":

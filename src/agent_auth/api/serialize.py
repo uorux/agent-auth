@@ -7,17 +7,33 @@ from ..core.states import RequestStatus
 from ..models import AccessRequest, Agent, Grant
 from ..schemas import GrantOut, RequestOut
 
+# Each names the MCP tool and the HTTP endpoint: agents reach the broker
+# through either.
 _GUIDANCE = {
     RequestStatus.LLM_DENIED: (
-        "Denied by LLM review — see decision_reason. You may POST /v1/requests/{id}/retry "
-        "with a revised justification, or POST /v1/requests/{id}/escalate for human review."
+        "Denied by LLM review — see decision_reason. Retry with a revised justification "
+        "that answers it (retry_request / POST /v1/requests/{id}/retry), or ask for human "
+        "review (escalate_request / POST /v1/requests/{id}/escalate)."
     ),
     RequestStatus.AWAITING_HUMAN: (
-        "Waiting for a human decision on Discord. Poll GET /v1/requests/{id}/wait."
+        "Waiting for a human decision on Discord; this can take a while. Keep waiting "
+        "(wait_for_decision / GET /v1/requests/{id}/wait)."
     ),
-    RequestStatus.LLM_EVALUATING: "Under LLM review. Poll GET /v1/requests/{id}/wait.",
+    RequestStatus.LLM_EVALUATING: (
+        "Under LLM review. Keep waiting (wait_for_decision / GET /v1/requests/{id}/wait)."
+    ),
     RequestStatus.GRANTED: (
-        "Granted. Fetch credentials with GET /v1/grants/{grant_id}/credential if applicable."
+        "Granted. If the grant carries a credential (a token, an account, a created repo's "
+        "URL), fetch it with get_credential(\"{grant_id}\") / "
+        "GET /v1/grants/{grant_id}/credential — and re-fetch rather than caching it."
+    ),
+    RequestStatus.DENIED: (
+        "Denied — see decision_reason. Final: don't resubmit it unchanged. A narrower "
+        "request, or one with a materially better justification, is a new request."
+    ),
+    RequestStatus.PROVISION_FAILED: (
+        "Approved, but setting it up failed (see decision_reason). Not your request's "
+        "fault; tell the user, or try again later as a new request."
     ),
 }
 

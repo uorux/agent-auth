@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT g.id FROM grants g JOIN agents a ON a.id = g.agent_id\n         WHERE g.platform = 'sandbox' AND g.status IN ('active', 'provisioning')\n           AND a.sandbox_id = $1\n         ORDER BY g.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "grants",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "d4d7921465b1ec6aab5d8e6e580f5735a584618c4482ad39e9ce28719d08be21"
+}

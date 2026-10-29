@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE access_requests SET risk_notes = risk_notes || jsonb_build_array($2::text),\n             updated_at = now()\n         WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "aa151b3597ee973aab2a09d949c54198327c9ab9618c5bbdcab5535287360e7e"
+}

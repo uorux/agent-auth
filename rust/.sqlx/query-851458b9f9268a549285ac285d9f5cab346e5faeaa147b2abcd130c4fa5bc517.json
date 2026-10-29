@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM pool_leases l USING grants g\n         WHERE l.grant_id = g.id AND l.pool = $1\n           AND g.status NOT IN ('provisioning', 'active')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "851458b9f9268a549285ac285d9f5cab346e5faeaa147b2abcd130c4fa5bc517"
+}

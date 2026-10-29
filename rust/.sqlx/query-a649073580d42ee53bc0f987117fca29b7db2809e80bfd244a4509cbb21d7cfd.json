@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM eval_runs WHERE id IN (\n           SELECT id FROM eval_runs WHERE created_at < $1 AND status <> 'running' LIMIT $2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a649073580d42ee53bc0f987117fca29b7db2809e80bfd244a4509cbb21d7cfd"
+}

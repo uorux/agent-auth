@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT client_id, count(*) AS \"n!\" FROM oauth_tokens\n           WHERE kind = 'refresh' AND revoked_at IS NULL AND used_at IS NULL AND expires_at > $1\n           GROUP BY client_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "client_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oauth_tokens",
+            "name": "client_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "n!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "68fd041866b94ac61b664aa2888d1eb41d813588a37d828bb430ce6ef6225623"
+}

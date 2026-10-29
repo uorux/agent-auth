@@ -1,0 +1,88 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT l.item, l.slot, l.agent_id, l.agent_slot, l.grant_id, g.expires_at\n         FROM pool_leases l JOIN grants g ON g.id = l.grant_id\n         WHERE l.pool = $1\n         ORDER BY l.created_at, l.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "item",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "pool_leases",
+            "name": "item"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "slot",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "pool_leases",
+            "name": "slot"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "agent_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "pool_leases",
+            "name": "agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "agent_slot",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "pool_leases",
+            "name": "agent_slot"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "grant_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "pool_leases",
+            "name": "grant_id"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "expires_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "grants",
+            "name": "expires_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "01a1e45aef0b4322883e33a68ca4057805f4af7f41d612f9f1055816052af651"
+}

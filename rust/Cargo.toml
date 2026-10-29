@@ -1,0 +1,111 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+publish = false
+
+# Every dependency: default features off, then only what is used. Fewer
+# features is less code to trust: no gzip/brotli/zstd decoding anywhere in the
+# HTTP stack, no HTTP/2, no proxies from the environment, no native-tls.
+# Versions are chosen by scripts/cooldown.py (published >= 14 days ago).
+[workspace.dependencies]
+agent-auth-core = { path = "crates/core", version = "0.1.0" }
+agent-auth-crypto = { path = "crates/crypto", version = "0.1.0" }
+agent-auth-wire = { path = "crates/wire", version = "0.1.0" }
+agent-auth-store = { path = "crates/store", version = "0.1.0" }
+agent-auth-client = { path = "crates/client", version = "0.1.0" }
+agent-auth-daemon = { path = "crates/daemon", version = "0.1.0" }
+agent-auth-hostd = { path = "crates/hostd", version = "0.1.0" }
+agent-auth-sandboxd = { path = "crates/sandboxd", version = "0.1.0" }
+agent-auth-mcp = { path = "crates/mcp", version = "0.1.0" }
+agent-auth-tls = { path = "crates/tls", version = "0.1.0" }
+agent-auth-mail = { path = "crates/mail", version = "0.1.0" }
+
+tokio = { version = "1.54.1", default-features = false }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "form", "tokio", "matched-path"] }
+tower = { version = "0.5.3", default-features = false }
+tower-http = { version = "0.7.1", default-features = false, features = ["limit", "timeout", "set-header"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+webpki-roots = { version = "1.0.11", default-features = false }
+rustls-pki-types = { version = "1.15.1", default-features = false, features = ["std"] }
+# `__rustls-tls`: TLS through a rustls config we pass in (agent-auth-tls),
+# with no bundled root store of its own.
+tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect", "handshake", "__rustls-tls"] }
+# TLS for the daemons' channel and the mail gateway's IMAP/SMTP, over the
+# shared rustls config (agent-auth-tls).
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["tls12"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "macros", "migrate", "json", "time", "uuid", "tls-rustls-ring-webpki"] }
+ring = { version = "0.17.14", default-features = false, features = ["alloc", "std"] }
+serde = { version = "1.0.229", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1.0.152", default-features = false, features = ["std", "float_roundtrip"] }
+serde-saphyr = { version = "1.3.0", default-features = false, features = ["deserialize"] }
+# hostexec template parameter patterns (linear-time, no backreferences or
+# lookaround); Unicode classes and case folding as Python's `re` has them.
+regex = { version = "1.13.1", default-features = false, features = ["std", "unicode-perl", "unicode-case"] }
+time = { version = "0.3.55", default-features = false, features = ["std", "formatting", "parsing", "serde", "macros"] }
+uuid = { version = "1.28.0", default-features = false, features = ["std", "v4", "serde"] }
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
+hex = { version = "0.4.3", default-features = false, features = ["std"] }
+thiserror = { version = "2.0.21", default-features = false, features = ["std"] }
+anyhow = { version = "1.0.104", default-features = false, features = ["std"] }
+url = { version = "2.5.8", default-features = false, features = ["std"] }
+clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "env"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std", "attributes"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt", "env-filter", "ansi"] }
+# Hidden input for the operator's TOTP and arm codes (termios, /dev/tty).
+rpassword = { version = "7.5.4", default-features = false }
+futures = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
+zeroize = { version = "1.9.1", default-features = false, features = ["alloc", "derive"] }
+rmcp = { version = "3.5.1", default-features = false }
+# Constants only (open flags for no-follow directory handles in sandboxd);
+# never its unsafe functions.
+libc = { version = "0.2.190", default-features = false }
+# Discord types only (serde). twilight-http and twilight-gateway are not
+# used: twilight-http always enables HTTP/2 (h2), and both bring their own
+# TLS roots. The broker speaks REST over reqwest and the gateway over
+# tokio-tungstenite, both through agent-auth-tls.
+twilight-model = { version = "0.17.1", default-features = false }
+# MIME parsing of untrusted mail (Stalwart's; pure Rust, no unsafe). No
+# `full_encoding`: no encoding_rs (CJK multi-byte charsets decode lossily).
+mail-parser = { version = "0.11.9", default-features = false }
+
+# dev/test only
+http-body-util = { version = "0.1.3", default-features = false }
+proptest = { version = "1.12.0", default-features = false, features = ["std"] }
+# Test certificates for the IMAP/SMTP fakes (ring, no aws-lc).
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unused_must_use = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"
+arithmetic_side_effects = "warn"
+as_conversions = "warn"
+dbg_macro = "deny"
+todo = "warn"
+unimplemented = "deny"
+mem_forget = "deny"
+exit = "warn"
+float_cmp = "deny"
+
+[profile.release]
+overflow-checks = true
+lto = "thin"
+codegen-units = 4
+
+[profile.dev]
+overflow-checks = true

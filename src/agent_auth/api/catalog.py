@@ -3,7 +3,9 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .. import authority as authority_mod
 from ..core.a2a import reachability
+from ..core.zones import Zones
 from ..core.states import Platform
 from ..models import AccessRequest, Agent
 from ..policy.engine import PolicyEngine
@@ -37,7 +39,16 @@ async def _disposition(
         justification="",
         requested_duration_secs=0,
     )
+    probe.authority = authority_mod.fold(platform, capability, {})
     decision = await engine.evaluate(session, agent, probe)
+    # Mirror the service's gate: a privilege only an explicit rule may clear
+    # (github "create") goes to a human when a catch-all matched it.
+    if (
+        decision.action in (PolicyAction.APPROVE, PolicyAction.LLM)
+        and not decision.explicit
+        and engine.needs_explicit_rule(probe)
+    ):
+        return _DISPOSITION[PolicyAction.SURFACE]
     return _DISPOSITION.get(decision.action, decision.action.value)
 
 
@@ -47,6 +58,7 @@ async def build_catalog(
     registry: ProvisionerRegistry,
     engine: PolicyEngine,
     listen_threshold_secs: int = 300,
+    hosts: list[dict] | None = None,
 ) -> CatalogOut:
     """What this agent may request, per enabled platform — the menu it needs
     before composing a request."""
@@ -62,6 +74,70 @@ async def build_catalog(
                 resource_hint="owner/repo",
                 repo_allowlist=gh.repo_allowlist or ["<any>"],
                 permission_ceiling=gh.permission_ceiling,
+                create_owners=gh.create_owners or None,
+                create_disposition=(
+                    await _disposition(session, engine, agent, Platform.GITHUB, "create")
+                    if gh.create_owners
+                    else None
+                ),
+            )
+        )
+
+    # Agent VMs (docs/sandbox-design.md): only agents living in one can mint
+    # or reach other projects, so only they see these.
+    if agent.sandbox_id and registry.enabled(Platform.AGENTS):
+        platforms.append(
+            PlatformCatalog(
+                platform=Platform.AGENTS,
+                capability_hint="mint",
+                resource_hint="<runtime>-<project>-<this host>-sandbox",
+                capabilities=list(policy.platforms.agents.runtimes),
+            )
+        )
+    if agent.sandbox_id and agent.project and registry.enabled(Platform.SANDBOX):
+        platforms.append(
+            PlatformCatalog(
+                platform=Platform.SANDBOX,
+                capability_hint="project.read | project.write (write: always a human)",
+                resource_hint="<another project in this agent VM>",
+                capabilities=["project.read", "project.write"],
+            )
+        )
+
+    if registry.enabled(Platform.HOSTEXEC) and hosts:
+        platforms.append(
+            PlatformCatalog(
+                platform=Platform.HOSTEXEC,
+                capability_hint='run | tpl.<template> | shell (root and every shell: always a human)',
+                resource_hint="<host>",
+                capabilities=["run", "shell", *[f"tpl.{name}" for name in policy.platforms.hostexec.templates]],
+                hosts=hosts,
+            )
+        )
+
+    if registry.enabled(Platform.MCP):
+        platforms.append(
+            PlatformCatalog(
+                platform=Platform.MCP,
+                capability_hint='use (scope {"tools": [...]}; omit for every tool)',
+                resource_hint="<server>",
+                capabilities=["use"],
+                servers=[
+                    {"name": name, "url": s.url, "description": s.description, "tools": s.tools or None}
+                    for name, s in sorted(policy.platforms.mcp.servers.items())
+                ],
+            )
+        )
+
+    if registry.enabled(Platform.MODELS):
+        gw = policy.platforms.models
+        platforms.append(
+            PlatformCatalog(
+                platform=Platform.MODELS,
+                capability_hint="use",
+                resource_hint=gw.name,
+                capabilities=["use"],
+                gateway={"name": gw.name, "url": gw.url, "models": gw.models or None},
             )
         )
 
@@ -116,12 +192,14 @@ async def build_catalog(
                 )
             )
         ).scalars().all()
+        zones = Zones(policy)
         peers = [
             PeerEntry(
                 description=peer.description or None,
                 **reachability(peer, listen_threshold_secs),
             )
             for peer in rows
+            if not zones.apart(agent, peer)
         ]
         platforms.append(
             PlatformCatalog(

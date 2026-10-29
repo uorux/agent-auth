@@ -5,21 +5,39 @@ import logging
 
 import uvicorn
 
-from .api.app import create_app
+from .api.app import create_app, enable_remote_mcp
 from .config import Settings, get_settings
 from .core.a2a import A2AThreadService
+from .core.daemons import DaemonHub
+from .core.attention import AttentionService
+from .core.desktop import DesktopService, FanoutNotifier
+from .core.hostexec import HostExecService
+from .core.sandboxes import SandboxService
 from .core.events import KeyedEvents
 from .core.scheduler import ExpiryScheduler
 from .core.service import RequestService
+from .core.states import Platform
+from .core.webui import UiAuth
+from .core.wiki import GithubWikiBackend, WikiService
 from .crypto import SecretBox
 from .db import Database
 from .discord_bot.bot import AgentAuthBot, DiscordNotifier
+from .policy.agents import pattern_text
 from .policy.engine import PolicyEngine
 from .policy.llm import LLMEvaluator
+from .core.tokens import TokenIssuer
+from .daemon_common.crypto import private_key_from_text
+from .policy.risk import RiskSummarizer, Watcher
+from .provisioners.mcp import McpProvisioner
+from .provisioners.models import ModelsProvisioner
 from .policy.schema import load_policy
+from .core.zones import Zones
 from .provisioners.a2a import A2AProvisioner
+from .provisioners.agents import AgentsProvisioner
+from .provisioners.sandbox import SandboxProvisioner
 from .provisioners.base import ProvisionerRegistry
 from .provisioners.github import GithubProvisioner
+from .provisioners.hostexec import HostexecProvisioner
 from .provisioners.google_stub import GoogleStubProvisioner
 from .provisioners.kubernetes import KubernetesProvisioner
 from .provisioners.lldap import LldapProvisioner
@@ -79,18 +97,25 @@ def build_registry(settings: Settings, policy) -> ProvisionerRegistry:
     else:
         log.info("homelab provisioner disabled (LLDAP_URL not set)")
     if settings.kubernetes_api_url:
-        registry.register(
-            KubernetesProvisioner(
-                api_url=settings.kubernetes_api_url,
-                config=policy.platforms.kubernetes,
-                token=settings.kubernetes_token,
-                token_file=settings.kubernetes_token_file,
-                ca_file=settings.kubernetes_ca_file,
-                insecure_skip_verify=settings.kubernetes_insecure_skip_verify,
-            )
+        k8s = KubernetesProvisioner(
+            api_url=settings.kubernetes_api_url,
+            config=policy.platforms.kubernetes,
+            token=settings.kubernetes_token,
+            token_file=settings.kubernetes_token_file,
+            ca_file=settings.kubernetes_ca_file,
+            insecure_skip_verify=settings.kubernetes_insecure_skip_verify,
         )
+        k8s.zones = Zones(policy)
+        registry.register(k8s)
     else:
         log.info("kubernetes provisioner disabled (KUBERNETES_API_URL not set)")
+    models = policy.platforms.models
+    if models.url:
+        if not settings.litellm_master_key or not settings.encryption_key:
+            log.warning("platforms.models has a url but LITELLM_MASTER_KEY or ENCRYPTION_KEY is unset: models is disabled")
+        else:
+            registry.register(ModelsProvisioner(models, settings.litellm_master_key, SecretBox(settings.encryption_key)))
+            log.info("models: gateway %s at %s", models.name, models.url)
     return registry
 
 
@@ -99,7 +124,7 @@ async def serve(settings: Settings) -> None:
         level=settings.log_level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    policy = load_policy(settings.policy_file)
+    policy = load_policy(settings.policy_file, [p for p in settings.policy_overlays.split(",") if p.strip()])
     db = Database(settings.database_url)
     events = KeyedEvents()
     registry = build_registry(settings, policy)
@@ -117,12 +142,88 @@ async def serve(settings: Settings) -> None:
 
     service = RequestService(db, PolicyEngine(policy), registry, events, llm=llm)
     a2a = A2AThreadService(db, settings, KeyedEvents())
-    app = create_app(settings, db, service, registry, events, a2a)
-    scheduler = ExpiryScheduler(service, a2a)
+    daemons = DaemonHub(db, settings)
+    sandboxes = hostexec = None
+    if not daemons.enabled:
+        log.info("daemon channel disabled (BROKER_SIGNING_KEY not set)")
+    else:
+        # Agent VMs: minted identities and cross-project access. Keys are
+        # handed to sandboxes Fernet-wrapped in between, so ENCRYPTION_KEY too.
+        sandboxes = SandboxService(
+            db, daemons, SecretBox(settings.encryption_key) if settings.encryption_key else None
+        )
+        if not settings.encryption_key:
+            log.warning("ENCRYPTION_KEY unset: agent VMs can pair but receive no agent keys")
+        registry.register(AgentsProvisioner(policy.platforms.agents, sandboxes))
+        registry.register(SandboxProvisioner(daemons))
+        # Commands on hosts: each host's hostd decides what it runs.
+        hostexec = HostExecService(db, daemons, events)
+        hostexec.bind(service, a2a)
+        registry.register(HostexecProvisioner(policy.platforms.hostexec, hostexec))
+        if settings.openrouter_api_key and policy.platforms.hostexec.risk_summary:
+            service.risk = RiskSummarizer(
+                settings.openrouter_api_key,
+                settings.openrouter_base_url,
+                policy.platforms.hostexec.risk_model or policy.llm.model,
+            )
+        if settings.openrouter_api_key and policy.platforms.hostexec.watch:
+            hostexec.watcher = Watcher(
+                settings.openrouter_api_key,
+                settings.openrouter_base_url,
+                policy.platforms.hostexec.risk_model or policy.llm.model,
+            )
+    app = create_app(settings, db, service, registry, events, a2a, daemons, hostexec)
+    # MCP servers that take the broker's own tokens (signed with a key derived
+    # from the broker's signing key).
+    if policy.platforms.mcp.servers:
+        if settings.broker_signing_key:
+            tokens = TokenIssuer(private_key_from_text(settings.broker_signing_key), policy.platforms.mcp.issuer)
+            registry.register(McpProvisioner(policy.platforms.mcp, tokens))
+            app.state.tokens = tokens
+            log.info("mcp: %d server(s), tokens issued as %s (kid %s)", len(policy.platforms.mcp.servers),
+                     tokens.issuer, tokens.kid)
+        else:
+            log.warning("platforms.mcp lists servers but BROKER_SIGNING_KEY is not set: mcp is disabled")
+    # The agents' wiki: a repo the broker reads and writes as its GitHub App.
+    if policy.wiki.repo:
+        if registry.enabled(Platform.GITHUB):
+            app.state.wiki = WikiService(
+                policy.wiki,
+                GithubWikiBackend(registry.get(Platform.GITHUB), policy.wiki.repo, policy.wiki.branch),
+            )
+            app.state.wiki.zones = Zones(policy)
+            log.info("wiki: %s (%s)", policy.wiki.repo, policy.wiki.branch)
+        else:
+            log.warning("wiki.repo is set but GitHub is not configured: the wiki is disabled")
+    # The admin panel, signed into at the homelab's OpenID provider.
+    if policy.ui.enabled:
+        if settings.encryption_key:
+            app.state.ui_auth = UiAuth(policy.ui, settings.encryption_key)
+            log.info("admin panel: %s/ui (sign-in at %s, group %s)", policy.ui.base_url.rstrip("/"),
+                     policy.ui.issuer, policy.ui.admin_group)
+        else:
+            log.warning("ui.enabled is set but ENCRYPTION_KEY is not: the admin panel is disabled")
+    # Web UIs (claude.ai, ChatGPT): /mcp, signed into with OAuth at the
+    # panel's provider.
+    if policy.remote_mcp.enabled:
+        if settings.encryption_key:
+            signin = app.state.ui_auth or UiAuth(policy.ui, settings.encryption_key)
+            enable_remote_mcp(app, policy, settings, signin)
+            log.info("remote mcp: %s/mcp, %d tool(s), redirects to %s", policy.remote_mcp.base_url.rstrip("/"),
+                     len(policy.remote_mcp.tools), ", ".join(policy.remote_mcp.redirect_hosts))
+        else:
+            log.warning("remote_mcp.enabled is set but ENCRYPTION_KEY is not: remote MCP is disabled")
+    scheduler = ExpiryScheduler(service, a2a, sandboxes=sandboxes)
 
     server = uvicorn.Server(
         uvicorn.Config(
-            app, host=settings.listen_host, port=settings.listen_port, log_level="info"
+            app,
+            host=settings.listen_host,
+            port=settings.listen_port,
+            log_level="info",
+            # The only WebSocket is the daemon channel, reachable before
+            # authentication; its messages are small.
+            ws_max_size=1024 * 1024,
         )
     )
 
@@ -131,16 +232,29 @@ async def serve(settings: Settings) -> None:
         asyncio.create_task(scheduler.run(), name="scheduler"),
     ]
 
+    # Approval prompts on the desktops you are at, next to Discord.
+    desktop = None
+    if daemons.enabled and policy.desktop.enabled:
+        desktop = DesktopService(db, daemons, policy.desktop, service, hostexec)
+        log.info(
+            "desktop prompts enabled for agents %s",
+            ", ".join(pattern_text(p) for p in policy.desktop.agents) or "(none listed)",
+        )
+
     bot: AgentAuthBot | None = None
+    notifier = service.notifier
     if settings.discord_token:
-        bot = AgentAuthBot(settings, db, service)
-        service.set_notifier(DiscordNotifier(bot, db, settings))
+        bot = AgentAuthBot(settings, db, service, daemons, hostexec, desktop)
+        bot.containment = app.state.containment
+        notifier = DiscordNotifier(bot, db, settings)
         tasks.append(asyncio.create_task(bot.start(settings.discord_token), name="discord"))
     else:
         log.warning(
             "DISCORD_TOKEN not set — running headless; surfaced requests are only "
             "visible via the admin API"
         )
+    service.set_notifier(FanoutNotifier(notifier, desktop) if desktop is not None else notifier)
+    app.state.attention = AttentionService(service, desktop)
 
     try:
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

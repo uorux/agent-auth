@@ -1095,3 +1095,22 @@ async def test_legacy_null_thread_messages_invisible(api, db):
     assert (await api.get("/v1/a2a/threads", headers=auth(r["api_key"]))).json() == []
     events = (await api.get("/v1/a2a/events", headers=auth(r["api_key"]))).json()
     assert events["pending_opens"] == [] and events["activity"] == []
+
+
+async def test_payload_keys_survive_verbatim(api, db):
+    """FastAPI's default encoder drops dict keys starting with "_sa"; a2a
+    payloads must come back exactly as sent."""
+    from .conftest import make_agent
+
+    _, akey = await make_agent(db, "auto-sender")
+    _, bkey = await make_agent(db, "plain-receiver")
+    h = {"Authorization": f"Bearer {akey}"}
+    hb = {"Authorization": f"Bearer {bkey}"}
+    g = await api.post("/v1/requests", json={"platform": "a2a", "capability": "talk",
+        "resource": "plain-receiver", "scope": {}, "justification": "test", "requested_duration": "1h"}, headers=h)
+    assert g.json()["status"] == "granted"
+    await api.get("/v1/a2a/events", headers=hb)  # the receiver is listening
+    payload = {"_sandbox": {"conversation": "c1"}, "_sample": 1, "task": "x"}
+    tid = (await api.post("/v1/a2a/threads", json={"to": "plain-receiver", "payload": payload}, headers=h)).json()["thread_id"]
+    got = (await api.get(f"/v1/a2a/threads/{tid}/messages", headers=hb)).json()["messages"][0]["payload"]
+    assert got == payload

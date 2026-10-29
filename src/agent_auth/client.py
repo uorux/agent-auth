@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 import httpx
@@ -11,6 +12,24 @@ class BrokerError(Exception):
         self.status_code = status_code
         self.detail = detail
         super().__init__(f"[{status_code}] {detail}")
+
+
+# One long-poll request stays under what a reverse proxy in front of the broker
+# allows (Cloudflare cuts a request at 100s); a longer wait is several of them.
+POLL_SLICE = 60.0
+WAITING = ("pending", "llm_evaluating", "awaiting_human", "approved", "provisioning")
+JOB_ENDED = ("done", "refused", "lost")
+
+
+def _poll(fetch, settled, total: float):
+    """fetch(wait) repeatedly, each at most POLL_SLICE long, until settled(result)
+    or `total` seconds have gone by. Returns the last result."""
+    deadline = time.monotonic() + total
+    while True:
+        left = deadline - time.monotonic()
+        out = fetch(max(0.0, min(left, POLL_SLICE)))
+        if settled(out) or deadline - time.monotonic() <= 0:
+            return out
 
 
 class BrokerClient:
@@ -64,6 +83,29 @@ class BrokerClient:
     def me(self):
         return self._request("GET", "/v1/me")
 
+    def attention(self, text: str, urgency: str = "normal"):
+        return self._request("POST", "/v1/attention", json={"text": text, "urgency": urgency})
+
+    def wiki_list(self, prefix: str = ""):
+        return self._request("GET", "/v1/wiki", params={"prefix": prefix})
+
+    def wiki_read(self, path: str):
+        return self._request("GET", "/v1/wiki/page", params={"path": path})
+
+    def wiki_search(self, query: str, limit: int = 8):
+        return self._request("GET", "/v1/wiki/search", params={"q": query, "limit": limit})
+
+    def wiki_write(self, path: str, content: str, summary: str, base_sha: str | None = None):
+        return self._request(
+            "PUT", "/v1/wiki/page",
+            json={"path": path, "content": content, "summary": summary, "base_sha": base_sha},
+        )
+
+    def wiki_delete(self, path: str, summary: str, base_sha: str | None = None):
+        return self._request(
+            "POST", "/v1/wiki/delete", json={"path": path, "summary": summary, "base_sha": base_sha}
+        )
+
     def catalog(self):
         return self._request("GET", "/v1/catalog")
 
@@ -95,11 +137,12 @@ class BrokerClient:
         return self._request("GET", f"/v1/requests/{request_id}")
 
     def wait(self, request_id: str, timeout: float = 60):
-        return self._request(
-            "GET",
-            f"/v1/requests/{request_id}/wait",
-            params={"timeout": timeout},
-            timeout=timeout + 10,
+        return _poll(
+            lambda t: self._request(
+                "GET", f"/v1/requests/{request_id}/wait", params={"timeout": t}, timeout=t + 10
+            ),
+            lambda req: req.get("status") not in WAITING,
+            timeout,
         )
 
     def retry(self, request_id: str, justification: str):
@@ -143,11 +186,15 @@ class BrokerClient:
         )
 
     def a2a_poll(self, thread_id: str, after_seq: int = 0, wait: float = 0):
-        return self._request(
-            "GET",
-            f"/v1/a2a/threads/{thread_id}/messages",
-            params={"after_seq": after_seq, "wait": wait},
-            timeout=wait + 10,
+        return _poll(
+            lambda t: self._request(
+                "GET",
+                f"/v1/a2a/threads/{thread_id}/messages",
+                params={"after_seq": after_seq, "wait": t},
+                timeout=t + 10,
+            ),
+            lambda out: bool(out.get("messages")) or out.get("thread", {}).get("state") == "closed",
+            wait,
         )
 
     def a2a_threads(self, state: str | None = None, role: str | None = None):
@@ -178,9 +225,21 @@ class BrokerClient:
         params: dict[str, Any] = {"wait": wait}
         if after:
             params["after"] = after
-        return self._request("GET", "/v1/a2a/events", params=params, timeout=wait + 10)
+        return _poll(
+            lambda t: self._request(
+                "GET", "/v1/a2a/events", params={**params, "wait": t}, timeout=t + 10
+            ),
+            lambda out: bool(out.get("pending_opens") or out.get("activity")),
+            wait,
+        )
 
     # admin operations
+    def admin_set_attributes(self, agent: str, **fields: str):
+        return self._request("PATCH", f"/admin/agents/{agent}/attributes", admin=True, json=fields)
+
+    def admin_rename_agent(self, agent: str, name: str):
+        return self._request("POST", f"/admin/agents/{agent}/rename", admin=True, json={"name": name})
+
     def admin_create_agent(
         self,
         name: str,
@@ -188,6 +247,9 @@ class BrokerClient:
         webhook_url: str | None = None,
         lldap_username: str | None = None,
         kind: str = "service",
+        runtime: str | None = None,
+        project: str | None = None,
+        host: str | None = None,
     ):
         return self._request(
             "POST",
@@ -197,6 +259,9 @@ class BrokerClient:
                 "name": name,
                 "description": description,
                 "kind": kind,
+                "runtime": runtime,
+                "project": project,
+                "host": host,
                 "webhook_url": webhook_url,
                 "lldap_username": lldap_username,
             },
@@ -249,15 +314,99 @@ class BrokerClient:
         approve: bool,
         reason: str = "",
         duration: str | None = None,
+        totp: str | None = None,
     ):
         return self._request(
             "POST",
             f"/admin/requests/{request_id}/decide",
             admin=True,
-            json={"approve": approve, "reason": reason, "duration": duration},
+            json={"approve": approve, "reason": reason, "duration": duration, "totp": totp},
         )
 
     def admin_revoke_grant(self, grant_id: str, reason: str):
         return self._request(
             "POST", f"/admin/grants/{grant_id}/revoke", admin=True, params={"reason": reason}
         )
+
+    # --- paired daemons -------------------------------------------------------
+
+    def admin_create_pairing_code(self, role: str, name: str):
+        return self._request(
+            "POST", "/admin/daemons/pairing-codes", admin=True, json={"role": role, "name": name}
+        )
+
+    def admin_disable_agent(self, agent_id: str):
+        return self._request("POST", f"/admin/agents/{agent_id}/disable", admin=True)
+
+    def admin_list_daemons(self):
+        return self._request("GET", "/admin/daemons", admin=True)
+
+    def admin_unpair_daemon(self, daemon_id: str):
+        return self._request("DELETE", f"/admin/daemons/{daemon_id}", admin=True)
+
+    def admin_broker_key(self):
+        return self._request("GET", "/admin/broker-key", admin=True)
+
+    def admin_hosts(self):
+        return self._request("GET", "/admin/hosts", admin=True)
+
+    def admin_arm(self, host: str, tier: str, duration: str, totp: str):
+        return self._request(
+            "POST", f"/admin/hosts/{host}/arm", admin=True,
+            json={"tier": tier, "duration": duration, "totp": totp},
+        )
+
+    def admin_disarm(self, host: str, tier: str | None = None):
+        return self._request(
+            "POST", f"/admin/hosts/{host}/disarm", admin=True, params={"tier": tier} if tier else None
+        )
+
+    def admin_contain(self, match: dict, reason: str, evidence: str = ""):
+        return self._request("POST", "/admin/containment", admin=True, json={"match": match, "reason": reason, "evidence": evidence})
+
+    def admin_connectors(self):
+        return self._request("GET", "/admin/connectors", admin=True)
+
+    def admin_connector_revoke(self, client_id: str):
+        return self._request("POST", f"/admin/connectors/{client_id}/revoke", admin=True)
+
+    def admin_containment(self):
+        return self._request("GET", "/admin/containment", admin=True)
+
+    def admin_contain_lift(self, entry: str | None):
+        return self._request("POST", "/admin/containment/lift", admin=True, json={"id": entry})
+
+    def admin_lockdown(self, scope: str, host: str | None, kill_vm: bool):
+        return self._request(
+            "POST", "/admin/lockdown", admin=True, json={"scope": scope, "host": host, "kill_vm": kill_vm}
+        )
+
+    def admin_unlock(self, host: str | None, totp: str | None):
+        return self._request("POST", "/admin/unlock", admin=True, json={"host": host, "totp": totp})
+
+    # --- commands on hosts ------------------------------------------------------
+
+    def host_job(self, job_id: str, wait: float = 0):
+        return _poll(
+            lambda t: self._request(
+                "GET", f"/v1/hostexec/jobs/{job_id}", params={"wait": t}, timeout=t + 15
+            ),
+            lambda job: job.get("status") in JOB_ENDED,
+            wait,
+        )
+
+    def host_shell_exec(self, grant_id: str, argv: list[str], cwd: str | None = None,
+                        stdin: str | None = None, timeout: int | None = None, wait: float = 60):
+        # The exec itself is one request (it must not be sent twice); the rest
+        # of the wait is on the job it returns.
+        first = min(wait, POLL_SLICE)
+        job = self._request(
+            "POST", f"/v1/hostexec/shells/{grant_id}/exec", timeout=first + 30,
+            json={"argv": argv, "cwd": cwd, "stdin": stdin, "timeout": timeout, "wait": first},
+        )
+        if wait > first and job.get("id") and job.get("status") not in JOB_ENDED:
+            return self.host_job(job["id"], wait - first)
+        return job
+
+    def host_shell_close(self, grant_id: str):
+        return self._request("POST", f"/v1/hostexec/shells/{grant_id}/close")

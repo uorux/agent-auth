@@ -11,11 +11,50 @@ defaults:
   max_duration: 24h
 
 llm:
-  model: anthropic/claude-sonnet-4.5   # OpenRouter model id; per-rule override below
+  model: deepseek/deepseek-v4.1-flash-1017   # OpenRouter model id; per-rule override below
   retry_budget: 2          # LLM denials the agent may retry before human escalation
   timeout_secs: 60
 
+# Approval prompts on the desktops you are at, next to Discord (README:
+# "Desktop prompts"). Off unless enabled. Whatever is listed here can be
+# approved by any process running as you on such a desktop.
+#
+# desktop:
+#   enabled: true
+#   agents: [{runtime: [claude, codex]}, {placement: sandbox}]   # or globs on names
+#   platforms: []            # empty = any platform
+#   sensitive: false         # secrets permissions, another project's files, … stay on Discord
+#   per_agent_per_hour: 6
+
 platforms:
+  # Commands on hosts (README: "Commands on hosts"). Each host's own config
+  # decides what it runs; nothing here can loosen that.
+  # hostexec:
+  #   # Mirrors of the hosts' templates, to show the expanded command.
+  #   templates:
+  #     nixos-rebuild:
+  #       tier: root
+  #       argv: ["nixos-rebuild", "switch", "--flake", "{flake}"]
+  #       params: {flake: "git\\+https://git\\.example/me/[a-z0-9-]+#[a-z0-9-]+"}
+  #   risk_model: deepseek/deepseek-v4.1-flash-1017   # the advisory risk line (default: llm.model)
+  #   watch: true    # that model also watches shell commands, and commands no human saw
+  #                  # one by one, as they run, and pings you about an alarming one
+  #   window_default: 30m                  # "Approve all…"
+  #   window_max: 8h
+
+  # MCP servers that take this broker's own tokens (README: "MCP servers").
+  # models:                                   # the LiteLLM gateway (README "Model gateway")
+  #   url: https://litellm.example.org
+  #   models: ["claude-*"]
+  # mcp:
+  #   issuer: https://agent-auth.example.org   # this broker's public URL
+  #   token_ttl: 1h
+  #   servers:
+  #     playwright:
+  #       url: https://mcp-playwright.example.org/mcp
+  #       description: "A browser"
+  #       tools: [browser_navigate, browser_snapshot]
+
   github:
     # GitHub account owners whose repos are brokered (the app must be
     # installed on each)
@@ -51,6 +90,14 @@ platforms:
       - secrets
       - administration
       - organization_secrets
+    # Orgs where capability "create" makes a new repo (resource "org/name",
+    # scope {visibility: private|public}). The broker does the create with an
+    # Administration token that never leaves it; public repos always reach a
+    # human. Only a rule with `capability: create` (exactly) auto-approves or
+    # LLM-routes a create; repo-access rules and catch-alls surface it. The
+    # app needs Administration: write on these installations.
+    # create_owners:
+    #   - "uorux"
   homelab:
     # Only these LLDAP groups are brokered. Authelia rules per group are
     # configured in Authelia itself, not here.
@@ -118,6 +165,32 @@ platforms:
       - admin
       - pod-exec
       - secret-reader
+    # Every grant in these reaches a human, whatever the role: workload-manager
+    # or job-runner there runs code as the namespace's ServiceAccounts — the
+    # cluster's controllers, or the broker's own provisioner credential.
+    # cluster_grant_namespace is always included.
+    sensitive_namespaces:
+      - kube-system
+      - kube-public
+      - kube-node-lease
+      - flux-system
+      - agent-auth
+
+# The agents' shared wiki (README "Wiki"): markdown in one repo the broker
+# reads and writes as its GitHub App. Every agent reads it; an agent writes
+# under projects/<its project>/, and `editors` write anywhere. Keep the repo
+# on platforms.github.repo_denylist.
+# wiki:
+#   repo: example-org/agent-wiki
+#   editors: [{project: homelab}]
+
+# The admin panel at /ui (README "Admin panel"): signed into at your OpenID
+# provider, which needs a public PKCE client with <base_url>/ui/callback.
+# ui:
+#   enabled: true
+#   base_url: https://agent-auth.internal.example.org
+#   issuer: https://auth.example.org
+#   admin_group: agent-auth-admins
 
 rules:
   # Low-risk homelab groups: auto-approve, short leash
@@ -176,14 +249,24 @@ rules:
   # (or add an explicit rule for them if that changes).
 
   # CLI agents (Claude Code / Codex): register one agent PER FOLDER with its
-  # key in that folder's env, named <agent-type>-<folder>-<host> to match the
-  # rest of the fleet (hermes-homelab-recusant, claude-nixos-dots-uorux, ...).
-  # The key is the permission boundary, so folder-level rules are just agent
-  # name matches — e.g. only the homelab folder's claude may touch kubernetes:
+  # key in that folder's env, and say what it is:
+  #   agent-auth admin agent-create claude-homelab-excelsior --kind ephemeral \
+  #     --runtime claude --project homelab --host excelsior
+  # The key is the permission boundary and the fields are what rules match
+  # (README: "What an agent is"); the name is a label. E.g. only the homelab
+  # project's agents may look at kubernetes, and a claude agent gets its own
+  # project's repos reviewed by the LLM rather than by you:
   #
-  #   - match: {agent: "claude-homelab-*", platform: kubernetes, capability: view}
+  #   - match: {agent: {project: homelab}, platform: kubernetes, capability: view}
   #     action: approve
   #     constraints: {max_duration: 8h}
+  #   - match: {agent: {runtime: claude}, platform: github, resource: "{agent.repos}"}
+  #     action: llm
+  #
+  # Projects named in a rule must be listed (top level of this file):
+  #
+  #   projects:
+  #     homelab: {repos: [uorux/homelab]}
   #
   # a2a grants are agent-level (all sessions of a folder share them); the grant
   # only lets them OPEN threads to service agents — the responder can still
@@ -210,6 +293,37 @@ rules:
   - match: {platform: a2a}
     action: surface
 
+  # Commands on hosts. Root commands and every shell reach a human whatever
+  # is written here; only a rule that names the capability clears a user
+  # command, and the host still wants its tier armed (or the command in its
+  # autoCommands) before it runs anything.
+  #
+  #   - match: {agent: "*-sandbox", platform: hostexec, capability: run}
+  #     action: approve        # then each host's autoCommands / arm state decide
+  - match: {platform: hostexec}
+    action: surface
+
   # Google (stub) — always a human decision while unimplemented
   - match: {platform: google}
     action: surface
+
+# Restricted zones (README "Restricted zones"): resources only their members
+# reach, checked before any rule. Keep a real zone in an overlay
+# (POLICY_OVERLAYS) rather than here, if agents read this file.
+#
+# restricted:
+#   private-thing:
+#     members: [{project: private-thing}]
+#     kubernetes: [private-thing]
+#     github: [owner/private-thing]
+#
+# Agents that read the broker's own record (GET /v1/audit/events):
+# audit:
+#   readers: [{project: private-thing, runtime: auditor}]
+
+# Web UIs (claude.ai, ChatGPT) as MCP clients (README "Web UIs (remote MCP)").
+# Needs ui.issuer/client_id for the sign-in; every request a connector
+# makes goes to a human.
+# remote_mcp:
+#   enabled: true
+#   base_url: https://agent-auth.example

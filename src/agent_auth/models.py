@@ -130,6 +130,27 @@ class Agent(Base, TimestampMixin):
     # so it is stored plaintext (same trust level as the env-var global secret;
     # Fernet-wrapping under encryption_key is a possible future hardening).
     webhook_secret: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Sandbox agents (minted in an agent VM, docs/sandbox-design.md §4): the
+    # agent whose `agents mint` request created this one, the sandbox daemon
+    # that holds its key and dispatches its a2a, and the structured parts of
+    # its a2a. All null for hand-registered agents.
+    parent_agent_id: Mapped[str | None] = mapped_column(
+        ForeignKey("agents.id"), nullable=True, index=True
+    )
+    sandbox_id: Mapped[str | None] = mapped_column(
+        ForeignKey("daemons.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # What the agent is (agent_auth.policy.agents): policy matches on these,
+    # never on the name. Set by the operator at registration, or by the
+    # broker for an agent minted in a VM; an agent cannot change its own.
+    runtime: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    project: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    host: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # "sandbox" = runs in an agent VM; "host" = on the machine itself.
+    placement: Mapped[str] = mapped_column(String(16), default="host", server_default="host")
+    # A minted agent's identity lease: past it, the agent is disabled (with
+    # everything it minted). Renewed by minting it again. Null = no lease.
+    lease_expires_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
 
 
 class AgentSession(Base, TimestampMixin):
@@ -179,7 +200,9 @@ class A2AThread(Base, TimestampMixin):
         ForeignKey("agent_sessions.id"), nullable=True
     )
     topic: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    grant_id: Mapped[str] = mapped_column(ForeignKey("grants.id"))
+    # Null only for the operator's threads from the admin panel, which no
+    # grant backs (agent_auth.core.a2a.OPERATOR_KIND).
+    grant_id: Mapped[str | None] = mapped_column(ForeignKey("grants.id"), nullable=True)
     state: Mapped[str] = mapped_column(String(16), default="pending_open", index=True)
     accepted_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     closed_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
@@ -236,6 +259,8 @@ class AccessRequest(AuthoritySugar, Base, TimestampMixin):
     decided_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
     discord_channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     discord_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # hostexec shells: the Discord thread that mirrors every command.
+    discord_thread_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         TZDateTime(), default=utcnow, onupdate=utcnow
     )
@@ -318,6 +343,9 @@ class Rule(Base, TimestampMixin):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_by: Mapped[str] = mapped_column(String(128), default="")
     notes: Mapped[str] = mapped_column(Text, default="")
+    # Null = until deleted. Set for "approve all" windows: past it the rule
+    # no longer matches anything.
+    expires_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
 
 
 class Credential(Base, TimestampMixin):
@@ -346,10 +374,148 @@ class A2AMessage(Base, TimestampMixin):
         ForeignKey("agent_sessions.id"), nullable=True
     )
     recipient_agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), index=True)
-    # The thread's backing grant (the initiator's), for both directions.
-    grant_id: Mapped[str] = mapped_column(ForeignKey("grants.id"))
+    # The thread's backing grant (the initiator's), for both directions; null
+    # on the operator's threads, as on the thread.
+    grant_id: Mapped[str | None] = mapped_column(ForeignKey("grants.id"), nullable=True)
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
 
     __table_args__ = (
         Index("ix_a2a_messages_thread_seq", "thread_id", "seq", unique=True),
     )
+
+
+class Daemon(Base, TimestampMixin):
+    """A paired daemon: hostd on a physical host (role "host") or sandboxd in
+    an agent VM (role "sandbox"). The public key, bound at pairing, is the
+    only credential: every connection proves possession of its private half."""
+
+    __tablename__ = "daemons"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    role: Mapped[str] = mapped_column(String(16))
+    name: Mapped[str] = mapped_column(String(128))
+    public_key: Mapped[str] = mapped_column(String(128))
+    paired_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+    last_seen_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # The daemon's latest self-reported heartbeat status. Informational only:
+    # never an input to an authorization decision.
+    last_status: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    __table_args__ = (UniqueConstraint("role", "name", name="uq_daemons_role_name"),)
+
+
+class DaemonPairingCode(Base, TimestampMixin):
+    """A one-time code admitting one (role, name) to pair. Single use, short-lived."""
+
+    __tablename__ = "daemon_pairing_codes"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    role: Mapped[str] = mapped_column(String(16))
+    name: Mapped[str] = mapped_column(String(128))
+    # The HMAC key derived from the code (hex), not a one-way verifier: proofs
+    # are HMACs, so the broker must hold the key. Read access to the DB during
+    # a code's lifetime is therefore enough to pair as that daemon. Codes live
+    # minutes and burn on first use, which bounds that window.
+    pairing_key: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[datetime] = mapped_column(TZDateTime())
+    used_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    failed_attempts: Mapped[int] = mapped_column(Integer, default=0)
+
+    __table_args__ = (Index("ix_daemon_pairing_codes_role_name", "role", "name"),)
+
+
+class PendingKeyDelivery(Base, TimestampMixin):
+    """A minted agent's API key, waiting for its sandbox daemon to collect it.
+
+    The broker stores only key hashes otherwise; this row is the one window in
+    which it can still hand the key out — to the sandbox daemon only, over the
+    signed channel, never to the agent that asked for the mint. Deleted when
+    the daemon acknowledges it.
+    """
+
+    __tablename__ = "pending_key_deliveries"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), unique=True)
+    sandbox_id: Mapped[str] = mapped_column(ForeignKey("daemons.id", ondelete="CASCADE"), index=True)
+    key_encrypted: Mapped[str] = mapped_column(Text)
+
+
+class HostJob(Base, TimestampMixin):
+    """One command run (or to be run) on a host by its hostd: a `run`/`tpl`
+    grant's single execution (id = the request's id), or one command of a
+    shell. The output is what hostd reported, capped there at 1 MiB."""
+
+    __tablename__ = "host_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    grant_id: Mapped[str | None] = mapped_column(ForeignKey("grants.id"), nullable=True, index=True)
+    request_id: Mapped[str] = mapped_column(ForeignKey("access_requests.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), index=True)
+    host: Mapped[str] = mapped_column(String(128))
+    tier: Mapped[str] = mapped_column(String(8))
+    # The grant's id when this is a command of a shell; null for run/tpl.
+    shell_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    spec: Mapped[dict] = mapped_column(JSON, default=dict)
+    # starting | running | done | refused | lost
+    status: Mapped[str] = mapped_column(String(16), default="starting", index=True)
+    # What hostd admitted it on (totp, auto, armed+human, …).
+    via: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    output: Mapped[str | None] = mapped_column(Text, nullable=True)
+    output_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    truncated: Mapped[bool] = mapped_column(Boolean, default=False)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+
+
+class BrokerFlag(Base):
+    """Small durable switches of the broker itself (the lockdown)."""
+
+    __tablename__ = "broker_flags"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow, onupdate=utcnow)
+
+
+class OAuthClient(Base, TimestampMixin):
+    """A web UI's connector, registered with the broker's OAuth server
+    (api/oauth_routes.py; dynamic registration, RFC 7591). It acts as one
+    agent (`agent_id`, set when someone first authorizes it)."""
+
+    __tablename__ = "oauth_clients"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # client_id
+    name: Mapped[str] = mapped_column(String(200), default="")
+    redirect_uris: Mapped[list] = mapped_column(JSON, default=list)
+    # Null: a public client (PKCE alone). Else sha256 of its secret.
+    secret_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    agent_id: Mapped[str | None] = mapped_column(ForeignKey("agents.id"), nullable=True, index=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+
+
+class OAuthToken(Base, TimestampMixin):
+    """An authorization code, access token or refresh token, by its sha256.
+    One authorization's tokens share a `family`: a refresh token used twice
+    revokes the whole family (it was stolen, or replayed)."""
+
+    __tablename__ = "oauth_tokens"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    kind: Mapped[str] = mapped_column(String(8))  # code | access | refresh
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    client_id: Mapped[str] = mapped_column(ForeignKey("oauth_clients.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), index=True)
+    family: Mapped[str] = mapped_column(String(36), index=True)
+    expires_at: Mapped[datetime] = mapped_column(TZDateTime(), index=True)
+    used_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    # A code's PKCE challenge and the redirect it was issued for.
+    code_challenge: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    redirect_uri: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    authorized_by: Mapped[str] = mapped_column(String(128), default="")

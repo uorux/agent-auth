@@ -9,6 +9,15 @@ class Platform(str, enum.Enum):
     KUBERNETES = "kubernetes"
     A2A = "a2a"
     GOOGLE = "google"
+    # docs/sandbox-design.md §5: identities minted in an agent VM, and access
+    # between projects inside one.
+    AGENTS = "agents"
+    SANDBOX = "sandbox"
+    # §8: commands (and time-boxed shells) on a host, outside the agent VM.
+    HOSTEXEC = "hostexec"
+    MCP = "mcp"
+    # Model calls through the LiteLLM gateway (provisioners/models.py).
+    MODELS = "models"
 
 
 class RequestStatus(str, enum.Enum):

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE daemon_pairing_codes SET failed_attempts = failed_attempts + 1, updated_at = now()\n         WHERE id = $1 AND used_at IS NULL AND failed_attempts < $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fadf24d986d20d6ed56cd3719c2051329e69ba2e72ce5398493566146b2d363c"
+}

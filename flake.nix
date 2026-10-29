@@ -38,8 +38,25 @@
           ]);
 
       venv = pythonSet.mkVirtualEnv "agent-auth-env" workspace.deps.default;
+
+      # The same virtualenv for a Mac (hostd there: darwinModules.hostd,
+      # docs/hostd-macos.md). Not built from this Linux flake's CI; a Mac
+      # builds it (or a darwin builder).
+      darwinVenv =
+        let
+          darwinPkgs = nixpkgs.legacyPackages.aarch64-darwin;
+          darwinSet =
+            (darwinPkgs.callPackage pyproject-nix.build.packages { python = darwinPkgs.python313; }).overrideScope
+              (lib.composeManyExtensions [
+                pyproject-build-systems.overlays.default
+                overlay
+              ]);
+        in
+        darwinSet.mkVirtualEnv "agent-auth-env" workspace.deps.default;
     in
     {
+      packages.aarch64-darwin.default = darwinVenv;
+
       packages.${system} = {
         default = venv;
 
@@ -92,6 +109,22 @@
               '';
             };
 
+            policyOverlays = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              example = lib.literalExpression
+                ''[ config.sops.secrets."agent-auth/policy-private".path ]'';
+              description = ''
+                More policy, merged over policyFile in order (mappings key
+                by key, lists with the overlay's items first): policy that
+                must not sit in the repo agents read, such as a restricted
+                zone's project, rules and readers. Paths to secret files
+                (sops-nix), as strings so they never reach the nix store;
+                loaded with LoadCredential. A missing one stops the broker
+                from starting.
+              '';
+            };
+
             listenHost = lib.mkOption {
               type = lib.types.str;
               default = "127.0.0.1";
@@ -110,9 +143,13 @@
                 ''[ config.sops.secrets."agent-auth/env".path ]'';
               description = ''
                 EnvironmentFile(s) with secrets (ADMIN_TOKEN, ENCRYPTION_KEY,
-                DISCORD_*, OPENROUTER_API_KEY, GITHUB_*, LLDAP_*, ...).
-                Point at sops-nix (`format = "dotenv"`) or agenix paths — never
-                nix-store files. Root-owned 0400 secrets are fine: systemd reads
+                BROKER_SIGNING_KEY, DISCORD_*, OPENROUTER_API_KEY, GITHUB_*,
+                LLDAP_*, ...). BROKER_SIGNING_KEY is the broker's private
+                ed25519 seed (`agent-auth admin gen-signing-key --out FILE`):
+                it belongs here, never in `settings`, which lands in the
+                world-readable nix store. Point at sops-nix
+                (`format = "dotenv"`) or agenix paths — never nix-store
+                files. Root-owned 0400 secrets are fine: systemd reads
                 EnvironmentFile before dropping to the DynamicUser.
               '';
             };
@@ -153,6 +190,9 @@
               environment = {
                 DATABASE_URL = "sqlite+aiosqlite:////var/lib/agent-auth/agent-auth.db";
                 POLICY_FILE = "${cfg.policyFile}";
+                POLICY_OVERLAYS = lib.concatStringsSep "," (lib.imap0
+                  (i: _: "/run/credentials/agent-auth.service/policy-overlay-${toString i}")
+                  cfg.policyOverlays);
                 LISTEN_HOST = cfg.listenHost;
                 LISTEN_PORT = toString cfg.port;
               } // cfg.settings;
@@ -163,7 +203,8 @@
                 StateDirectory = "agent-auth";
                 WorkingDirectory = "/var/lib/agent-auth";
                 EnvironmentFile = cfg.environmentFiles;
-                LoadCredential = cfg.loadCredentials;
+                LoadCredential = cfg.loadCredentials
+                  ++ lib.imap0 (i: path: "policy-overlay-${toString i}:${path}") cfg.policyOverlays;
                 Restart = "on-failure";
                 RestartSec = 5;
 
@@ -189,6 +230,890 @@
                 CapabilityBoundingSet = "";
                 SystemCallFilter = [ "@system-service" "~@privileged" ];
                 SystemCallArchitectures = "native";
+                UMask = "0077";
+              };
+            };
+          };
+        };
+
+      # The per-host daemon (docs/sandbox-design.md §8). Import on every host;
+      # it dials out to the broker (no inbound ports). Pair once per host:
+      #   broker admin:  agent-auth admin daemon-pair <hostname>
+      #   on the host:   sudo agent-auth-hostd pair      (prompts for the code)
+      #
+      # With no tier enabled and no VM it only connects and reports, as an
+      # unprivileged user. Enabling a tier (or vm.unit) makes it root: it then
+      # runs approved commands, in transient systemd units, under THIS config
+      # — which is the host's local policy, and the broker can't change it.
+      # Then, once per host:
+      #   sudo agent-auth-hostd totp-enroll              (four QR codes, shown once)
+      #
+      # State (the identity key, TOTP secrets, the lockdown flag) lives in
+      # /var/lib/agent-auth-hostd: persist it on impermanence hosts.
+      nixosModules.hostd = { config, lib, pkgs, ... }:
+        let
+          cfg = config.services.agent-auth-hostd;
+          stateDir = "/var/lib/agent-auth-hostd";
+          serviceUser = "agent-auth-hostd";
+          privileged = cfg.tiers.user.enable || cfg.tiers.root.enable || cfg.vm.unit != null;
+          owner = if privileged then "root" else serviceUser;
+          tier = t: {
+            inherit (t) enable;
+            max_arm = t.maxArm;
+            accept_approve_all = t.acceptApproveAll;
+            accept_machine_approvals = t.acceptMachineApprovals;
+            shell = { inherit (t.shell) enable; max_duration = t.shell.maxDuration; };
+          };
+          settings = {
+            broker_url = cfg.brokerUrl;
+            broker_public_key = cfg.brokerPublicKey;
+            name = cfg.name;
+            state_dir = stateDir;
+            runtime_dir = "/run/agent-auth-hostd";
+            user = cfg.user;
+            tiers = { user = tier cfg.tiers.user; root = tier cfg.tiers.root; };
+            auto_commands = cfg.autoCommands;
+            deny_commands = cfg.denyCommands;
+            templates = cfg.templates;
+            env_allow = cfg.envAllow;
+            vm_unit = cfg.vm.unit;
+            job_path = cfg.jobPath;
+            default_timeout = cfg.defaultTimeout;
+            max_timeout = cfg.maxTimeout;
+            systemd_run = "${config.systemd.package}/bin/systemd-run";
+            systemctl = "${config.systemd.package}/bin/systemctl";
+            qrencode = "${pkgs.qrencode}/bin/qrencode";
+            pkcheck = "${pkgs.polkit}/bin/pkcheck";
+            desktop = {
+              inherit (cfg.desktop) enable;
+              max_idle = cfg.desktop.maxIdle;
+              idle_source = cfg.desktop.idleSource;
+              prompt_command = cfg.desktop.promptCommand;
+              prompt_timeout = cfg.desktop.promptTimeout;
+              busy_command = cfg.desktop.busyCommand;
+              approve = { inherit (cfg.desktop.approve) user root; };
+              attention_command = cfg.desktop.attentionCommand;
+              notify_command = cfg.desktop.notifyCommand;
+            };
+          };
+          configFile = pkgs.writeText "hostd.json" (builtins.toJSON settings);
+          # What hostd asks polkit for before a root command approved at this
+          # host's desk: the user's password, in their own session only.
+          # (hostd is root, so the dialog shows its own description of the
+          # command instead of the message here.)
+          polkitAction = pkgs.writeTextDir "share/polkit-1/actions/dev.agent-auth.hostd.policy" ''
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+              "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+            <policyconfig>
+              <action id="dev.agent-auth.hostd.run-as-root">
+                <description>Approve a command an agent asked to run as root</description>
+                <message>Authentication is required to let an agent run a command as root</message>
+                <defaults>
+                  <allow_any>no</allow_any>
+                  <allow_inactive>no</allow_inactive>
+                  <allow_active>auth_admin</allow_active>
+                </defaults>
+              </action>
+            </policyconfig>
+          '';
+          # `agent-auth-hostd pair|totp-enroll|key` on the host use the same
+          # config as the service. While the service is unprivileged, root
+          # drops to its user so the key it creates is one the service reads.
+          cli = pkgs.writeShellScriptBin "agent-auth-hostd" ''
+            export AGENT_AUTH_HOSTD_CONFIG=${configFile}
+            ${lib.optionalString (!privileged) ''
+              if [ "$EUID" = 0 ] && [ "''${1:-}" != totp-enroll ]; then
+                exec ${pkgs.util-linux}/bin/runuser -u ${serviceUser} -- ${cfg.package}/bin/agent-auth-hostd "$@"
+              fi
+            ''}
+            exec ${cfg.package}/bin/agent-auth-hostd "$@"
+          '';
+          hostctl = pkgs.writeShellScriptBin "agent-auth-hostctl" ''
+            exec ${cfg.package}/bin/agent-auth-hostctl "$@"
+          '';
+          duration = lib.types.either lib.types.ints.positive (lib.types.strMatching "[0-9]+[smhdw]?");
+          argvPattern = lib.types.listOf lib.types.str;
+          tierOptions = { rootDefaults }: {
+            enable = lib.mkEnableOption "this tier";
+            maxArm = lib.mkOption {
+              type = duration;
+              default = if rootDefaults then "1h" else "8h";
+              description = "The longest one arming of this tier lasts.";
+            };
+            acceptApproveAll = lib.mkOption {
+              type = lib.types.bool;
+              default = !rootDefaults;
+              description = "While armed, honour \"approve all\" windows for this tier.";
+            };
+            acceptMachineApprovals = lib.mkOption {
+              type = lib.types.bool;
+              default = false;
+              description = ''
+                While armed, honour approvals no human made for the request
+                itself: a saved rule, the LLM reviewer, a policy rule. Off =
+                an armed tier still needs a human's click per command.
+              '';
+            };
+            shell = {
+              enable = lib.mkEnableOption "time-boxed shells on this tier (always opened with a TOTP code)";
+              maxDuration = lib.mkOption {
+                type = duration;
+                default = if rootDefaults then "30m" else "1h";
+              };
+            };
+          };
+        in
+        {
+          options.services.agent-auth-hostd = {
+            enable = lib.mkEnableOption "agent-auth host daemon";
+
+            package = lib.mkOption {
+              type = lib.types.package;
+              default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+              defaultText = lib.literalExpression "agent-auth.packages.<system>.default";
+            };
+
+            brokerUrl = lib.mkOption {
+              # https only; plain http just to a loopback broker (development).
+              type = lib.types.strMatching
+                "https://[^/].*|http://(localhost|127\\.0\\.0\\.1|\\[::1])(:[0-9]+)?(/.*)?";
+              example = "https://agent-auth.recusant.rooty.dev";
+            };
+
+            brokerPublicKey = lib.mkOption {
+              type = lib.types.strMatching "ed25519:[A-Za-z0-9_-]{43}";
+              description = ''
+                The broker's public signing key (`agent-auth admin broker-key`).
+                Pinned here, in the host's own config, so a compromised network
+                path or broker URL can't substitute another broker.
+              '';
+            };
+
+            name = lib.mkOption {
+              type = lib.types.strMatching "[a-z0-9][a-z0-9-]{0,62}";
+              default = config.networking.hostName;
+              defaultText = lib.literalExpression "config.networking.hostName";
+            };
+
+            user = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              example = "jrt";
+              description = ''
+                The account the user tier runs commands as (system units with
+                User=; their session's bus is in the environment while they
+                are logged in), and whose desktop is asked.
+              '';
+            };
+
+            tiers.user = tierOptions { rootDefaults = false; };
+            tiers.root = tierOptions { rootDefaults = true; };
+
+            autoCommands = lib.mkOption {
+              type = lib.types.listOf argvPattern;
+              default = [ ];
+              example = [ [ "systemctl" "--user" "status" "*" ] ];
+              description = ''
+                User-tier commands that run on any approval the broker relays,
+                armed or not. One glob per argument; a final "**" stands for
+                any further arguments. Whatever matches needs no human at this
+                host, so keep these read-only.
+              '';
+            };
+
+            denyCommands = lib.mkOption {
+              type = lib.types.listOf argvPattern;
+              default = [ ];
+              example = [ [ "rm" "**" ] ];
+              description = ''
+                Never run, whatever the approval (also inside shells). The
+                first element also matches the program's basename. A guard
+                against mistakes, not a boundary: `sh -c` walks around it.
+              '';
+            };
+
+            templates = lib.mkOption {
+              type = lib.types.attrsOf (lib.types.submodule {
+                options = {
+                  tier = lib.mkOption { type = lib.types.enum [ "user" "root" ]; };
+                  argv = lib.mkOption {
+                    type = lib.types.listOf lib.types.str;
+                    description = "The command; {name} is replaced by a parameter, whole arguments only.";
+                  };
+                  params = lib.mkOption {
+                    type = lib.types.attrsOf lib.types.str;
+                    default = { };
+                    description = "Parameter name -> regex its value must match in full.";
+                  };
+                };
+              });
+              default = { };
+              example = lib.literalExpression ''
+                {
+                  nixos-rebuild = {
+                    tier = "root";
+                    argv = [ "nixos-rebuild" "switch" "--flake" "{flake}" ];
+                    params.flake = "git\\+https://git\\.example/me/[a-z0-9-]+#[a-z0-9-]+";
+                  };
+                }
+              '';
+              description = "Named commands with checked parameters (capability tpl.<name>).";
+            };
+
+            envAllow = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ "LANG" "LC_ALL" "TZ" "TERM" ];
+              description = "Environment variables a request may set.";
+            };
+
+            jobPath = lib.mkOption {
+              type = lib.types.str;
+              default = "/run/wrappers/bin:/run/current-system/sw/bin";
+              description = "PATH of commands (the user tier adds the user's profile).";
+            };
+
+            defaultTimeout = lib.mkOption { type = duration; default = "10m"; };
+            maxTimeout = lib.mkOption { type = duration; default = "1h"; };
+
+            vm.unit = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              example = "agent-vm.service";
+              description = "The agent VM's unit on this host: frozen on lockdown.";
+            };
+
+            desktop = {
+              enable = lib.mkEnableOption ''
+                approval prompts on this host's desktop: a helper in the user's
+                graphical session (hostd-user) reports presence and shows them
+              '';
+              maxIdle = lib.mkOption {
+                type = duration;
+                default = "5m";
+                description = "Prompts are shown only if the session was used this recently.";
+              };
+              idleSource = lib.mkOption {
+                type = lib.types.enum [ "hooks" "logind" ];
+                default = "hooks";
+                description = ''
+                  Where idle and locked come from. "hooks": what
+                  `agent-auth-hostctl presence idle|active|locked|unlocked`
+                  reports — call it from hypridle and around the lock screen
+                  (Hyprland keeps no logind hints). "logind": the session's
+                  IdleHint/LockedHint.
+                '';
+              };
+              approve = {
+                user = lib.mkEnableOption ''
+                  Allow at this desk as this host's own approval of a
+                  user-tier command on this host: the dialog shows what the
+                  host would run, and no arming or TOTP code is needed.
+                  Anything running as the user can answer that dialog, and
+                  could run the command itself anyway
+                '';
+                root = lib.mkEnableOption ''
+                  the same for root commands, after polkit has also asked
+                  for the user's password (they must be allowed to
+                  authenticate as an administrator, and a polkit agent must
+                  run in their session)
+                '';
+              };
+              attentionCommand = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+                example = lib.literalExpression ''[ "''${pkgs.pipewire}/bin/pw-play" "/path/to/sound.oga" ]'';
+                description = "Run when a prompt or a notification arrives at this desk (a sound).";
+              };
+              notifyCommand = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [
+                  "${pkgs.libnotify}/bin/notify-send" "--app-name" "agent-auth"
+                  "--urgency" "{urgency}" "{title}" "{text}"
+                ];
+                defaultText = lib.literalExpression ''[ "''${pkgs.libnotify}/bin/notify-send" … ]'';
+                description = ''
+                  Shows a notification an agent asked for. {title}, {text}
+                  (markup escaped) and {urgency} (low, normal or critical)
+                  are replaced, each as one argument.
+                '';
+              };
+              promptCommand = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [
+                  "${pkgs.zenity}/bin/zenity" "--question" "--no-markup" "--default-cancel" "--width" "560"
+                  "--title" "{title}" "--text" "{text}" "--timeout" "{timeout}"
+                  "--ok-label" "Allow once" "--cancel-label" "Deny"
+                  "--extra-button" "Mute agent 1h" "--extra-button" "Send to Discord"
+                ];
+                defaultText = lib.literalExpression ''[ "''${pkgs.zenity}/bin/zenity" "--question" … ]'';
+                description = ''
+                  The dialog. Placeholders are replaced, each as one
+                  argument: {who} (the agent), {what} and {detail} (one line
+                  each), or the same laid out as {title} and {text}; and
+                  {timeout}. Exit 0 = allow, 5 = timed out, anything else =
+                  deny; it may print "mute", "discord", or sbx-prompt's
+                  once|session|deny on stdout.
+                '';
+              };
+              promptTimeout = lib.mkOption { type = duration; default = "90s"; };
+              busyCommand = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+                description = ''
+                  A command run every few seconds in the user's session: exit
+                  0 = show no prompts now (a fullscreen window, a
+                  presentation, …); failing to run counts as that too. Empty:
+                  the built-in check, Hyprland's focused window being
+                  fullscreen (needs hyprctl and HYPRLAND_INSTANCE_SIGNATURE in
+                  the user service's environment).
+                '';
+              };
+            };
+          };
+
+          config = lib.mkIf cfg.enable {
+            assertions = [
+              {
+                assertion = !cfg.tiers.user.enable || cfg.user != null;
+                message = "services.agent-auth-hostd: the user tier needs `user`.";
+              }
+              {
+                assertion = !(cfg.desktop.approve.user || cfg.desktop.approve.root) || cfg.desktop.enable;
+                message = "services.agent-auth-hostd.desktop.approve needs desktop.enable.";
+              }
+              {
+                assertion = !cfg.desktop.enable || cfg.user != null;
+                message = "services.agent-auth-hostd: desktop prompts need `user`.";
+              }
+            ];
+
+            # A root without capabilities is authorized by polkit when it
+            # asks systemd for a unit.
+            security.polkit.enable = lib.mkIf (privileged || cfg.desktop.approve.root) true;
+
+            environment.systemPackages = [ cli hostctl ] ++ lib.optional cfg.desktop.approve.root polkitAction;
+            environment.etc."agent-auth/hostd.json".source = configFile;
+
+            users.users.${serviceUser} = {
+              isSystemUser = true;
+              group = serviceUser;
+              description = "agent-auth host daemon";
+            };
+            users.groups.${serviceUser} = { };
+
+            # `pair` may run before the service ever started, so the state dir
+            # must exist without it. Z keeps everything in it with the owner
+            # the service runs as (hostd refuses a key that isn't its own), in
+            # both directions: enabling a tier moves it to root.
+            systemd.tmpfiles.rules = [
+              "d ${stateDir} 0700 ${owner} ${owner} -"
+              "Z ${stateDir} - ${owner} ${owner} -"
+            ];
+
+            systemd.services.agent-auth-hostd = {
+              description = "agent-auth host daemon";
+              wantedBy = [ "multi-user.target" ];
+              wants = [ "network-online.target" ];
+              after = [ "network-online.target" ];
+              environment.AGENT_AUTH_HOSTD_CONFIG = "/etc/agent-auth/hostd.json";
+              restartTriggers = [ configFile ];
+              serviceConfig = {
+                ExecStart = "${cfg.package}/bin/agent-auth-hostd run";
+                # ctl.sock and user.sock take any local uid's connection
+                # (each capped per uid and overall, and checked before a byte
+                # is read): room for those and the jobs' pipes.
+                LimitNOFILE = 65536;
+                StateDirectory = "agent-auth-hostd";
+                StateDirectoryMode = "0700";
+                RuntimeDirectory = "agent-auth-hostd";
+                RuntimeDirectoryMode = "0755";
+                Restart = "always";
+                RestartSec = 10;
+
+                NoNewPrivileges = true;
+                ProtectSystem = "strict";
+                PrivateTmp = true;
+                PrivateDevices = true;
+                ProtectKernelTunables = true;
+                ProtectKernelModules = true;
+                ProtectKernelLogs = true;
+                ProtectControlGroups = true;
+                ProtectClock = true;
+                RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
+                RestrictNamespaces = true;
+                RestrictRealtime = true;
+                RestrictSUIDSGID = true;
+                RemoveIPC = true;
+                ProtectHostname = true;
+                LockPersonality = true;
+                SystemCallArchitectures = "native";
+                UMask = "0077";
+              } // (if privileged then {
+                # Root, to ask PID 1 for units over the system bus: the jobs
+                # (as root, or with User= for the user tier) and the VM's
+                # freeze. systemd starts them, outside this sandbox. That
+                # takes root's uid and no capability (polkit vouches for uid
+                # 0), so none is kept.
+                User = "root";
+                CapabilityBoundingSet = "";
+              } else {
+                # Connect-and-report only: unprivileged and locked down hard.
+                User = serviceUser;
+                Group = serviceUser;
+                ProtectHome = true;
+                ProtectProc = "invisible";
+                CapabilityBoundingSet = "";
+                SystemCallFilter = [ "@system-service" "~@privileged" ];
+              });
+            };
+
+            # hostd-user: in the user's graphical session, so its dialogs have
+            # a display. It holds no secrets and decides nothing.
+            systemd.user.services.agent-auth-hostd-user = lib.mkIf cfg.desktop.enable {
+              description = "agent-auth desktop prompts";
+              wantedBy = [ "graphical-session.target" ];
+              partOf = [ "graphical-session.target" ];
+              after = [ "graphical-session.target" ];
+              unitConfig.ConditionUser = cfg.user;
+              environment.AGENT_AUTH_HOSTD_CONFIG = "/etc/agent-auth/hostd.json";
+              serviceConfig = {
+                ExecStart = "${cfg.package}/bin/agent-auth-hostd user";
+                Restart = "always";
+                RestartSec = 5;
+              };
+            };
+          };
+        };
+
+      # hostd on a Mac, for nix-darwin (docs/hostd-macos.md). The same daemon
+      # and local policy as nixosModules.hostd, without what needs systemd or
+      # polkit: no VM unit, and root commands are never approved at the desk.
+      # It is a LaunchDaemon, always root (it holds the host's key and TOTP
+      # secrets out of reach of the user the agents run as); user-tier jobs go
+      # through `launchctl asuser` into the user's session, then drop to them.
+      # Pair once:
+      #   broker admin:  agent-auth admin daemon-pair <name>
+      #   on the Mac:    sudo agent-auth-hostd pair       (prompts for the code)
+      #                  sudo agent-auth-hostd totp-enroll
+      # State: /var/db/agent-auth-hostd. Log: /var/log/agent-auth-hostd.log.
+      darwinModules.hostd = { config, lib, pkgs, ... }:
+        let
+          cfg = config.services.agent-auth-hostd;
+          label = "dev.agent-auth.hostd";
+          tier = t: {
+            inherit (t) enable;
+            max_arm = t.maxArm;
+            accept_approve_all = t.acceptApproveAll;
+            accept_machine_approvals = t.acceptMachineApprovals;
+            shell = { inherit (t.shell) enable; max_duration = t.shell.maxDuration; };
+          };
+          settings = {
+            broker_url = cfg.brokerUrl;
+            broker_public_key = cfg.brokerPublicKey;
+            name = cfg.name;
+            state_dir = "/var/db/agent-auth-hostd";
+            runtime_dir = "/var/run/agent-auth-hostd";
+            user = cfg.user;
+            tiers = { user = tier cfg.tiers.user; root = tier cfg.tiers.root; };
+            auto_commands = cfg.autoCommands;
+            deny_commands = cfg.denyCommands;
+            templates = cfg.templates;
+            env_allow = cfg.envAllow;
+            job_path = cfg.jobPath;
+            default_timeout = cfg.defaultTimeout;
+            max_timeout = cfg.maxTimeout;
+            qrencode = "${pkgs.qrencode}/bin/qrencode";
+            desktop = {
+              inherit (cfg.desktop) enable;
+              max_idle = cfg.desktop.maxIdle;
+              idle_source = cfg.desktop.idleSource;
+              prompt_command = cfg.desktop.promptCommand;
+              prompt_timeout = cfg.desktop.promptTimeout;
+              busy_command = cfg.desktop.busyCommand;
+              approve = { user = cfg.desktop.approve.user; root = false; };
+              attention_command = cfg.desktop.attentionCommand;
+              notify_command = cfg.desktop.notifyCommand;
+            };
+          };
+          configFile = pkgs.writeText "hostd.json" (builtins.toJSON settings);
+          cli = pkgs.writeShellScriptBin "agent-auth-hostd" ''
+            export AGENT_AUTH_HOSTD_CONFIG=${configFile}
+            exec ${cfg.package}/bin/agent-auth-hostd "$@"
+          '';
+          hostctl = pkgs.writeShellScriptBin "agent-auth-hostctl" ''
+            exec ${cfg.package}/bin/agent-auth-hostctl "$@"
+          '';
+          duration = lib.types.either lib.types.ints.positive (lib.types.strMatching "[0-9]+[smhdw]?");
+          argvPattern = lib.types.listOf lib.types.str;
+          tierOptions = { rootDefaults }: {
+            enable = lib.mkEnableOption "this tier";
+            maxArm = lib.mkOption { type = duration; default = if rootDefaults then "1h" else "8h"; };
+            acceptApproveAll = lib.mkOption { type = lib.types.bool; default = !rootDefaults; };
+            acceptMachineApprovals = lib.mkOption {
+              type = lib.types.bool;
+              default = false;
+              description = "As in nixosModules.hostd: off = an armed tier still needs a human's click per command.";
+            };
+            shell = {
+              enable = lib.mkEnableOption "time-boxed shells on this tier (always opened with a TOTP code)";
+              maxDuration = lib.mkOption { type = duration; default = if rootDefaults then "30m" else "1h"; };
+            };
+          };
+        in
+        {
+          options.services.agent-auth-hostd = {
+            enable = lib.mkEnableOption "agent-auth host daemon (macOS)";
+
+            package = lib.mkOption {
+              type = lib.types.package;
+              default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+              defaultText = lib.literalExpression "agent-auth.packages.<system>.default";
+            };
+
+            brokerUrl = lib.mkOption {
+              type = lib.types.strMatching
+                "https://[^/].*|http://(localhost|127\\.0\\.0\\.1|\\[::1])(:[0-9]+)?(/.*)?";
+              example = "https://agent-auth.recusant.rooty.dev";
+            };
+
+            brokerPublicKey = lib.mkOption {
+              type = lib.types.strMatching "ed25519:[A-Za-z0-9_-]{43}";
+              description = "The broker's public signing key (`agent-auth admin broker-key`), pinned here.";
+            };
+
+            name = lib.mkOption {
+              type = lib.types.nullOr (lib.types.strMatching "[a-z0-9][a-z0-9-]{0,62}");
+              default = if config.networking.hostName == null then null else lib.toLower config.networking.hostName;
+              defaultText = lib.literalExpression "lib.toLower config.networking.hostName";
+            };
+
+            user = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              example = "jrt";
+              description = ''
+                The account the user tier runs commands as (in that user's
+                launchd domain, via `launchctl asuser`), and whose desktop is
+                asked.
+              '';
+            };
+
+            tiers.user = tierOptions { rootDefaults = false; };
+            tiers.root = tierOptions { rootDefaults = true; };
+
+            autoCommands = lib.mkOption {
+              type = lib.types.listOf argvPattern;
+              default = [ ];
+              example = [ [ "xcodebuild" "-list" ] [ "xcrun" "simctl" "list" "**" ] ];
+              description = "User-tier commands that run on any approval the broker relays. Keep these read-only.";
+            };
+
+            denyCommands = lib.mkOption {
+              type = lib.types.listOf argvPattern;
+              default = [ ];
+              example = [ [ "security" "**" ] ];
+              description = "Never run, whatever the approval. A guard against mistakes, not a boundary.";
+            };
+
+            templates = lib.mkOption {
+              type = lib.types.attrsOf (lib.types.submodule {
+                options = {
+                  tier = lib.mkOption { type = lib.types.enum [ "user" "root" ]; };
+                  argv = lib.mkOption { type = lib.types.listOf lib.types.str; };
+                  params = lib.mkOption { type = lib.types.attrsOf lib.types.str; default = { }; };
+                };
+              });
+              default = { };
+              example = lib.literalExpression ''
+                {
+                  darwin-rebuild = {
+                    tier = "root";
+                    argv = [ "darwin-rebuild" "switch" "--flake" "{flake}" ];
+                    params.flake = "/Users/me/dots#[a-z0-9-]+";
+                  };
+                  xcode-test = {
+                    tier = "user";
+                    argv = [ "xcodebuild" "test" "-scheme" "{scheme}" "-destination" "platform=iOS Simulator,name={device}" ];
+                    params = { scheme = "[A-Za-z0-9_-]+"; device = "iPhone [0-9]+( Pro)?"; };
+                  };
+                }
+              '';
+              description = "Named commands with checked parameters (capability tpl.<name>).";
+            };
+
+            envAllow = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ "LANG" "LC_ALL" "TZ" "TERM" ];
+            };
+
+            jobPath = lib.mkOption {
+              type = lib.types.str;
+              default = "/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+              description = ''
+                PATH of commands; the user tier adds /etc/profiles/per-user/<user>/bin
+                and Homebrew's. Root-owned directories only: hostd refuses root
+                jobs while any directory here is writable by someone else.
+              '';
+            };
+
+            defaultTimeout = lib.mkOption { type = duration; default = "10m"; };
+            maxTimeout = lib.mkOption { type = duration; default = "1h"; };
+
+            desktop = {
+              enable = lib.mkEnableOption ''
+                approval prompts on this Mac: a LaunchAgent in the user's GUI
+                session (hostd-user) reports presence and shows them
+              '';
+              maxIdle = lib.mkOption { type = duration; default = "5m"; };
+              idleSource = lib.mkOption {
+                type = lib.types.enum [ "macos" "hooks" ];
+                default = "macos";
+                description = ''
+                  "macos": keyboard/mouse idle time and the screen lock, from
+                  ioreg. "hooks": only what `agent-auth-hostctl presence …` reports.
+                '';
+              };
+              approve.user = lib.mkEnableOption ''
+                Allow at this desk as this host's own approval of a user-tier
+                command on this host (no arming or TOTP code). Anything running
+                as the user can answer that dialog, and could run the command
+                itself anyway. (Root has no desk approval on macOS: no polkit.)
+              '';
+              attentionCommand = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+                example = [ "/usr/bin/afplay" "/System/Library/Sounds/Glass.aiff" ];
+              };
+              notifyCommand = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+                description = "Empty: a notification through osascript. {title} {text} {urgency} are replaced.";
+              };
+              promptCommand = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+                description = ''
+                  Empty: an osascript dialog (Deny / Send to Discord / Allow once;
+                  AppleScript has no fourth button, so no "Mute agent 1h").
+                  Otherwise as in nixosModules.hostd.
+                '';
+              };
+              promptTimeout = lib.mkOption { type = duration; default = "90s"; };
+              busyCommand = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+                description = "Exit 0 = show no prompts now. Empty: never busy.";
+              };
+            };
+          };
+
+          config = lib.mkIf cfg.enable {
+            assertions = [
+              {
+                assertion = cfg.name != null;
+                message = "services.agent-auth-hostd.name: set it, or networking.hostName.";
+              }
+              {
+                assertion = !cfg.tiers.user.enable || cfg.user != null;
+                message = "services.agent-auth-hostd: the user tier needs `user`.";
+              }
+              {
+                assertion = !cfg.desktop.approve.user || cfg.desktop.enable;
+                message = "services.agent-auth-hostd.desktop.approve needs desktop.enable.";
+              }
+              {
+                assertion = !cfg.desktop.enable || cfg.user != null;
+                message = "services.agent-auth-hostd: desktop prompts need `user`.";
+              }
+            ];
+
+            environment.systemPackages = [ cli hostctl ];
+            environment.etc."agent-auth/hostd.json".source = configFile;
+
+            launchd.daemons.agent-auth-hostd.serviceConfig = {
+              Label = label;
+              ProgramArguments = [ "${cfg.package}/bin/agent-auth-hostd" "run" ];
+              EnvironmentVariables.AGENT_AUTH_HOSTD_CONFIG = "${configFile}"; # a config change changes the plist: launchd restarts it
+              RunAtLoad = true;
+              KeepAlive = true;
+              ThrottleInterval = 10;
+              Umask = 63; # 0077
+              StandardOutPath = "/var/log/agent-auth-hostd.log";
+              StandardErrorPath = "/var/log/agent-auth-hostd.log";
+            };
+
+            # hostd-user: in the GUI session, so its dialogs have a display.
+            # Installed for every user who logs in; hostd listens only to `user`.
+            launchd.user.agents.agent-auth-hostd-user = lib.mkIf cfg.desktop.enable {
+              serviceConfig = {
+                Label = "${label}-user";
+                ProgramArguments = [ "${cfg.package}/bin/agent-auth-hostd" "user" ];
+                EnvironmentVariables.AGENT_AUTH_HOSTD_CONFIG = "${configFile}";
+                RunAtLoad = true;
+                KeepAlive = true;
+                LimitLoadToSessionType = "Aqua";
+                ProcessType = "Interactive";
+              };
+            };
+          };
+        };
+
+      # sandboxd, inside an agent VM's guest (docs/sandbox-design.md §6). The
+      # host side (the VM itself) is nixos-dots' modules.agentVm; this module
+      # goes into its guestModules. Pair once:
+      #   broker admin:  agent-auth admin daemon-pair --role sandbox <host>
+      #   in the guest:  agent-auth-sandboxd pair        (prompts for the code)
+      # State (agent keys, conversations) is in /var/lib/sandboxd, projects in
+      # /var/lib/sandbox: both on the guest's persisted /var/lib.
+      nixosModules.sandboxd = { config, lib, pkgs, ... }:
+        let
+          cfg = config.services.agent-auth-sandboxd;
+          pkg = cfg.package;
+          agentEnv = pkgs.buildEnv {
+            name = "agent-sandbox-path";
+            paths = cfg.agentPackages;
+          };
+          settings = {
+            broker_url = cfg.brokerUrl;
+            broker_public_key = cfg.brokerPublicKey;
+            name = cfg.hostName;
+            agent_path = "${agentEnv}/bin:${pkg}/bin";
+            agent_auth_mcp = "${pkg}/bin/agent-auth-mcp";
+            sandbox_mcp = "${pkg}/bin/agent-auth-sandbox-mcp";
+            mcp_bridge = "${pkg}/bin/agent-auth-mcp-bridge";
+            tmux = "${pkgs.tmux}/bin/tmux";
+            systemd_run = "${config.systemd.package}/bin/systemd-run";
+            systemctl = "${config.systemd.package}/bin/systemctl";
+            setfacl = "${pkgs.acl}/bin/setfacl";
+            orchestrator_runtime = cfg.orchestratorRuntime;
+            runtimes = lib.mapAttrs (name: r: {
+              command = "${r.package}/bin/${r.binary}";
+              model = r.model;
+            }) cfg.runtimes;
+            inherit (cfg) park_grace_secs max_processes unit_memory_max;
+          };
+          configFile = pkgs.writeText "sandboxd.json" (builtins.toJSON settings);
+        in
+        {
+          options.services.agent-auth-sandboxd = {
+            enable = lib.mkEnableOption "agent-auth sandboxd (in an agent VM)";
+
+            package = lib.mkOption {
+              type = lib.types.package;
+              default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+              defaultText = lib.literalExpression "agent-auth.packages.<system>.default";
+            };
+
+            brokerUrl = lib.mkOption {
+              type = lib.types.strMatching
+                "https://[^/].*|http://(localhost|127\\.0\\.0\\.1|\\[::1])(:[0-9]+)?(/.*)?";
+            };
+
+            brokerPublicKey = lib.mkOption {
+              type = lib.types.strMatching "ed25519:[A-Za-z0-9_-]{43}";
+              description = "The broker's public signing key, pinned (as for hostd).";
+            };
+
+            hostName = lib.mkOption {
+              type = lib.types.strMatching "[a-z0-9][a-z0-9-]{0,62}";
+              description = ''
+                The PHYSICAL host this VM runs on: the sandbox daemon's name,
+                and the <host> in its agents' names
+                (<runtime>-<project>-<host>-sandbox).
+              '';
+            };
+
+            runtimes = lib.mkOption {
+              type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
+                options = {
+                  package = lib.mkOption { type = lib.types.package; };
+                  binary = lib.mkOption {
+                    type = lib.types.str;
+                    default = name;
+                    description = "The binary in the package (unwrapped, not a sandbox launcher).";
+                  };
+                  model = lib.mkOption {
+                    type = lib.types.nullOr lib.types.str;
+                    default = null;
+                  };
+                };
+              }));
+              default = { };
+              example = lib.literalExpression
+                ''{ claude.package = pkgs.claude-code; codex.package = pkgs.codex; }'';
+              description = "Agent runtimes: claude and/or codex.";
+            };
+
+            orchestratorRuntime = lib.mkOption {
+              type = lib.types.str;
+              default = "claude";
+              description = "Which runtime the VM's orchestrator runs as.";
+            };
+
+            agentPackages = lib.mkOption {
+              type = lib.types.listOf lib.types.package;
+              default = with pkgs; [
+                bashInteractive coreutils findutils gnugrep gnused gawk diffutils
+                gnutar gzip xz unzip which file less procps
+                git gh openssh curl wget jq ripgrep fd tree
+                config.nix.package python3
+              ];
+              defaultText = lib.literalExpression "[ git gh coreutils nix python3 ripgrep … ]";
+              description = "What agents find on PATH in their units.";
+            };
+
+            park_grace_secs = lib.mkOption {
+              type = lib.types.number;
+              default = 30;
+              description = "Idle seconds after a turn before a conversation's process is parked.";
+            };
+            max_processes = lib.mkOption {
+              type = lib.types.ints.positive;
+              default = 16;
+            };
+            unit_memory_max = lib.mkOption {
+              type = lib.types.str;
+              default = "8G";
+              description = "MemoryMax= of each agent process's unit.";
+            };
+          };
+
+          config = lib.mkIf cfg.enable {
+            environment.etc."agent-auth/sandboxd.json".source = configFile;
+            # Project users are userdb drop-ins sandboxd writes at run time.
+            services.userdbd.enable = lib.mkDefault true;
+            environment.etc.userdb.source = lib.mkDefault "/var/lib/userdb";
+            environment.systemPackages = [ pkg pkgs.tmux pkgs.acl ];
+
+            systemd.tmpfiles.rules = [
+              "d /var/lib/sandbox 0711 root root -"
+              "d /var/lib/sandbox/projects 0711 root root -"
+              "d /var/lib/sandbox/homes 0711 root root -"
+              "d /var/lib/sandbox/tmp 0711 root root -"
+            ];
+
+            systemd.services.agent-auth-sandboxd = {
+              description = "agent-auth sandbox daemon";
+              wantedBy = [ "multi-user.target" ];
+              wants = [ "network-online.target" ];
+              after = [ "network-online.target" "systemd-userdbd.service" ];
+              environment.AGENT_AUTH_SANDBOXD_CONFIG = "/etc/agent-auth/sandboxd.json";
+              path = [ pkgs.util-linux pkgs.acl pkgs.coreutils config.systemd.package pkgs.tmux ];
+              # Running agents live in their own transient units: restarting the
+              # daemon parks them (they resume on their next message).
+              restartIfChanged = true;
+              serviceConfig = {
+                ExecStart = "${pkg}/bin/agent-auth-sandboxd run";
+                Restart = "always";
+                RestartSec = 5;
+                StateDirectory = "sandboxd";
+                StateDirectoryMode = "0700";
+                RuntimeDirectory = [ "sandboxd" "sandboxd-agent" ];
+                RuntimeDirectoryMode = "0755";
+                # The daemon manages users, ACLs and units: it is root, on purpose.
+                # It holds every agent key in the VM; the agents themselves run
+                # unprivileged, each in its own unit.
                 UMask = "0077";
               };
             };

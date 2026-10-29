@@ -1,0 +1,126 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO a2a_messages (id, thread_id, seq, sender_agent_id, sender_session_id,\n               recipient_agent_id, grant_id, payload, created_at)\n           VALUES ($1, $2, 1, $3, $4, $5, $6, $7::text::json, $8)\n           RETURNING id, thread_id, seq, sender_agent_id, sender_session_id, recipient_agent_id,\n                     grant_id, payload::text AS \"payload!\", created_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "a2a_messages",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "thread_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "a2a_messages",
+            "name": "thread_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "seq",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "a2a_messages",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "sender_agent_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "a2a_messages",
+            "name": "sender_agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "sender_session_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "a2a_messages",
+            "name": "sender_session_id"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "recipient_agent_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "a2a_messages",
+            "name": "recipient_agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "grant_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "a2a_messages",
+            "name": "grant_id"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "payload!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "a2a_messages",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      null,
+      false
+    ]
+  },
+  "hash": "5c2e5cd83314ad2f565e590d1bdcdd1ba52e250d25288385881feef5ee19732f"
+}

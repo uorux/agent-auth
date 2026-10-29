@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT set_config('tcp_keepalives_idle', '30', false) || set_config('tcp_keepalives_interval', '10', false) || set_config('tcp_keepalives_count', '3', false) AS \"set!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "set!",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "8b5703d8fc8d3a2fdaf29fd3ce7110803d9bd4e16384de474d2b24914d7d5332"
+}

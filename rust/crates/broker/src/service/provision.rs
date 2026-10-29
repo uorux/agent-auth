@@ -1,0 +1,609 @@
+//! Approving, provisioning in two phases, and ending grants (spec §4.7-4.9).
+//!
+//! Phase one ([`begin_provision`]) runs inside the deciding transaction and
+//! only writes rows: the request moves to PROVISIONING and the grant row is
+//! inserted PROVISIONING (`store::grants::begin`, which needs a `NotHeld`
+//! proof). Phase two ([`finish_provision`]) runs after that commit, in its
+//! own transaction: containment again, the provisioner, then
+//! `store::grants::activate` (another `NotHeld`). A crash between the two
+//! leaves a PROVISIONING row for the reaper (INV-21).
+
+use agent_auth_core::lifecycle::{CanMoveTo, state};
+use agent_auth_core::{GrantId, GrantStatus, RequestId};
+use agent_auth_store::grants::{self, GrantEnd, GrantRow};
+use agent_auth_store::requests::{self, AnyRequest, Enter, ProvisionFailure, Request, RequestRow};
+use agent_auth_store::{StoreError, Tx, lockdown};
+use time::{Duration, OffsetDateTime};
+
+use super::{ServiceError, ServiceResult};
+use crate::notify::Notify;
+use crate::provisioners::{Provisioner, not_enabled};
+use crate::state::AppState;
+
+pub(crate) const CONCURRENT: &str = "request changed state concurrently";
+
+/// Move a request by compare-and-swap; a lost race is the Python's
+/// `request changed state concurrently`.
+pub(crate) async fn step<F, T>(
+    tx: &Tx<'_>,
+    request: Request<F>,
+    data: T::Data,
+    now: OffsetDateTime,
+) -> ServiceResult<Request<T>>
+where
+    F: CanMoveTo<T>,
+    T: Enter,
+{
+    requests::transition::<F, T>(tx, request, data, now)
+        .await?
+        .map_err(|_| ServiceError::transition(CONCURRENT))
+}
+
+/// Phase one, inside the deciding transaction: PROVISIONING, then (unless
+/// the agent is held or the delegation is gone) the grant row. Returns the
+/// grant to finish after commit.
+pub(crate) async fn begin_provision(
+    tx: &Tx<'_>,
+    request: Request<state::Approved>,
+    now: OffsetDateTime,
+) -> ServiceResult<Option<GrantId>> {
+    let request = step::<_, state::Provisioning>(tx, request, (), now).await?;
+    let not_held = match lockdown::check(tx, request.agent_id(), now).await? {
+        Ok(n) => n,
+        Err(held) => {
+            step::<_, state::ProvisionFailed>(
+                tx,
+                request,
+                ProvisionFailure { why: held.text() },
+                now,
+            )
+            .await?;
+            return Ok(None);
+        }
+    };
+    match grants::begin(tx, &request, &not_held, GrantId::new(), now).await? {
+        Ok(grant) => Ok(Some(grant.grant().id)),
+        Err(refused) => {
+            step::<_, state::ProvisionFailed>(
+                tx,
+                request,
+                ProvisionFailure {
+                    why: refused.to_string(),
+                },
+                now,
+            )
+            .await?;
+            Ok(None)
+        }
+    }
+}
+
+/// PROVISIONING → PROVISION_FAILED for the request of a grant, if it is
+/// still there.
+async fn fail_request(
+    tx: &Tx<'_>,
+    id: RequestId,
+    why: &str,
+    now: OffsetDateTime,
+) -> ServiceResult<()> {
+    if let Some(AnyRequest::Provisioning(r)) = requests::get(tx, id).await? {
+        step::<_, state::ProvisionFailed>(
+            tx,
+            r,
+            ProvisionFailure {
+                why: why.to_owned(),
+            },
+            now,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn grant_succeeded(tx: &Tx<'_>, id: RequestId, now: OffsetDateTime) -> ServiceResult<()> {
+    if let Some(AnyRequest::Provisioning(r)) = requests::get(tx, id).await? {
+        step::<_, state::Granted>(tx, r, (), now).await?;
+    }
+    Ok(())
+}
+
+/// Phase two, after the decision committed. Never fails its caller:
+/// whatever goes wrong is recorded on the grant and request, or left for
+/// the reaper.
+pub(crate) async fn finish_provision(st: &AppState, grant_id: GrantId) {
+    if let Err(e) = finish_inner(st, grant_id).await {
+        tracing::error!(grant = %grant_id, error = %e, "finishing provisioning failed; the reaper will revert it");
+    }
+    // A containment (or disable) that landed while the provisioner ran
+    // found no ACTIVE grant to revoke: this one is revoked here (INV-2).
+    if let Err(e) = revoke_if_held(st, grant_id).await {
+        tracing::error!(grant = %grant_id, error = %e, "revoking a held agent's new grant failed");
+    }
+}
+
+async fn revoke_if_held(st: &AppState, grant_id: GrantId) -> ServiceResult<()> {
+    let now = st.now();
+    let held = {
+        let tx = st.store.begin().await?;
+        let Some(grant) = grants::get(&tx, grant_id).await? else {
+            return Ok(());
+        };
+        if grant.status != GrantStatus::Active {
+            return Ok(());
+        }
+        let held = lockdown::check(&tx, grant.agent_id, now).await?.err();
+        tx.rollback().await?;
+        held
+    };
+    if let Some(held) = held {
+        match revoke_grant(st, grant_id, &held.text(), "containment").await {
+            Ok(_) | Err(ServiceError::Transition(_)) => {}
+            Err(e) => {
+                // Retried by expiry: the grant's end moves to now.
+                tracing::error!(grant = %grant_id, error = %e, "revoke failed; expiring it instead");
+                let tx = st.store.begin().await?;
+                grants::expire_now(&tx, grant_id, now).await?;
+                tx.commit().await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn finish_inner(st: &AppState, grant_id: GrantId) -> ServiceResult<()> {
+    let now = st.now();
+    let tx = st.store.begin().await?;
+    let Some(row) = grants::get(&tx, grant_id).await? else {
+        return Ok(());
+    };
+    if row.status != GrantStatus::Provisioning {
+        return Ok(());
+    }
+    // Work the provisioner does in its own transactions before this one
+    // locks anything (an LLDAP managed account: the agent row is written
+    // before, never after, the grant is locked).
+    let prepared = match st.registry.get(row.platform) {
+        Some(p) => p.prepare(&st.store, &row, now).await,
+        None => Ok(()),
+    };
+    // Lock order: containment and the agent, then the grant, then the
+    // request.
+    let held = lockdown::check(&tx, row.agent_id, now).await?;
+    let Some(grant) = grants::load_provisioning(&tx, grant_id).await? else {
+        return Ok(());
+    };
+    let not_held = match held {
+        Ok(n) => n,
+        Err(held) => {
+            let why = held.text();
+            let _ = grants::fail_provisioning(&tx, grant, &why, None).await?;
+            fail_request(&tx, row.request_id, &why, now).await?;
+            tx.commit().await?;
+            notify_request(st, row.request_id);
+            return Ok(());
+        }
+    };
+    let Some(provisioner) = st.registry.get(row.platform) else {
+        let why = not_enabled(row.platform);
+        let _ = grants::fail_provisioning(&tx, grant, &why, None).await?;
+        fail_request(&tx, row.request_id, &why, now).await?;
+        tx.commit().await?;
+        return Ok(());
+    };
+    let outcome = match prepared {
+        Ok(()) => match crate::provisioners::provision_within(
+            provisioner,
+            &tx,
+            &grant,
+            now,
+            crate::provisioners::PROVISION_DEADLINE,
+        )
+        .await
+        {
+            Some(r) => r,
+            None => {
+                // Too slow: undo what it may have done, then fail the
+                // grant; if undoing fails, leave it PROVISIONING for the
+                // reaper (which reverts before failing it).
+                tracing::error!(grant = %grant_id, "provisioning did not finish in time");
+                let snapshot = grant.grant().clone();
+                let undone = tokio::time::timeout(
+                    crate::provisioners::PROVISION_DEADLINE,
+                    provisioner.revoke(&tx, &snapshot, now),
+                )
+                .await;
+                if !matches!(undone, Ok(Ok(()))) {
+                    tracing::error!(grant = %grant_id, "reverting a slow provision failed; the reaper will retry");
+                    tx.rollback().await?;
+                    return Ok(());
+                }
+                let why = crate::provisioners::TOO_SLOW.to_owned();
+                let _ = grants::fail_provisioning(&tx, grant, &why, Some(now)).await?;
+                fail_request(&tx, row.request_id, &why, now).await?;
+                tx.commit().await?;
+                notify_request(st, row.request_id);
+                return Ok(());
+            }
+        },
+        Err(e) => Err(e),
+    };
+    match outcome {
+        Err(e) => {
+            tracing::error!(request = %row.request_id, error = %e, "provisioning failed");
+            let why = agent_visible(&e);
+            let recorded = async {
+                let _ = grants::fail_provisioning(&tx, grant, &why, None).await?;
+                fail_request(&tx, row.request_id, &why, now).await
+            }
+            .await;
+            match recorded {
+                Ok(()) => tx.commit().await?,
+                Err(e2) => {
+                    // The provisioner's own writes broke the transaction:
+                    // record the failure in a fresh one.
+                    tracing::warn!(error = %e2, "recording the failure in a new transaction");
+                    tx.rollback().await?;
+                    let tx = st.store.begin().await?;
+                    if let Some(grant) = grants::load_provisioning(&tx, grant_id).await? {
+                        let _ = grants::fail_provisioning(&tx, grant, &why, None).await?;
+                    }
+                    fail_request(&tx, row.request_id, &why, now).await?;
+                    tx.commit().await?;
+                }
+            }
+        }
+        Ok(provisioner_state) => {
+            let snapshot = grant.grant().clone();
+            match grants::activate(&tx, grant, &not_held, &provisioner_state).await? {
+                Ok(_) => {
+                    grant_succeeded(&tx, row.request_id, now).await?;
+                    tx.commit().await?;
+                }
+                Err(_) => {
+                    // Ended while the provisioner ran: undo what it did.
+                    tracing::warn!(grant = %grant_id, "grant ended while it was provisioned; reverting");
+                    if let Err(e) = provisioner.revoke(&tx, &snapshot, now).await {
+                        tracing::error!(grant = %grant_id, error = %e, "reverting failed");
+                    }
+                    tx.commit().await?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A provisioner's failure as the agent may read it (it lands in the
+/// request's decision reason). Transport errors (an HTTP client's text,
+/// which can name hosts and internals) become generic text; the detail is
+/// in the broker's log. The provisioners' own refusals pass, cut to 300
+/// characters.
+fn agent_visible(e: &crate::provisioners::ProvisionError) -> String {
+    let text = e.to_string();
+    let lower = text.to_lowercase();
+    const TRANSPORT: [&str; 9] = [
+        "error sending request",
+        "error decoding",
+        "error trying to connect",
+        "connection",
+        "timed out",
+        "dns error",
+        "tcp connect",
+        "certificate",
+        "request or response body error",
+    ];
+    if TRANSPORT.iter().any(|t| lower.contains(t)) {
+        return "the platform could not be reached; try again later".to_owned();
+    }
+    text.chars().take(300).collect()
+}
+
+fn notify_request(st: &AppState, id: RequestId) {
+    st.request_events.notify(&id);
+}
+
+/// The reaper (spec §4.8): PROVISIONING grants older than `max_age` (zero
+/// at boot: the broker is one process, so nothing is in flight then) are
+/// reverted through their provisioner and failed. A revert that fails
+/// leaves the row for the next tick. Returns how many were reaped.
+pub async fn reap_stale_provisioning(st: &AppState, max_age: Duration) -> usize {
+    let now = st.now();
+    let stale = async {
+        let tx = st.store.begin().await?;
+        grants::stale_provisioning(&tx, now.saturating_sub(max_age)).await
+    }
+    .await;
+    let stale = match stale {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "listing stale provisioning failed");
+            return 0;
+        }
+    };
+    let mut reaped = 0usize;
+    for id in stale {
+        match reap_one(st, id, now, &ReapWhy::interrupted()).await {
+            Ok(Some(request)) => {
+                reaped = reaped.saturating_add(1);
+                tracing::warn!(grant = %id, "reaped interrupted provisioning");
+                notify_request(st, request);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(grant = %id, error = %e, "failed to reap stale provisioning; will retry");
+            }
+        }
+    }
+    reaped
+}
+
+/// Why a reaped grant failed: the grant's revoke reason and the request's.
+struct ReapWhy {
+    grant: &'static str,
+    request: String,
+}
+
+impl ReapWhy {
+    fn interrupted() -> ReapWhy {
+        ReapWhy {
+            grant: "provisioning interrupted; external state reverted",
+            request: "interrupted (broker restarted mid-provision)".to_owned(),
+        }
+    }
+}
+
+async fn reap_one(
+    st: &AppState,
+    id: GrantId,
+    now: OffsetDateTime,
+    why: &ReapWhy,
+) -> ServiceResult<Option<RequestId>> {
+    let tx = st.store.begin().await?;
+    let Some(grant) = grants::load_provisioning(&tx, id).await? else {
+        return Ok(None);
+    };
+    let request_id = grant.grant().request_id;
+    let external = revoke_external(st, &tx, grant.grant(), now).await?;
+    let reason = if external { why.grant } else { RETIRED };
+    if grants::fail_provisioning(&tx, grant, reason, Some(now))
+        .await?
+        .is_err()
+    {
+        return Ok(None);
+    }
+    fail_request(&tx, request_id, &why.request, now).await?;
+    tx.commit().await?;
+    Ok(Some(request_id))
+}
+
+/// Containment: PROVISIONING grants of these agents are reverted and failed
+/// now (a finish phase that has not run yet would refuse them anyway; one
+/// that died left external state behind).
+pub async fn reap_provisioning_of(st: &AppState, agents: &[agent_auth_core::AgentId]) {
+    let now = st.now();
+    let ids = async {
+        let tx = st.store.begin().await?;
+        let mut out = Vec::new();
+        for id in grants::stale_provisioning(&tx, now).await? {
+            if let Some(g) = grants::get(&tx, id).await?
+                && agents.contains(&g.agent_id)
+            {
+                out.push(id);
+            }
+        }
+        Ok::<_, StoreError>(out)
+    }
+    .await;
+    let ids = match ids {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::error!(error = %e, "listing a held agent's provisioning grants failed");
+            return;
+        }
+    };
+    let why = ReapWhy {
+        grant: "contained while provisioning; external state reverted",
+        request: "contained while provisioning".to_owned(),
+    };
+    for id in ids {
+        match reap_one(st, id, now, &why).await {
+            Ok(Some(request)) => notify_request(st, request),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(grant = %id, error = %e, "reaping a held agent's grant failed; the reaper retries")
+            }
+        }
+    }
+}
+
+/// Phase two in its own tracked task, awaited: a caller that goes away (a
+/// dropped connection) does not leave the provision half done.
+pub(crate) async fn finish_detached(st: &AppState, grant_id: GrantId) {
+    let task_state = st.clone();
+    let done = super::detached(
+        st,
+        async move { finish_provision(&task_state, grant_id).await },
+    )
+    .await;
+    if done.is_none() {
+        tracing::error!(grant = %grant_id, "the provisioning task failed; the reaper reverts it");
+    }
+}
+
+async fn request_row(st: &AppState, id: RequestId) -> Result<Option<RequestRow>, StoreError> {
+    let tx = st.store.begin().await?;
+    Ok(requests::get(&tx, id).await?.map(AnyRequest::into_row))
+}
+
+/// After a grant ended: wake the request's long-polls, update its card.
+async fn grant_ended(st: &AppState, grant: &GrantRow) {
+    notify_request(st, grant.request_id);
+    match request_row(st, grant.request_id).await {
+        Ok(Some(request)) => st.notifier.update_grant_ended(&request, grant).await,
+        Ok(None) => {}
+        Err(e) => tracing::error!(error = %e, "loading the request of an ended grant"),
+    }
+}
+
+/// Why a grant of a platform no longer configured ended.
+pub(crate) const RETIRED: &str = "platform no longer configured";
+
+/// Undo a grant's external state through its platform's provisioner.
+/// `Ok(false)`: the platform is no longer configured (retired at startup
+/// because it still had live grants): there is nothing to call, so the
+/// grant just ends; external state the platform kept is the operator's to
+/// clean up (logged).
+async fn revoke_external(
+    st: &AppState,
+    tx: &Tx<'_>,
+    grant: &GrantRow,
+    now: OffsetDateTime,
+) -> ServiceResult<bool> {
+    match st.registry.get(grant.platform) {
+        Some(p) => {
+            p.revoke(tx, grant, now).await?;
+            Ok(true)
+        }
+        None if st.registry.is_retired(grant.platform) => {
+            tracing::warn!(
+                grant = %grant.id,
+                platform = %grant.platform,
+                resource = %grant.resource,
+                "ending a grant of a platform no longer configured; any external access it gave must be removed by hand"
+            );
+            Ok(false)
+        }
+        None => Err(ServiceError::NotEnabled(grant.platform)),
+    }
+}
+
+/// End an ACTIVE grant through its provisioner (spec §4.9). The
+/// provisioner's error leaves the grant active, but expired now: nothing
+/// more is issued for it, and the expiry pass retries the revoke until the
+/// provisioner manages (a host that was unreachable stops the job or shell
+/// when it is back; security review 2026-10). The error is returned.
+pub async fn revoke_grant(
+    st: &AppState,
+    grant_id: GrantId,
+    reason: &str,
+    revoked_by: &str,
+) -> ServiceResult<GrantRow> {
+    let now = st.now();
+    let tx = st.store.begin().await?;
+    let grant = match grants::get_for_update(&tx, grant_id).await? {
+        Some(g) if g.status == GrantStatus::Active => g,
+        _ => return Err(ServiceError::transition("grant is not active")),
+    };
+    let external = match revoke_external(st, &tx, &grant, now).await {
+        Ok(x) => x,
+        Err(e) => {
+            drop(tx);
+            let expired = async {
+                let tx = st.store.begin().await?;
+                grants::expire_now(&tx, grant_id, now).await?;
+                tx.commit().await
+            }
+            .await;
+            if let Err(store) = expired {
+                tracing::error!(grant = %grant_id, error = %store, "a grant whose revoke failed was not expired");
+            }
+            return Err(e);
+        }
+    };
+    let reason = if !external {
+        RETIRED.to_owned()
+    } else if revoked_by.is_empty() {
+        reason.to_owned()
+    } else {
+        format!("{reason} ({revoked_by})")
+    };
+    let ended = grants::end(&tx, grant_id, GrantEnd::Revoked { reason }, now)
+        .await?
+        .map_err(|_| ServiceError::transition("grant is not active"))?;
+    tx.commit().await?;
+    grant_ended(st, &ended).await;
+    Ok(ended)
+}
+
+async fn expire_one(st: &AppState, id: GrantId) -> ServiceResult<Option<GrantRow>> {
+    let now = st.now();
+    let tx = st.store.begin().await?;
+    let grant = match grants::get_for_update(&tx, id).await? {
+        Some(g) if g.status == GrantStatus::Active && g.expires_at <= now => g,
+        _ => return Ok(None),
+    };
+    let how = if revoke_external(st, &tx, &grant, now).await? {
+        GrantEnd::Expired
+    } else {
+        GrantEnd::Revoked {
+            reason: RETIRED.to_owned(),
+        }
+    };
+    let ended = grants::end(&tx, id, how, now).await?.ok();
+    tx.commit().await?;
+    Ok(ended)
+}
+
+/// One expiry pass: every ACTIVE grant past its end is revoked through its
+/// provisioner and marked EXPIRED. Failures stay ACTIVE for the next pass.
+pub async fn expire_due_grants(st: &AppState) -> usize {
+    let now = st.now();
+    let due = async {
+        let tx = st.store.begin().await?;
+        grants::due(&tx, now).await
+    }
+    .await;
+    let due = match due {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(error = %e, "listing due grants failed");
+            return 0;
+        }
+    };
+    let mut expired = 0usize;
+    for id in due {
+        match expire_one(st, id).await {
+            Ok(Some(grant)) => {
+                expired = expired.saturating_add(1);
+                grant_ended(st, &grant).await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(grant = %id, error = %e, "failed to expire grant; will retry")
+            }
+        }
+    }
+    expired
+}
+
+/// Delegated grants die with their thread (INV-12): every ACTIVE grant
+/// whose delegation thread is closed is revoked.
+pub async fn revoke_delegated_for_closed_threads(st: &AppState) -> usize {
+    let rows = async {
+        let tx = st.store.begin().await?;
+        grants::delegated_on_closed_threads(&tx).await
+    }
+    .await;
+    let rows = match rows {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "listing delegated grants of closed threads failed");
+            return 0;
+        }
+    };
+    let mut revoked = 0usize;
+    for (id, close_reason) in rows {
+        let reason = format!(
+            "delegation thread closed ({})",
+            close_reason.as_deref().unwrap_or("closed")
+        );
+        match revoke_grant(st, id, &reason, "scheduler").await {
+            Ok(_) => revoked = revoked.saturating_add(1),
+            Err(ServiceError::Transition(_)) => {}
+            Err(e) => {
+                tracing::error!(grant = %id, error = %e, "failed to revoke delegated grant; will retry")
+            }
+        }
+    }
+    revoked
+}

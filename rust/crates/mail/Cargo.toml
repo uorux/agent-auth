@@ -1,0 +1,34 @@
+[package]
+name = "agent-auth-mail"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+agent-auth-core.workspace = true
+mail-parser.workspace = true
+regex.workspace = true
+base64.workspace = true
+time.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "time"] }
+tokio-rustls.workspace = true
+rcgen = { workspace = true, optional = true }
+
+[features]
+# Test doubles: a throwaway CA, fake IMAP and SMTP servers (for tests in
+# this and other crates; never in a release binary).
+testing = ["dep:rcgen"]
+
+[dev-dependencies]
+proptest.workspace = true
+rcgen.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "time", "macros", "rt-multi-thread"] }

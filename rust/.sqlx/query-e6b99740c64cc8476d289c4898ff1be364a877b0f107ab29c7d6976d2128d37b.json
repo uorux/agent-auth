@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE mail_items SET payload_encrypted = NULL, reason = COALESCE($2, reason)\n         WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e6b99740c64cc8476d289c4898ff1be364a877b0f107ab29c7d6976d2128d37b"
+}

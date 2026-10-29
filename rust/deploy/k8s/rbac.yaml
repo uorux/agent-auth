@@ -1,0 +1,78 @@
+# The broker's ServiceAccount and what the Kubernetes provisioner may do
+# with it (KUBERNETES_API_URL=in-cluster). Per grant it makes a
+# ServiceAccount aa-<agent>-<grant id> in agent-auth-grants, a RoleBinding
+# of the granted role (or a ClusterRoleBinding, components/cluster-grants)
+# with the same name, mints the ServiceAccount's tokens, and deletes both
+# when the grant ends. admission-policy.yaml holds it to exactly that.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agent-auth
+  namespace: agent-auth
+# Its token is mounted: the provisioner talks to the API server with it.
+automountServiceAccountToken: true
+---
+# The grants' ServiceAccounts and their tokens: only in agent-auth-grants
+# (a Role, not a ClusterRole: no token for any other ServiceAccount).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: agent-auth-grants
+  namespace: agent-auth-grants
+rules:
+  - apiGroups: [""]
+    resources: [serviceaccounts]
+    verbs: [create, get, delete]
+  - apiGroups: [""]
+    resources: [serviceaccounts/token]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agent-auth-grants
+  namespace: agent-auth-grants
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: agent-auth-grants
+subjects:
+  - kind: ServiceAccount
+    name: agent-auth
+    namespace: agent-auth
+---
+# RoleBindings of the allowlisted roles, wherever this ClusterRole is bound
+# (components/namespaces: per namespace; components/all-namespaces: every
+# namespace). `bind` lets it make a RoleBinding of a role without holding
+# that role's permissions itself (no privilege escalation), and only for
+# these roles.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: agent-auth-provisioner
+rules:
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [rolebindings]
+    verbs: [create, get, delete]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterroles]
+    verbs: [bind]
+    # MUST list exactly the policy's platforms.kubernetes.role_allowlist.
+    # The broker can only hand out roles it can `bind`; adding one here
+    # widens its standing power, so prefer the narrow roles in roles.yaml
+    # over edit/admin.
+    resourceNames:
+      - view
+      - edit
+      - traefik-patcher
+      - logs-reader
+      - workload-manager
+      - cm-editor
+      - port-forwarder
+      - job-runner
+      - pod-exec
+      - secret-reader
+      # In the homelab policy's role_allowlist; defined by the homelab
+      # repo's pending rbac change (until then a grant of either fails).
+      - flux-reconciler
+      - crd-reader

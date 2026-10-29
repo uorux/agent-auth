@@ -8,7 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import authority as authority_mod
 from ..core.states import Platform, RuleAction
-from ..models import AccessRequest, Agent, Rule
+from ..models import AccessRequest, Agent, Rule, utcnow
+from .agents import AgentPattern, Project, agent_matches, resources_for
 from .schema import PolicyAction, PolicyFile, PolicyRule
 
 
@@ -25,27 +26,39 @@ class PolicyDecision:
     # may bypass the sensitive-capability gate — a wildcard (null-authority) rule
     # cannot silently auto-approve a sensitive role/permission.
     pinned_authority: bool = False
+    # True when the matched rule names this request's privilege itself: a DB
+    # rule pinned to the exact authority, or a YAML rule whose match.capability
+    # is literally the request's capability (no glob). Privileges flagged by
+    # `needs_explicit_rule` (github "create") are only cleared by such a rule.
+    explicit: bool = False
+    # True when the rule is a time-boxed "approve all" window (hostexec): the
+    # host is told so, and decides for itself whether it honours windows.
+    window: bool = False
 
 
 def _matches(
-    agent_pattern: str,
+    agent_pattern: AgentPattern,
     platform: Platform | None,
     capability_pattern: str,
     resource_pattern: str,
-    agent_name: str,
+    agent: Agent,
     request: AccessRequest,
+    projects: dict[str, Project],
 ) -> bool:
     if platform is not None and platform != request.platform:
         return False
     return (
-        fnmatch(agent_name, agent_pattern)
+        agent_matches(agent_pattern, agent)
         and fnmatch(request.capability, capability_pattern)
-        and fnmatch(request.resource, resource_pattern)
+        and any(
+            fnmatch(request.resource, resource)
+            for resource in resources_for(resource_pattern, agent, projects)
+        )
     )
 
 
 def _delegator_matches(
-    pattern: str | None, delegator_name: str | None, grants_access: bool
+    pattern: AgentPattern | None, delegator: Agent | None, grants_access: bool
 ) -> bool:
     """Delegation axis of rule matching.
 
@@ -56,10 +69,14 @@ def _delegator_matches(
     thing that auto-approves or LLM-clears one.
     """
     if pattern is not None:
-        return delegator_name is not None and fnmatch(delegator_name, pattern)
-    if delegator_name is None:
+        return delegator is not None and agent_matches(pattern, delegator)
+    if delegator is None:
         return True
     return not grants_access
+
+
+# Stands in for a delegator whose agent no longer exists.
+_GONE = Agent(name="?", placement="host")
 
 
 class PolicyEngine:
@@ -75,25 +92,26 @@ class PolicyEngine:
     async def evaluate(
         self, session: AsyncSession, agent: Agent, request: AccessRequest
     ) -> PolicyDecision:
-        delegator_name = None
+        delegator = None
         if request.delegator_agent_id is not None:
-            delegator = await session.get(Agent, request.delegator_agent_id)
-            delegator_name = delegator.name if delegator else "?"
+            # A delegator that is gone matches no rule that names one, and
+            # still keeps rules written without delegation from approving.
+            delegator = await session.get(Agent, request.delegator_agent_id) or _GONE
 
-        db_decision = await self._match_db_rules(session, agent, request, delegator_name)
+        db_decision = await self._match_db_rules(session, agent, request, delegator)
         if db_decision is not None:
             return db_decision
 
         for rule in self.policy.rules:
             m = rule.match
             if _matches(
-                m.agent, m.platform, m.capability, m.resource, agent.name, request
+                m.agent, m.platform, m.capability, m.resource, agent, request, self.policy.projects
             ) and _delegator_matches(
                 m.delegator,
-                delegator_name,
+                delegator,
                 grants_access=rule.action in (PolicyAction.APPROVE, PolicyAction.LLM),
             ):
-                return self._from_yaml_rule(rule)
+                return self._from_yaml_rule(rule, explicit=m.capability == request.capability)
 
         defaults = self.policy.defaults
         return PolicyDecision(
@@ -110,21 +128,24 @@ class PolicyEngine:
         session: AsyncSession,
         agent: Agent,
         request: AccessRequest,
-        delegator_name: str | None,
+        delegator: Agent | None,
     ) -> PolicyDecision | None:
         rows = await session.execute(
             select(Rule)
             .where(Rule.enabled.is_(True), Rule.platform == request.platform)
             .order_by(Rule.created_at.desc())
         )
+        now = utcnow()
         for rule in rows.scalars():
+            if rule.expires_at is not None and rule.expires_at <= now:
+                continue
             if not fnmatch(agent.name, rule.agent_pattern):
                 continue
             if not fnmatch(request.resource, rule.resource_pattern):
                 continue
             if not _delegator_matches(
                 rule.delegator_pattern,
-                delegator_name,
+                delegator,
                 grants_access=rule.action == RuleAction.AUTO_APPROVE,
             ):
                 continue
@@ -132,7 +153,7 @@ class PolicyEngine:
             # privilege, so an "approve contents:write" rule never rubber-stamps
             # a later secrets:write, and an "approve view" rule never clears an
             # edit. null authority = any privilege (but see pinned_authority).
-            if rule.authority is not None and rule.authority != request.authority:
+            if not authority_mod.rule_covers(request.platform, rule.authority, request.authority):
                 continue
             action = (
                 PolicyAction.APPROVE
@@ -147,10 +168,12 @@ class PolicyEngine:
                 or self.policy.defaults.max_duration_secs,
                 rule_id=rule.id,
                 pinned_authority=rule.authority is not None,
+                explicit=rule.authority is not None,
+                window=(rule.authority or {}).get("action") == "window",
             )
         return None
 
-    def _from_yaml_rule(self, rule: PolicyRule) -> PolicyDecision:
+    def _from_yaml_rule(self, rule: PolicyRule, explicit: bool = False) -> PolicyDecision:
         c = rule.constraints
         return PolicyDecision(
             action=rule.action,
@@ -161,6 +184,7 @@ class PolicyEngine:
             retry_budget=c.retry_budget
             if c.retry_budget is not None
             else self.policy.llm.retry_budget,
+            explicit=explicit,
         )
 
     def cap_duration(self, requested_secs: int, max_secs: int | None) -> int:
@@ -173,5 +197,10 @@ class PolicyEngine:
         """An authority that must always reach a human (unless a human's own
         authority-pinned rule already approved this exact privilege)."""
         return authority_mod.is_sensitive(
-            request.platform, request.authority, self.policy.platforms
+            request.platform, request.authority, self.policy.platforms, request.resource
         )
+
+    def needs_explicit_rule(self, request: AccessRequest) -> bool:
+        """An authority that only a rule naming it may approve or LLM-route
+        (see PolicyDecision.explicit); anything else surfaces it to a human."""
+        return authority_mod.needs_explicit_rule(request.platform, request.authority)

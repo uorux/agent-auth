@@ -1,0 +1,229 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT c.id, c.kind, c.model, '{}'::jsonb AS \"facts!\", c.context, c.system_sha256,\n                  '' AS \"user_message!\",\n                  c.answer, c.class, c.error, c.latency_ms, c.subject, c.created_at,\n                  l.expected AS \"expected?\", l.note AS \"note?\", l.source AS \"source?\",\n                  l.labeled_by AS \"labeled_by?\", l.labeled_at AS \"labeled_at?\"\n           FROM model_calls c LEFT JOIN model_call_labels l ON l.call_id = c.id\n           WHERE ($1::text IS NULL OR c.kind = $1)\n             AND ($2::boolean IS NULL OR (l.call_id IS NOT NULL) = $2)\n             AND ($3::timestamptz IS NULL OR c.created_at >= $3)\n             AND ($4::timestamptz IS NULL OR c.created_at < $4)\n             AND ($5::timestamptz IS NULL OR (c.created_at, c.id) < ($5, $6::uuid))\n             AND ($7::uuid[] IS NULL OR c.id = ANY($7))\n           ORDER BY c.created_at DESC, c.id DESC\n           LIMIT $8",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "model_calls",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "model_calls",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "model_calls",
+            "name": "model"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "facts!",
+        "type_info": "Jsonb",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "context",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "model_calls",
+            "name": "context"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "system_sha256",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "model_calls",
+            "name": "system_sha256"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "user_message!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 7,
+        "name": "answer",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "model_calls",
+            "name": "answer"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "class",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "model_calls",
+            "name": "class"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "error",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "model_calls",
+            "name": "error"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "latency_ms",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "model_calls",
+            "name": "latency_ms"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "subject",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "model_calls",
+            "name": "subject"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "model_calls",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "expected?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "model_call_labels",
+            "name": "expected"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "note?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "model_call_labels",
+            "name": "note"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "source?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "model_call_labels",
+            "name": "source"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "labeled_by?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "model_call_labels",
+            "name": "labeled_by"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "labeled_at?",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "model_call_labels",
+            "name": "labeled_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bool",
+        "Timestamptz",
+        "Timestamptz",
+        "Timestamptz",
+        "Uuid",
+        "UuidArray",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      null,
+      false,
+      false,
+      null,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "8ffc5cb5a658411c95f38fde18745a19223b6150a6514e3de7b0454f417dc2f3"
+}

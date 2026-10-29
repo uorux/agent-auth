@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT initiator_agent_id, responder_agent_id, grant_id FROM a2a_threads WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "initiator_agent_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "a2a_threads",
+            "name": "initiator_agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "responder_agent_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "a2a_threads",
+            "name": "responder_agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "grant_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "a2a_threads",
+            "name": "grant_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "a1564cde47c370b2177c634426714d1017f864dd1b30eb91e3bddea058d2a79b"
+}
