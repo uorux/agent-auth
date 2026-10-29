@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-auth-broker"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-auth-core",
  "agent-auth-crypto",
@@ -48,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "agent-auth-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-auth-client",
  "agent-auth-core",
@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "agent-auth-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-auth-client",
  "agent-auth-core",
@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "agent-auth-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proptest",
  "regex",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "agent-auth-crypto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-auth-core",
  "base64 0.23.1",
@@ -114,7 +114,7 @@ dependencies = [
 
 [[package]]
 name = "agent-auth-daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-auth-crypto",
  "agent-auth-tls",
@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "agent-auth-e2e"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-auth-mail",
  "agent-auth-tls",
@@ -152,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "agent-auth-hostd"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-auth-core",
  "agent-auth-crypto",
@@ -175,7 +175,7 @@ dependencies = [
 
 [[package]]
 name = "agent-auth-mail"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-auth-core",
  "base64 0.23.1",
@@ -194,7 +194,7 @@ dependencies = [
 
 [[package]]
 name = "agent-auth-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-auth-client",
  "agent-auth-core",
@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "agent-auth-sandboxd"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-auth-client",
  "agent-auth-core",
@@ -242,7 +242,7 @@ dependencies = [
 
 [[package]]
 name = "agent-auth-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-auth-core",
  "serde",
@@ -257,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "agent-auth-tls"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "reqwest",
  "rustls",
@@ -268,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "agent-auth-wire"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-auth-core",
  "proptest",
