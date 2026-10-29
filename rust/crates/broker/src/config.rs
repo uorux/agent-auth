@@ -340,7 +340,7 @@ impl Config {
             daemons_enabled: env.get("BROKER_SIGNING_KEY").is_some(),
             log_level: env.string("LOG_LEVEL", "INFO"),
             trust_proxy_headers: env.flag("TRUST_PROXY_HEADERS", false)?,
-            requests_per_hour: env.number("REQUESTS_PER_AGENT_PER_HOUR", 60)?,
+            requests_per_hour: env.number("REQUESTS_PER_AGENT_PER_HOUR", 600)?,
             max_waits_per_agent: env.number("MAX_WAITS_PER_AGENT", 16)?,
         })
     }

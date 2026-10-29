@@ -93,7 +93,7 @@ value that does not parse stops the broker with the variable's name.
 | `LISTEN_PORT` | `8400` | |
 | `LOG_LEVEL` | `INFO` | a tracing filter: `info`, `debug`, `agent_auth_broker=debug,info` |
 | `TRUST_PROXY_HEADERS` | `false` | believe `X-Real-IP` (a reverse proxy that sets it is in front): the security log, registration and handshake limits see the client |
-| `REQUESTS_PER_AGENT_PER_HOUR` | `60` | new access requests per agent per hour (`0`: unlimited) |
+| `REQUESTS_PER_AGENT_PER_HOUR` | `600` | new access requests per agent per hour (`0`: unlimited) |
 | `MAX_WAITS_PER_AGENT` | `16` | concurrent decision long-polls per agent (`0`: unlimited) |
 
 **Secrets and keys**

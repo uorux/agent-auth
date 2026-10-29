@@ -427,6 +427,12 @@ pub async fn run(env: Env) -> anyhow::Result<()> {
         config.encryption_key.as_ref().map(|k| k.expose().as_str()),
     )
     .map_err(|e| anyhow::anyhow!("web UI: {e}"))?;
+    if let Some(panel) = &web.panel {
+        panel
+            .load_signouts(&store)
+            .await
+            .map_err(|e| anyhow::anyhow!("web UI: reading panel sign-outs: {e}"))?;
+    }
     let discord = match crate::discord::DiscordConfig::from_vars(lookup)
         .map_err(|e| anyhow::anyhow!("discord: {e}"))?
     {

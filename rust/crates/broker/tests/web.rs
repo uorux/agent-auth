@@ -786,6 +786,7 @@ async fn without_a_session(pool: sqlx::PgPool) {
         user: "jrt".into(),
         csrf: "x".into(),
         exp: now.unix_timestamp() + 600,
+        iat_ms: now.unix_timestamp() * 1000,
     };
     let other = Sealer::new(&b64url_encode(&[9u8; 32])).unwrap();
     let stolen = other.seal(Kind::Session, &session, now).unwrap();
@@ -891,6 +892,38 @@ async fn signing_out(pool: sqlx::PgPool) {
         send(&s.app, "GET", "/ui/logout", &[], None).await.status,
         StatusCode::NOT_FOUND
     );
+    // The cookie itself, kept (a copy elsewhere), opens nothing any more.
+    assert_eq!(
+        send(&s.app, "GET", "/ui/session", &[("cookie", &cookie)], None)
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn signing_out_ends_every_session_of_the_user(pool: sqlx::PgPool) {
+    let s = setup(pool.clone(), true, false).await;
+    let panel = s.state.web.panel.clone().unwrap();
+    let now = OffsetDateTime::now_utc();
+    let first = panel.seal_session("jrt", now).unwrap();
+    let other = panel.seal_session("someone", now).unwrap();
+    panel
+        .sign_out(&s.state.store, "jrt", now + time::Duration::seconds(1))
+        .await
+        .unwrap();
+    let later = now + time::Duration::seconds(2);
+    assert!(panel.open_session(&first, later).is_none());
+    assert_eq!(panel.open_session(&other, later).unwrap().user, "someone");
+    // Signing in again after it works.
+    let again = panel.seal_session("jrt", later).unwrap();
+    assert_eq!(panel.open_session(&again, later).unwrap().user, "jrt");
+    // And it holds across a restart: a new panel reads the sign-outs back.
+    let restarted = setup(pool, true, false).await;
+    let fresh = restarted.state.web.panel.clone().unwrap();
+    fresh.load_signouts(&restarted.state.store).await.unwrap();
+    assert!(fresh.open_session(&first, later).is_none());
+    assert_eq!(fresh.open_session(&again, later).unwrap().user, "jrt");
 }
 
 #[sqlx::test(migrations = "../store/migrations")]

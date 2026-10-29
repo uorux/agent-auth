@@ -416,6 +416,15 @@ and why. Keep entries short. Group by area.
   Python served it).
 - **CSRF compares bytes** (Bug-B3): a non-ASCII `X-CSRF-Token` is a 403,
   not a 500.
+- **Signing out signs the user out everywhere** (Bug-B1, fixed
+  2026-10-29; the Python only deleted the cookie, so a copy stayed valid
+  for 8 h). A session carries when it was sealed (`iat_ms`); `/ui/logout`
+  records the user's sign-out time in `broker_flags` (`panel_signouts`),
+  and any session of theirs sealed before it is void, copies of the cookie
+  and this broker's restarts included. Other users' sessions stay. If the
+  write fails the logout is an error and the cookie stays, so a retry can
+  still void it. The map is held in memory (one broker per database) and
+  read back at start; entries older than a session's lifetime are dropped.
 - **The session cookie is looked at only without an `Authorization`
   header** (§B.6). The Python also took it with a non-Bearer
   `Authorization` header.
@@ -1098,9 +1107,10 @@ and why. Keep entries short. Group by area.
   hostexec approval gate (409 without it), and a shell needs a TOTP code in
   the decision (`a shell is approved with a TOTP code only (Approve with
   TOTP)`), whatever the gate does.
-- **Per-agent limits** (new): at most `REQUESTS_PER_AGENT_PER_HOUR` (60)
-  new access requests an hour and `MAX_WAITS_PER_AGENT` (16) concurrent
-  decision long-polls, else 429. The long-poll re-reads the database every
+- **Per-agent limits** (new): at most `REQUESTS_PER_AGENT_PER_HOUR` (600;
+  60 at first, raised 2026-10-29 as too few for a busy agent) new access
+  requests an hour and `MAX_WAITS_PER_AGENT` (16) concurrent decision
+  long-polls, else 429. The long-poll re-reads the database every
   10 s (wake-ups do the rest); the Python polled every 2 s.
 - **Provisioner transport errors** reach the agent as `the platform could
   not be reached; try again later` (the detail is logged); other
@@ -2109,9 +2119,6 @@ Final review (sandboxes), fixed:
   registry decide its policy and RBAC (the reason the Python ran on
   recusant). The manifests are ready; whether to move is Jacob's call.
 
-- **Panel logout is client-side only** (Bug-B1, unchanged): a copied
-  session cookie stays valid until its `exp` (8 h). A server-side session
-  table or a per-user generation would allow "sign out everywhere".
 - **Consent can merge identities** (Bug-C5, unchanged): a new connector
   whose name normalizes to an existing `web-*` agent binds to it silently.
 - **Does an empty `platforms.homelab.allowed_groups` mean "nothing"?**

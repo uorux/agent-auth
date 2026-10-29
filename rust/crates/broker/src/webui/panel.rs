@@ -11,9 +11,11 @@
 //! loopback): a request a proxy forwarded for another name gets 404 here
 //! and its session cookie is not looked at on the admin API.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use agent_auth_crypto::{ct_eq, token_urlsafe};
+use agent_auth_store::{Store, StoreError, flags};
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, RawQuery, State};
@@ -38,6 +40,10 @@ pub const SESSION_COOKIE: &str = "__Host-aa_ui";
 pub const LOGIN_COOKIE: &str = "__Host-aa_ui_login";
 /// How long a sign-in may take, seconds.
 pub const LOGIN_TTL: i64 = 600;
+/// The `broker_flags` key holding when each panel user last signed out:
+/// `{"<user>": <unix milliseconds>}`. A session sealed before its user's
+/// sign-out is void, wherever its cookie went.
+pub const SIGNOUTS_FLAG: &str = "panel_signouts";
 /// The CSRF header the page sends on every write.
 pub const CSRF_HEADER: &str = "x-csrf-token";
 
@@ -98,6 +104,9 @@ pub struct Session {
     pub csrf: String,
     /// Unix seconds; the lifetime is absolute.
     pub exp: i64,
+    /// Unix milliseconds it was sealed: a sign-out by its user after that
+    /// voids it.
+    pub iat_ms: i64,
 }
 
 /// The admin panel.
@@ -108,6 +117,10 @@ pub struct Panel {
     ttl: i64,
     sealer: Arc<Sealer>,
     sign_in: Arc<OidcClient>,
+    /// [`SIGNOUTS_FLAG`]'s value, read at start and written through on
+    /// every sign-out (one broker per database, so this copy is the
+    /// truth): checked on every request without a database round trip.
+    signouts: RwLock<HashMap<String, i64>>,
 }
 
 impl Panel {
@@ -125,7 +138,45 @@ impl Panel {
             ttl: ttl_secs,
             sealer,
             sign_in,
+            signouts: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Reads the sign-outs from the database (at start, before serving).
+    pub async fn load_signouts(&self, store: &Store) -> Result<(), StoreError> {
+        let tx = store.begin().await?;
+        let value = flags::get(&tx, SIGNOUTS_FLAG).await?;
+        tx.commit().await?;
+        let loaded = value.map(|v| signouts_from(&v)).unwrap_or_default();
+        if let Ok(mut map) = self.signouts.write() {
+            *map = loaded;
+        }
+        Ok(())
+    }
+
+    /// Signs `user` out everywhere: every session of theirs sealed before
+    /// `now` is void from here on, this broker's restarts included. Entries
+    /// older than a session's lifetime are dropped (nothing they void is
+    /// still alive).
+    pub async fn sign_out(
+        &self,
+        store: &Store,
+        user: &str,
+        now: OffsetDateTime,
+    ) -> Result<(), StoreError> {
+        let at = unix_ms(now);
+        let horizon = at.saturating_sub(self.ttl.saturating_mul(1000));
+        let tx = store.begin().await?;
+        let current = flags::get_for_update(&tx, SIGNOUTS_FLAG, &json!({}), now).await?;
+        let mut map = signouts_from(&current);
+        map.retain(|_, t| *t > horizon);
+        map.insert(user.to_owned(), at);
+        flags::set(&tx, SIGNOUTS_FLAG, &json!(map), now).await?;
+        tx.commit().await?;
+        if let Ok(mut held) = self.signouts.write() {
+            *held = map;
+        }
+        Ok(())
     }
 
     /// Where the provider sends the browser back.
@@ -199,11 +250,18 @@ impl Panel {
     }
 
     /// Opens a session cookie value: sealed by this broker, of the session
-    /// kind, within its TTL, and before its `exp`.
+    /// kind, within its TTL, before its `exp`, and after its user's last
+    /// sign-out. A poisoned sign-out map opens nothing.
     #[must_use]
     pub fn open_session(&self, cookie: &str, now: OffsetDateTime) -> Option<Session> {
         let session: Session = self.sealer.open(Kind::Session, cookie, self.ttl, now)?;
-        (session.exp > now.unix_timestamp()).then_some(session)
+        if session.exp <= now.unix_timestamp() {
+            return None;
+        }
+        let signed_out = self.signouts.read().ok()?.get(&session.user).copied();
+        signed_out
+            .is_none_or(|t| session.iat_ms > t)
+            .then_some(session)
     }
 
     /// A new session for `user` (sealed), as the callback sets it.
@@ -213,6 +271,7 @@ impl Panel {
             user: user.to_owned(),
             csrf: token_urlsafe(24).ok()?,
             exp: now.unix_timestamp().saturating_add(self.ttl),
+            iat_ms: unix_ms(now),
         };
         self.sealer.seal(Kind::Session, &session, now)
     }
@@ -446,22 +505,51 @@ async fn asset(
         .into_response()
 }
 
+/// Signs out: the cookie goes, and so does every session of its user,
+/// copies of the cookie included (`Panel::sign_out`). Without a live
+/// session there's nothing to void and only the cookie goes.
 async fn logout(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
     let Some(panel) = panel_for(&state, &headers, &uri) else {
         return not_found();
     };
-    if let Some(current) = panel.session(&headers, state.now()) {
+    let now = state.now();
+    if let Some(current) = panel.session(&headers, now) {
         let sent = headers
             .get(CSRF_HEADER)
             .map_or(&[][..], HeaderValue::as_bytes);
         if !ct_eq(sent, current.csrf.as_bytes()) {
             return ApiError::forbidden("missing or wrong CSRF token").into_response();
         }
+        if let Err(e) = panel.sign_out(&state.store, &current.user, now).await {
+            // Not signed out: say so, and keep the cookie, so a retry can
+            // still void the session.
+            tracing::error!("admin panel: signing {} out failed: {e}", current.user);
+            return ApiError::from(e).into_response();
+        }
+        tracing::info!("admin panel: {} signed out", current.user);
     }
     with_cookie(
         StatusCode::NO_CONTENT.into_response(),
         cookies::delete(SESSION_COOKIE, "/"),
     )
+}
+
+/// Unix milliseconds (saturating).
+fn unix_ms(at: OffsetDateTime) -> i64 {
+    i64::try_from(at.unix_timestamp_nanos() / 1_000_000).unwrap_or(i64::MAX)
+}
+
+/// The sign-out map from its stored JSON; anything malformed is skipped
+/// (the broker writes this key alone).
+fn signouts_from(value: &serde_json::Value) -> HashMap<String, i64> {
+    value
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .filter_map(|(user, t)| Some((user.clone(), t.as_i64()?)))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn nothing() -> Response {
