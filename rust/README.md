@@ -245,11 +245,14 @@ config; `AGENT_AUTH_HOSTD_PAIRING_CODE` for `pair`; `AGENT_AUTH_HOSTD_CTL`
 
 TOTP secrets: `totp-enroll` makes the four of the Python (`user-arm`,
 `user-direct`, `root-arm`, `root-direct`). Three optional ones are new
-(`totp-enroll --add <name>`): `root-shell` (a root shell needs it),
-`root-unlock` (unlocking from the broker needs it; otherwise unlock locally
-with hostctl), `user-shell` (if enrolled, user shells take it instead of
-the direct code). Five wrong codes lock a secret for escalating periods; 20
-in 30 days lock it until `sudo agent-auth-hostctl totp-unlock NAME`.
+(`totp-enroll --add <name>`): `user-shell`, `root-shell` (if enrolled,
+that tier's shells take it instead of the tier's arm code; a direct code
+never opens a shell), `root-unlock` (unlocking from the broker needs it;
+otherwise unlock locally with hostctl). A shell can also be approved at its
+own host's desk (`desktop.approve` for its tier), with the user's password
+through polkit whatever the tier. Five wrong codes lock a secret for
+escalating periods; 20 in 30 days lock it until
+`sudo agent-auth-hostctl totp-unlock NAME`.
 
 ### Shell modes
 
@@ -376,7 +379,7 @@ AGENT_AUTH_API_KEY=... agent-auth request github repo me/repo --why "..." --wait
 agent-auth admin daemon-pair myhost                       # on the operator's side
 sudo agent-auth-hostd pair                                # on the host (prompts for the code)
 sudo agent-auth-hostd totp-enroll                         # once (QR codes, shown once)
-sudo agent-auth-hostd totp-enroll --add root-shell        # optional secrets
+sudo agent-auth-hostd totp-enroll --add root-unlock       # optional secrets
 agent-auth-hostd run                                      # the service
 agent-auth-hostctl status | presence idle | dnd 2h | totp-unlock NAME
 
@@ -570,9 +573,10 @@ long-lived token as `KUBERNETES_TOKEN_FILE`).
 
 ## Migrating from the Python deployment
 
-Nothing carries over in the database: the Rust broker starts on a new,
-empty PostgreSQL database (its own schema; it never reads the Python's
-SQLite or Postgres tables). Plan a short cutover:
+The Rust broker runs on a new PostgreSQL database (its own schema; it never
+reads the Python's SQLite or Postgres tables). `agent-auth-server
+import-python` carries over the host pairings and the agents with their API
+keys; nothing else. Plan a short cutover:
 
 1. **Drain the Python broker.** Let active grants end or revoke them
    (`agent-auth admin revoke <grant>`): what it provisioned (Kubernetes
@@ -581,35 +585,88 @@ SQLite or Postgres tables). Plan a short cutover:
    broker and would otherwise stay. Check with
    `kubectl get sa,rolebinding,clusterrolebinding -A -l app.kubernetes.io/managed-by=agent-auth`.
    Then stop it.
-2. **Keep the keys.** Reuse `BROKER_SIGNING_KEY` (the daemons' pinned
-   `brokerPublicKey`, the JWKS and its `kid` stay the same) and
+2. **Keep the keys.** Reuse `BROKER_SIGNING_KEY`: the daemons pin its
+   public key (`brokerPublicKey`), so with another one every daemon fails
+   at the welcome; the JWKS and its `kid` stay the same too. Reuse
    `ADMIN_TOKEN`; `ENCRYPTION_KEY` may stay (same shape), though nothing
    encrypted by the Python is read.
-3. **Fix the policy** for the stricter loader (above; DEVIATIONS.md).
-   Start the Rust broker once against it: it refuses a policy it cannot
-   load, naming the key.
-4. **Start the Rust broker** on the new database (NixOS: import the Rust
-   modules, `database.createLocally`; Kubernetes: the steps above).
-5. **Re-register agents**: `agent-auth admin agent-create <name>` for each
-   (with `--lldap-username` for hand-registered LLDAP accounts,
-   `--webhook-url` for service agents), and give each its new API key.
-   Broker-managed LLDAP accounts (`svc-<name>`, display name
-   `<agent> (agent-auth managed)`) are adopted again at the agent's next
-   homelab grant. Webhook receivers must check the new timestamped
-   signature (top-level README, "Verifying webhook pings").
-6. **Re-pair the daemons**: the new database knows no daemon. On each host,
-   switch its module to the Rust one, then `agent-auth admin daemon-pair
-   <host>` and `sudo agent-auth-hostd pair`. hostd's state directory carries
-   over as is (the identity key, the TOTP secrets and their state are in
-   the Python's formats), so the authenticator entries stay valid; enroll
-   the new optional secrets if wanted (`sudo agent-auth-hostd totp-enroll
-   --add root-shell`: root shells now need it; `--add root-unlock`: remote
-   unlock now needs it). Agent VMs: `daemon-pair --role sandbox <host>`,
-   then `agent-auth-sandboxd pair` in the guest; sandboxd's state is new
-   (JSON documents instead of SQLite), so the VM's agents are minted again
-   by its orchestrator.
-7. **Reconnect web UIs**: remote MCP connectors (claude.ai, ChatGPT) and
+3. **Fix the policy** for the stricter loader (above; DEVIATIONS.md), and
+   **start the Rust broker** on the new database (NixOS: import the Rust
+   modules, `database.createLocally`; Kubernetes: the steps above). It
+   refuses a policy it cannot load, naming the key. Register no agent and
+   pair no daemon yet: the import wants an empty database.
+4. **Export** on the old host, as root, the Python broker stopped. The
+   file holds API key hashes and webhook secrets: keep it on tmpfs, copy it
+   over ssh, delete it after the import (both copies).
+
+   ```sh
+   umask 077; d=$(mktemp -d /dev/shm/agent-auth.XXXXXX)
+   cp /var/lib/private/agent-auth/agent-auth.db* "$d"/   # with any -wal: the live file is not touched
+   nix shell nixpkgs#sqlite -c sqlite3 "$d/agent-auth.db" > /dev/shm/agent-auth-export.json <<'SQL'
+   SELECT json_object('format', 'agent-auth-python-export/1',
+     'agents', json((SELECT json_group_array(json_object(
+       'id', id, 'name', name, 'description', description, 'key_id', key_id,
+       'api_key_hash', api_key_hash, 'webhook_url', webhook_url,
+       'webhook_secret', webhook_secret, 'lldap_username', lldap_username,
+       'lldap_managed', lldap_password_encrypted IS NOT NULL, 'disabled', disabled,
+       'kind', kind, 'last_seen_at', last_seen_at, 'last_listen_at', last_listen_at,
+       'parent_agent_id', parent_agent_id, 'sandbox_id', sandbox_id,
+       'runtime', runtime, 'project', project, 'host', host, 'placement', placement,
+       'lease_expires_at', lease_expires_at, 'created_at', created_at)) FROM agents)),
+     'daemons', json((SELECT json_group_array(json_object(
+       'id', id, 'role', role, 'name', name, 'public_key', public_key,
+       'paired_at', paired_at, 'last_seen_at', last_seen_at,
+       'created_at', created_at)) FROM daemons)));
+   SQL
+   rm -r "$d"
+   ```
+
+   (The path is the Python module's default, `DynamicUser` +
+   `StateDirectory`; the LLDAP password ciphertexts are not exported, only
+   whether there is one.)
+5. **Import**, with the broker's own `DATABASE_URL`, first with
+   `--dry-run` (checks every row and prints what would be carried, what
+   stays behind and why, and warnings; never opens the database), then
+   without. One transaction: a bad row aborts it all, naming the row. The
+   export is read from a file or from stdin (`-`):
+
+   ```sh
+   # Kubernetes (the image has no shell; the pod has DATABASE_URL):
+   kubectl -n agent-auth exec -i deploy/agent-auth -- /bin/agent-auth-server import-python --dry-run - < agent-auth-export.json
+   # NixOS, database.createLocally (peer auth as the service's user, while it runs):
+   sudo -u agent-auth env DATABASE_URL='postgres://agent-auth@localhost/agent-auth?host=/run/postgresql' \
+     "$(readlink /proc/$(systemctl show -P MainPID agent-auth)/exe)" import-python --dry-run - < agent-auth-export.json
+   ```
+
+   Carried: host daemons (id, name, public key), and agents registered by
+   hand, with their API keys (key id and hash: the old keys keep working),
+   kind, attributes, webhook URL and secret, hand-registered LLDAP
+   username, and disabled state. Not carried: agent VMs (sandbox daemons),
+   every agent minted in or for one, or by another agent, and the
+   orchestrators (step 7); web UI connectors' agents (step 8); the
+   Python's operator stand-in (the broker makes its own); LLDAP passwords
+   (Fernet): a broker-managed account (`svc-<name>`, display name
+   `<agent> (agent-auth managed)`) is adopted again at the agent's next
+   homelab grant, with a new password. The warnings name service agents
+   whose webhook has no secret of their own (they get no pings until
+   `agent-auth admin rotate-webhook-secret`), `http` webhooks to hosts not
+   in `A2A_WEBHOOK_HTTP_HOSTS`, and the managed accounts to be adopted.
+   Webhook receivers must check the new timestamped signature (top-level
+   README, "Verifying webhook pings").
+6. **Switch the hosts**: on each, import the Rust hostd module instead of
+   the Python's. hostd's state directory carries over as is (the identity
+   key, the TOTP secrets and their state are in the Python's formats): it
+   reconnects without pairing, and the authenticator entries stay valid.
+   Shells now open with the tier's arm code (a direct code no longer does),
+   or at the host's own desk with the password; `sudo agent-auth-hostd
+   totp-enroll --add root-unlock` if remote unlock is wanted (it now needs
+   it), `--add user-shell` / `--add root-shell` for a shell code of its own.
+7. **Re-pair the agent VMs**: `agent-auth admin daemon-pair --role sandbox
+   <host>`, then `agent-auth-sandboxd pair` in the guest; sandboxd's state
+   is new (JSON documents instead of SQLite), the broker makes the VM's
+   orchestrator again, and the orchestrator mints the VM's agents again.
+8. **Reconnect web UIs**: remote MCP connectors (claude.ai, ChatGPT) and
    panel sessions start over; the connector is authorized again from its
    settings.
-8. Saved rules ("approve all like this") and the audit history stay in
-   the old database; recreate the rules you want.
+9. Saved rules ("approve all like this"), grants and the audit history
+   stay in the old database; recreate the rules you want.

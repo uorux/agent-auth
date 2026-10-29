@@ -118,6 +118,11 @@ pub struct HumanDecision {
     /// hostexec: a TOTP code for the host, handed to the approval gate and
     /// never stored.
     pub totp: Option<String>,
+    /// Set by the desktop service alone: the host whose own desk answered
+    /// Allow, which that hostd reported as its own (password-confirmed)
+    /// approval. A shell is approved without a TOTP code only this way, at
+    /// its own host.
+    pub desk_host: Option<String>,
 }
 
 impl fmt::Debug for HumanDecision {
@@ -130,6 +135,7 @@ impl fmt::Debug for HumanDecision {
             .field("scope_override", &self.scope_override)
             .field("rule", &self.rule)
             .field("totp", &self.totp.as_ref().map(|_| "<redacted>"))
+            .field("desk_host", &self.desk_host)
             .finish()
     }
 }

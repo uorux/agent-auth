@@ -1459,13 +1459,26 @@ Security review 2026-10 (hostd/hostexec), fixed:
 - **4 A TOTP code is bound to what it was typed for.** New optional
   secrets `user-shell`, `root-shell`, `root-unlock` (`agent-auth-hostd
   totp-enroll --add <name>`). A shell is opened with its tier's shell code
-  when that secret is enrolled (a direct code then opens no shell, and a
-  shell code admits no job); a root shell needs `root-shell` (a direct
-  code never opens one). Unlocking from the broker takes `root-unlock`
+  when that secret is enrolled, otherwise with the tier's arm code
+  (2026-10-29: Jacob judged a relayed arm code worth about the same either
+  way, since arming already admits the tier's commands); never with a
+  direct code (the Python's, typed to approve one command), and a shell's
+  code admits no job. Or at the shell's own host's desk (below). Unlocking
+  from the broker takes `root-unlock`
   (a root-arm code no longer unlocks, so a code typed to unlock can't arm);
   without it, unlock locally with hostctl. Arm durations were already
   capped by hostd's own `max_arm`. `hostexec.authorize` carries
   `shell: true` for shells.
+- **A shell can be approved at its own host's desk** (2026-10-29, the
+  review's alternative to a code, finding 4): the broker asks a shell only
+  at its host's desk, and only where `desktop.approve` has its tier and its
+  shells are on; hostd shows it as a shell ("open a shell on <host> as
+  <user> for <duration>") and Allow takes the user's password through
+  polkit for either tier (a shell is many commands, not one shown). The
+  approval (`DeskShell`) opens that shell and admits no job, and a desk
+  approval of a command opens no shell. The broker approves the request
+  without a code only when that host reported the Allow as its own; the
+  Kani harness's approvals include it.
 - **5** Arming reads the lock under the state lock a lockdown disarms
   under. A prompt id is shown at most once (kept for the last 4096). A
   TOTP failure that can't be written to disk locks that secret in memory
@@ -2003,6 +2016,26 @@ inherited from the Python; "port" what the port introduced.
   is read again (at least once; deliveries happen under the thread's
   lock, so the claim and the watcher don't both deliver it).
 
+## Migration (`agent-auth-server import-python`, new 2026-10-29)
+
+- **A Python broker's agents and host pairings carry over** (the Python
+  started fresh by design; Jacob asked for this so hosts don't re-pair).
+  `agent-auth-server import-python [--dry-run] <export|->` loads a SQLite
+  export (README, "Migrating") into an empty database: host daemons (id,
+  name, public key, times), so hostd reconnects with its old key unpaired,
+  and hand-registered agents with their key id and hash, so old API keys
+  keep working, plus kind, attributes, webhook URL and secret, a
+  hand-registered LLDAP username and the disabled state (reason
+  `operator`). Not carried: sandbox daemons and any agent minted in, for or
+  by another (orchestrators included: the VM re-pairs), web-connector
+  agents, the operator stand-in, LLDAP password ciphertexts (managed
+  `svc-<name>` accounts are re-adopted at the next homelab grant, with a
+  new password), saved rules, grants, requests, a2a, sessions, OAuth, mail
+  and pools. Every row passes the Rust validators first; one transaction
+  under a table lock, refused unless the database is unused. Webhook agents
+  without their own secret get no pings (no global fallback); the import
+  warns about them.
+
 ## Packaging (`flake.nix`, `nix/`, `deploy/k8s`)
 
 - **Modules keep the Python's names and options** (`services.agent-auth`,
@@ -2099,16 +2132,15 @@ Final review (sandboxes), fixed:
   passes on an auto pattern** (bug 13): kept as in the Python.
 - **TOTP hard-lock thresholds** (20 wrong codes in 30 days) are a guess at
   the right balance between typos and relayed guessing; tune?
-- **Root shells now need a `root-shell` secret** (security review
-  2026-10, finding 4): with only the four original secrets a root shell is
-  refused. The review also allowed a polkit desk approval instead; that
-  path isn't built (shells are approved on Discord only). Build it, or keep
-  root shells TOTP-only? Likewise remote unlock now needs `root-unlock`.
+- **Remote unlock needs `root-unlock`** (security review 2026-10, finding
+  4); without it, unlock locally with hostctl. (Shells: settled, finding 4
+  above.)
 - **A user-tier job can reach the user's service manager** and start a
   process outside its unit, past the `aa-job-*` peer check (and so arm
-  the user tier via hostctl, or act as the desk helper). Close it by
-  denying job units the user bus (`InaccessiblePaths=/run/user/<uid>/bus`
-  and `.../systemd`, which breaks `systemctl --user` in jobs), or accept?
+  the user tier via hostctl, or act as the desk helper). Accepted
+  (Jacob, 2026-10-29): user-tier jobs already run as the user. Closing it
+  would deny job units the user bus (`InaccessiblePaths=/run/user/<uid>/bus`
+  and `.../systemd`), breaking `systemctl --user` in jobs.
 
 - **The CNPG CA on Kubernetes** (packaging): the broker verifies Postgres
   against a copy of CNPG's CA in a ConfigMap, which must be refreshed when

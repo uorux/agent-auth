@@ -38,8 +38,8 @@ pub use admission::{
     AUTHZ_TTL_SECS, AdmissionFacts, AdmittedJob, ApprovalVia, ArmProof, ArmState, Authorizations,
     AuthzFacts, DeskApproval, DeskPrompt, Evidence, HostView, LocalCaller, Normalized, OpenShell,
     PolkitConfirmed, RefusalKind, TotpApproval, admit, admit_shell_command, auto_matches,
-    check_tier, decide, deny_matches, desk_approval, desk_prompt, loggable, normalize, open_shell,
-    parse_shell_request, precheck_job, precheck_shell, shell_secret,
+    check_tier, decide, deny_matches, desk_approval, desk_prompt, desk_shell_prompt, loggable,
+    normalize, open_shell, parse_shell_request, precheck_job, precheck_shell, shell_secret,
 };
 pub use policy::{HostPolicy, TierPolicy};
 

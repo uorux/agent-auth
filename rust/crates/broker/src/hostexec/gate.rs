@@ -64,7 +64,10 @@ impl HostExec {
     }
 
     /// The gate. `totp`: the code the human typed (relayed to the host's
-    /// `<tier>-direct` secret with this request's digest; never stored).
+    /// `<tier>-direct` secret with this request's digest, or for a shell
+    /// its shell or arm secret; never stored). `at_its_desk`: the host's own
+    /// desk answered Allow and that hostd recorded it as its own approval
+    /// (a shell then needs no code: `shell.open` finds that approval).
     pub async fn approval_gate(
         &self,
         request: RequestId,
@@ -72,6 +75,7 @@ impl HostExec {
         authority: &Authority,
         approved_duration_secs: u32,
         totp: Option<&str>,
+        at_its_desk: bool,
     ) -> Result<(), GateRefusal> {
         let spec = self
             .final_spec(resource, authority, approved_duration_secs)
@@ -79,9 +83,10 @@ impl HostExec {
         let host = spec.host().to_owned();
         let shell = matches!(spec, JobSpec::Shell(_));
         let totp = totp.filter(|c| !c.is_empty());
-        if shell && totp.is_none() {
+        if shell && totp.is_none() && !at_its_desk {
             return Err(GateRefusal(
-                "a shell is approved with a TOTP code only (Approve with TOTP)".into(),
+                "a shell is approved with a TOTP code (Approve with TOTP) or at its host's desk"
+                    .into(),
             ));
         }
         let value = spec.to_json();
@@ -169,6 +174,7 @@ pub fn approval_gate_hook(hostexec: std::sync::Arc<HostExec>) -> crate::service:
                     &authority,
                     duration,
                     decision.totp.as_deref(),
+                    decision.desk_host.as_deref() == Some(request.resource.as_str()),
                 )
                 .await
                 .map_err(|e| e.0)

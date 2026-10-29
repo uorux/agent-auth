@@ -370,7 +370,7 @@ pub fn host_line(host: Option<&Value>, tier: &str, shell: bool) -> String {
     }
     if shell {
         return if flag("shell") {
-            "🔐 a shell is approved with a TOTP code only".to_owned()
+            "🔐 a shell is approved with a TOTP code (or at its desk, with the password)".to_owned()
         } else {
             "⛔ shells are not enabled here".to_owned()
         };

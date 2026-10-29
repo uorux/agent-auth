@@ -22,9 +22,10 @@ fn any_source() -> Option<Source> {
 fn any_facts() -> AdmissionFacts {
     let authorization = if kani::any() {
         Some(AuthzFacts {
-            via: match kani::any::<u8>() % 3 {
+            via: match kani::any::<u8>() % 4 {
                 0 => ApprovalVia::Totp,
                 1 => ApprovalVia::TotpShell,
+                2 => ApprovalVia::DeskShell,
                 _ => ApprovalVia::Desk,
             },
             tier: any_tier(),

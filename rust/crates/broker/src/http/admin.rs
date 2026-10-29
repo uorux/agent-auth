@@ -597,6 +597,8 @@ async fn decide(
         scope_override: body.scope_override.map(|s| s.into_map()),
         rule: None,
         totp: body.totp.map(|t| t.into_inner()),
+        // The admin API never stands for a desk.
+        desk_host: None,
     };
     let row = service::decide(&st, id, &decider, decision).await?;
     let tx = st.store.begin().await?;

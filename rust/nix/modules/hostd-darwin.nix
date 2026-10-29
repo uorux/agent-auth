@@ -9,8 +9,8 @@
 #   broker admin:  agent-auth admin daemon-pair <name>
 #   on the Mac:    sudo agent-auth-hostd pair       (prompts for the code)
 #                  sudo agent-auth-hostd totp-enroll
-#                  sudo agent-auth-hostd totp-enroll --add root-shell   (root shells)
 #                  sudo agent-auth-hostd totp-enroll --add root-unlock  (unlock from the broker)
+#                  sudo agent-auth-hostd totp-enroll --add root-shell   (optional: else root-arm)
 # State: /var/db/agent-auth-hostd. Log: /var/log/agent-auth-hostd.log.
 self:
 {

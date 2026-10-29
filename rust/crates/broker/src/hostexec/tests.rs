@@ -341,7 +341,7 @@ async fn a_shell_takes_a_code_and_shows_every_command_first(pool: sqlx::PgPool) 
     .unwrap_err();
     assert_eq!(
         err.to_string(),
-        "a shell is approved with a TOTP code only (Approve with TOTP)"
+        "a shell is approved with a TOTP code (Approve with TOTP) or at its host's desk"
     );
     let d = HumanDecision {
         duration_secs: Some(600),

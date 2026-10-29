@@ -80,11 +80,22 @@ impl T {
     }
 
     fn start(dir: TestDir, cfg: HostConfig) -> T {
+        T::start_enrolled(dir, cfg, SecretName::every())
+    }
+
+    /// Only the four secrets every host has: no shell or unlock secret.
+    fn without_optional_secrets() -> T {
+        let dir = TestDir::new("hostd");
+        let cfg = config(&dir, |_| {});
+        T::start_enrolled(dir, cfg, SecretName::ALL.into_iter())
+    }
+
+    fn start_enrolled(dir: TestDir, cfg: HostConfig, names: impl Iterator<Item = SecretName>) -> T {
         let exec = DirectExecutor::new(&std::env::var("PATH").unwrap_or_default(), &find("kill"));
         let hostd = Hostd::new(cfg, exec);
         hostd.pin_user_uid(Some(USER_UID));
         let mut secrets = BTreeMap::new();
-        for name in SecretName::every() {
+        for name in names {
             secrets.insert(name.as_str(), hostd.totp().enroll(name, false).unwrap());
         }
         T {
@@ -418,6 +429,25 @@ async fn a_job_timeout_kills_its_whole_group() {
     assert!(done["duration_secs"].as_f64().unwrap() < 10.0);
 }
 
+/// Without a `{tier}-shell` secret a shell opens with the tier's arm code
+/// (2026-10-29), never with a direct one.
+#[tokio::test]
+async fn without_a_shell_secret_the_arm_code_opens_a_shell() {
+    let t = T::without_optional_secrets();
+    for (n, tier) in [(60, "user"), (61, "root")] {
+        let shell = job_id(n);
+        let spec = json!({"kind": "shell", "host": HOST, "tier": tier, "duration": 300});
+        let open = json!({"type": "shell.open", "shell_id": shell, "spec": spec});
+        let mut direct = authorize(&shell, tier, &spec, &t.code_peek(&format!("{tier}-direct")));
+        direct["shell"] = json!(true);
+        assert_eq!(t.call(direct).await.unwrap_err(), "wrong code");
+        let mut arm = authorize(&shell, tier, &spec, &t.code(&format!("{tier}-arm")));
+        arm["shell"] = json!(true);
+        t.call(arm).await.unwrap();
+        t.call(open).await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn shells_take_a_totp_code_and_stay_bounded() {
     let t = T::new();
@@ -445,7 +475,7 @@ async fn shells_take_a_totp_code_and_stay_bounded() {
     let open = json!({"type": "shell.open", "shell_id": shell, "spec": spec});
     assert_eq!(
         t.call(open.clone()).await.unwrap_err(),
-        "a shell is opened with a TOTP code only"
+        "a shell is opened with a TOTP code or at its own desk only"
     );
     // A direct code (typed to approve a command) doesn't open a shell
     // once the tier has a shell secret (security review 2026-10, finding 4).
@@ -454,7 +484,7 @@ async fn shells_take_a_totp_code_and_stay_bounded() {
         .unwrap();
     assert_eq!(
         t.call(open.clone()).await.unwrap_err(),
-        "a user shell is opened with a user-shell code"
+        "a user shell is opened with a user-shell code, or at this desk with your password"
     );
     // Nor is a direct code relayed as a shell code checked as one.
     let mut as_shell = authorize(&shell, "user", &spec, &t.code_peek("user-direct"));
@@ -698,6 +728,55 @@ async fn a_host_without_tiers_runs_nothing() {
     let status = t.hostd.status();
     assert_eq!(status["tiers"]["user"]["enabled"], json!(false));
     assert_eq!(status["role"], json!("host"));
+}
+
+/// A shell at its own desk: shown as a shell, Allow takes the password
+/// even for a user shell, and then opens exactly that shell.
+#[tokio::test]
+async fn a_shell_at_its_own_desk_takes_the_password() {
+    let t = T::new();
+    let mut rx = t.hostd.helper_attached(7, 1234, Some(4321)).await;
+    for state in ["unlocked", "active"] {
+        t.ctl(USER_UID, "presence", json!({"state": state}))
+            .await
+            .unwrap();
+    }
+    let shell = job_id(95);
+    let spec = json!({"kind": "shell", "host": HOST, "tier": "user", "duration": 300});
+    let ask = |prompt_id: &str| {
+        json!({"type": "prompt", "prompt_id": prompt_id, "request_id": shell,
+               "who": "agent-1", "what": "broker text", "detail": "", "timeout": 30,
+               "job": {"job_id": shell, "spec": spec}})
+    };
+    let open = json!({"type": "shell.open", "shell_id": shell, "spec": spec});
+    let shown = t
+        .call(ask("11111111-2222-4333-8444-555555555590"))
+        .await
+        .unwrap();
+    assert_eq!(shown["approves"], json!(true));
+    let line: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+    assert!(
+        line["what"]
+            .as_str()
+            .unwrap()
+            .starts_with("open a shell on excelsior as "),
+        "{line}"
+    );
+    // No password: nothing opens.
+    t.hostd.executor().recorded.lock().unwrap().password_ok = false;
+    let nonce = line["id"].as_str().unwrap().to_owned();
+    t.hostd.answered(&nonce, "allow", 7).await;
+    assert!(t.call(open.clone()).await.is_err());
+    // With it: that shell opens, and polkit was asked for a user shell.
+    t.hostd.executor().recorded.lock().unwrap().password_ok = true;
+    t.call(ask("11111111-2222-4333-8444-555555555591"))
+        .await
+        .unwrap();
+    let line: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+    let nonce = line["id"].as_str().unwrap().to_owned();
+    t.hostd.answered(&nonce, "allow", 7).await;
+    t.call(open).await.unwrap();
+    assert_eq!(t.hostd.executor().recorded.lock().unwrap().polkit.len(), 2);
 }
 
 #[tokio::test]

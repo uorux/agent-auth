@@ -461,12 +461,12 @@ pub fn totp_modal(request: &RequestRow) -> Modal {
                 &format!(
                     "{} {}",
                     request.resource,
-                    // A shell takes its tier's shell code (a user shell a
-                    // user-direct one while the host has no user-shell).
-                    match (capability(request) == "shell", tier.as_str()) {
-                        (true, "root") => "root-shell code".to_owned(),
-                        (true, _) => format!("{tier}-shell (or -direct) code"),
-                        (false, _) => format!("{tier}-direct code"),
+                    // A shell takes its tier's shell code, or its arm code
+                    // while the host has no shell secret of that tier.
+                    if capability(request) == "shell" {
+                        format!("{tier}-shell (or -arm) code")
+                    } else {
+                        format!("{tier}-direct code")
                     }
                 ),
                 45,

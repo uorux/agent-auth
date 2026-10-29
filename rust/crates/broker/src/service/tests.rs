@@ -2196,7 +2196,7 @@ async fn host_approvals_fail_closed(pool: sqlx::PgPool) {
         .unwrap_err();
     assert_eq!(
         err.to_string(),
-        "a shell is approved with a TOTP code only (Approve with TOTP)"
+        "a shell is approved with a TOTP code (Approve with TOTP) or at its host's desk"
     );
     // Denying needs neither.
     let d = decide(&st, shell.id, &jrt(), HumanDecision::deny("no"))

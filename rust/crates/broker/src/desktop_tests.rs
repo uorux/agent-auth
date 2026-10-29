@@ -149,16 +149,6 @@ async fn who_is_never_asked_and_answers_for_unknown_prompts_count_for_nothing(po
         desktop.refusal(&r, &other),
         Some("agent not listed under desktop.agents")
     );
-    // A shell, ever.
-    let a = b.agent("desk-1").await;
-    let shell: RequestCreate = serde_json::from_value(json!({
-        "platform": "hostexec", "capability": "shell", "resource": HOST,
-        "scope": {"tier": "user"}, "justification": "x", "requested_duration": "1h"}))
-    .unwrap();
-    let r = crate::service::create(&b.st, &caller(&a), shell)
-        .await
-        .unwrap();
-    assert_eq!(desktop.refusal(&r, &a), Some("never asked on a desktop"));
     // An answer for a prompt nobody sent decides nothing.
     let pending = crate::service::create(&b.st, &caller(&other), homelab())
         .await
@@ -188,6 +178,58 @@ async fn rates_keep_an_agent_from_flooding_the_desk(pool: sqlx::PgPool) {
     assert_eq!(
         desktop.refusal(&r, &a),
         Some("desktop rate-limited (agent)")
+    );
+}
+
+fn user_shell() -> RequestCreate {
+    serde_json::from_value(json!({
+        "platform": "hostexec", "capability": "shell", "resource": HOST,
+        "scope": {"tier": "user"}, "justification": "x", "requested_duration": "1h"}))
+    .unwrap()
+}
+
+/// A shell at its own host's desk: hostd shows it as a shell and takes the
+/// user's password; then the request is approved with no TOTP code and the
+/// shell opens. Without the password it stays where it was.
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_shell_at_its_own_desk_is_approved_with_the_password(pool: sqlx::PgPool) {
+    let b = Broker::start(pool).await;
+    let (host, mut rx) = at_desk(&b).await;
+    let a = b.agent("desk-1").await;
+    host.hostd.executor().recorded.lock().unwrap().password_ok = false;
+    let first = crate::service::create(&b.st, &caller(&a), user_shell())
+        .await
+        .unwrap();
+    let prompt = next_prompt(&mut rx).await;
+    assert!(
+        prompt["what"]
+            .as_str()
+            .unwrap()
+            .starts_with("open a shell on excelsior as "),
+        "{prompt}"
+    );
+    host.hostd
+        .answered(prompt["id"].as_str().unwrap(), "allow", 1)
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        status(&b, first.id).await.status,
+        RequestStatus::AwaitingHuman
+    );
+    host.hostd.executor().recorded.lock().unwrap().password_ok = true;
+    // The second in the agent's burst of two.
+    let r = crate::service::create(&b.st, &caller(&a), user_shell())
+        .await
+        .unwrap();
+    let prompt = next_prompt(&mut rx).await;
+    host.hostd
+        .answered(prompt["id"].as_str().unwrap(), "allow", 1)
+        .await;
+    let r = settled(&b, r.id).await;
+    assert_eq!(r.status, RequestStatus::Granted, "{:?}", r.decision_reason);
+    assert_eq!(
+        host.hostd.executor().recorded.lock().unwrap().polkit.len(),
+        2
     );
 }
 

@@ -493,7 +493,6 @@ impl<E: Executor> Hostd<E> {
                     Some(&tier),
                     Some(&json!(s.duration)),
                     self.lock_state(),
-                    self.shell_enrolled(Tier::from(s.tier)),
                 )
                 .map_err(refused)?;
                 Ok(data(json!({"needs": "totp"})))
@@ -562,15 +561,21 @@ impl<E: Executor> Hostd<E> {
             return Err(format!("{} is locked down", self.name()));
         }
         // The secret the code was typed for: a shell's is its own when
-        // enrolled (a root shell's always), so a code typed to approve one
-        // command doesn't open a shell (security review 2026-10, finding 4).
+        // enrolled, else the tier's arm secret, never the direct one, so a
+        // code typed to approve one command doesn't open a shell (security
+        // review 2026-10, finding 4).
         let secret = if a.shell {
-            core_hostd::shell_secret(tier, self.shell_enrolled(tier)).map_err(refused)?
+            core_hostd::shell_secret(tier, self.shell_enrolled(tier))
         } else {
             SecretName::new(tier, Purpose::Direct)
         };
         let code = self.verify(secret, a.totp.expose(), Some(&job))?;
-        let approval = TotpApproval::new(code, d.clone()).map_err(refused)?;
+        let approval = if a.shell {
+            TotpApproval::for_shell(code, d.clone())
+        } else {
+            TotpApproval::new(code, d.clone())
+        }
+        .map_err(refused)?;
         let mut st = self.state();
         // A lockdown that landed while the code was checked wins.
         if self.lock_state().is_locked() {
@@ -1193,6 +1198,9 @@ impl<E: Executor> Hostd<E> {
     ) -> Result<(String, String, DeskPrompt), String> {
         let job_id = LocalId::parse(&job.job_id.to_string()).map_err(refused)?;
         let raw = Value::Object(job.spec.as_map().clone());
+        if raw.get("kind").and_then(Value::as_str) == Some("shell") {
+            return self.desk_shell(job_id, &raw, who);
+        }
         let d = spec_digest(&raw)?;
         let normalized =
             core_hostd::normalize(&self.config.policy, &raw, false).map_err(refused)?;
@@ -1224,6 +1232,39 @@ impl<E: Executor> Hostd<E> {
         };
         let st = self.state();
         let prompt = core_hostd::desk_prompt(self.view(&st.arm), job_id, d, &normalized, message)
+            .map_err(refused)?;
+        Ok((what, extra, prompt))
+    }
+
+    /// A prompt about opening a shell on this host: (what, extra detail,
+    /// the desk approval it would be). The digest is of the shell spec as
+    /// this host parses it, which is what `shell.open` will carry; Allow
+    /// takes the user's password whatever the tier.
+    fn desk_shell(
+        &self,
+        shell_id: LocalId,
+        raw: &Value,
+        who: &str,
+    ) -> Result<(String, String, DeskPrompt), String> {
+        let spec = core_hostd::parse_shell_request(&self.config.policy, raw).map_err(refused)?;
+        let d = spec_digest(&spec.to_json())?;
+        let as_whom = match spec.tier() {
+            Tier::Root => "ROOT".to_owned(),
+            Tier::User => self
+                .config
+                .user
+                .clone()
+                .unwrap_or_else(|| "your user".to_owned()),
+        };
+        let what = format!(
+            "open a shell on {} as {as_whom} for {}",
+            self.name(),
+            agent_auth_core::durations::format_duration(u64::from(spec.duration()))
+        );
+        let extra = "every command in it runs without asking again".to_owned();
+        let message = format!("{who} asks to {what}");
+        let st = self.state();
+        let prompt = core_hostd::desk_shell_prompt(self.view(&st.arm), shell_id, d, &spec, message)
             .map_err(refused)?;
         Ok((what, extra, prompt))
     }
@@ -1373,7 +1414,7 @@ impl<E: Executor> Hostd<E> {
             && answer == "allow"
         {
             let mut polkit = None;
-            if desk.tier() == Tier::Root && !self.lock_state().is_locked() {
+            if desk.needs_polkit() && !self.lock_state().is_locked() {
                 let uid = self.user_uid().await.unwrap_or(u32::MAX);
                 polkit = self
                     .executor

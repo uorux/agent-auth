@@ -337,9 +337,13 @@ pub fn normalize(
 pub enum ApprovalVia {
     /// A `{tier}-direct` code.
     Totp,
-    /// A `{tier}-shell` code: opens a shell, never admits a job.
+    /// A shell's code (`{tier}-shell`, or `{tier}-arm` where no shell
+    /// secret is enrolled): opens that shell, never admits a job.
     TotpShell,
     Desk,
+    /// Allow at this desk for a shell, with the user's password (polkit):
+    /// opens that shell, never admits a job.
+    DeskShell,
 }
 
 /// A direct TOTP code accepted for one digest. Its tier is the tier of the
@@ -349,22 +353,37 @@ pub enum ApprovalVia {
 pub struct TotpApproval {
     tier: Tier,
     digest: SpecDigest,
-    /// `Direct` or `Shell`: what the code was typed for.
+    /// `Direct` (one command) or `Shell` (one shell).
     purpose: Purpose,
 }
 
 impl TotpApproval {
-    /// The approval a `{tier}-direct` or `{tier}-shell` code stands for.
-    /// An arm or unlock code is not an approval.
+    /// The approval a `{tier}-direct` code stands for: one command. An
+    /// arm, shell or unlock code is not one.
     pub fn new(code: AcceptedCode, digest: SpecDigest) -> Result<TotpApproval, Refused> {
         let name = code.name();
-        if !matches!(name.purpose, Purpose::Direct | Purpose::Shell) {
+        if name.purpose != Purpose::Direct {
             return Err(Refused(format!("{name} is not a direct approval code")));
         }
         Ok(TotpApproval {
             tier: name.tier,
             digest,
-            purpose: name.purpose,
+            purpose: Purpose::Direct,
+        })
+    }
+
+    /// The approval a shell's code stands for (`{tier}-shell`, or
+    /// `{tier}-arm`: [`shell_secret`]): that one shell, never a job. A
+    /// direct code never opens a shell.
+    pub fn for_shell(code: AcceptedCode, digest: SpecDigest) -> Result<TotpApproval, Refused> {
+        let name = code.name();
+        if !matches!(name.purpose, Purpose::Shell | Purpose::Arm) {
+            return Err(Refused(format!("{name} doesn't open a shell")));
+        }
+        Ok(TotpApproval {
+            tier: name.tier,
+            digest,
+            purpose: Purpose::Shell,
         })
     }
 
@@ -385,11 +404,12 @@ impl TotpApproval {
     }
 }
 
-/// Allow at this host's desk for a command on this host.
+/// Allow at this host's desk for a command, or a shell, on this host.
 #[derive(Debug, PartialEq, Eq)]
 pub struct DeskApproval {
     tier: Tier,
     digest: SpecDigest,
+    shell: bool,
 }
 
 impl DeskApproval {
@@ -399,14 +419,16 @@ impl DeskApproval {
     }
 }
 
-/// A desk prompt about a command on this host: Allow approves exactly its
-/// digest. Registered only when `desktop.approve.{tier}` is on.
+/// A desk prompt about a command, or a shell, on this host: Allow
+/// approves exactly its digest. Registered only when
+/// `desktop.approve.{tier}` is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeskPrompt {
     job: LocalId,
     digest: SpecDigest,
     tier: Tier,
     message: String,
+    shell: bool,
 }
 
 impl DeskPrompt {
@@ -420,10 +442,17 @@ impl DeskPrompt {
         self.tier
     }
 
-    /// What polkit shows with the password prompt (root).
+    /// What polkit shows with the password prompt.
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// Whether Allow takes the user's password (polkit): for anything
+    /// root, and for every shell (a shell is many commands, not one shown).
+    #[must_use]
+    pub fn needs_polkit(&self) -> bool {
+        self.tier == Tier::Root || self.shell
     }
 }
 
@@ -466,6 +495,49 @@ pub fn desk_prompt(
         digest: raw_digest,
         tier,
         message,
+        shell: false,
+    })
+}
+
+/// A prompt about opening a shell at this desk: only when this desk
+/// approves the shell's tier, its shells are enabled and the duration is
+/// within the tier's limit (what [`open_shell`] will check again). Allow
+/// takes the user's password, whatever the tier. Refused when locked.
+pub fn desk_shell_prompt(
+    host: HostView<'_>,
+    shell: LocalId,
+    digest: SpecDigest,
+    spec: &ShellSpec,
+    message: String,
+) -> Result<DeskPrompt, Refused> {
+    let HostView { policy, lock, .. } = host;
+    if lock.is_locked() {
+        return Err(locked_refusal(policy));
+    }
+    let tier = spec.tier();
+    let t = tier_word(tier);
+    if !policy.desk_approves(tier) {
+        return Err(Refused(format!("this desk doesn't approve {t} shells")));
+    }
+    let cfg = policy.tier(tier);
+    if !cfg.shell_enable {
+        return Err(Refused(format!(
+            "{t} shells are not enabled on {}",
+            policy.name
+        )));
+    }
+    if spec.duration() > cfg.shell_max_duration_secs {
+        return Err(Refused(format!(
+            "a {t} shell on {} lasts at most {}s",
+            policy.name, cfg.shell_max_duration_secs
+        )));
+    }
+    Ok(DeskPrompt {
+        job: shell,
+        digest,
+        tier,
+        message,
+        shell: true,
     })
 }
 
@@ -480,7 +552,7 @@ pub fn desk_approval(
     polkit: Option<PolkitConfirmed>,
 ) -> Result<(LocalId, DeskApproval), DeskPrompt> {
     let ok =
-        !lock.is_locked() && from_current_helper && (prompt.tier == Tier::User || polkit.is_some());
+        !lock.is_locked() && from_current_helper && (!prompt.needs_polkit() || polkit.is_some());
     if !ok {
         return Err(prompt);
     }
@@ -489,6 +561,7 @@ pub fn desk_approval(
         DeskApproval {
             tier: prompt.tier,
             digest: prompt.digest,
+            shell: prompt.shell,
         },
     ))
 }
@@ -545,12 +618,16 @@ impl Authorizations {
         self.insert(job, a, now);
     }
 
-    /// Allow at the desk for `job`.
+    /// Allow at the desk for `job` (or the shell of that id).
     pub fn record_desk(&mut self, job: LocalId, approval: DeskApproval, now: UnixMillis) {
         let a = Authorization {
             digest: approval.digest,
             tier: approval.tier,
-            via: ApprovalVia::Desk,
+            via: if approval.shell {
+                ApprovalVia::DeskShell
+            } else {
+                ApprovalVia::Desk
+            },
             expires_at: now.plus_secs(AUTHZ_TTL_SECS),
         };
         self.insert(job, a, now);
@@ -751,8 +828,8 @@ pub fn decide(f: &AdmissionFacts) -> Result<Via, RefusalKind> {
         match a.via {
             ApprovalVia::Totp => return Ok(Via::Totp),
             ApprovalVia::Desk => return Ok(Via::Desk),
-            // A shell code admits no job.
-            ApprovalVia::TotpShell => {}
+            // A shell's approval admits no job.
+            ApprovalVia::TotpShell | ApprovalVia::DeskShell => {}
         }
     }
     if f.kind_run && f.tier == Tier::User && f.auto_match {
@@ -969,7 +1046,7 @@ pub fn precheck_job(
     if let Some(id) = job_id
         && !lock.is_locked()
         && let Some(via) = auths.peek(id).and_then(|a| a.admits(tier, raw_digest, now))
-        && via != ApprovalVia::TotpShell
+        && !matches!(via, ApprovalVia::TotpShell | ApprovalVia::DeskShell)
     {
         return Ok(match via {
             ApprovalVia::Desk => Via::Desk,
@@ -981,31 +1058,32 @@ pub fn precheck_job(
 }
 
 /// The secret whose code opens a `tier` shell: `{tier}-shell` when it is
-/// enrolled; otherwise `user-direct` for a user shell, and nothing for a
-/// root shell (a code typed to approve one command must not open a root
-/// shell; security review 2026-10, finding 4).
-pub fn shell_secret(tier: Tier, shell_enrolled: bool) -> Result<SecretName, Refused> {
-    match (tier, shell_enrolled) {
-        (_, true) => Ok(SecretName::new(tier, Purpose::Shell)),
-        (Tier::User, false) => Ok(SecretName::new(Tier::User, Purpose::Direct)),
-        (Tier::Root, false) => Err(Refused::new(
-            "a root shell needs a root-shell code; enroll one on the host (agent-auth-hostd totp-enroll root-shell)",
-        )),
-    }
+/// enrolled, otherwise `{tier}-arm`. Never `{tier}-direct`: a code typed to
+/// approve one command doesn't open a shell (security review 2026-10,
+/// finding 4). An arm code may: arming already admits the tier's commands
+/// for its window, so a relayed one gains about as much either way
+/// (Jacob, 2026-10-29).
+#[must_use]
+pub fn shell_secret(tier: Tier, shell_enrolled: bool) -> SecretName {
+    SecretName::new(
+        tier,
+        if shell_enrolled {
+            Purpose::Shell
+        } else {
+            Purpose::Arm
+        },
+    )
 }
 
 /// `hostexec.precheck` for a shell: everything the host would refuse,
-/// before a code is spent. Replied `{"needs": "totp"}`. `shell_enrolled`:
-/// the tier's `{tier}-shell` secret is enrolled.
+/// before a code is spent. Replied `{"needs": "totp"}`.
 pub fn precheck_shell(
     policy: &HostPolicy,
     tier: Option<&Value>,
     duration: Option<&Value>,
     lock: LockState,
-    shell_enrolled: bool,
 ) -> Result<(), Refused> {
     let tier = check_tier(policy, tier)?;
-    shell_secret(tier, shell_enrolled)?;
     let cfg = policy.tier(tier);
     let t = tier_word(tier);
     if !cfg.shell_enable {
@@ -1104,19 +1182,19 @@ pub fn open_shell(
     let via = auths
         .take(&shell_id)
         .and_then(|a| a.admits(tier, digest, now));
-    let wanted = match shell_secret(tier, shell_enrolled)?.purpose {
-        Purpose::Shell => ApprovalVia::TotpShell,
-        _ => ApprovalVia::Totp,
-    };
-    if via != Some(wanted) {
-        return Err(Refused(if via.is_some_and(|v| v != ApprovalVia::Desk) {
-            format!(
-                "a {t} shell is opened with a {} code",
-                shell_secret(tier, shell_enrolled)?
-            )
-        } else {
-            "a shell is opened with a TOTP code only".to_owned()
-        }));
+    match via {
+        Some(ApprovalVia::TotpShell | ApprovalVia::DeskShell) => {}
+        Some(_) => {
+            return Err(Refused(format!(
+                "a {t} shell is opened with a {} code, or at this desk with your password",
+                shell_secret(tier, shell_enrolled)
+            )));
+        }
+        None => {
+            return Err(Refused::new(
+                "a shell is opened with a TOTP code or at its own desk only",
+            ));
+        }
     }
     Ok(OpenShell {
         id: shell_id,

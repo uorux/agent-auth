@@ -8,7 +8,9 @@
 //! - A command at its own host's desk shows what that hostd would run, and
 //!   that hostd decides whether Allow there is its own approval
 //!   (`desktop.approve`; root also takes the user's password).
-//! - Shells and other human-only requests are never asked on a desk.
+//! - A shell is asked only at its own host's desk, where hostd takes the
+//!   user's password before Allow counts; other requests without an
+//!   authority never are.
 //!
 //! Rates (per agent, overall, bursts), pauses after denies and mutes, and
 //! do-not-disturb are kept in memory (a restart resets them: B19). The
@@ -344,7 +346,13 @@ impl Desktop {
         if !c.platforms.is_empty() && !c.platforms.contains(&request.platform) {
             return Some("platform not listed under desktop.platforms");
         }
-        if request.authority.as_ref().is_none_or(Authority::human_only) {
+        // A shell (the human-only authority) only at its own host's desk
+        // (`ask`), where that hostd takes the password.
+        if request
+            .authority
+            .as_ref()
+            .is_none_or(|a| a.human_only() && request.platform != Platform::Hostexec)
+        {
             return Some("never asked on a desktop");
         }
         // A command is asked at its own host's desk, where the host itself
@@ -682,6 +690,8 @@ impl Desktop {
             } else {
                 "denied at the desk".to_owned()
             },
+            // Only an Allow this host vouched for gets here (`believed`).
+            desk_host: (answer == Answer::Allow).then(|| host.clone()),
             ..crate::service::HumanDecision::default()
         };
         if let Err(e) = crate::service::decide(st, request, &decider, decision).await {

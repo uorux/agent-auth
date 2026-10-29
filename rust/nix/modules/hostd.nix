@@ -12,9 +12,9 @@
 # per host:
 #   sudo agent-auth-hostd totp-enroll              (four QR codes, shown once)
 # and, for what needs its own code (rust/DEVIATIONS.md, hostd finding 4):
-#   sudo agent-auth-hostd totp-enroll --add root-shell    (root shells need it)
 #   sudo agent-auth-hostd totp-enroll --add root-unlock   (unlocking from the broker)
-#   sudo agent-auth-hostd totp-enroll --add user-shell    (optional)
+#   sudo agent-auth-hostd totp-enroll --add root-shell    (optional: else root-arm)
+#   sudo agent-auth-hostd totp-enroll --add user-shell    (optional: else user-arm)
 # A secret locked by 20 wrong codes in 30 days stays locked until
 #   sudo agent-auth-hostctl totp-unlock NAME
 #

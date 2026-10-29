@@ -40,6 +40,8 @@ fn decision(d: BotDecision) -> HumanDecision {
             any_authority: d.rule_any_authority,
         }),
         totp: d.totp,
+        // Discord never stands for a desk.
+        desk_host: None,
     }
 }
 

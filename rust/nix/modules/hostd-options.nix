@@ -50,10 +50,11 @@ rec {
       };
       shell = {
         enable = lib.mkEnableOption ''
-          time-boxed shells on this tier, always opened with a TOTP code:
-          the tier's shell secret (`user-shell`, `root-shell`) when enrolled
-          with `agent-auth-hostd totp-enroll --add <name>`; a root shell
-          needs `root-shell`
+          time-boxed shells on this tier, opened with a TOTP code (the
+          tier's shell secret, `user-shell` or `root-shell`, when enrolled
+          with `agent-auth-hostd totp-enroll --add <name>`, else its arm
+          secret; never a direct code), or at this host's desk with the
+          user's password when `desktop.approve` has the tier
         '';
         maxDuration = mkOption {
           type = duration;

@@ -144,16 +144,18 @@ async fn run_gate(st: &AppState, id: RequestId, decision: &HumanDecision) -> Ser
             return Err(resolved(request.status));
         }
         // A shell is never approved without a code for the host's own
-        // secret, whatever gate is (or is not) registered.
+        // secret, or its own desk's password-confirmed Allow, whatever gate
+        // is (or is not) registered.
         let shell = matches!(
             request.authority,
             Some(Authority::Hostexec(
                 agent_auth_core::authority::HostexecAuthority::Shell { .. }
             ))
         );
-        if shell && decision.totp.as_deref().is_none_or(|t| t.trim().is_empty()) {
+        let at_its_desk = decision.desk_host.as_deref() == Some(request.resource.as_str());
+        if shell && !at_its_desk && decision.totp.as_deref().is_none_or(|t| t.trim().is_empty()) {
             return Err(ServiceError::transition(
-                "a shell is approved with a TOTP code only (Approve with TOTP)",
+                "a shell is approved with a TOTP code (Approve with TOTP) or at its host's desk",
             ));
         }
         if !st
