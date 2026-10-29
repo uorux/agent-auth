@@ -34,6 +34,7 @@ pub mod error;
 pub mod events;
 pub mod hostexec;
 pub mod http;
+pub mod import_python;
 pub mod limits;
 pub mod llm;
 pub mod mail;

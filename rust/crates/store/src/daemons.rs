@@ -296,6 +296,48 @@ pub async fn upsert_paired(
     raw.try_into()
 }
 
+/// A daemon carried over from the Python broker (`agent-auth-server
+/// import-python`): its id, key and times as they were; no version or
+/// status until it says hello.
+#[derive(Debug, Clone)]
+pub struct ImportedDaemon<'a> {
+    pub id: DaemonId,
+    pub role: DaemonRole,
+    pub name: &'a str,
+    /// Canonical text (`PublicKey::to_text`): heartbeats compare it as is.
+    pub public_key: &'a str,
+    pub paired_at: OffsetDateTime,
+    pub last_seen_at: Option<OffsetDateTime>,
+    pub created_at: OffsetDateTime,
+}
+
+/// Insert an [`ImportedDaemon`]; `now` is its `updated_at`.
+pub async fn import(
+    tx: &Tx<'_>,
+    d: &ImportedDaemon<'_>,
+    now: OffsetDateTime,
+) -> Result<DaemonRow, StoreError> {
+    let mut c = tx.conn().await;
+    let raw = sqlx::query_as!(
+        RawDaemon,
+        "INSERT INTO daemons (id, role, name, public_key, paired_at, last_seen_at, created_at,
+             updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING *",
+        Uuid::from(d.id),
+        d.role.as_str(),
+        d.name,
+        d.public_key,
+        d.paired_at,
+        d.last_seen_at,
+        d.created_at,
+        now
+    )
+    .fetch_one(&mut **c)
+    .await?;
+    raw.try_into()
+}
+
 /// Delete a daemon and burn its unused codes (a leaked code cannot
 /// re-pair). Its pending key deliveries go with it; its agents keep
 /// running with `sandbox_id` NULL (sandboxd B-10, see `sandboxes`).

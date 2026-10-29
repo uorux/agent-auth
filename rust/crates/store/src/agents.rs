@@ -257,6 +257,93 @@ pub async fn insert(tx: &Tx<'_>, a: &NewAgent<'_>) -> Result<AgentRow, StoreErro
     raw.try_into()
 }
 
+/// An agent carried over from the Python broker (`agent-auth-server
+/// import-python`): its own id, key, times and disabled state. Top-level
+/// only (no parent, no agent VM); no LLDAP password (the Python's are
+/// Fernet, which this broker does not read). `Debug` leaves out the key
+/// hash and the webhook secret.
+#[derive(Clone)]
+pub struct ImportedAgent<'a> {
+    pub id: AgentId,
+    pub name: &'a str,
+    pub description: &'a str,
+    pub key_id: &'a str,
+    pub api_key_hash: &'a str,
+    pub kind: AgentKind,
+    pub webhook_url: Option<&'a str>,
+    pub webhook_secret: Option<&'a str>,
+    pub lldap_username: Option<&'a str>,
+    pub disabled: bool,
+    pub disabled_reason: Option<DisableReason>,
+    pub runtime: Option<&'a str>,
+    pub project: Option<&'a str>,
+    pub host: Option<&'a str>,
+    pub placement: Placement,
+    pub lease_expires_at: Option<OffsetDateTime>,
+    pub last_seen_at: Option<OffsetDateTime>,
+    pub last_listen_at: Option<OffsetDateTime>,
+    pub created_at: OffsetDateTime,
+}
+
+impl fmt::Debug for ImportedAgent<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ImportedAgent")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("disabled", &self.disabled)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Insert an [`ImportedAgent`] as it is; the row read back is parsed like
+/// any other.
+pub async fn import(tx: &Tx<'_>, a: &ImportedAgent<'_>) -> Result<AgentRow, StoreError> {
+    let mut c = tx.conn().await;
+    let raw = sqlx::query_as!(
+        RawAgent,
+        r#"INSERT INTO agents (id, name, description, key_id, api_key_hash, kind, webhook_url,
+               webhook_secret, lldap_username, disabled, disabled_reason, runtime, project, host,
+               placement, lease_expires_at, last_seen_at, last_listen_at, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                   $18, $19)
+           RETURNING *"#,
+        Uuid::from(a.id),
+        a.name,
+        a.description,
+        a.key_id,
+        a.api_key_hash,
+        a.kind.as_str(),
+        a.webhook_url,
+        a.webhook_secret,
+        a.lldap_username,
+        a.disabled,
+        a.disabled_reason.map(DisableReason::as_str),
+        a.runtime,
+        a.project,
+        a.host,
+        a.placement.as_str(),
+        a.lease_expires_at,
+        a.last_seen_at,
+        a.last_listen_at,
+        a.created_at,
+    )
+    .fetch_one(&mut **c)
+    .await?;
+    raw.try_into()
+}
+
+/// Hold off every other writer of `agents` and `daemons` until the
+/// transaction ends (an import's emptiness check stays true until its
+/// commit, a running broker or not). Readers are not blocked.
+pub async fn lock_for_import(tx: &Tx<'_>) -> Result<(), StoreError> {
+    let mut c = tx.conn().await;
+    sqlx::query!("LOCK TABLE daemons, agents IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut **c)
+        .await?;
+    Ok(())
+}
+
 pub async fn get(tx: &Tx<'_>, id: AgentId) -> Result<Option<AgentRow>, StoreError> {
     let mut c = tx.conn().await;
     let raw = sqlx::query_as!(
