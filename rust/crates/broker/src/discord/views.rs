@@ -199,7 +199,7 @@ pub fn scope_of(word: &str) -> Option<LockdownScope> {
 }
 
 fn live(label: &str, style: ButtonStyle, id: CustomId) -> Component {
-    button(label, style, Some(id.render()), false)
+    button(label, style, id.render(), false)
 }
 
 /// `pending_view`: Approve, Deny, Edit.
@@ -251,7 +251,7 @@ pub fn kill_vm_view(scope: LockdownScope, host: Option<&str>, disabled: bool) ->
     vec![row(vec![button(
         "Kill VMs",
         ButtonStyle::Danger,
-        Some(id.render()),
+        id.render(),
         disabled,
     )])]
 }
@@ -291,13 +291,16 @@ pub fn read_window(form: &Submitted, max: DurationSecs) -> Result<DurationSecs, 
     Ok(d)
 }
 
-/// `disabled_view`: the three buttons, greyed out, with no custom ids.
+/// `disabled_view`: the three buttons, greyed out. They keep their custom
+/// ids: Discord refuses a button without one, disabled or not (code 50035,
+/// `BUTTON_COMPONENT_CUSTOM_ID_REQUIRED`), and with it the whole edit.
 #[must_use]
-pub fn disabled_view() -> Vec<Component> {
+pub fn disabled_view(rid: RequestId) -> Vec<Component> {
+    let off = |label, style, id: CustomId| button(label, style, id.render(), true);
     vec![row(vec![
-        button("Approve", ButtonStyle::Success, None, true),
-        button("Deny", ButtonStyle::Danger, None, true),
-        button("Edit", ButtonStyle::Secondary, None, true),
+        off("Approve", ButtonStyle::Success, CustomId::Approve(rid)),
+        off("Deny", ButtonStyle::Danger, CustomId::Deny(rid)),
+        off("Edit", ButtonStyle::Secondary, CustomId::Edit(rid)),
     ])]
 }
 

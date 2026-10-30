@@ -263,7 +263,10 @@ async fn channel_end_to_end(pool: sqlx::PgPool) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let row = row.unwrap();
-    assert_eq!(row.version.as_deref(), Some("0.1.0"));
+    assert_eq!(
+        row.version.as_deref(),
+        Some(agent_auth_hostd::daemon::VERSION)
+    );
     assert_eq!(row.last_status.as_ref().unwrap()["role"], json!("host"));
     // A call goes to the daemon and its reply comes back.
     let data = b

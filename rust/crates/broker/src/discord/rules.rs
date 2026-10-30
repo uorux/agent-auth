@@ -215,7 +215,7 @@ pub fn rules_view(p: &Page, selected: Option<&RuleRow>) -> Vec<Component> {
             button(
                 label,
                 ButtonStyle::Primary,
-                Some(CustomId::RulesPage { target }.render()),
+                CustomId::RulesPage { target }.render(),
                 !(0..pages).contains(&target),
             )
         };
@@ -234,13 +234,13 @@ pub fn rules_view(p: &Page, selected: Option<&RuleRow>) -> Vec<Component> {
             button(
                 label,
                 style,
-                Some(CustomId::RulesToggle { page, rule: s.id }.render()),
+                CustomId::RulesToggle { page, rule: s.id }.render(),
                 false,
             ),
             button(
                 "Delete",
                 ButtonStyle::Danger,
-                Some(CustomId::RulesDelete { page, rule: s.id }.render()),
+                CustomId::RulesDelete { page, rule: s.id }.render(),
                 false,
             ),
         ]));

@@ -101,13 +101,13 @@ pub fn held_view(id: MailItemId) -> Vec<twilight_model::channel::message::Compon
         button(
             "Release",
             ButtonStyle::Success,
-            Some(super::views::CustomId::MailRelease(id).render()),
+            super::views::CustomId::MailRelease(id).render(),
             false,
         ),
         button(
             "Discard",
             ButtonStyle::Danger,
-            Some(super::views::CustomId::MailDiscard(id).render()),
+            super::views::CustomId::MailDiscard(id).render(),
             false,
         ),
     ])]

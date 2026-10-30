@@ -288,7 +288,7 @@ impl DiscordNotifier {
             Some(g) if is_shell(request) && g.status == GrantStatus::Active => {
                 shell_view(request.id)
             }
-            _ => disabled_view(),
+            _ => disabled_view(request.id),
         };
         let msg = Message {
             embeds: Some(vec![card]),

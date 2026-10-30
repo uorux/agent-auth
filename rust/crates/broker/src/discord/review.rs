@@ -249,7 +249,7 @@ pub fn review_message(shown: &[(CallRow, Kind)], kind: Option<Kind>, everything:
         buttons.push(button(
             &format!("Wrong #{n}"),
             ButtonStyle::Secondary,
-            Some(CustomId::WrongCall(c.id).render()),
+            CustomId::WrongCall(c.id).render(),
             false,
         ));
     }

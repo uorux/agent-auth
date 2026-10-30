@@ -87,16 +87,13 @@ pub fn discord_time(t: OffsetDateTime, style: char) -> String {
     format!("<t:{}:{style}>", t.unix_timestamp())
 }
 
+/// A button. Discord refuses one without a custom id (link buttons aside,
+/// which the bot doesn't send), disabled or not, so it isn't optional.
 #[must_use]
-pub fn button(
-    label: &str,
-    style: ButtonStyle,
-    custom_id: Option<String>,
-    disabled: bool,
-) -> Component {
+pub fn button(label: &str, style: ButtonStyle, custom_id: String, disabled: bool) -> Component {
     Component::Button(Button {
         id: None,
-        custom_id,
+        custom_id: Some(custom_id),
         disabled,
         emoji: None,
         label: Some(label.to_owned()),

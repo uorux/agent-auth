@@ -568,11 +568,16 @@ fn views() {
         .map(|b| b.0)
         .collect();
     assert_eq!(labels, ["Approve", "Deny", "Edit"]);
-    assert!(
-        buttons(&disabled_view())
-            .iter()
-            .all(|b| b.2 && b.1.is_none())
+    // Greyed out, but with the live buttons' ids: Discord refuses an edit
+    // whose buttons lack one (BUTTON_COMPONENT_CUSTOM_ID_REQUIRED).
+    let live = buttons(&pending_view(r.id));
+    let off = buttons(&disabled_view(r.id));
+    assert!(off.iter().all(|b| b.2));
+    assert_eq!(
+        off.iter().map(|b| (&b.0, &b.1)).collect::<Vec<_>>(),
+        live.iter().map(|b| (&b.0, &b.1)).collect::<Vec<_>>()
     );
+    assert!(off.iter().all(|b| b.1.is_some()));
     let shell = request(
         Platform::Hostexec,
         "shell",
