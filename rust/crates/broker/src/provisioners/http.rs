@@ -1,7 +1,7 @@
 //! Outbound HTTP for the provisioners and the wiki: one client per upstream
 //! on the shared TLS configuration (`agent_auth_tls`: no proxy from the
-//! environment, no redirects, no compression), a timeout on every call, and
-//! response bodies read up to a bound.
+//! environment, no redirects, no compression), a User-Agent, a timeout on
+//! every call, and response bodies read up to a bound.
 
 use std::time::Duration;
 
@@ -18,6 +18,9 @@ pub const MAX_BODY: usize = 4 << 20;
 /// holds the containment lock shared, so a slow platform must not hold
 /// back a containment for long (see also [`super::PROVISION_DEADLINE`]).
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Sent on every call: GitHub refuses requests without one (403).
+pub const USER_AGENT: &str = concat!("agent-auth-broker/", env!("CARGO_PKG_VERSION"));
 
 /// A client for one upstream.
 #[derive(Debug, Clone)]
@@ -37,6 +40,7 @@ impl Http {
     /// A client with this TLS configuration (e.g. a cluster's own CA).
     pub fn with_tls(tls: rustls::ClientConfig) -> Result<Http, ConfigError> {
         let client = agent_auth_tls::reqwest_builder(tls, CALL_TIMEOUT)
+            .user_agent(USER_AGENT)
             .build()
             .map_err(|e| ConfigError(format!("HTTP client: {e}")))?;
         Ok(Http {

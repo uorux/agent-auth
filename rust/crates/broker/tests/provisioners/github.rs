@@ -37,6 +37,13 @@ fn later() -> String {
 
 /// GitHub as the tests expect it, with numbered installation tokens.
 pub fn github_default(c: &Call, n: &AtomicUsize) -> R {
+    // The real API refuses requests without a User-Agent.
+    if c.header("user-agent").is_empty() {
+        return r(
+            403,
+            json!({"message": "Request forbidden by administrative rules."}),
+        );
+    }
     let path = c.path.as_str();
     match (c.method.as_str(), path) {
         ("GET", "/app/installations/7") => r(200, json!({"id": 7, "account": {"login": "JRT"}})),
@@ -252,6 +259,11 @@ async fn a_repo_grant_mints_caches_and_stops_when_it_ends(pool: PgPool) {
     assert!(mints[0].header("authorization").starts_with("Bearer ey"));
     assert_eq!(mints[0].header("accept"), "application/vnd.github+json");
     assert_eq!(mints[0].header("x-github-api-version"), "2022-11-28");
+    assert!(
+        mints[0]
+            .header("user-agent")
+            .starts_with("agent-auth-broker/")
+    );
     let revokes = t.fake.find("DELETE", "/installation/token");
     assert_eq!(revokes.len(), 1);
     assert_eq!(revokes[0].header("authorization"), "token ghs_1");
